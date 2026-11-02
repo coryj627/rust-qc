@@ -93,3 +93,7 @@ These crates were studied as examples of the practices in use:
 - [ripgrep](https://github.com/BurntSushi/ripgrep)
 - [fd](https://github.com/sharkdp/fd)
 - [dua-cli](https://github.com/Byron/dua-cli)
+
+## License
+
+MIT. See `LICENSE`.
