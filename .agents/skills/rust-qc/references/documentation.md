@@ -1,0 +1,70 @@
+# Documentation
+
+## Doc comments
+
+**DOC-1. Every public item has a doc comment** (`#![deny(missing_docs)]` in libraries, as memchr, jiff, ripgrep's library crates, and dua-cli all do). Private items get doc comments when their purpose or invariants are not obvious.
+
+**DOC-2. The first sentence is a one-line summary of about 15 words**, written in the third person ("Returns the index of...", "A parsed glob pattern."). rustdoc shows it in module listings, and a long one wraps badly.
+
+**DOC-3. Canonical sections, in this order, when they apply:**
+
+```rust
+/// Summary sentence.
+///
+/// Extended explanation in prose: behavior, edge cases, complexity if it matters.
+///
+/// # Examples
+///
+/// ```
+/// # use mycrate::Thing;
+/// let t = Thing::new("x")?;
+/// assert_eq!(t.name(), "x");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+///
+/// # Errors
+///
+/// Returns an error if `name` is empty or contains a NUL byte.
+///
+/// # Panics
+///
+/// Panics if called after `close`.
+///
+/// # Safety
+///
+/// (unsafe fn only) The caller must ensure `ptr` is valid for reads of `len` bytes.
+```
+
+`# Errors` is required on public functions returning `Result`. `# Panics` is required when any input or state can cause a panic. `# Safety` is required on every `unsafe fn` and `unsafe trait`. Match the crate's heading form (`# Example` versus `# Examples`, see `precedence.md`).
+
+**DOC-4. No parameter tables.** Do not write `# Arguments` or `# Parameters` lists. Name parameters in prose: "Copies the file at `src` to `dst`."
+
+**DOC-5. Examples compile and run.** Use `?` and the hidden `# Ok::<(), Box<dyn std::error::Error>>(())` line instead of `unwrap()` (jiff does this about 800 times). Hide setup lines with `# `. Use `no_run` for examples that touch the network or filesystem, `ignore` only for illustrations that cannot compile, and `compile_fail` to demonstrate a misuse the type system prevents.
+
+**DOC-6. Link, do not describe.** Use intra-doc links (`` [`Searcher::search_path`] ``) for every type, method, and module you mention.
+
+**DOC-7. Do not explain the language.** "Returns a `Result`" and "This is a struct" waste the reader's time. If the only thing to say is the function name in sentence form, a doc comment on a private item can be omitted.
+
+**DOC-8. Document magic values.** Every non-obvious constant explains where its value came from and what breaks if it changes.
+
+**DOC-9. Feature-gated items** say which feature enables them (`#[cfg_attr(docsrs, doc(cfg(feature = "std")))]` with `[package.metadata.docs.rs] all-features = true`, as memchr and jiff do).
+
+## Module and crate docs
+
+**DOC-10. Every public module has a `//!` overview**: what it provides, the main entry points, and a short example. The crate root's doc is the front page: purpose, a quick-start example, a feature-flag table, and links to the main types. memchr's `src/lib.rs` is the model.
+
+**DOC-11. Document the end state, not the journey.** No changelogs, design diaries, "we chose X over Y" essays, or lists of guidelines followed inside rustdoc. A type-level `# Design` section that explains an enduring trade-off users need to understand is fine (jiff's `Error` does this, with a link to the issue).
+
+## Comments
+
+**CMT-1. Comments explain why.** State intent, constraints, invariants, and trade-offs. Delete comments that restate the next line.
+
+**CMT-2. Full sentences**, capitalized and punctuated. `//` with one space. Line comments, not block comments.
+
+**CMT-3. `TODO` comments carry an owner or issue link** (`// TODO(#123): ...`). A bare `TODO` is a forgotten task.
+
+**CMT-4. No commented-out code.** Version control remembers it.
+
+**CMT-5. No ASCII-art diagrams or box-drawing characters.** Describe layout and flow in sentences or numbered steps. (Team convention for screen-reader accessibility.)
+
+**CMT-6. Mix doc and implementation comments freely.** A `///` doc for users followed by a `//` note for maintainers on the same item is correct.
