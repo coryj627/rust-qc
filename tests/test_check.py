@@ -31,7 +31,9 @@ exit 0
 """
 
 STUB_RUSTUP = """#!/bin/sh
+echo "auto_install=$RUSTUP_AUTO_INSTALL rustup $* toolchain=$RUSTUP_TOOLCHAIN" >> "$STUB_LOG"
 case "$*" in
+    --version) echo "rustup ${STUB_RUSTUP_VERSION:-1.29.0} (28d1352db 2026-03-05)" ;;
     "toolchain list")
         echo "stable-aarch64-apple-darwin (active, default)"
         echo "$EXTRA_TOOLCHAIN"
@@ -56,10 +58,10 @@ with tempfile.TemporaryDirectory() as tmp:
         stub.write_text(body)
         stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
 
-    def run(*args, **stub_env):
+    def run(*args, path=None, **stub_env):
         log.write_text("")
-        env = {**os.environ, "PATH": f"{tmp}{os.pathsep}{os.environ['PATH']}", "STUB_LOG": str(log),
-               **stub_env}
+        env = {**os.environ, "PATH": path or f"{tmp}{os.pathsep}{os.environ['PATH']}",
+               "STUB_LOG": str(log), **stub_env}
         env.pop("RUSTUP_AUTO_INSTALL", None)
         out = subprocess.run(["bash", str(CHECK), *args], capture_output=True, text=True,
                              env=env, check=False)
@@ -109,7 +111,25 @@ with tempfile.TemporaryDirectory() as tmp:
             # rustup downloads a toolchain named with `+` if it is missing.
             expect(label, "+nightly" not in calls, f"asked rustup for nightly\n{calls}")
 
+    # rustup before 1.28 downloads a missing toolchain with no way to opt out, so the gate stops
+    # before cargo runs. The versions compare as numbers, and an unreadable one counts as too old.
+    for version, want in (("1.27.1", 2), ("1.9.0", 2), ("0.99.0", 2), ("unknown", 2),
+                          ("1.28.0", 0), ("1.100.0", 0), ("2.0.0", 0)):
+        code, out, calls = run(str(CRATE), STUB_RUSTUP_VERSION=version)
+        expect(f"rustup {version}", code == want, f"exit {code}, want {want}\n{out}")
+        if want == 2:
+            expect(f"rustup {version}", " cargo " not in calls, f"ran cargo first\n{calls}")
+
+    no_rustup = Path(tmp) / "no_rustup"
+    no_rustup.mkdir()
+    (no_rustup / "cargo").symlink_to(Path(tmp) / "cargo")
+    code, out, _ = run(str(CRATE), path=os.pathsep.join((str(no_rustup), "/usr/bin", "/bin")))
+    expect("cargo without rustup", code == 0, f"exit {code}\n{out}")
+
     code, out, calls = run(str(CRATE))
+    # An old rustup's `--version` looks up the active toolchain and installs it if it is missing,
+    # unless a toolchain is named for that one call.
+    expect("rustup version query", "rustup --version toolchain=rust-qc-" in calls, f"{calls}")
     for line in calls.splitlines():
         expect("auto-install off", line.startswith("auto_install=0 "), f"{line}\n{out}")
 

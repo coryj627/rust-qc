@@ -32,6 +32,7 @@ To install a specific version, copy the folder from its tag, for example `git cl
 
 - cargo, rustfmt, clippy and bash (3.2 or newer), for the verification gate
 - python3, for the heuristic scan
+- rustup 1.28 or newer, if you use rustup
 - nightly rustfmt, only for projects whose `rustfmt.toml` uses nightly-only options
 - Miri, recommended for crates that contain `unsafe`
 
@@ -62,7 +63,7 @@ The skill never installs toolchains or tools on its own.
 - `--target` lints and documents code behind a platform gate, such as Windows-only code checked from Linux.
 - `--features` replaces `--all-features` for crates whose features cannot all be enabled together.
 
-It exits 0 when every step passes, 1 when any step fails, and 2 when a precondition is missing. A toolchain the project pins but you have not installed counts as missing, because the script turns off rustup's automatic downloads.
+It exits 0 when every step passes, 1 when any step fails, and 2 when a precondition is missing. A toolchain the project pins but you have not installed counts as missing, because the script turns off rustup's automatic downloads. rustup older than 1.28 also counts as a missing precondition, because those versions have no way to turn the downloads off.
 
 `python3 -I audit_scan.py <crate-root>` reports glob re-exports, weasel-word type names, ASCII-art comments, design-history docs, parameter tables, bare TODOs, empty `expect` messages and print macros in library code. It skips benchmark, fuzz and data folders, and treats tests and examples as non-production code. Inside `src/` it skips only test data and treats only `tests` as non-production, because folder names there are module names. A workspace member whose own folder is named like a skipped folder, such as `crates/data`, is still skipped.
 
