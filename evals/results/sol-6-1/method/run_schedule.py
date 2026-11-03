@@ -4,6 +4,8 @@
 Existing private run directories are always skipped. A provider cyberPolicy
 failure blocks further dispatch for that project; it is never rephrased/retried.
 Other failures stop new dispatch. Already-running independent tasks may finish.
+With --stop-on-policy, any provider block stops the entire condition, including
+when a later invocation finds an existing blocked attempt in its schedule.
 """
 
 import argparse
@@ -37,6 +39,8 @@ async def dispatch(args):
                 continue  # A live runner may be replacing its snapshot.
             if (metadata.get("error") or {}).get("codexErrorInfo") == "cyberPolicy":
                 blocked.add(row.get("project"))
+                if getattr(args, "stop_on_policy", False):
+                    stop.set()
 
     for row in rows:
         private = scratch / "private" / row["run_id"]
@@ -49,6 +53,8 @@ async def dispatch(args):
                     metadata = {}
                 if (metadata.get("error") or {}).get("codexErrorInfo") == "cyberPolicy":
                     blocked.add(row.get("project"))
+                    if getattr(args, "stop_on_policy", False):
+                        stop.set()
             decisions.append({"run_id": row["run_id"], "dispatch": "already_attempted"})
         else:
             queue.put_nowait(row)
@@ -56,6 +62,8 @@ async def dispatch(args):
     async def worker():
         while not queue.empty() and not stop.is_set():
             refresh_blocks()
+            if stop.is_set():
+                break
             if (scratch / "STOP-RESOURCE-LIMIT.json").exists():
                 stop.set()
                 break
@@ -100,6 +108,8 @@ async def dispatch(args):
             print(f"FINISHED {run} exit={code} failure={failure}", flush=True)
             if failure == "cyberPolicy":
                 blocked.add(row.get("project"))
+                if getattr(args, "stop_on_policy", False):
+                    stop.set()
             elif code:
                 stop.set()
                 failure_text = json.dumps(metadata.get("error") or {}).lower()
@@ -129,6 +139,8 @@ def main():
     parser.add_argument("schedule", type=Path)
     parser.add_argument("--workers", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--exclude-project", action="append", default=[])
+    parser.add_argument("--stop-on-policy", action="store_true",
+                        help="Stop the entire condition after any provider policy block")
     parser.add_argument("--codex", default="codex")
     parser.add_argument("--auth-file", type=Path, required=True)
     args = parser.parse_args()

@@ -63,6 +63,26 @@ class ScheduleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await dispatch(self.args), 0)
         self.assertEqual(self.calls, ["test-0", "test-2"])
 
+    async def test_stop_on_policy_halts_the_whole_condition(self):
+        self.rows(["blocked", "independent"])
+        self.args.stop_on_policy = True
+        self.failures["test-0"] = "cyberPolicy"
+        with patch("run_schedule.asyncio.create_subprocess_exec", self.fake_process):
+            self.assertEqual(await dispatch(self.args), 1)
+        self.assertEqual(self.calls, ["test-0"])
+
+    async def test_stop_on_policy_remains_stopped_when_resumed(self):
+        self.rows(["blocked", "independent"])
+        self.args.stop_on_policy = True
+        failed = self.root / "private/test-0"
+        failed.mkdir(parents=True)
+        (failed / "metadata.json").write_text(json.dumps({
+            "status": "failed", "error": {"codexErrorInfo": "cyberPolicy"},
+        }))
+        with patch("run_schedule.asyncio.create_subprocess_exec", self.fake_process):
+            self.assertEqual(await dispatch(self.args), 1)
+        self.assertEqual(self.calls, [])
+
     async def test_usage_limit_stops_dispatch_and_sets_global_marker(self):
         self.rows(["one", "two"])
         self.failures["test-0"] = "usageLimitExceeded"
