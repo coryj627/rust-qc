@@ -18,6 +18,8 @@ The skill lives in `.agents/skills/rust-qc/`. Its name, for agents that invoke s
 
 The report is ordered by severity. Each finding is headed by a plain description of the problem, so it reads well with a screen reader and pastes cleanly into an issue.
 
+**Auditing a repository runs its code.** `check.sh` and the audit's harnesses build and run the crate's build scripts, procedural macros and tests with your permissions. Audit untrusted code inside a sandbox, container or disposable VM. Only `audit_scan.py` is read-only: it reads the source without building or running it.
+
 ## Installing
 
 Copy the `.agents/skills/rust-qc` folder into the `.agents/skills/` folder of your project, or into the user-level skills folder your agent reads. If your agent reads skills from a different folder, copy or link the `rust-qc` folder there.
