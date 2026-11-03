@@ -1,0 +1,337 @@
+diff -ru base/quinn-proto/src/connection/ack_frequency.rs reprotree/quinn-proto/src/connection/ack_frequency.rs
+--- base/quinn-proto/src/connection/ack_frequency.rs	2025-08-27 16:59:47
++++ reprotree/quinn-proto/src/connection/ack_frequency.rs	2026-11-02 23:48:48
+@@ -153,3 +153,35 @@
+ /// extension and an explicit max ACK delay is not configured.
+ // Keep in sync with `AckFrequencyConfig::max_ack_delay` documentation
+ const MIN_AUTOMATIC_ACK_DELAY: Duration = Duration::from_millis(25);
++
++
++#[cfg(test)]
++mod repro_key {
++    use super::*;
++    use std::panic::{catch_unwind, AssertUnwindSafe};
++
++    // qp-6912dad (crash-from-input): candidate_max_ack_delay clamps a candidate delay
++    // with a peer-derived lower bound (min_ack_delay) and an RTT-derived upper bound.
++    // Nothing guarantees lower <= upper, so a peer advertising a large min_ack_delay at
++    // low RTT makes Duration::clamp panic ("min > max"). Transport-parameter validation
++    // only checks min_ack_delay <= max_ack_delay, not against the RTT.
++    #[test]
++    fn repro_key_6912dad_high_min_ack_delay_panics() {
++        // Peer advertises min_ack_delay = 100_000 us (100 ms).
++        let peer_params = TransportParameters {
++            min_ack_delay: Some(100_000u32.into()),
++            ..TransportParameters::default()
++        };
++        let state = AckFrequencyState::new(Duration::from_millis(100));
++        let config = crate::AckFrequencyConfig::default();
++        // Low RTT (5 ms): upper clamp bound becomes max(5ms, 25ms) = 25ms < 100ms lower.
++        let res = catch_unwind(AssertUnwindSafe(|| {
++            state.candidate_max_ack_delay(Duration::from_millis(5), &config, &peer_params)
++        }));
++        assert!(
++            res.is_err(),
++            "expected Duration::clamp to panic (min > max) at baseline; got {:?}",
++            res.ok()
++        );
++    }
++}
+diff -ru base/quinn-proto/src/connection/assembler.rs reprotree/quinn-proto/src/connection/assembler.rs
+--- base/quinn-proto/src/connection/assembler.rs	2025-08-27 16:59:47
++++ reprotree/quinn-proto/src/connection/assembler.rs	2026-11-02 23:50:24
+@@ -661,3 +661,116 @@
+         x.read(size, true).map(|chunk| chunk.bytes)
+     }
+ }
++
++
++#[cfg(test)]
++mod repro_key {
++    use super::*;
++    use bytes::Bytes;
++    use std::panic::{catch_unwind, AssertUnwindSafe};
++
++    // qp-fed0321 (resource-exhaustion): Assembler::insert has no limit on the number of
++    // buffered out-of-order fragments and no gap limit. A peer sending many small,
++    // non-adjacent (gapped) fragments forces the assembler to retain one Buffer per
++    // fragment; defragment cannot merge across gaps, so the retained chunk count grows
++    // linearly with the number of gapped fragments, pinning far more memory (per-chunk
++    // overhead + allocation) than the stream's byte count suggests.
++    fn chunks_after(n: usize) -> (usize, usize, u64) {
++        let mut a = Assembler::new();
++        a.ensure_ordering(false).unwrap();
++        // 1-byte fragments at offsets 0, 2, 4, ... leaving a 1-byte gap between each.
++        // allocation_size mimics each byte arriving in its own ~1200-byte datagram.
++        for i in 0..n as u64 {
++            a.insert(i * 2, Bytes::from_static(b"x"), 1200);
++        }
++        (a.data.len(), a.allocated, a.end)
++    }
++
++    #[test]
++    fn repro_key_fed0321_gapped_fragments_grow_unbounded() {
++        let (small_chunks, _small_alloc, _) = chunks_after(2_000);
++        let (big_chunks, _big_alloc, _) = chunks_after(20_000);
++        // Retained chunk count tracks the number of gapped fragments, with no cap: linear.
++        assert!(
++            small_chunks >= 2_000,
++            "expected >= 2000 retained chunks, got {small_chunks}"
++        );
++        assert!(
++            big_chunks >= 20_000,
++            "expected >= 20000 retained chunks, got {big_chunks}"
++        );
++        // ~10x growth in input gives ~10x growth in retained chunks.
++        assert!(
++            big_chunks >= small_chunks * 9,
++            "chunk count did not grow ~linearly: {small_chunks} -> {big_chunks}"
++        );
++    }
++
++    // qp-981d88e DIAGNOSTIC: zero-length STREAM frame in unordered mode -> empty range
++    // in RangeSet. Observe whether a later overlapping insert panics.
++    #[test]
++    fn diag_981d88e_assembler_empty_range() {
++        let outcome = catch_unwind(AssertUnwindSafe(|| {
++            let mut a = Assembler::new();
++            a.ensure_ordering(false).unwrap();
++            // A real fragment at [6,10)
++            a.insert(6, Bytes::from_static(b"ABCD"), 4);
++            // A zero-length STREAM frame at offset 5 -> recvd.replace(5..5) (empty range)
++            a.insert(5, Bytes::new(), 0);
++            // An overlapping fragment spanning the empty range
++            a.insert(2, Bytes::from_static(b"abcde"), 5);
++            a.data.len()
++        }));
++        println!("DIAG 981d88e assembler outcome = {outcome:?}");
++    }
++}
++
++
++#[cfg(test)]
++mod repro_key_search {
++    use super::*;
++    use bytes::Bytes;
++    use std::panic::{catch_unwind, AssertUnwindSafe};
++
++    // Brute-force search for a zero-length-STREAM-frame sequence that panics the
++    // unordered assembler (qp-981d88e). Each op is (offset, len); len 0 is a
++    // zero-length STREAM frame.
++    #[test]
++    fn diag_981d88e_search() {
++        let offs: [u64; 5] = [0, 1, 2, 3, 4];
++        let lens: [usize; 4] = [0, 1, 2, 3];
++        let mut found = 0;
++        for a_off in offs {
++            for a_len in lens {
++                for b_off in offs {
++                    for b_len in lens {
++                        for c_off in offs {
++                            for c_len in lens {
++                                let seq = [(a_off, a_len), (b_off, b_len), (c_off, c_len)];
++                                let r = catch_unwind(AssertUnwindSafe(|| {
++                                    let mut asm = Assembler::new();
++                                    asm.ensure_ordering(false).unwrap();
++                                    for &(o, l) in &seq {
++                                        let b = if l == 0 {
++                                            Bytes::new()
++                                        } else {
++                                            Bytes::copy_from_slice(&vec![b'z'; l])
++                                        };
++                                        asm.insert(o, b, l.max(1));
++                                    }
++                                    // drain
++                                    while asm.read(1024, false).is_some() {}
++                                }));
++                                if r.is_err() && found < 5 {
++                                    found += 1;
++                                    println!("PANIC seq = {seq:?}");
++                                }
++                            }
++                        }
++                    }
++                }
++            }
++        }
++        println!("total panicking seqs found (capped at 5 printed) = {found}");
++    }
++}
+diff -ru base/quinn-proto/src/connection/datagrams.rs reprotree/quinn-proto/src/connection/datagrams.rs
+--- base/quinn-proto/src/connection/datagrams.rs	2025-08-27 16:59:47
++++ reprotree/quinn-proto/src/connection/datagrams.rs	2026-11-02 23:51:37
+@@ -209,3 +209,39 @@
+     #[error("datagram send blocked")]
+     Blocked(Bytes),
+ }
++
++
++#[cfg(test)]
++mod repro_key {
++    use super::*;
++    use crate::frame::Datagram;
++    use bytes::Bytes;
++
++    // qp-a3109c3 (resource-exhaustion): DatagramState::received charges only the payload
++    // length against the receive window, so a zero-length DATAGRAM frame adds nothing to
++    // `recv_buffered` and never trips the eviction loop. `incoming` has no other bound, so
++    // a peer can queue an unbounded number of empty datagrams. recv_buffered stays 0 while
++    // the queue grows one entry per frame, independent of the configured window.
++    fn queued_after(n: usize) -> (usize, usize) {
++        let mut state = DatagramState::default();
++        let window = Some(1024usize);
++        for _ in 0..n {
++            state
++                .received(Datagram { data: Bytes::new() }, &window)
++                .expect("empty datagram accepted");
++        }
++        (state.incoming.len(), state.recv_buffered)
++    }
++
++    #[test]
++    fn repro_key_a3109c3_empty_datagrams_grow_unbounded() {
++        let (small_len, small_buf) = queued_after(1_000);
++        let (big_len, big_buf) = queued_after(20_000);
++        // The window (1024 bytes) is never consulted because 0 bytes are charged.
++        assert_eq!(small_buf, 0, "recv_buffered should stay 0 for empty datagrams");
++        assert_eq!(big_buf, 0, "recv_buffered should stay 0 for empty datagrams");
++        // One queued entry per empty datagram, with no cap: 20x input -> 20x entries.
++        assert_eq!(small_len, 1_000, "queued {small_len}, expected 1000");
++        assert_eq!(big_len, 20_000, "queued {big_len}, expected 20000");
++    }
++}
+diff -ru base/quinn-proto/src/range_set/btree_range_set.rs reprotree/quinn-proto/src/range_set/btree_range_set.rs
+--- base/quinn-proto/src/range_set/btree_range_set.rs	2025-08-27 16:59:47
++++ reprotree/quinn-proto/src/range_set/btree_range_set.rs	2026-11-02 23:51:37
+@@ -379,3 +379,65 @@
+         assert_eq!(set.peek_min().unwrap(), 0..4);
+     }
+ }
++
++
++#[cfg(test)]
++mod repro_key {
++    use super::*;
++    use std::panic::{catch_unwind, AssertUnwindSafe};
++
++    // qp-981d88e DIAGNOSTIC at the RangeSet layer: replacing an empty range stores an
++    // empty (start==end) entry, violating the no-empty-range invariant; a later
++    // overlapping replace then misbehaves. The fix guards Replace::drop against empty.
++    #[test]
++    fn diag_981d88e_rangeset_empty() {
++        let outcome = catch_unwind(AssertUnwindSafe(|| {
++            let mut set = RangeSet::new();
++            set.replace(3..3);
++            set.replace(6..10);
++            set.replace(5..5);
++            set.replace(2..7);
++            set.0.iter().map(|(&s, &e)| (s, e)).collect::<Vec<_>>()
++        }));
++        println!("DIAG 981d88e rangeset outcome = {outcome:?} (fixed expects [(2,10)])");
++    }
++}
++
++
++#[cfg(test)]
++mod repro_key2 {
++    use super::*;
++
++    // qp-981d88e (observed as wrong-behavior at baseline): replacing an empty range
++    // (as happens when a zero-length STREAM frame reaches the unordered-read assembler,
++    // which calls recvd.replace(offset..offset)) makes Replace::drop store an empty
++    // (start==end) entry. This violates the RangeSet invariant that it holds no empty
++    // ranges and no pair of ranges that could be simplified. A subsequent overlapping
++    // replace then fails to merge correctly. The advisory (RUSTSEC-2026-0338) describes
++    // the downstream consequence as a connection panic / DoS; this harness demonstrates
++    // the invariant corruption that causes it, matching the maintainers' own fix test.
++    #[test]
++    fn repro_key_981d88e_empty_range_corrupts_rangeset() {
++        let mut set = RangeSet::new();
++        set.replace(3..3); // empty range -> stores (3,3)
++        set.replace(6..10);
++        set.replace(5..5); // empty range -> stores (5,5)
++        set.replace(2..7); // overlaps 6..10, should merge to (2,10)
++        let contents: Vec<(u64, u64)> = set.0.iter().map(|(&s, &e)| (s, e)).collect();
++        // Correct per RangeSet's documented invariant: a single merged range [2,10).
++        let correct = vec![(2u64, 10u64)];
++        assert_ne!(
++            contents, correct,
++            "baseline should NOT produce the correct merged set"
++        );
++        // Baseline actually leaves a stray empty range and an unmerged overlap.
++        assert!(
++            contents.iter().any(|&(s, e)| s == e),
++            "expected a stray empty range at baseline; got {contents:?}"
++        );
++        assert!(
++            contents.len() > 1,
++            "expected unmerged/corrupted ranges at baseline; got {contents:?}"
++        );
++    }
++}
+diff -ru base/quinn-proto/src/transport_parameters.rs reprotree/quinn-proto/src/transport_parameters.rs
+--- base/quinn-proto/src/transport_parameters.rs	2025-08-27 16:59:47
++++ reprotree/quinn-proto/src/transport_parameters.rs	2026-11-02 23:48:48
+@@ -874,3 +874,62 @@
+         low_limit.validate_resumption_from(&high_limit).unwrap_err();
+     }
+ }
++
++
++#[cfg(test)]
++mod repro_key {
++    use super::*;
++    use crate::Side;
++    use std::panic::{catch_unwind, AssertUnwindSafe};
++
++    // qp-655a8ad (crash-from-input): a truncated MaxDatagramFrameSize transport
++    // parameter (declared length 0, so no value bytes) reaches `r.get().unwrap()`
++    // on an empty buffer, where the varint decode returns Err and unwrap panics.
++    #[test]
++    fn repro_key_655a8ad_truncated_max_datagram_frame_size_panics() {
++        // id=0x20 (MaxDatagramFrameSize), len=0x00, no value bytes.
++        let buf: [u8; 2] = [0x20, 0x00];
++        let res = catch_unwind(AssertUnwindSafe(|| {
++            let mut slice = &buf[..];
++            TransportParameters::read(Side::Server, &mut slice)
++        }));
++        assert!(
++            res.is_err(),
++            "expected a panic parsing a truncated max_datagram_frame_size at baseline; \
++             instead got {:?}",
++            res.ok()
++        );
++    }
++
++    // qp-621e38a (wrong-behavior): the MaxDatagramFrameSize arm decodes a varint from
++    // the whole remaining buffer instead of exactly `len` bytes, and never checks that
++    // the value occupied its declared length. A parameter that declares length 8 but
++    // encodes a 1-byte value leaves 7 bytes that the parser then interprets as further
++    // transport parameters. Per RFC 9000 s7.4 / s18, each parameter's value occupies
++    // exactly its declared length and surplus must be rejected (Error::Malformed).
++    #[test]
++    fn repro_key_621e38a_mismatched_length_smuggles_params() {
++        // MaxDatagramFrameSize id=0x20, len=0x08, 8-byte value region:
++        //   0x05                 -> 1-byte varint value 5 (consumes 1 of the 8)
++        //   0x6A 0xB2 0x00       -> GreaseQuicBit (id 0x2AB2) len 0 -> grease=true
++        //   0x08 0x02 0x40 0x64  -> InitialMaxStreamsBidi (id 0x08) len 2, value 100
++        let buf: [u8; 10] = [0x20, 0x08, 0x05, 0x6A, 0xB2, 0x00, 0x08, 0x02, 0x40, 0x64];
++        let mut slice = &buf[..];
++        let params = TransportParameters::read(Side::Server, &mut slice)
++            .expect("baseline wrongly accepts a mismatched-length transport parameter");
++        assert_eq!(
++            params.max_datagram_frame_size,
++            Some(VarInt(5)),
++            "max_datagram_frame_size parsed from only 1 of its 8 declared bytes"
++        );
++        assert!(
++            params.grease_quic_bit,
++            "a GreaseQuicBit smuggled inside the declared length took effect"
++        );
++        assert_eq!(
++            params.initial_max_streams_bidi,
++            VarInt(100),
++            "an InitialMaxStreamsBidi smuggled inside the declared length took effect"
++        );
++    }
++}

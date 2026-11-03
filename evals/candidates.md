@@ -1,6 +1,6 @@
-# Projects for answer-key evaluation
+# Candidates for answer-key evaluation
 
-The 10 projects chosen for issue #2, with 76 candidate key bugs. Each project is tracked in its own issue, which builds the key and runs the evaluation.
+The 10 projects chosen for issue #2, with 76 candidate key bugs. Each project is tracked in its own issue. Running the candidates changed some of them, so `keys/` is the current record wherever it differs from the tables below.
 
 ## The list
 
@@ -21,12 +21,49 @@ Size is total lines / code lines / `unsafe` count in the audited path at the bas
 
 Kinds: crash = crash or panic from input; soundness = undefined behaviour from safe code; resource = resource exhaustion; wrong = wrong behaviour.
 
-## How far each fact was verified
+## Results of running the candidates
+
+Each project got one agent that built the crate and tried to reproduce every candidate at its baseline, in the container described in `README.md`. The keys in `keys/` hold the outcome, and `repro/` holds the reproducers and their output.
+
+| Project | Reproduced | Read only | Dropped | Reproduced kinds |
+|---|---|---|---|---|
+| h2 | 8 | 0 | 3 | crash 1, resource 3, wrong 4 |
+| quinn-proto | 6 | 2 | 0 | crash 2, resource 2, wrong 2 |
+| just | 11 | 0 | 1 | crash 5, resource 1, wrong 5 |
+| heapless | 11 | 2 | 3 | crash 1, soundness 8, wrong 2 |
+| git2 | 8 | 0 | 0 | crash 3, soundness 4, wrong 1 |
+| mlua | 9 | 0 | 0 | crash 2, soundness 2, resource 1, wrong 4 |
+| zip | 7 | 1 | 0 | crash 2, resource 2, wrong 3 |
+| pulldown-cmark | 10 | 0 | 2 | crash 3, resource 4, wrong 3 |
+| moka | 5 | 0 | 3 | soundness 2, resource 1, wrong 2 |
+| simd-json | 12 | 0 | 0 | crash 1, soundness 4, resource 1, wrong 6 |
+
+Read-only entries are supported by reading but do not count toward a key. Every project clears the 4 reproduced bugs each issue asks for.
+
+**Checks on these results:**
+
+- All 87 reproducers passed again from clean builds, on copies with all build output removed (`repro/rerun.tsv`).
+- A sample of 6, one each from h2, just, pulldown-cmark, zip, heapless and mlua, was also run against upstream's fixed code, and all 6 stopped reporting the bug. The other fix controls are the building agents' own runs.
+- The labels and evidence are the building agents' judgement, spot-checked rather than reviewed line by line.
+
+**Where a key is weaker than its count:**
+
+- **heapless still falls short.** There is no resource bug, and its only crash, heapless-11, is debug-only and shares a fix commit with heapless-5. heapless-9 and heapless-10 appear only under particular Miri settings, and heapless-12 is contrived.
+- **moka** reached all 5 of its entries, but moka-1 and moka-3 force the thread interleaving for their Miri or growth measurements, and moka-4 shows only under Miri Tree Borrows. It still has no crash.
+- **simd-json** shows 3 of its 4 soundness bugs only under Miri on the x86_64 fallback, and simd-json-9 only under Miri on aarch64. Its default build fails on `deny(warnings)` with this toolchain, so it needs `--cap-lints`.
+- **quinn-proto** runs 4 of its 6 reproducers as tests inside a patched copy of the crate, so they reach internal APIs. Two have no fix control, and two more entries stayed read only.
+- **zip:** `53bdadc` stayed read only because `ZipStreamReader` is `pub(crate)` at the tag, and `09c030e` reproduces only unchecked symlink creation, not the advisory's write escape.
+
+**Changes from the candidates:** some kinds were relabelled after running, such as quinn's `981d88e` (corruption, no panic found), mlua's `abe1c54` (no memory fault) and just's `53a658c`. Agents also added entries from reserves or the history, which is why some counts exceed the tables below.
+
+All results are from aarch64 Linux, so x86-only paths did not run natively. Doctest failures in several projects came from the container's `noexec` `/tmp`, not from the crates. Audits have not started.
+
+## How the candidates were verified when chosen
 
 - **Checked by script against the git history, for all 76 entries:** the commit exists, the baseline tag is its ancestor, it is not in the tag, it touches the audited Rust source, and every quoted baseline line matches its file and line number exactly. Sizes and dates were measured from the tags.
-- **Baseline code and fix diff read in the coordinating session, for 19 of 76, marked ✓:** all 11 entries the removed-lines check flagged, plus 8 sampled. All 19 held up. The flags came from later refactors moving the code.
+- **Baseline code and fix diff read in the coordinating session, for 19 of 76, marked ✓:** all 11 entries the removed-lines check flagged, plus 8 sampled. All 19 looked right on reading, and the flags came from later refactors moving the code. Running them later narrowed two of the 19; see Results.
 - **Read by a vetting agent only, for the other 57:** the quoted lines are proven to exist, but the judgement that they show the bug is the agent's.
-- **Not confirmed for any project:** nothing was built or run, so no bug has been reproduced at its baseline. 'Builds and tests on stable Rust in a Linux container' comes from reading manifests and CI files only.
+- **Nothing was built or run at this stage.** Build notes below come from reading manifests and CI files. See Results for what running them showed.
 - **AI policy:** 'none found' means none in the repo's contributor docs and `.github/` at the branch tip, plus the org's `.github` repo where one exists. It does not mean the project has no policy.
 
 ## Projects
