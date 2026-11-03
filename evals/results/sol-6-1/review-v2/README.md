@@ -20,6 +20,14 @@ not be included in a later effect estimate, regardless of its outcome. A later
 scored comparison requires a separately frozen plan and key eligibility for the
 narrower scope, identical across arms. Original audit results remain separate.
 
+The prospective [functional key set](comparison-eligibility.json) was selected
+from the existing definitions before reading the pilot report: 50 of 92 entries
+cover ordinary output, errors, API invariants and bounded regression behavior.
+Focused memory-safety, privilege/containment and resource-exhaustion investigations
+are outside that recall measure. These are operator scope decisions, not model
+grades or a claim that included defects have no possible security implications.
+The pilot remains excluded from a future comparison regardless of its result.
+
 There is exactly one pilot attempt. Any provider policy block stops the entire
 new condition. The dispatcher uses `--stop-on-policy`, which also prevents a
 later invocation from continuing a condition that already contains a blocked

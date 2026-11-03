@@ -24,7 +24,8 @@ class ProvenanceExportTests(unittest.TestCase):
                 sorted(str(p.relative_to(output)) for p in output.rglob('*') if p.is_file()),
                 ['grading/provenance.json', 'schedules/stage5-schedule.json'],
             )
-            folders = ("grading", "schedules", "invalid-attempts", "stage1", "stage2", "method")
+            folders = ("grading", "schedules", "invalid-attempts", "stage1", "stage2", "method",
+                       "review-v2")
             for folder in folders:
                 (output / folder).mkdir(exist_ok=True)
                 (output / folder / "canary.md").write_text('user@example.invalid')

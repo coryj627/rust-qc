@@ -166,7 +166,7 @@ def scan(output):
                  if path.is_file() and path.suffix in {".json", ".jsonl", ".md", ".log"})
     for folder in [output / name for name in (
         "raw", "reports", "artifacts", "controls", "stage5", "grading", "schedules", "preflight",
-        "stage1", "stage2", "invalid-attempts",
+        "stage1", "stage2", "invalid-attempts", "review-v2",
     )]:
         paths.extend(path for path in folder.rglob("*") if path.is_file())
     for path in paths:
