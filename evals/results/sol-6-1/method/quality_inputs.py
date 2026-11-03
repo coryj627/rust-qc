@@ -23,8 +23,8 @@ def provision(scratch, case, run_id, labels):
             subprocess.run(["/bin/cp", "-cR", str(source / "results" / label),
                             str(work / "results" / label)], check=True)
     assessment = json.loads((source / "results/assessment.json").read_text())
-    selected = {"case": case, "candidates": {label: assessment["candidates"][label]
-                                             for label in labels}}
+    selected = {"case": assessment["case"],
+                "candidates": {label: assessment["candidates"][label] for label in labels}}
     (work / "results/assessment.json").write_text(json.dumps(selected, indent=2) + "\n")
     for name in ("prepared", "baseline", ".cargo-home"):
         if (source / name).exists():
@@ -32,6 +32,9 @@ def provision(scratch, case, run_id, labels):
     structures = json.loads((Path(__file__).resolve().parent.parent /
                              "stage5/rubric-structure.json").read_text())
     (work / "rubric-structure.json").write_text(json.dumps(structures[case], indent=2) + "\n")
+    integrity = scratch / "grading-private" / f"s5-{case}" / "operator-input-integrity.json"
+    if integrity.exists():
+        shutil.copyfile(integrity, work / "input-integrity.json")
     (work / "clock").write_text(CLOCK)
     (work / "clock").chmod(0o755)
     return work

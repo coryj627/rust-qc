@@ -21,6 +21,10 @@ def main():
         path = scratch / f"stage{stage}-schedule.json"
         if path.exists():
             known.update({r["run_id"]: r for r in json.loads(path.read_text())})
+    grading = {}
+    for pattern in ("grading-*.json", "quality-*.json", "reconciliation-*.json"):
+        for path in scratch.glob(pattern):
+            grading.update({r["run_id"]: r for r in json.loads(path.read_text())})
     exports = []
     for path in sorted((scratch / "private").glob("*/metadata.json")):
         run = path.parent.name
@@ -40,6 +44,15 @@ def main():
             project = CASES[row["case"]]
             template = scratch / "audits/projects" / f"tmpl-{project}" if project else None
             record["artifacts"] = export_artifacts(scratch, run, output, template)
+        elif grading.get(run, {}).get("role") == "verifier":
+            template = scratch / "audits/projects" / f"tmpl-{grading[run]['project']}"
+            record["artifacts"] = export_artifacts(scratch, run, output, template)
+        elif grading.get(run, {}).get("role") in {"quality-grader", "quality-adjudicator"}:
+            # Candidate/input copies are already preserved elsewhere. Retain any
+            # fresh narrow-check scripts, copied probe sources and logs separately.
+            record["artifacts"] = export_artifacts(
+                scratch, run, output, include_roots={"tmp"},
+            )
         exports.append(record)
     hits = scan(output)
     reviews_path = output / "export-scans/privacy-review.json"

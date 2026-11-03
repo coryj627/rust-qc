@@ -26,7 +26,8 @@ class QualityInputTests(unittest.TestCase):
                 (source / "results" / label).mkdir(parents=True)
                 (source / "results" / label / "check.log").write_text(label)
             (source / "results/assessment.json").write_text(json.dumps({
-                "case": "decom", "candidates": {"A": {"outcome": "a"}, "B": {"outcome": "b"}},
+                "case": {"name": "decom", "limitations": ["case-wide context"]},
+                "candidates": {"A": {"outcome": "a"}, "B": {"outcome": "b"}},
             }))
 
             def clone(command, **_kwargs):
@@ -39,6 +40,7 @@ class QualityInputTests(unittest.TestCase):
             self.assertFalse((work / "results/B").exists())
             result = json.loads((work / "results/assessment.json").read_text())
             self.assertEqual(set(result["candidates"]), {"A"})
+            self.assertEqual(result["case"]["limitations"], ["case-wide context"])
 
 
 if __name__ == "__main__":

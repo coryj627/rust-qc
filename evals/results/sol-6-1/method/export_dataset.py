@@ -72,10 +72,12 @@ def workspace_files(workspace, skipped=None):
                 yield path, path.relative_to(workspace)
 
 
-def export_artifacts(scratch, run_id, output, template=None):
+def export_artifacts(scratch, run_id, output, template=None, include_roots=None):
     workspace = scratch / "audits/projects" / run_id
     copied, excluded = [], []
     for path, relative in workspace_files(workspace, excluded):
+        if include_roots is not None and relative.parts[0] not in include_roots:
+            continue
         if relative.parts[0] in {"skill", ".agents"} or relative.name in {
             ".budget.json", "clock", "run", ".clock-start", ".clock-log", ".waits",
             ".rustc_info.json",

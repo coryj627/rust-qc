@@ -30,6 +30,8 @@ def entries(root):
             "time_budget_minutes": float(run["budget_minutes"]),
             "minutes_used": float(run["minutes"]),
             "report": f"results/sol-6-1/{run['report']}",
+            "grading": "results/sol-6-1/key_scores.json",
+            "unredacted_recheck": "results/sol-6-1/key_recheck.json",
             "bugs_found": [s["bug"] for s in selected if s["runs"][run["run"]] == "found"],
             "bugs_partial": [s["bug"] for s in selected if s["runs"][run["run"]] == "partial"],
         })

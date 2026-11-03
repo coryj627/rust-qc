@@ -195,6 +195,18 @@ Recommendations must wait until all grading finishes and come from a new agent
 that has not audited, graded, read Claude's results, or seen Sol's arm mapping
 beforehand. No recommendation has been made during preparation.
 
+The DECOM assessor could not run the author's full `prepared.sha256` check: that
+manifest was omitted with author preparation logs to keep them out of assessment
+inputs. The missing check remains in its report. Before any quality grader starts,
+the operator separately compares every supplied case, rubric, scoring document,
+hidden test/runner and runtime baseline asset byte for byte against case-freeze
+commit `08dc878`, and compares the gate with the archived skill. Per-case
+`operator-input-integrity.json` records those hashes and scope. This supplements
+file-integrity evidence; it does not replace, rerun or change behavioral results,
+source, tests or rubric. Graders receive the retained assessment limitation and
+the supplemental check. Case-wide assessment context is preserved when filtering
+DECOM's JSON down to a single candidate. A canary test rejects an altered asset.
+
 ## Analysis rules fixed before grading
 
 - Key scores require both independent sheets. Agreements retain the shared
@@ -257,4 +269,21 @@ that archive were checked against the pinned baseline; an upstream terminal
 recording contains public fixture paths, not host data from this evaluation.
 Hashes and dispositions are in `../export-scans/privacy-review.json` and
 `baseline-archive-review.json`. Scanning covers raw evidence, reports, artifacts,
-control bundles and all Stage 5 preparation/assessment files.
+control bundles, grading inputs/maps, schedules and all Stage 5 preparation/assessment files.
+
+## Publication and handoff
+
+All 24 coding treatments completed with valid inputs and no transcript-checker
+flags. Their source/probe evidence is committed independently of later grading.
+The one valid audit receives a quoted, append-only Sol row in the moka key;
+failed or invalid audits receive no fabricated key scores. Original Claude key
+bytes and result files are preserved. The original scorer's output is compared
+byte for byte before and after the append in `claude-reproducibility.json`.
+
+The unredacted recheck is diagnostic and does not silently replace the original
+key scores. Its disagreements must accompany any result based on those scores.
+The recommendations profile is created only after every evaluation agent has
+finished and all quality reconciliation decisions are frozen. It receives the
+archived skill, scrubbed final Sol evidence, full submission sources and the
+earlier Claude results for the first time at that point. Its input hashes and
+fresh-profile provenance are recorded separately. It cannot edit the skill.

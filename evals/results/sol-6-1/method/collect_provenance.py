@@ -41,7 +41,8 @@ def collect(scratch, output):
             raise ValueError("Unexpected private grading directory")
         cell = private.name
         mapping = json.loads((private / "map.json").read_text())
-        for name in ("map.json", "redactions.json", "verifier-normalization.json"):
+        for name in ("map.json", "redactions.json", "verifier-normalization.json",
+                     "operator-input-integrity.json"):
             if (private / name).exists():
                 save(private / name, Path("grading") / cell / name)
         if cell.startswith("s5-"):
