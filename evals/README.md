@@ -6,6 +6,7 @@ Answer-key evaluation scores audit findings against real bugs that upstream fixe
 - `keys/`: one answer key per project, in the format described in `candidates.md`.
 - `repro/`: the reproducer for each key bug and its recorded output. `repro/rerun.tsv` holds the clean re-run results.
 - `sandbox/`: the container used to build and run upstream code.
+- `results/`: the 40 audit reports, their scores and the verified findings. Start with `results/README.md`.
 
 Never give an audit agent this folder. A workspace for an audit holds only the crate at its baseline tag.
 
@@ -14,7 +15,7 @@ Never give an audit agent this folder. A workspace for an audit holds only the c
 Building or testing these crates runs their build scripts, proc macros and tests, so do it only through `sandbox/sb`. It runs with no network, as non-root, with a read-only root filesystem, no capabilities, resource limits, and only one project folder mounted.
 
 ```bash
-docker build -t rqc-eval:1 evals/sandbox
+docker build -t rqc-eval:2 evals/sandbox
 ```
 
 `sb` keeps per-project folders next to itself, under `projects/<project>/`, mounted as `/work`. Each reproducer expects:

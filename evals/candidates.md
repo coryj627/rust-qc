@@ -21,6 +21,10 @@ Size is total lines / code lines / `unsafe` count in the audited path at the bas
 
 Kinds: crash = crash or panic from input; soundness = undefined behaviour from safe code; resource = resource exhaustion; wrong = wrong behaviour.
 
+## Evaluation results
+
+The audits for all 10 projects have run, testing skill `v1.0.0`. The results and their limits are in `results/README.md`.
+
 ## Results of running the candidates
 
 Each project got one agent that built the crate and tried to reproduce every candidate at its baseline, in the container described in `README.md`. The keys in `keys/` hold the outcome, and `repro/` holds the reproducers and their output.
