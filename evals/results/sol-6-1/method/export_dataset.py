@@ -6,7 +6,9 @@ the repository. Paths and credentials are scanned again after the export.
 """
 
 import argparse
+import filecmp
 import json
+import os
 import re
 from pathlib import Path
 
@@ -36,13 +38,18 @@ def publish(source, target, scratch):
 def workspace_files(workspace):
     """Do not follow agent-created links out into the exporter's host filesystem."""
     excluded = {"target", ".cargo-home", ".git", "__pycache__", ".pytest_cache"}
+    if workspace.is_symlink():
+        return
     resolved = workspace.resolve()
-    for path in workspace.rglob("*"):
-        relative = path.relative_to(workspace)
-        if any(part in excluded for part in relative.parts) or path.is_symlink():
-            continue
-        if path.is_file() and path.resolve().is_relative_to(resolved):
-            yield path, relative
+    for directory, folders, files in os.walk(workspace, followlinks=False):
+        parent = Path(directory)
+        folders[:] = [name for name in folders
+                      if name not in excluded and not (parent / name).is_symlink()]
+        for name in files:
+            path = parent / name
+            if (not path.is_symlink() and path.is_file()
+                    and path.resolve().is_relative_to(resolved)):
+                yield path, path.relative_to(workspace)
 
 
 def export_artifacts(scratch, run_id, output, template=None):
@@ -56,15 +63,15 @@ def export_artifacts(scratch, run_id, output, template=None):
         if template is not None:
             original = template / relative
             if (original.is_file() and not original.is_symlink()
-                    and original.read_bytes() == path.read_bytes()):
+                    and filecmp.cmp(original, path, shallow=False)):
                 continue
         target = output / "artifacts" / run_id / relative
+        if path.stat().st_size > 10_000_000:
+            excluded.append({"path": str(relative), "reason": "over_10MB_regenerate_from_probe"})
+            continue
         data = path.read_bytes()
         if data.startswith((b"\x7fELF", b"\xcf\xfa\xed\xfe", b"MZ", b"!<arch>\n")):
             excluded.append({"path": str(relative), "reason": "compiled_binary_or_core"})
-            continue
-        if len(data) > 10_000_000:
-            excluded.append({"path": str(relative), "reason": "over_10MB_regenerate_from_probe"})
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -82,6 +89,12 @@ def export_artifacts(scratch, run_id, output, template=None):
 def export(scratch, run_id, output, validity):
     private = scratch / "private" / run_id
     metadata = json.loads((private / "metadata.json").read_text())
+    review_path = private / "input_review.json"
+    if review_path.exists():
+        review = json.loads(review_path.read_text())
+        metadata["operator_input_review"] = review
+        if not review["valid"]:
+            validity = "invalid-other-source-skill"
     metadata["validity"] = validity
     metadata.pop("thread_id", None)
     folder = output / "raw" / run_id
@@ -101,7 +114,7 @@ def export(scratch, run_id, output, validity):
                 item.pop("id", None)
                 stream.write(scrub(json.dumps(item), scratch) + "\n")
     changes = []
-    for name in ["prompt.txt", "developer.txt", "commands.jsonl"]:
+    for name in ["prompt.txt", "developer.txt", "commands.jsonl", "input_review.json"]:
         if (private / name).exists():
             changes.append(publish(private / name, folder / name, scratch))
     for path in private.glob("command-*.log"):
@@ -124,7 +137,7 @@ def scan(output):
         "personal_name": re.compile(r"\bcoryj?\b", re.IGNORECASE),
     }
     hits = []
-    for folder in [output / "raw", output / "reports", output / "artifacts"]:
+    for folder in [output / name for name in ("raw", "reports", "artifacts", "controls", "stage5")]:
         for path in folder.rglob("*"):
             if path.is_file():
                 text = path.read_bytes().decode("utf-8", errors="replace")

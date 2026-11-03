@@ -1,0 +1,302 @@
+      fs::write(self.justfile_path(), justfile).unwrap();
+    }
+
+    let stdout = if self.unindent_stdout {
+      unindent(&self.stdout)
+    } else {
+      self.stdout.clone()
+    };
+
+    let stderr = unindent(&self.stderr);
+
+    let mut command = Command::new(JUST);
+
+    if self.shell {
+      command.args(["--shell", "bash"]);
+    }
+
+    let mut child = command
+      .args(&self.args)
+      .envs(&self.env)
+      .current_dir(self.tempdir.path().join(&self.current_dir))
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped())
+      .spawn()
+      .expect("just invocation failed");
+
+    let pid = child.id();
+
+    {
+      let mut stdin_handle = child.stdin.take().expect("failed to unwrap stdin handle");
+
+      stdin_handle
+        .write_all(self.stdin.as_bytes())
+        .expect("failed to write stdin to just process");
+    }
+
+    let output = child
+      .wait_with_output()
+      .expect("failed to wait for just process");
+
+    let output_stdout = str::from_utf8(&output.stdout).unwrap();
+    let output_stderr = str::from_utf8(&output.stderr).unwrap();
+
+    if let Some(ref stdout_regex) = self.stdout_regex {
+      assert!(
+        stdout_regex.is_match(output_stdout),
+        "Stdout regex mismatch:\n{output_stdout:?}\n!~=\n/{stdout_regex:?}/",
+      );
+    }
+
+    if let Some(ref stderr_regex) = self.stderr_regex {
+      assert!(
+        stderr_regex.is_match(output_stderr),
+        "Stderr regex mismatch:\n{output_stderr:?}\n!~=\n/{stderr_regex:?}/",
+      );
+    }
+
+    if !compare("status", output.status.code(), Some(status))
+      | (self.stdout_regex.is_none() && !compare_string("stdout", output_stdout, &stdout))
+      | (self.stderr_regex.is_none() && !compare_string("stderr", output_stderr, &stderr))
+    {
+      panic!("Output mismatch.");
+    }
+
+    if let Some(ref response) = self.response {
+      assert_eq!(
+        &serde_json::from_str::<Response>(output_stdout)
+          .expect("failed to deserialize stdout as response"),
+        response,
+        "response mismatch"
+      );
+    }
+
+    for (path, expected) in &self.expected_files {
+      let actual = fs::read(self.tempdir.path().join(path)).unwrap();
+      assert_eq!(
+        actual,
+        expected.as_slice(),
+        "mismatch for expected file at path {}",
+        path.display(),
+      );
+    }
+
+    if self.test_round_trip && status == 0 {
+      self.round_trip();
+    }
+
+    Output {
+      pid,
+      stdout: output_stdout.into(),
+      tempdir: self.tempdir,
+    }
+  }
+
+  fn round_trip(&self) {
+    let output = Command::new(JUST)
+      .current_dir(self.tempdir.path())
+      .arg("--dump")
+      .envs(&self.env)
+      .output()
+      .expect("just invocation failed");
+
+    assert!(
+      output.status.success(),
+      "dump failed: {} {:?}",
+      output.status,
+      output,
+    );
+
+    let dumped = String::from_utf8(output.stdout).unwrap();
+
+    let reparsed_path = self.tempdir.path().join("reparsed.just");
+
+    fs::write(&reparsed_path, &dumped).unwrap();
+
+    let output = Command::new(JUST)
+      .current_dir(self.tempdir.path())
+      .arg("--justfile")
+      .arg(&reparsed_path)
+      .arg("--dump")
+      .envs(&self.env)
+      .output()
+      .expect("just invocation failed");
+
+    assert!(output.status.success(), "reparse failed: {}", output.status);
+
+    let reparsed = String::from_utf8(output.stdout).unwrap();
+
+    assert_eq!(reparsed, dumped, "reparse mismatch");
+  }
+}
+
+pub(crate) fn assert_eval_eq(expression: &str, result: &str) {
+  Test::new()
+    .justfile(format!("x := {expression}"))
+    .args(["--evaluate", "x"])
+    .stdout(result)
+    .unindent_stdout(false)
+    .success();
+}
+use {
+  crate::{output::Output, tempdir::tempdir, test::Test},
+  just::{Response, unindent},
+  pretty_assertions::Comparison,
+  regex::Regex,
+  serde::{Deserialize, Serialize},
+  serde_json::{Value, json},
+  std::{
+    collections::BTreeMap,
+    env::{self, consts::EXE_SUFFIX},
+    error::Error,
+    fmt::Debug,
+    fs,
+    io::Write,
+    iter,
+    path::{MAIN_SEPARATOR, MAIN_SEPARATOR_STR, Path, PathBuf},
+    process::{Command, Stdio},
+    str, thread,
+    time::{Duration, Instant},
+  },
+  tempfile::TempDir,
+  which::which,
+};
+
+const FALSE: &str = "[]";
+const JUST: &str = env!("CARGO_BIN_EXE_just");
+const TRUE: &str = "\"true\"";
+
+#[track_caller]
+fn assert_dump(justfile: &str, dump: &str) {
+  Test::new()
+    .arg("--dump")
+    .justfile(justfile)
+    .stdout(dump)
+    .success();
+}
+
+#[track_caller]
+fn assert_eval(expression: &str, result: &str) {
+  Test::new()
+    .justfile(format!("x := {expression}"))
+    .args(["--evaluate", "x"])
+    .stdout(result)
+    .unindent_stdout(false)
+    .success();
+}
+
+#[track_caller]
+fn assert_list(expression: &str, result: &str) {
+  Test::new()
+    .justfile(format!("set lists\n\nx := show({expression})"))
+    .unstable()
+    .args(["--evaluate", "x"])
+    .stdout(result)
+    .unindent_stdout(false)
+    .success();
+}
+
+#[track_caller]
+fn assert_stdout(output: &std::process::Output, stdout: &str) {
+  assert_success(output);
+  assert_eq!(String::from_utf8_lossy(&output.stdout), stdout);
+}
+
+#[track_caller]
+fn assert_success(output: &std::process::Output) {
+  if !output.status.success() {
+    eprintln!("stderr: {}", String::from_utf8_lossy(&output.stderr));
+    eprintln!("stdout: {}", String::from_utf8_lossy(&output.stdout));
+    panic!("{}", output.status);
+  }
+}
+
+fn default<T: Default>() -> T {
+  Default::default()
+}
+
+#[macro_use]
+mod test;
+
+mod alias;
+mod alias_style;
+mod allow_duplicate_recipes;
+mod allow_duplicate_variables;
+mod allow_missing;
+mod arg_attribute;
+mod assertions;
+mod assignment;
+mod attributes;
+mod backticks;
+mod booleans;
+mod byte_order_mark;
+mod cache;
+mod ceiling;
+mod changelog;
+mod choose;
+mod command;
+mod comparison;
+mod completions;
+mod conditional;
+25:  pub(crate) fn new() -> Self {
+53:  pub(crate) fn args<'a>(mut self, args: impl AsRef<[&'a str]>) -> Self {
+116:  pub(crate) fn shell(mut self, shell: bool) -> Self {
+121:  pub(crate) fn stderr(mut self, stderr: impl Into<String>) -> Self {
+126:  pub(crate) fn stderr_regex(mut self, stderr_regex: impl AsRef<str>) -> Self {
+136:  pub(crate) fn stdout(mut self, stdout: impl Into<String>) -> Self {
+141:  pub(crate) fn stdout_regex(mut self, stdout_regex: impl AsRef<str>) -> Self {
+151:  pub(crate) fn write(self, path: impl AsRef<Path>, content: &str) -> Self {
+158:  pub(crate) fn write_executable(self, path: impl AsRef<Path> + Copy, content: &str) -> Self {
+186:  pub(crate) fn expect_file(mut self, path: impl AsRef<Path>, content: impl AsRef<[u8]>) -> Self {
+195:  pub(crate) fn success(self) -> Output {
+205:  pub(crate) fn status(self, status: i32) -> Output {
+grep: crate/tests/dry_run.rs: No such file or directory
+crate/tests/misc.rs:587:fn dry_run() {
+crate/tests/misc.rs:589:    .arg("--dry-run")
+
+fn sha256_file(context: Context, path: &str) -> StringResult {
+  let path = context.execution_context.working_directory().join(path);
+  let mut file =
+    File::open(&path).map_err(|err| format!("failed to open `{}`: {err}", path.display()))?;
+  let mut writer = HashWriter::<Sha256, Sink>::new(io::sink());
+  io::copy(&mut file, &mut writer)
+    .map_err(|err| format!("failed to read `{}`: {err}", path.display()))?;
+  Ok(hex::encode(writer.finalize()))
+}
+
+fn shell(context: Context, command: &str, args: &[String]) -> StringResult {
+  if context.execution_context.config.dry_run {
+    let mut output = String::from("shell(");
+    for (i, arg) in iter::once(command)
+      .chain(args.iter().map(String::as_str))
+      .enumerate()
+    {
+      if i > 0 {
+        output.push_str(", ");
+      }
+      output.push_str(&Element(arg).color_display(Color::never()).to_string());
+    }
+    output.push(')');
+
+    return Ok(output);
+  }
+
+  Evaluator::run_command(
+    context.execution_context,
+    &BTreeMap::new(),
+    context.scope,
+    command,
+    Some(args),
+  )
+  .map_err(|output_error| output_error.to_string())
+}
+
+fn shoutykebabcase(_context: Context, s: &str) -> StringResult {
+  Ok(s.to_shouty_kebab_case())
+}
+
+fn shoutysnakecase(_context: Context, s: &str) -> StringResult {
+  Ok(s.to_shouty_snake_case())
+}
+

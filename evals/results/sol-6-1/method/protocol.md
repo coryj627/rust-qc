@@ -56,6 +56,22 @@ skills can leak into the experiment. It tests selection and following of that
 catalog entry; it does not test Codex's host filesystem discovery implementation.
 Audit skill arms receive `skill/`; baseline arms receive no skill or catalog.
 
+During the final Stage 5 input review, the pinned `just` source was found to
+contain `crate/skills/just/SKILL.md`. It was never advertised in the skill catalog,
+but remained readable as source data. Under the requested sole-skill boundary,
+all eight model runs with that source are invalid: the original case author and
+control author, two main audits, and four short audits. Their outputs and
+per-run input reviews are retained, excluded from every score and case freeze.
+`source-skill-isolation-review.json` records the affected IDs. No treatment had
+started. All other source/cache templates were scanned and had no extra skills.
+
+The bundled `just` skill directory was quarantined outside all agent mounts in
+fresh templates/workspaces. New case/control authors receive pristine cleaned
+inputs and none of the invalid authors' outputs. Blocked audits are not retried.
+Every subsequent model run scans its entire input workspace for other SKILL.md
+files before creating a profile or contacting the model. This source exclusion
+is recorded separately from the pinned Rust sources, which remain unchanged.
+
 ## Tool and transcript adaptations
 
 - Claude's Read/Grep/Glob/Write/Edit/Bash surface becomes `sandbox_exec` using
@@ -117,6 +133,14 @@ even while response events stream continuously, and to record its own source
 hash. Earlier runs retain the earlier runner provenance in git. Budgets and
 task wording were not changed.
 
+Later dispatchers use atomic per-run claims so an additional worker can safely
+take queued work when a slot becomes available. They never reuse an existing
+run directory. A shared resource-stop marker halts new dispatch and interrupts
+new-version runners if a usage/disk limit is observed. No such limit has been
+observed so far. Exit-137 command records are possible timeout **or** memory
+kills; the original sandbox does not distinguish these causes. Do not interpret
+the legacy `command_timeouts` field as proof of a timeout.
+
 ## Case preparation and remaining gates
 
 Six separate clean-profile agents author the Stage 5 cases and rubrics. They
@@ -129,6 +153,15 @@ including hidden tests, must be committed before any treatment starts.
 24 independent workspaces. Stage 5 uses a frozen 45-minute budget per treatment.
 Captured author code is evidence and is excluded from repository Python linting;
 maintained orchestration code remains linted.
+
+The three upstream-case authors encountered uncached dependencies in their fixed
+snapshots. Their initial failures and supplemental source checks are retained.
+Before freezing treatment inputs, the operator provisioned separate fixed-source
+workspaces, fetched their package dependencies with the original `sb fetch`, and
+replayed the author-owned hidden-test runners with `sb run`. These are deterministic
+control checks, not additional model treatments. No toolchain was installed and
+no treatment template/cache was changed. `../stage5/control-refresh/` records
+commands, statuses, fetched lockfiles and the distinction from author-run checks.
 
 Independent control authors receive source and real defect summaries only, never
 audit reports or mappings. They must confirm two false key entries and five false
@@ -143,6 +176,27 @@ absent. A separate random 10% recheck must use unredacted reports.
 Recommendations must wait until all grading finishes and come from a new agent
 that has not audited, graded, read Claude's results, or seen Sol's arm mapping
 beforehand. No recommendation has been made during preparation.
+
+## Analysis rules fixed before grading
+
+- Key scores require both independent sheets. Agreements retain the shared
+  verdict. Disagreements remain `disputed` until a separate blind adjudicator
+  reads the reports and match rules; they are never silently treated as misses.
+- Planted key entries and false findings are excluded from every substantive
+  total, regardless of whether graders/verifiers believe them. A verifier item
+  that mixes a planted and real claim is flagged for review and prevents that
+  project's union metrics from entering a comparison until resolved.
+- Stage 5 quality is the mean of the two independent 12-point rubric scores;
+  both sheets and their difference remain visible. Unresolved intervals remain
+  intervals and do not enter point comparisons. Harm dimensions are reported
+  separately, with not-applicable cases distinguished from missing scores.
+- Each comparison requires two scored runs in each arm for that project/case.
+  Missing runs/grades are not zero. Every reported gap includes both replicate
+  values and within-arm absolute differences. The exact sign-flip function is
+  imported unchanged from `evals/results/score.py`; p-values are uncorrected.
+  No p-value is produced for an empty set of complete comparison cells.
+- Stage 3, Stage 4 and Stage 5 remain separate. Claude comparisons must use only
+  matched Stage 3 settings and disclose the changed tool/profile harness.
 
 ## Export
 

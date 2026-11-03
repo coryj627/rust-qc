@@ -18,6 +18,8 @@ import shutil
 import time
 from pathlib import Path
 
+from source_skills import require_sole_skill
+
 MODEL = "gpt-6.1-sol"
 EFFORT = "high"
 CONFIG = f'''
@@ -114,6 +116,7 @@ async def run_agent(args):
     work = scratch / "audits/projects" / args.run_id
     if not work.is_dir():
         raise ValueError("prepare the workspace first")
+    require_sole_skill(work, args.skill)
     private = scratch / "private" / args.run_id
     private.mkdir(parents=True, mode=0o700)
     profile = private / "profile"
@@ -234,6 +237,13 @@ async def run_agent(args):
             "capabilities": {"experimentalApi": True},
         }})
         while True:
+            if started is not None and (scratch / "STOP-RESOURCE-LIMIT.json").exists():
+                metadata["status"] = "cancelled_resource_limit"
+                if thread_id and turn_id:
+                    send({"id": 99, "method": "turn/interrupt", "params": {
+                        "threadId": thread_id, "turnId": turn_id,
+                    }})
+                break
             if started is not None and used() >= args.minutes * 60:
                 metadata["status"] = "budget_exhausted"
                 if thread_id and turn_id:

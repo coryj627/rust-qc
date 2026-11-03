@@ -1,0 +1,462 @@
+/work/crate/src/sync/base_cache.rs:404:    pub(crate) fn invalidate_all(&self) {
+/work/crate/src/sync/base_cache.rs:960:    fn is_write_order_queue_enabled(&self) -> bool {
+/work/crate/src/sync/base_cache.rs:1705:        if self.is_write_order_queue_enabled() {
+/work/crate/src/sync/base_cache.rs:1899:        if self.is_write_order_queue_enabled() {
+/work/crate/src/sync/cache.rs:1658:    pub fn invalidate_all(&self) {
+/work/crate/src/sync/cache.rs:1764:    pub fn run_pending_tasks(&self) {
+/work/crate/src/sync/cache.rs:2250:    fn invalidate_all() {
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn remove_expired_ao(
+        &self,
+        cache_region: CacheRegion,
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        batch_size: u32,
+        now: Instant,
+        eviction_state: &mut EvictionState<'_, K, V>,
+    ) where
+        V: Clone,
+    {
+        let tti = &self.expiration_policy.time_to_idle();
+        let va = &self.valid_after();
+        let deq_name = cache_region.name();
+        let (ao_deq, wo_deq) = deqs.select_mut(cache_region);
+        let mut more_to_evict = true;
+
+        for _ in 0..batch_size {
+            let maybe_key_hash_ts = ao_deq.peek_front().map(|node| {
+                let elem = &node.element;
+                (
+                    Arc::clone(elem.key()),
+                    elem.hash(),
+                    elem.is_dirty(),
+                    elem.last_accessed(),
+                )
+            });
+
+            let (key, hash, cause) = match maybe_key_hash_ts {
+                Some((key, hash, false, Some(ts))) => {
+                    let cause = match is_entry_expired_ao_or_invalid(tti, va, ts, now) {
+                        (true, _) => RemovalCause::Expired,
+                        (false, true) => RemovalCause::Explicit,
+                        (false, false) => {
+                            more_to_evict = false;
+                            break;
+                        }
+                    };
+                    (key, hash, cause)
+                }
+                // TODO: Remove the second pattern `Some((_key, false, None))` once
+                // we change `last_modified` and `last_accessed` in `EntryInfo` from
+                // `Option<Instant>` to `Instant`.
+                Some((key, hash, true, _) | (key, hash, false, None)) => {
+                    // `is_dirty` is true or `last_modified` is None. Skip this entry
+                    // as it may have been updated by this or other async task but
+                    // its `WriteOp` is not processed yet.
+                    self.skip_updated_entry_ao(&key, hash, deq_name, ao_deq, wo_deq);
+                    // Set `more_to_evict` to `false` to make `run_pending_tasks` to
+                    // return early. This will help that `schedule_write_op` to send
+                    // the `WriteOp` to the write op channel.
+                    more_to_evict = false;
+                    continue;
+                }
+                None => {
+                    more_to_evict = false;
+                    break;
+                }
+            };
+
+            // Lock the key for removal if blocking removal notification is enabled.
+            let kl = self.maybe_key_lock(&key);
+            let _klg = &kl.as_ref().map(|kl| kl.lock());
+
+            // Remove the key from the map only when the entry is really
+            // expired. This check is needed because it is possible that the entry in
+            // the map has been updated or deleted but its deque node we checked
+            // above has not been updated yet.
+            let maybe_entry = self.cache.remove_if(
+                hash,
+                |k| k == &key,
+                |_, v| is_expired_entry_ao(tti, va, v, now),
+            );
+
+            if let Some(entry) = maybe_entry {
+                if eviction_state.is_notifier_enabled() {
+                    eviction_state.notify_entry_removal(key, &entry, cause);
+                }
+                eviction_state.counters.incr_eviction_count();
+                Self::handle_remove_with_deques(
+                    deq_name,
+                    ao_deq,
+                    wo_deq,
+                    timer_wheel,
+                    entry,
+                    &mut eviction_state.counters,
+                );
+            } else {
+                self.skip_updated_entry_ao(&key, hash, deq_name, ao_deq, wo_deq);
+                more_to_evict = false;
+            }
+        }
+
+        if more_to_evict {
+            eviction_state.more_entries_to_evict = true;
+        }
+    }
+
+    #[inline]
+    fn skip_updated_entry_ao(
+        &self,
+        key: &K,
+        hash: u64,
+        deq_name: &str,
+        deq: &mut Deque<KeyHashDate<K>>,
+        write_order_deq: &mut Deque<KeyHashDate<K>>,
+    ) {
+        if let Some(entry) = self.cache.get(hash, |k| (k.borrow() as &K) == key) {
+            // The key exists and the entry may have been read or updated by other
+            // thread.
+            Deques::move_to_back_ao_in_deque(deq_name, deq, &entry);
+            if entry.is_dirty() {
+                Deques::move_to_back_wo_in_deque(write_order_deq, &entry);
+            }
+        } else {
+            // Skip this entry as the key may have been invalidated by other thread.
+            // Since the invalidated ValueEntry (which should be still in the write
+            // op queue) has a pointer to this node, move the node to the back of the
+            // deque instead of popping (dropping) it.
+            deq.move_front_to_back();
+        }
+    }
+
+    #[inline]
+    fn skip_updated_entry_wo(&self, key: &K, hash: u64, deqs: &mut Deques<K>) {
+        if let Some(entry) = self.cache.get(hash, |k| (k.borrow() as &K) == key) {
+            // The key exists and the entry may have been read or updated by other
+            // thread.
+            deqs.move_to_back_ao(&entry);
+            deqs.move_to_back_wo(&entry);
+        } else {
+            // Skip this entry as the key may have been invalidated by other thread.
+            // Since the invalidated `ValueEntry` (which should be still in the write
+            // op queue) has a pointer to this node, move the node to the back of the
+            // deque instead of popping (dropping) it.
+            deqs.write_order.move_front_to_back();
+        }
+    }
+
+
+        for KvEntry { key: _key, entry } in invalidated {
+            Self::handle_remove(deqs, timer_wheel, entry, None, &mut eviction_state.counters);
+        }
+        if is_done {
+            deqs.write_order.reset_cursor();
+        }
+        if !invalidator.is_empty() {
+            eviction_state.more_entries_to_evict = true;
+        }
+    }
+
+    fn evict_lru_entries(
+        &self,
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        batch_size: u32,
+        weights_to_evict: u64,
+        eviction_state: &mut EvictionState<'_, K, V>,
+    ) where
+        V: Clone,
+    {
+        const CACHE_REGION: CacheRegion = CacheRegion::MainProbation;
+        let deq_name = CACHE_REGION.name();
+        let (ao_deq, wo_deq) = deqs.select_mut(CACHE_REGION);
+        let mut evicted = 0u64;
+        let mut more_to_evict = true;
+
+        for _ in 0..batch_size {
+            if evicted >= weights_to_evict {
+                more_to_evict = false;
+                break;
+            }
+
+            let maybe_key_hash_ts = ao_deq.peek_front().map(|node| {
+                let entry_info = node.element.entry_info();
+                (
+                    Arc::clone(node.element.key()),
+                    node.element.hash(),
+                    entry_info.is_dirty(),
+                    entry_info.last_accessed(),
+                )
+            });
+
+            let (key, hash, ts) = match maybe_key_hash_ts {
+                Some((key, hash, false, Some(ts))) => (key, hash, ts),
+                // TODO: Remove the second pattern `Some((_key, false, None))` once we change
+                // `last_modified` and `last_accessed` in `EntryInfo` from `Option<Instant>` to
+                // `Instant`.
+                Some((key, hash, true, _) | (key, hash, false, None)) => {
+                    // `is_dirty` is true or `last_modified` is None. Skip this entry
+                    // as it may have been updated by this or other async task but
+                    // its `WriteOp` is not processed yet.
+                    self.skip_updated_entry_ao(&key, hash, deq_name, ao_deq, wo_deq);
+                    // Set `more_to_evict` to `false` to make `run_pending_tasks` to
+                    // return early. This will help that `schedule_write_op` to send
+                    // the `WriteOp` to the write op channel.
+                    more_to_evict = false;
+                    continue;
+                }
+                None => {
+                    more_to_evict = false;
+                    break;
+                }
+            };
+
+            // Lock the key for removal if blocking removal notification is enabled.
+            let kl = self.maybe_key_lock(&key);
+            let _klg = &kl.as_ref().map(|kl| kl.lock());
+
+            let maybe_entry = self.cache.remove_if(
+                hash,
+                |k| k == &key,
+                |_, v| {
+                    if let Some(la) = v.last_accessed() {
+                        la == ts
+                    } else {
+                        false
+                    }
+                },
+            );
+
+            if let Some(entry) = maybe_entry {
+                if eviction_state.is_notifier_enabled() {
+                    eviction_state.notify_entry_removal(key, &entry, RemovalCause::Size);
+                }
+                eviction_state.counters.incr_eviction_count();
+                let weight = entry.policy_weight();
+                Self::handle_remove_with_deques(
+                    deq_name,
+                    ao_deq,
+                    wo_deq,
+                    timer_wheel,
+                    entry,
+                    &mut eviction_state.counters,
+                );
+                evicted = evicted.saturating_add(weight as u64);
+            } else {
+                self.skip_updated_entry_ao(&key, hash, deq_name, ao_deq, wo_deq);
+                more_to_evict = false;
+            }
+            self.unlink_timer(node);
+            Self::drop_node(node);
+        }
+    }
+
+    /// Removes a timer event for this node if present.
+    ///
+    /// IMPORTANT: This method does not drop the node.
+    unsafe fn unlink_timer(&mut self, mut node: NonNull<DeqNode<TimerNode<K>>>) {
+        // SAFETY: The self (`TimerWheel`) is the only owner of the node, and we have
+        // `&mut self` here. We are the only one who can mutate the node.
+        let p = node.as_mut();
+        if let entry @ TimerNode::Entry { .. } = &mut p.element {
+            if let Some((level, index)) = entry.position() {
+                self.wheels[level][index].unlink(node);
+                entry.unset_position();
+            }
+        } else {
+            unreachable!();
+        }
+    }
+
+    unsafe fn drop_node(node: NonNull<DeqNode<TimerNode<K>>>) {
+        std::mem::drop(Box::from_raw(node.as_ptr()));
+    }
+
+    /// Advances the timer wheel to the current time, and returns an iterator over
+    /// timer events.
+    pub(crate) fn advance(
+        &mut self,
+        current_time: Instant,
+    ) -> impl Iterator<Item = TimerEvent<K>> + '_ {
+        debug_assert!(self.is_enabled());
+
+        let previous_time = self.current;
+        self.current = current_time;
+        TimerEventsIter::new(self, previous_time, current_time)
+    }
+
+    /// Returns a pointer to the timer event (cache entry) at the front of the queue.
+    /// Returns `None` if the front node is a sentinel.
+    fn pop_timer_node(&mut self, level: usize, index: usize) -> Option<Box<DeqNode<TimerNode<K>>>> {
+        let deque = &mut self.wheels[level][index];
+        if let Some(node) = deque.peek_front() {
+            if node.element.is_sentinel() {
+                return None;
+            }
+        }
+
+        deque.pop_front()
+    }
+
+    /// Reset the positions of the nodes in the queue at the given level and index.
+    /// When done, the sentinel is at the back of the queue.
+    fn reset_timer_node_positions(&mut self, level: usize, index: usize) {
+        let deque = &mut self.wheels[level][index];
+        debug_assert!(
+            deque.len() > 0,
+            "BUG: The queue is empty. level: {level}, index: {index}"
+        );
+
+        // Rotate the nodes in the queue until we see the sentinel at the back of the
+        // queue.
+        while !deque.peek_back().unwrap().element.is_sentinel() {
+            deque.move_front_to_back();
+        }
+    }
+
+    /// Returns the bucket indices to locate the bucket that the timer event
+    /// should be added to.
+    fn bucket_indices(&self, time: Instant) -> (usize, usize) {
+        let duration_nanos = self.duration_nanos_since_last_advanced(time);
+        let time_nanos = self.time_nanos(time);
+        for level in 0..=NUM_LEVELS {
+            if duration_nanos < SPANS[level + 1] {
+                let ticks = time_nanos >> SHIFT[level];
+                let index = ticks & (BUCKET_COUNTS[level] - 1);
+                return (level, index as usize);
+            }
+        }
+        (OVERFLOW_QUEUE_INDEX, 0)
+    }
+
+    // Returns nano-seconds between the given `time` and the time when this timer
+    // wheel was advanced. If the `time` is earlier than other, returns zero.
+    fn duration_nanos_since_last_advanced(&self, time: Instant) -> u64 {
+        // If `time` is earlier than `self.current`, use zero. This could happen
+        // when a user provided `Expiry` method returned zero or a very short
+        // duration.
+        time.saturating_duration_since(self.current).as_nanos() as u64
+    }
+
+    // Returns nano-seconds between the given `time` and `self.origin`, the time when
+    // this timer wheel was created.
+    //
+    // - If the `time` is earlier than other, returns zero.
+    // - If the `time` is later than `self.origin + u64::MAX`, returns `u64::MAX`,
+    //   which is ~584 years in nanoseconds.
+    //
+    fn time_nanos(&self, time: Instant) -> u64 {
+        let nanos_u128 = time
+            // If `time` is earlier than `self.origin`, use zero. This would never
+            // happen in practice as there should be some delay between the timer
+            // wheel was created and the first timer event is scheduled. But we will
+            // do this just in case.
+            .saturating_duration_since(self.origin)
+            .as_nanos();
+
+        // Convert an `u128` into an `u64`. If the value is too large, use `u64::MAX`
+        // (~584 years)
+        nanos_u128.try_into().unwrap_or(u64::MAX)
+    }
+}
+
+/// A timer event, which is either an expired/rescheduled cache entry, or a
+/// descheduled timer. `TimerWheel::advance` method returns an iterator over timer
+/// events.
+#[derive(Debug)]
+pub(crate) enum TimerEvent<K> {
+    /// This cache entry has expired.
+    Expired(Box<DeqNode<TimerNode<K>>>),
+    // This cache entry has been rescheduled. Rescheduling includes moving a timer
+    // from one wheel to another in a lower level of the hierarchy. (This variant
+    // is mainly used for testing)
+    #[cfg(test)]
+    Rescheduled(MiniArc<EntryInfo<K>>),
+    #[cfg(not(test))]
+    Rescheduled(()),
+    /// This timer node (containing a cache entry) has been removed from the timer.
+    /// (This variant is mainly used for testing)
+    Descheduled,
+}
+
+/// An iterator over expired cache entries.
+pub(crate) struct TimerEventsIter<'iter, K> {
+    timer_wheel: &'iter mut TimerWheel<K>,
+    previous_time: Instant,
+    current_time: Instant,
+    is_done: bool,
+    level: usize,
+    index: u8,
+    end_index: u8,
+    index_mask: u64,
+    is_new_level: bool,
+    is_new_index: bool,
+}
+
+impl<'iter, K> TimerEventsIter<'iter, K> {
+    fn new(
+        timer_wheel: &'iter mut TimerWheel<K>,
+        previous_time: Instant,
+        current_time: Instant,
+    ) -> Self {
+        Self {
+            timer_wheel,
+            previous_time,
+            current_time,
+            is_done: false,
+            level: 0,
+            index: 0,
+            end_index: 0,
+            index_mask: 0,
+            is_new_level: true,
+            is_new_index: true,
+        }
+    }
+}
+
+impl<K> Drop for TimerEventsIter<'_, K> {
+    fn drop(&mut self) {
+        if !self.is_done {
+            // This iterator was dropped before consuming all events. Reset the
+            // `current` to the time when the timer wheel was last successfully
+            // advanced.
+            self.timer_wheel.current = self.previous_time;
+        }
+    }
+}
+
+impl<K> Iterator for TimerEventsIter<'_, K> {
+    type Item = TimerEvent<K>;
+
+    /// NOTE: When necessary, this iterator will unset the timer node pointer in the
+    /// `ValueEntry`.
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.is_done {
+        let p = node.as_ref();
+        assert_eq!(
+            deq.region(),
+            tag,
+            "unlink_node - node is not a member of {deq_name} deque. {p:?}"
+        );
+        if deq.contains(p) {
+            // https://github.com/moka-rs/moka/issues/64
+            deq.unlink_and_drop(node);
+        }
+    }
+
+    pub(crate) fn unlink_node_wo(
+        deq: &mut Deque<KeyHashDate<K>>,
+        node: NonNull<DeqNode<KeyHashDate<K>>>,
+    ) {
+        unsafe {
+            let p = node.as_ref();
+            if deq.contains(p) {
+                // https://github.com/moka-rs/moka/issues/64
+                deq.unlink_and_drop(node);
+            }
+        }
+    }
+}
+
+// TODO: Add tests and run Miri with them.

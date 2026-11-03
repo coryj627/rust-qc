@@ -20,6 +20,9 @@ class ExportTests(unittest.TestCase):
             (work / "target/binary").write_bytes(b"cached build")
             (work / "probe.rs").write_text("fn main() {}\n")
             self.assertEqual([str(p) for _, p in workspace_files(work)], ["probe.rs"])
+            alias = root / "root-link"
+            alias.symlink_to(root, target_is_directory=True)
+            self.assertEqual(list(workspace_files(alias)), [])
 
     def test_scrubs_host_identity_and_synthetic_token(self):
         text = "/Users/example/project user@example.invalid sk-12345678901234567890"

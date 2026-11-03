@@ -1,0 +1,1058 @@
+        #[cfg(not(feature = "luau"))]
+        if libs.contains(StdLib::DEBUG) {
+            return Err(Error::SafetyError(
+                "The unsafe `debug` module can't be loaded using safe `new_with`".to_string(),
+            ));
+        }
+        #[cfg(feature = "luajit")]
+        if libs.contains(StdLib::FFI) {
+            return Err(Error::SafetyError(
+                "The unsafe `ffi` module can't be loaded using safe `new_with`".to_string(),
+            ));
+        }
+
+        let lua = unsafe { Self::inner_new(libs, options) };
+
+        #[cfg(not(feature = "luau"))]
+        if libs.contains(StdLib::PACKAGE) {
+            mlua_expect!(lua.disable_c_modules(), "Error disabling C modules");
+        }
+        lua.lock().mark_safe();
+
+        Ok(lua)
+    }
+
+    /// Creates a new Lua state and loads the specified subset of the standard libraries.
+    ///
+    /// Use the [`StdLib`] flags to specify the libraries you want to load.
+    ///
+    /// # Safety
+    /// The created Lua state will not have safety guarantees and allow to load C modules.
+    pub unsafe fn unsafe_new_with(libs: StdLib, options: LuaOptions) -> Lua {
+        // Workaround to avoid stripping a few unused Lua symbols that could be imported
+        // by C modules in unsafe mode
+        let mut _symbols: Vec<*const extern "C-unwind" fn()> =
+            vec![ffi::lua_isuserdata as _, ffi::lua_tocfunction as _];
+
+        #[cfg(not(feature = "luau"))]
+        _symbols.extend_from_slice(&[
+            ffi::lua_atpanic as _,
+            ffi::luaL_loadstring as _,
+            ffi::luaL_openlibs as _,
+        ]);
+        #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
+        {
+            _symbols.push(ffi::lua_getglobal as _);
+            _symbols.push(ffi::lua_setglobal as _);
+            _symbols.push(ffi::luaL_setfuncs as _);
+        }
+
+        Self::inner_new(libs, options)
+    }
+
+    /// Creates a new Lua state with required `libs` and `options`
+    unsafe fn inner_new(libs: StdLib, options: LuaOptions) -> Lua {
+        let lua = Lua {
+            raw: RawLua::new(libs, &options),
+            collect_garbage: true,
+        };
+
+        #[cfg(feature = "luau")]
+        mlua_expect!(lua.configure_luau(), "Error configuring Luau");
+
+        lua
+    }
+
+    /// Returns or constructs Lua instance from a raw state.
+    ///
+    /// Once initialized, the returned Lua instance is cached in the registry and can be retrieved
+    /// by calling this function again.
+    ///
+    /// # Safety
+    /// The `Lua` must outlive the chosen lifetime `'a`.
+    #[inline]
+    pub unsafe fn get_or_init_from_ptr<'a>(state: *mut ffi::lua_State) -> &'a Lua {
+        debug_assert!(!state.is_null(), "Lua state is null");
+        match ExtraData::get(state) {
+            extra if !extra.is_null() => (*extra).lua(),
+            _ => {
+                // The `owned` flag is set to `false` as we don't own the Lua state.
+                RawLua::init_from_ptr(state, false);
+                (*ExtraData::get(state)).lua()
+            }
+        }
+    }
+
+    /// Calls provided function passing a raw lua state.
+    ///
+    /// The arguments will be pushed onto the stack before calling the function.
+    ///
+    /// This method ensures that the Lua instance is locked while the function is called
+    /// and restores Lua stack after the function returns.
+    ///
+    /// # Example
+    /// ```
+    /// # use mlua::{Lua, Result};
+    /// # fn main() -> Result<()> {
+    /// let lua = Lua::new();
+    /// let n: i32 = unsafe {
+    ///     let nums = (3, 4, 5);
+    ///     lua.exec_raw(nums, |state| {
+    ///         let n = ffi::lua_gettop(state);
+    ///         let mut sum = 0;
+    ///         for i in 1..=n {
+    ///             sum += ffi::lua_tointeger(state, i);
+    ///         }
+    ///         ffi::lua_pop(state, n);
+    ///         ffi::lua_pushinteger(state, sum);
+    ///     })
+    /// }?;
+    /// assert_eq!(n, 12);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[allow(clippy::missing_safety_doc)]
+    pub unsafe fn exec_raw<R: FromLuaMulti>(
+        &self,
+        args: impl IntoLuaMulti,
+        f: impl FnOnce(*mut ffi::lua_State),
+    ) -> Result<R> {
+        let lua = self.lock();
+        let state = lua.state();
+        let _sg = StackGuard::new(state);
+        let stack_start = ffi::lua_gettop(state);
+        let nargs = args.push_into_stack_multi(&lua)?;
+        check_stack(state, 3)?;
+        protect_lua_closure::<_, ()>(state, nargs, ffi::LUA_MULTRET, f)?;
+        let nresults = ffi::lua_gettop(state) - stack_start;
+        R::from_stack_multi(nresults, &lua)
+    }
+
+    /// Loads the specified subset of the standard libraries into an existing Lua state.
+    ///
+    /// Use the [`StdLib`] flags to specify the libraries you want to load.
+    pub fn load_std_libs(&self, libs: StdLib) -> Result<()> {
+        unsafe { self.lock().load_std_libs(libs) }
+    }
+
+    /// Registers module into an existing Lua state using the specified value.
+    ///
+    /// After registration, the given value will always be immediately returned when the
+    /// given module is [required].
+    ///
+    /// [required]: https://www.lua.org/manual/5.4/manual.html#pdf-require
+    pub fn register_module(&self, modname: &str, value: impl IntoLua) -> Result<()> {
+        #[cfg(not(feature = "luau"))]
+        const LOADED_MODULES_KEY: *const c_char = ffi::LUA_LOADED_TABLE;
+        #[cfg(feature = "luau")]
+        const LOADED_MODULES_KEY: *const c_char = ffi::LUA_REGISTERED_MODULES_TABLE;
+
+        if cfg!(feature = "luau") && !modname.starts_with('@') {
+            return Err(Error::runtime("module name must begin with '@'"));
+        }
+        #[cfg(feature = "luau")]
+        let modname = modname.to_ascii_lowercase();
+        unsafe {
+            self.exec_raw::<()>(value, |state| {
+                ffi::luaL_getsubtable(state, ffi::LUA_REGISTRYINDEX, LOADED_MODULES_KEY);
+                ffi::lua_pushlstring(state, modname.as_ptr() as *const c_char, modname.len() as _);
+                ffi::lua_pushvalue(state, -3);
+                ffi::lua_rawset(state, -3);
+            })
+        }
+    }
+
+    /// Preloads module into an existing Lua state using the specified loader function.
+    ///
+    /// When the module is required, the loader function will be called with module name as the
+    /// first argument.
+    ///
+    /// This is similar to setting the [`package.preload[modname]`] field.
+    ///
+    /// [`package.preload[modname]`]: <https://www.lua.org/manual/5.4/manual.html#pdf-package.preload>
+    #[cfg(not(feature = "luau"))]
+    #[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
+    pub fn preload_module(&self, modname: &str, func: Function) -> Result<()> {
+        #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
+        let preload = unsafe {
+            self.exec_raw::<Option<Table>>((), |state| {
+                ffi::lua_getfield(state, ffi::LUA_REGISTRYINDEX, ffi::LUA_PRELOAD_TABLE);
+            })?
+        };
+        #[cfg(any(feature = "lua51", feature = "luajit"))]
+        let preload = unsafe {
+            self.exec_raw::<Option<Table>>((), |state| {
+                if ffi::lua_getfield(state, ffi::LUA_REGISTRYINDEX, ffi::LUA_LOADED_TABLE) != ffi::LUA_TNIL {
+                    ffi::luaL_getsubtable(state, -1, ffi::LUA_LOADLIBNAME);
+                    ffi::luaL_getsubtable(state, -1, cstr!("preload"));
+                    ffi::lua_rotate(state, 1, 1);
+                }
+            })?
+        };
+        if let Some(preload) = preload {
+            preload.raw_set(modname, func)?;
+        }
+        Ok(())
+    }
+
+    #[doc(hidden)]
+    #[deprecated(since = "0.11.0", note = "Use `register_module` instead")]
+    #[cfg(not(feature = "luau"))]
+    #[cfg(not(tarpaulin_include))]
+    pub fn load_from_function<T: FromLua>(&self, modname: &str, func: Function) -> Result<T> {
+        let loaded = unsafe {
+            self.exec_raw::<Table>((), |state| {
+                ffi::luaL_getsubtable(state, ffi::LUA_REGISTRYINDEX, ffi::LUA_LOADED_TABLE);
+            })?
+        };
+
+        let value = match loaded.raw_get(modname)? {
+            Value::Nil => {
+                let result = match func.call(modname)? {
+    ///
+    /// Any Lua instance which shares the underlying main state may call this method to get a value
+    /// previously placed by [`Lua::create_registry_value`].
+    pub fn registry_value<T: FromLua>(&self, key: &RegistryKey) -> Result<T> {
+        let lua = self.lock();
+        if !lua.owns_registry_value(key) {
+            return Err(Error::MismatchedRegistryKey);
+        }
+
+        let state = lua.state();
+        match key.id() {
+            ffi::LUA_REFNIL => T::from_lua(Value::Nil, self),
+            registry_id => unsafe {
+                let _sg = StackGuard::new(state);
+                check_stack(state, 1)?;
+
+                ffi::lua_rawgeti(state, ffi::LUA_REGISTRYINDEX, registry_id as Integer);
+                T::from_stack(-1, &lua)
+            },
+        }
+    }
+
+    /// Removes a value from the Lua registry.
+    ///
+    /// You may call this function to manually remove a value placed in the registry with
+    /// [`Lua::create_registry_value`]. In addition to manual [`RegistryKey`] removal, you can also
+    /// call [`Lua::expire_registry_values`] to automatically remove values from the registry
+    /// whose [`RegistryKey`]s have been dropped.
+    pub fn remove_registry_value(&self, key: RegistryKey) -> Result<()> {
+        let lua = self.lock();
+        if !lua.owns_registry_value(&key) {
+            return Err(Error::MismatchedRegistryKey);
+        }
+
+        unsafe { ffi::luaL_unref(lua.state(), ffi::LUA_REGISTRYINDEX, key.take()) };
+        Ok(())
+    }
+
+    /// Replaces a value in the Lua registry by its [`RegistryKey`].
+    ///
+    /// An identifier used in [`RegistryKey`] may possibly be changed to a new value.
+    ///
+    /// See [`Lua::create_registry_value`] for more details.
+    pub fn replace_registry_value(&self, key: &mut RegistryKey, t: impl IntoLua) -> Result<()> {
+        let lua = self.lock();
+        if !lua.owns_registry_value(key) {
+            return Err(Error::MismatchedRegistryKey);
+        }
+
+        let t = t.into_lua(self)?;
+
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            check_stack(state, 2)?;
+
+            match (t, key.id()) {
+                (Value::Nil, ffi::LUA_REFNIL) => {
+                    // Do nothing, no need to replace nil with nil
+                }
+                (Value::Nil, registry_id) => {
+                    // Remove the value
+                    ffi::luaL_unref(state, ffi::LUA_REGISTRYINDEX, registry_id);
+                    key.set_id(ffi::LUA_REFNIL);
+                }
+                (value, ffi::LUA_REFNIL) => {
+                    // Allocate a new `RegistryKey`
+                    let new_key = self.create_registry_value(value)?;
+                    key.set_id(new_key.take());
+                }
+                (value, registry_id) => {
+                    // It must be safe to replace the value without triggering memory error
+                    lua.push_value(&value)?;
+                    ffi::lua_rawseti(state, ffi::LUA_REGISTRYINDEX, registry_id as Integer);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns true if the given [`RegistryKey`] was created by a Lua which shares the
+    /// underlying main state with this Lua instance.
+    ///
+    /// Other than this, methods that accept a [`RegistryKey`] will return
+    /// [`Error::MismatchedRegistryKey`] if passed a [`RegistryKey`] that was not created with a
+    /// matching [`Lua`] state.
+    #[inline]
+    pub fn owns_registry_value(&self, key: &RegistryKey) -> bool {
+        self.lock().owns_registry_value(key)
+    }
+
+    /// Remove any registry values whose [`RegistryKey`]s have all been dropped.
+    ///
+    /// Unlike normal handle values, [`RegistryKey`]s do not automatically remove themselves on
+    /// Drop, but you can call this method to remove any unreachable registry values not
+    /// manually removed by [`Lua::remove_registry_value`].
+    pub fn expire_registry_values(&self) {
+        let lua = self.lock();
+        let state = lua.state();
+        unsafe {
+            let mut unref_list = (*lua.extra.get()).registry_unref_list.lock();
+            let unref_list = unref_list.replace(Vec::new());
+            for id in mlua_expect!(unref_list, "unref list is not set") {
+                ffi::luaL_unref(state, ffi::LUA_REGISTRYINDEX, id);
+            }
+        }
+    }
+
+    /// Sets or replaces an application data object of type `T`.
+    ///
+    /// Application data could be accessed at any time by using [`Lua::app_data_ref`] or
+    /// [`Lua::app_data_mut`] methods where `T` is the data type.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the app data container is currently borrowed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mlua::{Lua, Result};
+    ///
+    /// fn hello(lua: &Lua, _: ()) -> Result<()> {
+    ///     let mut s = lua.app_data_mut::<&str>().unwrap();
+    ///     assert_eq!(*s, "hello");
+    ///     *s = "world";
+    ///     Ok(())
+    /// }
+    ///
+    /// fn main() -> Result<()> {
+    ///     let lua = Lua::new();
+    ///     lua.set_app_data("hello");
+    ///     lua.create_function(hello)?.call::<()>(())?;
+    ///     let s = lua.app_data_ref::<&str>().unwrap();
+    ///     assert_eq!(*s, "world");
+    ///     Ok(())
+    /// }
+    /// ```
+    #[track_caller]
+    pub fn set_app_data<T: MaybeSend + 'static>(&self, data: T) -> Option<T> {
+        let lua = self.lock();
+        let extra = unsafe { &*lua.extra.get() };
+        extra.app_data.insert(data)
+    }
+
+    /// Tries to set or replace an application data object of type `T`.
+    ///
+    /// Returns:
+    /// - `Ok(Some(old_data))` if the data object of type `T` was successfully replaced.
+    /// - `Ok(None)` if the data object of type `T` was successfully inserted.
+    /// - `Err(data)` if the data object of type `T` was not inserted because the container is
+    ///   currently borrowed.
+    ///
+    /// See [`Lua::set_app_data`] for examples.
+    pub fn try_set_app_data<T: MaybeSend + 'static>(&self, data: T) -> StdResult<Option<T>, T> {
+        let lua = self.lock();
+        let extra = unsafe { &*lua.extra.get() };
+        extra.app_data.try_insert(data)
+    }
+
+    /// Gets a reference to an application data object stored by [`Lua::set_app_data`] of type
+    /// `T`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the data object of type `T` is currently mutably borrowed. Multiple immutable
+    /// reads can be taken out at the same time.
+    #[track_caller]
+    pub fn app_data_ref<T: 'static>(&self) -> Option<AppDataRef<'_, T>> {
+        let guard = self.lock_arc();
+        let extra = unsafe { &*guard.extra.get() };
+        extra.app_data.borrow(Some(guard))
+    }
+
+    /// Tries to get a reference to an application data object stored by [`Lua::set_app_data`] of
+    /// type `T`.
+    pub fn try_app_data_ref<T: 'static>(&self) -> StdResult<Option<AppDataRef<'_, T>>, BorrowError> {
+        let guard = self.lock_arc();
+        let extra = unsafe { &*guard.extra.get() };
+        extra.app_data.try_borrow(Some(guard))
+    }
+
+    /// Gets a mutable reference to an application data object stored by [`Lua::set_app_data`] of
+    /// type `T`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the data object of type `T` is currently borrowed.
+    #[track_caller]
+    pub fn app_data_mut<T: 'static>(&self) -> Option<AppDataRefMut<'_, T>> {
+        let guard = self.lock_arc();
+        let extra = unsafe { &*guard.extra.get() };
+        extra.app_data.borrow_mut(Some(guard))
+    }
+
+    /// Tries to get a mutable reference to an application data object stored by
+    /// [`Lua::set_app_data`] of type `T`.
+    pub fn try_app_data_mut<T: 'static>(&self) -> StdResult<Option<AppDataRefMut<'_, T>>, BorrowMutError> {
+        let guard = self.lock_arc();
+        let extra = unsafe { &*guard.extra.get() };
+        extra.app_data.try_borrow_mut(Some(guard))
+    }
+
+    /// Removes an application data of type `T`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the app data container is currently borrowed.
+    #[track_caller]
+    pub fn remove_app_data<T: 'static>(&self) -> Option<T> {
+        let lua = self.lock();
+        let extra = unsafe { &*lua.extra.get() };
+        extra.app_data.remove()
+    }
+
+    /// Returns an internal `Poll::Pending` constant used for executing async callbacks.
+    ///
+    /// Every time when [`Future`] is Pending, Lua corotine is suspended with this constant.
+    #[cfg(feature = "async")]
+    #[doc(hidden)]
+    #[inline(always)]
+    pub fn poll_pending() -> LightUserData {
+        static ASYNC_POLL_PENDING: u8 = 0;
+        LightUserData(&ASYNC_POLL_PENDING as *const u8 as *mut std::os::raw::c_void)
+    }
+
+    #[cfg(feature = "async")]
+    #[inline(always)]
+    pub(crate) fn poll_terminate() -> LightUserData {
+        static ASYNC_POLL_TERMINATE: u8 = 0;
+        LightUserData(&ASYNC_POLL_TERMINATE as *const u8 as *mut std::os::raw::c_void)
+    }
+
+    #[cfg(feature = "async")]
+    #[inline(always)]
+    pub(crate) fn poll_yield() -> LightUserData {
+        static ASYNC_POLL_YIELD: u8 = 0;
+        LightUserData(&ASYNC_POLL_YIELD as *const u8 as *mut std::os::raw::c_void)
+    }
+
+    /// Suspends the current async function, returning the provided arguments to caller.
+    ///
+    /// This function is similar to [`coroutine.yield`] but allow yeilding Rust functions
+    /// and passing values to the caller.
+    /// Please note that you cannot cross [`Thread`] boundaries (e.g. calling `yield_with` on one
+    /// thread and resuming on another).
+    ///
+    /// # Examples
+    ///
+    /// Async iterator:
+    ///
+    /// ```
+    /// # use mlua::{Lua, Result};
+    /// #
+    /// async fn generator(lua: Lua, _: ()) -> Result<()> {
+    ///     for i in 0..10 {
+    ///         lua.yield_with::<()>(i).await?;
+    ///     }
+    ///     Ok(())
+    /// }
+    ///
+    /// fn main() -> Result<()> {
+    ///     let lua = Lua::new();
+    ///     lua.globals().set("generator", lua.create_async_function(generator)?)?;
+    ///
+    ///     lua.load(r#"
+use std::any::Any;
+use std::fmt::Write as _;
+use std::mem::MaybeUninit;
+use std::os::raw::{c_int, c_void};
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::ptr;
+use std::sync::Arc;
+
+use crate::error::{Error, Result};
+use crate::memory::MemoryState;
+use crate::util::{
+    check_stack, get_internal_userdata, init_internal_metatable, push_internal_userdata, push_string,
+    push_table, rawset_field, to_string, TypeKey, DESTRUCTED_USERDATA_METATABLE,
+};
+
+static WRAPPED_FAILURE_TYPE_KEY: u8 = 0;
+
+pub(crate) enum WrappedFailure {
+    None,
+    Error(Error),
+    Panic(Option<Box<dyn Any + Send + 'static>>),
+}
+
+impl TypeKey for WrappedFailure {
+    #[inline(always)]
+    fn type_key() -> *const c_void {
+        &WRAPPED_FAILURE_TYPE_KEY as *const u8 as *const c_void
+    }
+}
+
+impl WrappedFailure {
+    pub(crate) unsafe fn new_userdata(state: *mut ffi::lua_State) -> *mut Self {
+        // Unprotected calls always return `Ok`
+        push_internal_userdata(state, WrappedFailure::None, false).unwrap()
+    }
+}
+
+// In the context of a lua callback, this will call the given function and if the given function
+// returns an error, *or if the given function panics*, this will result in a call to `lua_error` (a
+// longjmp). The error or panic is wrapped in such a way that when calling `pop_error` back on
+// the Rust side, it will resume the panic.
+//
+// This function assumes the structure of the stack at the beginning of a callback, that the only
+// elements on the stack are the arguments to the callback.
+//
+// This function uses some of the bottom of the stack for error handling, the given callback will be
+// given the number of arguments available as an argument, and should return the number of returns
+// as normal, but cannot assume that the arguments available start at 0.
+unsafe fn callback_error<F, R>(state: *mut ffi::lua_State, f: F) -> R
+where
+    F: FnOnce(c_int) -> Result<R>,
+{
+    let nargs = ffi::lua_gettop(state);
+
+    // We need 2 extra stack spaces to store preallocated memory and error/panic metatable
+    let extra_stack = if nargs < 2 { 2 - nargs } else { 1 };
+    ffi::luaL_checkstack(
+        state,
+        extra_stack,
+        cstr!("not enough stack space for callback error handling"),
+    );
+
+    // We cannot shadow Rust errors with Lua ones, we pre-allocate enough memory
+    // to store a wrapped error or panic *before* we proceed.
+    let ud = WrappedFailure::new_userdata(state);
+    ffi::lua_rotate(state, 1, 1);
+
+    match catch_unwind(AssertUnwindSafe(|| f(nargs))) {
+        Ok(Ok(r)) => {
+            ffi::lua_remove(state, 1);
+            r
+        }
+        Ok(Err(err)) => {
+            ffi::lua_settop(state, 1);
+
+            // Build `CallbackError` with traceback
+            let traceback = if ffi::lua_checkstack(state, ffi::LUA_TRACEBACK_STACK) != 0 {
+                ffi::luaL_traceback(state, state, ptr::null(), 0);
+                let traceback = to_string(state, -1);
+                ffi::lua_pop(state, 1);
+                traceback
+            } else {
+                "<not enough stack space for traceback>".to_string()
+            };
+            let cause = Arc::new(err);
+            let wrapped_error = WrappedFailure::Error(Error::CallbackError { traceback, cause });
+            ptr::write(ud, wrapped_error);
+            ffi::lua_error(state)
+        }
+        Err(p) => {
+            ffi::lua_settop(state, 1);
+            ptr::write(ud, WrappedFailure::Panic(Some(p)));
+            ffi::lua_error(state)
+        }
+    }
+}
+
+// Pops an error off of the stack and returns it. The specific behavior depends on the type of the
+// error at the top of the stack:
+//   1) If the error is actually a panic, this will continue the panic.
+//   2) If the error on the top of the stack is actually an error, just returns it.
+//   3) Otherwise, interprets the error as the appropriate lua error.
+// Uses 2 stack spaces, does not call checkstack.
+pub(crate) unsafe fn pop_error(state: *mut ffi::lua_State, err_code: c_int) -> Error {
+    mlua_debug_assert!(
+        err_code != ffi::LUA_OK && err_code != ffi::LUA_YIELD,
+        "pop_error called with non-error return code"
+    );
+
+    match get_internal_userdata::<WrappedFailure>(state, -1, ptr::null()).as_mut() {
+        Some(WrappedFailure::Error(err)) => {
+            ffi::lua_pop(state, 1);
+            err.clone()
+        }
+        Some(WrappedFailure::Panic(panic)) => {
+            if let Some(p) = panic.take() {
+                resume_unwind(p);
+            } else {
+                Error::PreviouslyResumedPanic
+            }
+        }
+        _ => {
+            let err_string = to_string(state, -1);
+            ffi::lua_pop(state, 1);
+
+            match err_code {
+                ffi::LUA_ERRRUN => Error::RuntimeError(err_string),
+                ffi::LUA_ERRSYNTAX => {
+                    Error::SyntaxError {
+                        // This seems terrible, but as far as I can tell, this is exactly what the
+                        // stock Lua REPL does.
+                        incomplete_input: err_string.ends_with("<eof>") || err_string.ends_with("'<eof>'"),
+                        message: err_string,
+                    }
+                }
+                ffi::LUA_ERRERR => {
+                    // This error is raised when the error handler raises an error too many times
+                    // recursively, and continuing to trigger the error handler would cause a stack
+                    // overflow. It is not very useful to differentiate between this and "ordinary"
+                    // runtime errors, so we handle them the same way.
+                    Error::RuntimeError(err_string)
+                }
+                ffi::LUA_ERRMEM => Error::MemoryError(err_string),
+                #[cfg(any(feature = "lua53", feature = "lua52"))]
+                ffi::LUA_ERRGCMM => Error::GarbageCollectorError(err_string),
+                _ => mlua_panic!("unrecognized lua error code"),
+            }
+        }
+    }
+}
+
+// Call a function that calls into the Lua API and may trigger a Lua error (longjmp) in a safe way.
+// Wraps the inner function in a call to `lua_pcall`, so the inner function only has access to a
+// limited lua stack. `nargs` is the same as the the parameter to `lua_pcall`, and `nresults` is
+// always `LUA_MULTRET`. Provided function must *not* panic, and since it will generally be
+// longjmping, should not contain any values that implements Drop.
+// Internally uses 2 extra stack spaces, and does not call checkstack.
+pub(crate) unsafe fn protect_lua_call(
+    state: *mut ffi::lua_State,
+    nargs: c_int,
+    f: unsafe extern "C-unwind" fn(*mut ffi::lua_State) -> c_int,
+) -> Result<()> {
+    let stack_start = ffi::lua_gettop(state) - nargs;
+
+    MemoryState::relax_limit_with(state, || {
+        ffi::lua_pushcfunction(state, error_traceback);
+        ffi::lua_pushcfunction(state, f);
+    });
+    if nargs > 0 {
+        ffi::lua_rotate(state, stack_start + 1, 2);
+    }
+
+    let ret = ffi::lua_pcall(state, nargs, ffi::LUA_MULTRET, stack_start + 1);
+    ffi::lua_remove(state, stack_start + 1);
+
+    if ret == ffi::LUA_OK {
+        Ok(())
+    } else {
+        Err(pop_error(state, ret))
+    }
+}
+
+// Call a function that calls into the Lua API and may trigger a Lua error (longjmp) in a safe way.
+// Wraps the inner function in a call to `lua_pcall`, so the inner function only has access to a
+// limited lua stack. `nargs` and `nresults` are similar to the parameters of `lua_pcall`, but the
+// given function return type is not the return value count, instead the inner function return
+// values are assumed to match the `nresults` param. Provided function must *not* panic, and since
+// it will generally be longjmping, should not contain any values that implements Drop.
+// Internally uses 3 extra stack spaces, and does not call checkstack.
+pub(crate) unsafe fn protect_lua_closure<F, R>(
+    state: *mut ffi::lua_State,
+    nargs: c_int,
+    nresults: c_int,
+    f: F,
+) -> Result<R>
+where
+    F: FnOnce(*mut ffi::lua_State) -> R,
+    R: Copy,
+{
+    struct Params<F, R: Copy> {
+        function: Option<F>,
+        result: MaybeUninit<R>,
+        nresults: c_int,
+    }
+
+    unsafe extern "C-unwind" fn do_call<F, R>(state: *mut ffi::lua_State) -> c_int
+    where
+        F: FnOnce(*mut ffi::lua_State) -> R,
+        R: Copy,
+    {
+        let params = ffi::lua_touserdata(state, -1) as *mut Params<F, R>;
+        ffi::lua_pop(state, 1);
+
+        let f = (*params).function.take().unwrap();
+        (*params).result.write(f(state));
+
+        if (*params).nresults == ffi::LUA_MULTRET {
+            ffi::lua_gettop(state)
+        } else {
+            (*params).nresults
+        }
+    }
+
+    let stack_start = ffi::lua_gettop(state) - nargs;
+
+    MemoryState::relax_limit_with(state, || {
+        ffi::lua_pushcfunction(state, error_traceback);
+        ffi::lua_pushcfunction(state, do_call::<F, R>);
+    });
+    if nargs > 0 {
+        ffi::lua_rotate(state, stack_start + 1, 2);
+    }
+
+    let mut params = Params {
+        function: Some(f),
+        result: MaybeUninit::uninit(),
+        nresults,
+    };
+
+    ffi::lua_pushlightuserdata(state, &mut params as *mut Params<F, R> as *mut c_void);
+    let ret = ffi::lua_pcall(state, nargs + 1, nresults, stack_start + 1);
+    ffi::lua_remove(state, stack_start + 1);
+
+    if ret == ffi::LUA_OK {
+        // `LUA_OK` is only returned when the `do_call` function has completed successfully, so
+        // `params.result` is definitely initialized.
+        Ok(params.result.assume_init())
+    } else {
+        Err(pop_error(state, ret))
+    }
+}
+
+pub(crate) unsafe extern "C-unwind" fn error_traceback(state: *mut ffi::lua_State) -> c_int {
+    // Luau calls error handler for memory allocation errors, skip it
+    // See https://github.com/luau-lang/luau/issues/880
+    #[cfg(feature = "luau")]
+    if MemoryState::limit_reached(state) {
+        return 0;
+    }
+
+    if ffi::lua_checkstack(state, 2) == 0 {
+        // If we don't have enough stack space to even check the error type, do
+        // nothing so we don't risk shadowing a rust panic.
+        return 1;
+    }
+
+    if get_internal_userdata::<WrappedFailure>(state, -1, ptr::null()).is_null() {
+        let s = ffi::luaL_tolstring(state, -1, ptr::null_mut());
+        if ffi::lua_checkstack(state, ffi::LUA_TRACEBACK_STACK) != 0 {
+            ffi::luaL_traceback(state, state, s, 0);
+            ffi::lua_remove(state, -2);
+        }
+    }
+
+    1
+}
+
+// A variant of `error_traceback` that can safely inspect another (yielded) thread stack
+pub(crate) unsafe fn error_traceback_thread(state: *mut ffi::lua_State, thread: *mut ffi::lua_State) {
+    // Move error object to the main thread to safely call `__tostring` metamethod if present
+    ffi::lua_xmove(thread, state, 1);
+
+    if get_internal_userdata::<WrappedFailure>(state, -1, ptr::null()).is_null() {
+        let s = ffi::luaL_tolstring(state, -1, ptr::null_mut());
+        if ffi::lua_checkstack(state, ffi::LUA_TRACEBACK_STACK) != 0 {
+            ffi::luaL_traceback(state, thread, s, 0);
+            ffi::lua_remove(state, -2);
+        }
+    }
+}
+
+// Initialize the error, panic, and destructed userdata metatables.
+pub(crate) unsafe fn init_error_registry(state: *mut ffi::lua_State) -> Result<()> {
+    check_stack(state, 7)?;
+
+    // Create error and panic metatables
+
+    static ERROR_PRINT_BUFFER_KEY: u8 = 0;
+
+    unsafe extern "C-unwind" fn error_tostring(state: *mut ffi::lua_State) -> c_int {
+        callback_error(state, |_| {
+            check_stack(state, 3)?;
+
+            let err_buf = match get_internal_userdata::<WrappedFailure>(state, -1, ptr::null()).as_ref() {
+                Some(WrappedFailure::Error(error)) => {
+                    let err_buf_key = &ERROR_PRINT_BUFFER_KEY as *const u8 as *const c_void;
+                    ffi::lua_rawgetp(state, ffi::LUA_REGISTRYINDEX, err_buf_key);
+                    let err_buf = ffi::lua_touserdata(state, -1) as *mut String;
+                    ffi::lua_pop(state, 2);
+
+                    (*err_buf).clear();
+                    // Depending on how the API is used and what error types scripts are given, it may
+                    // be possible to make this consume arbitrary amounts of memory (for example, some
+                    // kind of recursive error structure?)
+                    let _ = write!(&mut (*err_buf), "{error}");
+                    Ok(err_buf)
+                }
+                Some(WrappedFailure::Panic(Some(panic))) => {
+                    let err_buf_key = &ERROR_PRINT_BUFFER_KEY as *const u8 as *const c_void;
+                    ffi::lua_rawgetp(state, ffi::LUA_REGISTRYINDEX, err_buf_key);
+                    let err_buf = ffi::lua_touserdata(state, -1) as *mut String;
+                    (*err_buf).clear();
+                    ffi::lua_pop(state, 2);
+
+                    if let Some(msg) = panic.downcast_ref::<&str>() {
+                        let _ = write!(&mut (*err_buf), "{msg}");
+                    } else if let Some(msg) = panic.downcast_ref::<String>() {
+                        let _ = write!(&mut (*err_buf), "{msg}");
+                    } else {
+                        let _ = write!(&mut (*err_buf), "<panic>");
+                    };
+                    Ok(err_buf)
+                }
+                Some(WrappedFailure::Panic(None)) => Err(Error::PreviouslyResumedPanic),
+                _ => {
+                    // I'm not sure whether this is possible to trigger without bugs in mlua?
+                    Err(Error::UserDataTypeMismatch)
+                }
+            }?;
+
+            push_string(state, (*err_buf).as_bytes(), true)?;
+            (*err_buf).clear();
+
+            Ok(1)
+        })
+    }
+
+    init_internal_metatable::<WrappedFailure>(
+        state,
+        Some(|state| {
+            ffi::lua_pushcfunction(state, error_tostring);
+            ffi::lua_setfield(state, -2, cstr!("__tostring"));
+
+            // This is mostly for Luau typeof() function
+            ffi::lua_pushstring(state, cstr!("error"));
+            ffi::lua_setfield(state, -2, cstr!("__type"));
+        }),
+    )?;
+
+    // Create destructed userdata metatable
+
+    unsafe extern "C-unwind" fn destructed_error(state: *mut ffi::lua_State) -> c_int {
+        callback_error(state, |_| Err(Error::UserDataDestructed))
+    }
+
+    push_table(state, 0, 26, true)?;
+    ffi::lua_pushcfunction(state, destructed_error);
+    for &method in &[
+        "__add",
+        "__sub",
+        "__mul",
+        "__div",
+        "__mod",
+        "__pow",
+        "__unm",
+        #[cfg(any(feature = "lua54", feature = "lua53", feature = "luau"))]
+        "__idiv",
+        #[cfg(any(feature = "lua54", feature = "lua53"))]
+        "__band",
+        #[cfg(any(feature = "lua54", feature = "lua53"))]
+        "__bor",
+        #[cfg(any(feature = "lua54", feature = "lua53"))]
+        "__bxor",
+        #[cfg(any(feature = "lua54", feature = "lua53"))]
+        "__bnot",
+        #[cfg(any(feature = "lua54", feature = "lua53"))]
+        "__shl",
+        #[cfg(any(feature = "lua54", feature = "lua53"))]
+        "__shr",
+        "__concat",
+        "__len",
+        "__eq",
+        "__lt",
+        "__le",
+        "__index",
+        "__newindex",
+        "__call",
+        "__tostring",
+        #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luajit52"))]
+        "__pairs",
+        #[cfg(any(feature = "lua53", feature = "lua52", feature = "luajit52"))]
+        "__ipairs",
+        #[cfg(feature = "luau")]
+        "__iter",
+        #[cfg(feature = "luau")]
+        "__namecall",
+        #[cfg(feature = "lua54")]
+        "__close",
+    ] {
+        ffi::lua_pushvalue(state, -1);
+        rawset_field(state, -3, method)?;
+    }
+    ffi::lua_pop(state, 1);
+
+    protect_lua!(state, 1, 0, fn(state) {
+        let destructed_mt_key = &DESTRUCTED_USERDATA_METATABLE as *const u8 as *const c_void;
+        ffi::lua_rawsetp(state, ffi::LUA_REGISTRYINDEX, destructed_mt_key);
+    })?;
+
+    // Create error print buffer
+    init_internal_metatable::<String>(state, None)?;
+    push_internal_userdata(state, String::new(), true)?;
+    protect_lua!(state, 1, 0, fn(state) {
+        let err_buf_key = &ERROR_PRINT_BUFFER_KEY as *const u8 as *const c_void;
+        ffi::lua_rawsetp(state, ffi::LUA_REGISTRYINDEX, err_buf_key);
+    })?;
+
+    Ok(())
+}
+use std::os::raw::c_int;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::ptr;
+use std::sync::Arc;
+
+use crate::error::{Error, Result};
+use crate::state::{ExtraData, RawLua};
+use crate::util::{self, get_internal_metatable, WrappedFailure};
+
+struct StateGuard<'a>(&'a RawLua, *mut ffi::lua_State);
+
+impl<'a> StateGuard<'a> {
+    fn new(inner: &'a RawLua, mut state: *mut ffi::lua_State) -> Self {
+        state = inner.state.replace(state);
+        Self(inner, state)
+    }
+}
+
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        self.0.state.set(self.1);
+    }
+}
+
+// An optimized version of `callback_error` that does not allocate `WrappedFailure` userdata
+// and instead reuses unused values from previous calls (or allocates new).
+pub(crate) unsafe fn callback_error_ext<F, R>(
+    state: *mut ffi::lua_State,
+    mut extra: *mut ExtraData,
+    wrap_error: bool,
+    f: F,
+) -> R
+where
+    F: FnOnce(*mut ExtraData, c_int) -> Result<R>,
+{
+    if extra.is_null() {
+        extra = ExtraData::get(state);
+    }
+
+    let nargs = ffi::lua_gettop(state);
+
+    enum PreallocatedFailure {
+        New(*mut WrappedFailure),
+        Reserved,
+    }
+
+    impl PreallocatedFailure {
+        unsafe fn reserve(state: *mut ffi::lua_State, extra: *mut ExtraData) -> Self {
+            if (*extra).wrapped_failure_top > 0 {
+                (*extra).wrapped_failure_top -= 1;
+                return PreallocatedFailure::Reserved;
+            }
+
+            // We need to check stack for Luau in case when callback is called from interrupt
+            // See https://github.com/luau-lang/luau/issues/446 and mlua #142 and #153
+            #[cfg(feature = "luau")]
+            ffi::lua_rawcheckstack(state, 2);
+            // Place it to the beginning of the stack
+            let ud = WrappedFailure::new_userdata(state);
+            ffi::lua_insert(state, 1);
+            PreallocatedFailure::New(ud)
+        }
+
+        #[cold]
+        unsafe fn r#use(&self, state: *mut ffi::lua_State, extra: *mut ExtraData) -> *mut WrappedFailure {
+            let ref_thread = (*extra).ref_thread;
+            match *self {
+                PreallocatedFailure::New(ud) => {
+                    ffi::lua_settop(state, 1);
+                    ud
+                }
+                PreallocatedFailure::Reserved => {
+                    let index = (*extra).wrapped_failure_pool.pop().unwrap();
+                    ffi::lua_settop(state, 0);
+                    #[cfg(feature = "luau")]
+                    ffi::lua_rawcheckstack(state, 2);
+                    ffi::lua_xpush(ref_thread, state, index);
+                    ffi::lua_pushnil(ref_thread);
+                    ffi::lua_replace(ref_thread, index);
+                    (*extra).ref_free.push(index);
+                    ffi::lua_touserdata(state, -1) as *mut WrappedFailure
+                }
+            }
+        }
+
+        unsafe fn release(self, state: *mut ffi::lua_State, extra: *mut ExtraData) {
+            let ref_thread = (*extra).ref_thread;
+            match self {
+                PreallocatedFailure::New(_) => {
+                    ffi::lua_rotate(state, 1, -1);
+                    ffi::lua_xmove(state, ref_thread, 1);
+                    let index = (*extra).ref_stack_pop();
+                    (*extra).wrapped_failure_pool.push(index);
+                    (*extra).wrapped_failure_top += 1;
+                }
+                PreallocatedFailure::Reserved => (*extra).wrapped_failure_top += 1,
+            }
+        }
+    }
+
+    // We cannot shadow Rust errors with Lua ones, so we need to reserve pre-allocated memory
+    // to store a wrapped failure (error or panic) *before* we proceed.
+    let prealloc_failure = PreallocatedFailure::reserve(state, extra);
+
+    match catch_unwind(AssertUnwindSafe(|| {
+        let rawlua = (*extra).raw_lua();
+        let _guard = StateGuard::new(rawlua, state);
+        f(extra, nargs)
+    })) {
+        Ok(Ok(r)) => {
+            // Return unused `WrappedFailure` to the pool
+            prealloc_failure.release(state, extra);
+            r
+        }
+        Ok(Err(err)) => {
+            let wrapped_error = prealloc_failure.r#use(state, extra);
+
+            if !wrap_error {
+                ptr::write(wrapped_error, WrappedFailure::Error(err));
+                get_internal_metatable::<WrappedFailure>(state);
+                ffi::lua_setmetatable(state, -2);
+                ffi::lua_error(state)
+            }
+
+            // Build `CallbackError` with traceback
+            let traceback = if ffi::lua_checkstack(state, ffi::LUA_TRACEBACK_STACK) != 0 {
+                ffi::luaL_traceback(state, state, ptr::null(), 0);
+                let traceback = util::to_string(state, -1);
+                ffi::lua_pop(state, 1);
+                traceback
+            } else {
+                "<not enough stack space for traceback>".to_string()
+            };
+            let cause = Arc::new(err);
+            ptr::write(
+                wrapped_error,
+                WrappedFailure::Error(Error::CallbackError { traceback, cause }),
+            );
+            get_internal_metatable::<WrappedFailure>(state);
+            ffi::lua_setmetatable(state, -2);
+
+            ffi::lua_error(state)
+        }
+        Err(p) => {
+            let wrapped_panic = prealloc_failure.r#use(state, extra);
+            ptr::write(wrapped_panic, WrappedFailure::Panic(Some(p)));
+            get_internal_metatable::<WrappedFailure>(state);
+            ffi::lua_setmetatable(state, -2);
+            ffi::lua_error(state)
+        }
+    }
+}

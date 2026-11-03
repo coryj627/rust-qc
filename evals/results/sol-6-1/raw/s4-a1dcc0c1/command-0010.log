@@ -1,0 +1,692 @@
+use super::*;
+
+/// The top-level type produced by the parser. Not all successful parses result
+/// in valid justfiles, so additional consistency checks and name resolution
+/// are performed by the `Analyzer`, which produces a `Justfile` from an `Ast`.
+#[derive(Debug, Clone)]
+pub(crate) struct Ast<'src> {
+  pub(crate) items: Vec<Item<'src>>,
+  pub(crate) module_path: Modulepath,
+  pub(crate) unstable_features: BTreeSet<UnstableFeature>,
+  pub(crate) warnings: Vec<Warning>,
+  pub(crate) working_directory: PathBuf,
+}
+
+impl ColorDisplay for Ast<'_> {
+  fn fmt(&self, f: &mut Formatter, color: Color) -> fmt::Result {
+    let mut newlines = 0;
+    for (i, item) in self.items.iter().enumerate() {
+      if matches!(item, Item::Newline) {
+        newlines += 1;
+        continue;
+      }
+
+      match newlines {
+        0 => {}
+        1 => writeln!(f)?,
+        _ => {
+          writeln!(f)?;
+          writeln!(f)?;
+        }
+      }
+      newlines = 0;
+
+      if let Some(i) = i.checked_sub(1) {
+        if let Some(last) = self.items.get(i) {
+          if !matches!(last, Item::Newline) {
+            write!(f, " ")?;
+          }
+        }
+      }
+
+      write!(f, "{}", item.color_display(color))?;
+    }
+
+    writeln!(f)?;
+
+    Ok(())
+  }
+}
+use super::*;
+
+/// A single top-level item
+#[derive(Debug, Clone)]
+pub(crate) enum Item<'src> {
+  Alias(Alias<'src, Namepath<'src>>),
+  Assignment(Assignment<'src>),
+  Comment(&'src str),
+  Function(FunctionDefinition<'src>),
+  Import {
+    absolute: Option<PathBuf>,
+    optional: bool,
+    relative: StringLiteral<'src>,
+  },
+  Module {
+    absolute: Option<PathBuf>,
+    doc: Option<String>,
+    groups: Vec<StringLiteral<'src>>,
+    name: Name<'src>,
+    optional: bool,
+    private: bool,
+    relative: Option<StringLiteral<'src>>,
+  },
+  Newline,
+  Recipe(UnresolvedRecipe<'src>),
+  Set(Set<'src>),
+  Unexport {
+    name: Name<'src>,
+  },
+}
+
+impl ColorDisplay for Item<'_> {
+  fn fmt(&self, f: &mut Formatter, color: Color) -> fmt::Result {
+    match self {
+      Self::Alias(alias) => write!(f, "{alias}"),
+      Self::Assignment(assignment) => write!(f, "{assignment}"),
+      Self::Comment(comment) => write!(f, "{comment}"),
+      Self::Function(function) => {
+        write!(f, "{}(", function.name)?;
+        for (i, (parameter, _number)) in function.parameters.iter().enumerate() {
+          if i > 0 {
+            write!(f, ", ")?;
+          }
+          write!(f, "{parameter}")?;
+        }
+        write!(f, ") := {}", function.body)
+      }
+      Self::Import {
+        relative, optional, ..
+      } => {
+        write!(f, "import")?;
+
+        if *optional {
+          write!(f, "?")?;
+        }
+
+        write!(f, " {relative}")
+      }
+      Self::Module {
+        doc,
+        groups,
+        name,
+        optional,
+        relative,
+        ..
+      } => {
+        if let Some(doc) = doc {
+          writeln!(f, "# {doc}")?;
+        }
+
+        for group in groups {
+          writeln!(f, "[group: {group}]")?;
+        }
+
+        write!(f, "mod")?;
+
+        if *optional {
+          write!(f, "?")?;
+        }
+
+        write!(f, " {name}")?;
+
+        if let Some(path) = relative {
+          write!(f, " {path}")?;
+        }
+
+        Ok(())
+      }
+      Self::Newline => Ok(()),
+      Self::Recipe(recipe) => write!(f, "{}", recipe.color_display(color)),
+      Self::Set(set) => write!(f, "{set}"),
+      Self::Unexport { name } => write!(f, "unexport {name}"),
+    }
+  }
+}
+use super::*;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, ValueEnum)]
+pub(crate) enum EvaluateFormat {
+  #[default]
+  Just,
+  Shell,
+}
+use {super::*, TokenKind::*};
+
+/// Just language parser
+///
+/// The parser is a (hopefully) straightforward recursive descent parser.
+///
+/// It uses a few tokens of lookahead to disambiguate different constructs.
+///
+/// The `expect_*` and `presume_*` methods are similar in that they assert the
+/// type of unparsed tokens and consume them. However, upon encountering an
+/// unexpected token, the `expect_*` methods return an unexpected token error,
+/// whereas the `presume_*` tokens return an internal error.
+///
+/// The `presume_*` methods are used when the token stream has been inspected in
+/// some other way, and thus encountering an unexpected token is a bug in Just,
+/// and not a syntax error.
+///
+/// All methods starting with `parse_*` parse and return a language construct.
+///
+/// The parser tracks an expected set of tokens as it parses. This set contains
+/// all tokens which would have been accepted at the current point in the
+/// parse. Whenever the parser tests for a token that would be accepted, but
+/// does not find it, it adds that token to the set. When the parser accepts a
+/// token, the set is cleared. If the parser finds a token which is unexpected,
+/// the elements of the set are printed in the resultant error message.
+pub(crate) struct Parser<'run, 'src> {
+  expected_tokens: BTreeSet<TokenKind>,
+  file_depth: u32,
+  import_offsets: Vec<usize>,
+  items: Vec<Item<'src>>,
+  module_namepath: Option<&'run Namepath<'src>>,
+  next_token: usize,
+  numerator: &'run mut Numerator,
+  recursion_depth: usize,
+  tokens: &'run [Token<'src>],
+  unstable_features: BTreeSet<UnstableFeature>,
+  working_directory: &'run Path,
+}
+
+impl<'run, 'src> Parser<'run, 'src> {
+  /// Parse `tokens` into an `Ast`
+  pub(crate) fn parse(
+    file_depth: u32,
+    import_offsets: &[usize],
+    module_namepath: Option<&'run Namepath<'src>>,
+    numerator: &'run mut Numerator,
+    tokens: &'run [Token<'src>],
+    working_directory: &'run Path,
+  ) -> CompileResult<'src, Ast<'src>> {
+    Self {
+      expected_tokens: BTreeSet::new(),
+      file_depth,
+      import_offsets: import_offsets.to_vec(),
+      items: Vec::new(),
+      module_namepath,
+      next_token: 0,
+      numerator,
+      recursion_depth: 0,
+      tokens,
+      unstable_features: BTreeSet::new(),
+      working_directory,
+    }
+    .parse_ast()
+  }
+
+  pub(crate) fn parse_source(
+    numerator: &mut Numerator,
+    path: &'src Path,
+    source: &Source<'src>,
+    src: &'src str,
+  ) -> CompileResult<'src, Ast<'src>> {
+    let tokens = Lexer::lex(path, src)?;
+
+    Parser::parse(
+      source.file_depth,
+      &source.import_offsets,
+      source.namepath.as_ref(),
+      numerator,
+      &tokens,
+      &source.working_directory,
+    )
+  }
+
+  #[cfg(test)]
+  pub(crate) fn parse_tokens(
+    numerator: &'run mut Numerator,
+    tokens: &'run [Token<'src>],
+  ) -> CompileResult<'src, Ast<'src>> {
+    Self::parse(0, &[], None, numerator, tokens, "".as_ref())
+  }
+
+  fn error(&self, kind: CompileErrorKind<'src>) -> CompileResult<'src, CompileError<'src>> {
+    Ok(self.next()?.error(kind))
+  }
+
+  /// Construct an unexpected token error with the token returned by
+  /// `Parser::next`
+  fn unexpected_token(&self) -> CompileResult<'src, CompileError<'src>> {
+    self.error(CompileErrorKind::UnexpectedToken {
+      expected: self
+        .expected_tokens
+        .iter()
+        .copied()
+        .filter(|kind| *kind != ByteOrderMark)
+        .collect::<Vec<TokenKind>>(),
+      found: self.next()?.kind,
+    })
+  }
+
+  fn internal_error(&self, message: impl Into<String>) -> CompileResult<'src, CompileError<'src>> {
+    self.error(CompileErrorKind::Internal {
+      message: message.into(),
+    })
+  }
+
+  /// An iterator over the remaining significant tokens
+  fn rest(&self) -> impl Iterator<Item = Token<'src>> + 'run {
+    self.tokens[self.next_token..]
+      .iter()
+      .copied()
+      .filter(|token| token.kind != Whitespace)
+  }
+
+  /// The next significant token
+  fn next(&self) -> CompileResult<'src, Token<'src>> {
+    if let Some(token) = self.rest().next() {
+      Ok(token)
+    } else {
+      Err(self.internal_error("`Parser::next()` called after end of token stream")?)
+    }
+  }
+
+  /// Check if the next significant token is of kind `kind`
+  fn next_is(&mut self, kind: TokenKind) -> bool {
+    self.next_are(&[kind])
+  }
+
+  /// Check if the next significant tokens are of kinds `kinds`
+  ///
+  /// The first token in `kinds` will be added to the expected token set.
+  fn next_are(&mut self, kinds: &[TokenKind]) -> bool {
+    if let Some(&kind) = kinds.first() {
+      self.expected_tokens.insert(kind);
+    }
+
+    let mut rest = self.rest();
+    for kind in kinds {
+      match rest.next() {
+        Some(token) => {
+          if token.kind != *kind {
+            return false;
+          }
+        }
+        None => return false,
+      }
+    }
+    true
+  }
+
+  /// Check if the next significant tokens are of kinds `kinds`, followed by a
+  /// comment, end-of-file, or end-of-line.
+  ///
+  /// The first token in `kinds` will be added to the expected token set.
+  fn line_is(&mut self, kinds: &[TokenKind]) -> bool {
+    if let Some(&kind) = kinds.first() {
+      self.expected_tokens.insert(kind);
+    }
+
+    let mut rest = self.rest();
+    for kind in kinds {
+      match rest.next() {
+        Some(token) => {
+          if token.kind != *kind {
+            return false;
+          }
+        }
+        None => return false,
+      }
+    }
+
+    if let Some(token) = rest.next() {
+      if matches!(token.kind, Comment | Eof | Eol) {
+        return true;
+      }
+    }
+
+    false
+  }
+
+  /// Advance past one significant token, clearing the expected token set.
+  fn advance(&mut self) -> CompileResult<'src, Token<'src>> {
+    self.expected_tokens.clear();
+
+    for skipped in &self.tokens[self.next_token..] {
+      self.next_token += 1;
+
+      if skipped.kind != Whitespace {
+        return Ok(*skipped);
+      }
+    }
+
+    Err(self.internal_error("`Parser::advance()` advanced past end of token stream")?)
+  }
+
+  /// Return next token if it is of kind `expected`, otherwise, return an
+  /// unexpected token error
+  fn expect(&mut self, expected: TokenKind) -> CompileResult<'src, Token<'src>> {
+    if let Some(token) = self.accept(expected)? {
+      Ok(token)
+    } else {
+      Err(self.unexpected_token()?)
+    }
+  }
+
+  /// Return the next token if it is any of kinds in `expected`, otherwise,
+  /// return an unexpected token error
+  fn expect_any(&mut self, expected: &[TokenKind]) -> CompileResult<'src, Token<'src>> {
+    for &kind in expected {
+      if let Some(token) = self.accept(kind)? {
+        return Ok(token);
+      }
+    }
+
+    Err(self.unexpected_token()?)
+  }
+
+  /// Return an unexpected token error if the next token is not an EOL
+  fn expect_eol(&mut self) -> CompileResult<'src> {
+    self.accept(Comment)?;
+
+    if self.next_is(Eof) {
+      return Ok(());
+    }
+
+    self.expect(Eol).map(|_| ())
+  }
+
+  fn expect_keyword(&mut self, expected: Keyword) -> CompileResult<'src> {
+    let found = self.advance()?;
+
+    if found.kind == Identifier && expected == found.lexeme() {
+      Ok(())
+    } else {
+      Err(found.error(CompileErrorKind::ExpectedKeyword {
+        expected: vec![expected],
+        found,
+      }))
+    }
+  }
+
+  /// Return an internal error if the next token is not of kind `Identifier`
+  /// with lexeme `lexeme`.
+  fn presume_keyword(&mut self, keyword: Keyword) -> CompileResult<'src> {
+    let next = self.advance()?;
+
+    if next.kind != Identifier {
+      Err(self.internal_error(format!(
+        "Presumed next token would have kind {Identifier}, but found {}",
+        next.kind
+      ))?)
+    } else if keyword == next.lexeme() {
+      Ok(())
+    } else {
+      Err(self.internal_error(format!(
+        "Presumed next token would have lexeme \"{keyword}\", but found \"{}\"",
+        next.lexeme(),
+      ))?)
+    }
+  }
+
+  /// Return an internal error if the next token is not of kind `kind`.
+  fn presume(&mut self, kind: TokenKind) -> CompileResult<'src, Token<'src>> {
+    let next = self.advance()?;
+
+    if next.kind == kind {
+      Ok(next)
+    } else {
+      Err(self.internal_error(format!(
+        "Presumed next token would have kind {kind:?}, but found {:?}",
+        next.kind
+      ))?)
+    }
+  }
+
+  /// Return an internal error if the next token is not one of kinds `kinds`.
+  fn presume_any(&mut self, kinds: &[TokenKind]) -> CompileResult<'src, Token<'src>> {
+    let next = self.advance()?;
+    if kinds.contains(&next.kind) {
+      Ok(next)
+    } else {
+      Err(self.internal_error(format!(
+        "Presumed next token would be {}, but found {}",
+        List::or(kinds),
+        next.kind
+      ))?)
+    }
+  }
+
+  /// Accept and return a token of kind `kind`
+  fn accept(&mut self, kind: TokenKind) -> CompileResult<'src, Option<Token<'src>>> {
+    if self.next_is(kind) {
+      Ok(Some(self.advance()?))
+    } else {
+      Ok(None)
+    }
+  }
+
+  /// Return an error if the next token is of kind `forbidden`
+  fn forbid<F>(&self, forbidden: TokenKind, error: F) -> CompileResult<'src>
+  where
+    F: FnOnce(Token) -> CompileError,
+  {
+    let next = self.next()?;
+
+    if next.kind == forbidden {
+      Err(error(next))
+    } else {
+      Ok(())
+    }
+  }
+
+  /// Accept a double-colon separated sequence of identifiers
+  fn accept_namepath(&mut self) -> CompileResult<'src, Option<Namepath<'src>>> {
+    if self.next_is(Identifier) {
+      Ok(Some(self.parse_namepath()?))
+    } else {
+      Ok(None)
+    }
+  }
+
+use super::*;
+
+pub(crate) struct SignalHandler {
+  caught: Option<Signal>,
+  children: BTreeMap<i32, Command>,
+  initialized: bool,
+  verbosity: Verbosity,
+}
+
+impl SignalHandler {
+  pub(crate) fn install(verbosity: Verbosity) -> RunResult<'static> {
+    let mut instance = Self::instance();
+    instance.verbosity = verbosity;
+    if !instance.initialized {
+      Platform::install_signal_handler(|signal| Self::instance().handle(signal))?;
+      instance.initialized = true;
+    }
+    Ok(())
+  }
+
+  pub(crate) fn instance() -> MutexGuard<'static, Self> {
+    static INSTANCE: Mutex<SignalHandler> = Mutex::new(SignalHandler::new());
+
+    match INSTANCE.lock() {
+      Ok(guard) => guard,
+      Err(poison_error) => {
+        eprintln!(
+          "{}",
+          Error::internal(format!("signal handler mutex poisoned: {poison_error}"),)
+            .color_display(Color::auto().stderr())
+        );
+        process::exit(EXIT_FAILURE);
+      }
+    }
+  }
+
+  const fn new() -> Self {
+    Self {
+      caught: None,
+      children: BTreeMap::new(),
+      initialized: false,
+      verbosity: Verbosity::default(),
+    }
+  }
+
+  fn handle(&mut self, signal: Signal) {
+    if signal.is_fatal() {
+      if self.children.is_empty() {
+        process::exit(signal.code());
+      }
+
+      if self.caught.is_none() {
+        self.caught = Some(signal);
+      }
+    }
+
+    match signal {
+      // SIGHUP, SIGINT, and SIGQUIT are normally sent on terminal close,
+      // ctrl-c, and ctrl-\, respectively, and are sent to all processes in the
+      // foreground process group. this includes child processes, so we ignore
+      // the signal and wait for them to exit
+      Signal::Hangup | Signal::Interrupt | Signal::Quit => {}
+      #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+      ))]
+      Signal::Info => {
+        let id = process::id();
+        if self.children.is_empty() {
+          eprintln!("just {id}: no child processes");
+        } else {
+          let n = self.children.len();
+
+          let mut message = format!(
+            "just {id}: {n} child {}:\n",
+            if n == 1 { "process" } else { "processes" }
+          );
+
+          for (&child, command) in &self.children {
+            use std::fmt::Write;
+            writeln!(message, "{child}: {command:?}").unwrap();
+          }
+
+          eprint!("{message}");
+        }
+      }
+      // SIGTERM is the default signal sent by kill. forward it to child
+      // processes and wait for them to exit
+      Signal::Terminate =>
+      {
+        #[cfg(not(windows))]
+        for &child in self.children.keys() {
+          if self.verbosity.loquacious() {
+            eprintln!("just: sending SIGTERM to child process {child}");
+          }
+          nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child),
+            Some(Signal::Terminate.into()),
+          )
+          .ok();
+        }
+      }
+    }
+  }
+
+  pub(crate) fn spawn<T>(
+    mut command: Command,
+    f: impl Fn(process::Child) -> io::Result<T>,
+  ) -> (io::Result<T>, Option<Signal>) {
+    let mut instance = Self::instance();
+
+    let child = match command.spawn() {
+      Err(err) => return (Err(err), None),
+      Ok(child) => child,
+    };
+
+    let pid = match child.id().try_into() {
+      Err(err) => {
+        return (
+          Err(io::Error::other(format!("invalid child PID: {err}"))),
+          None,
+        );
+      }
+      Ok(pid) => pid,
+    };
+
+    instance.children.insert(pid, command);
+
+    drop(instance);
+
+    let result = f(child);
+
+    let mut instance = Self::instance();
+
+    instance.children.remove(&pid);
+
+    (result, instance.caught)
+  }
+}
+use super::*;
+
+impl PlatformInterface for Platform {
+  fn make_shebang_command(
+    _config: &Config,
+    path: &Path,
+    _shebang: Shebang,
+    working_directory: Option<&Path>,
+  ) -> Result<Command, OutputError> {
+    // shebang scripts can be executed directly on unix
+    let mut command = Command::resolve(path);
+
+    if let Some(working_directory) = working_directory {
+      command.current_dir(working_directory);
+    }
+
+    Ok(command)
+  }
+
+  fn set_execute_permission(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // get current permissions
+    let mut permissions = fs::metadata(path)?.permissions();
+
+    // set the execute bit
+    let current_mode = permissions.mode();
+    permissions.set_mode(current_mode | 0o100);
+
+    // set the new permissions
+    fs::set_permissions(path, permissions)
+  }
+
+  fn signal_from_exit_status(exit_status: ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    exit_status.signal()
+  }
+
+  fn convert_native_path(
+    _config: &Config,
+    _working_directory: &Path,
+    path: &Path,
+  ) -> FunctionResult {
+    path
+      .to_str()
+      .map(str::to_string)
+      .ok_or_else(|| String::from("Error getting current directory: unicode decode error"))
+  }
+
+  fn install_signal_handler<T: Fn(Signal) + Send + 'static>(handler: T) -> RunResult<'static> {
+    let signals = crate::signals::Signals::new()?;
+
+    std::thread::Builder::new()
+      .name("signal handler".into())
+      .spawn(move || {
+        for signal in signals {
+          match signal {
+            Ok(signal) => handler(signal),
+            Err(io_error) => eprintln!("warning: I/O error reading from signal pipe: {io_error}"),
+          }
+        }
+      })
+      .map_err(|io_error| Error::SignalHandlerSpawnThread { io_error })?;
+
+    Ok(())
+  }
+}

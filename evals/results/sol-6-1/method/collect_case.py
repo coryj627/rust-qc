@@ -12,6 +12,9 @@ from export_dataset import scrub, workspace_files
 def main():
     scratch, run_id, case = Path(sys.argv[1]).resolve(), sys.argv[2], sys.argv[3]
     metadata = json.loads((scratch / "private" / run_id / "metadata.json").read_text())
+    review = scratch / "private" / run_id / "input_review.json"
+    if review.exists() and not json.loads(review.read_text())["valid"]:
+        raise SystemExit("Author input isolation was invalid")
     if metadata["status"] != "completed":
         raise SystemExit("Only completed author output may be frozen")
     workspace = scratch / "audits/projects" / run_id

@@ -9,7 +9,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from collect_grades import completed
 from prepare_audits import CLOCK
+from source_skills import require_sole_skill
 
 CASES = {
     "decom": "alacritty", "heapless": "heapless", "wikilink": "pulldown-cmark",
@@ -35,6 +37,8 @@ def main():
             if committed != (folder / name).read_bytes():
                 raise SystemExit(f"Uncommitted case input: {relative}")
         record = json.loads((folder / "preparation.json").read_text())
+        if not completed(scratch, record["author_run"]):
+            raise SystemExit(f"Case author did not complete with valid inputs: {case}")
         for name, expected in record.get("sha256", record.get("files", {})).items():
             path = folder / name
             if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
@@ -71,6 +75,7 @@ def main():
             (work / "clock").chmod(0o755)
             if arm == "with-skill":
                 shutil.copytree(scratch / "skill-tree/.agents/skills/rust-qc", work / "skill")
+            require_sole_skill(work, "skill" if arm == "with-skill" else None)
             task = (root / "stage5/cases" / case / "case.md").read_text()
             prompt = task + """
 

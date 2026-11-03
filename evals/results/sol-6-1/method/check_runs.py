@@ -19,6 +19,9 @@ def read_jsonl(path):
 def check(folder):
     metadata = json.loads((folder / "metadata.json").read_text())
     flags = []
+    review = folder / "input_review.json"
+    if review.exists() and not json.loads(review.read_text())["valid"]:
+        flags.append("invalid_input_isolation")
     if metadata.get("model") != MODEL or metadata.get("effort") != EFFORT:
         flags.append("model_or_effort_mismatch")
     if metadata.get("status") != "completed" or not metadata.get("report_collected"):

@@ -1,0 +1,737 @@
+   368 crate/quinn-proto/src/bloom_token_log.rs
+   180 crate/quinn-proto/src/cid_generator.rs
+   303 crate/quinn-proto/src/cid_queue.rs
+   130 crate/quinn-proto/src/coding.rs
+   105 crate/quinn-proto/src/congestion.rs
+    22 crate/quinn-proto/src/constant_time.rs
+   223 crate/quinn-proto/src/crypto.rs
+  1331 crate/quinn-proto/src/endpoint.rs
+  1008 crate/quinn-proto/src/frame.rs
+   336 crate/quinn-proto/src/lib.rs
+  1014 crate/quinn-proto/src/packet.rs
+   180 crate/quinn-proto/src/shared.rs
+   507 crate/quinn-proto/src/token.rs
+   246 crate/quinn-proto/src/token_memory_cache.rs
+   132 crate/quinn-proto/src/transport_error.rs
+   876 crate/quinn-proto/src/transport_parameters.rs
+   193 crate/quinn-proto/src/varint.rs
+   155 crate/quinn-proto/src/connection/ack_frequency.rs
+   663 crate/quinn-proto/src/connection/assembler.rs
+   223 crate/quinn-proto/src/connection/cid_state.rs
+   211 crate/quinn-proto/src/connection/datagrams.rs
+  4102 crate/quinn-proto/src/connection/mod.rs
+   970 crate/quinn-proto/src/connection/mtud.rs
+   308 crate/quinn-proto/src/connection/pacing.rs
+   282 crate/quinn-proto/src/connection/packet_builder.rs
+   173 crate/quinn-proto/src/connection/packet_crypto.rs
+   456 crate/quinn-proto/src/connection/paths.rs
+   190 crate/quinn-proto/src/connection/qlog.rs
+   394 crate/quinn-proto/src/connection/send_buffer.rs
+  1088 crate/quinn-proto/src/connection/spaces.rs
+   174 crate/quinn-proto/src/connection/stats.rs
+    65 crate/quinn-proto/src/connection/timer.rs
+   528 crate/quinn-proto/src/connection/streams/mod.rs
+   543 crate/quinn-proto/src/connection/streams/recv.rs
+   402 crate/quinn-proto/src/connection/streams/send.rs
+  2102 crate/quinn-proto/src/connection/streams/state.rs
+ 20183 total
+use std::{cmp::Ordering, io, ops::Range, str};
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use thiserror::Error;
+
+use crate::{
+    ConnectionId,
+    coding::{self, BufExt, BufMutExt},
+    crypto,
+};
+
+/// Decodes a QUIC packet's invariant header
+///
+/// Due to packet number encryption, it is impossible to fully decode a header
+/// (which includes a variable-length packet number) without crypto context.
+/// The crypto context (represented by the `Crypto` type in Quinn) is usually
+/// part of the `Connection`, or can be derived from the destination CID for
+/// Initial packets.
+///
+/// To cope with this, we decode the invariant header (which should be stable
+/// across QUIC versions), which gives us the destination CID and allows us
+/// to inspect the version and packet type (which depends on the version).
+/// This information allows us to fully decode and decrypt the packet.
+#[cfg_attr(test, derive(Clone))]
+#[derive(Debug)]
+pub struct PartialDecode {
+    plain_header: ProtectedHeader,
+    buf: io::Cursor<BytesMut>,
+}
+
+#[allow(clippy::len_without_is_empty)]
+impl PartialDecode {
+    /// Begin decoding a QUIC packet from `bytes`, returning any trailing data not part of that packet
+    pub fn new(
+        bytes: BytesMut,
+        cid_parser: &(impl ConnectionIdParser + ?Sized),
+        supported_versions: &[u32],
+        grease_quic_bit: bool,
+    ) -> Result<(Self, Option<BytesMut>), PacketDecodeError> {
+        let mut buf = io::Cursor::new(bytes);
+        let plain_header =
+            ProtectedHeader::decode(&mut buf, cid_parser, supported_versions, grease_quic_bit)?;
+        let dgram_len = buf.get_ref().len();
+        let packet_len = plain_header
+            .payload_len()
+            .map(|len| (buf.position() + len) as usize)
+            .unwrap_or(dgram_len);
+        match dgram_len.cmp(&packet_len) {
+            Ordering::Equal => Ok((Self { plain_header, buf }, None)),
+            Ordering::Less => Err(PacketDecodeError::InvalidHeader(
+                "packet too short to contain payload length",
+            )),
+            Ordering::Greater => {
+                let rest = Some(buf.get_mut().split_off(packet_len));
+                Ok((Self { plain_header, buf }, rest))
+            }
+        }
+    }
+
+    /// The underlying partially-decoded packet data
+    pub(crate) fn data(&self) -> &[u8] {
+        self.buf.get_ref()
+    }
+
+    pub(crate) fn initial_header(&self) -> Option<&ProtectedInitialHeader> {
+        self.plain_header.as_initial()
+    }
+
+    pub(crate) fn has_long_header(&self) -> bool {
+        !matches!(self.plain_header, ProtectedHeader::Short { .. })
+    }
+
+    pub(crate) fn is_initial(&self) -> bool {
+        self.space() == Some(SpaceId::Initial)
+    }
+
+    pub(crate) fn space(&self) -> Option<SpaceId> {
+        use ProtectedHeader::*;
+        match self.plain_header {
+            Initial { .. } => Some(SpaceId::Initial),
+            Long {
+                ty: LongType::Handshake,
+                ..
+            } => Some(SpaceId::Handshake),
+            Long {
+                ty: LongType::ZeroRtt,
+                ..
+            } => Some(SpaceId::Data),
+            Short { .. } => Some(SpaceId::Data),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_0rtt(&self) -> bool {
+        match self.plain_header {
+            ProtectedHeader::Long { ty, .. } => ty == LongType::ZeroRtt,
+            _ => false,
+        }
+    }
+
+    /// The destination connection ID of the packet
+    pub fn dst_cid(&self) -> &ConnectionId {
+        self.plain_header.dst_cid()
+    }
+
+    /// Length of QUIC packet being decoded
+    #[allow(unreachable_pub)] // fuzzing only
+    pub fn len(&self) -> usize {
+        self.buf.get_ref().len()
+    }
+
+    pub(crate) fn finish(
+        self,
+        header_crypto: Option<&dyn crypto::HeaderKey>,
+    ) -> Result<Packet, PacketDecodeError> {
+        use ProtectedHeader::*;
+        let Self {
+            plain_header,
+            mut buf,
+        } = self;
+
+        if let Initial(ProtectedInitialHeader {
+            dst_cid,
+            src_cid,
+            token_pos,
+            version,
+            ..
+        }) = plain_header
+        {
+            let number = Self::decrypt_header(&mut buf, header_crypto.unwrap())?;
+            let header_len = buf.position() as usize;
+            let mut bytes = buf.into_inner();
+
+            let header_data = bytes.split_to(header_len).freeze();
+            let token = header_data.slice(token_pos.start..token_pos.end);
+            return Ok(Packet {
+                header: Header::Initial(InitialHeader {
+                    dst_cid,
+                    src_cid,
+                    token,
+                    number,
+                    version,
+                }),
+                header_data,
+                payload: bytes,
+            });
+        }
+
+        let header = match plain_header {
+            Long {
+                ty,
+                dst_cid,
+                src_cid,
+                version,
+                ..
+            } => Header::Long {
+                ty,
+                dst_cid,
+                src_cid,
+                number: Self::decrypt_header(&mut buf, header_crypto.unwrap())?,
+                version,
+            },
+            Retry {
+                dst_cid,
+                src_cid,
+                version,
+            } => Header::Retry {
+                dst_cid,
+                src_cid,
+                version,
+            },
+            Short { spin, dst_cid, .. } => {
+                let number = Self::decrypt_header(&mut buf, header_crypto.unwrap())?;
+                let key_phase = buf.get_ref()[0] & KEY_PHASE_BIT != 0;
+                Header::Short {
+                    spin,
+                    key_phase,
+                    dst_cid,
+                    number,
+                }
+            }
+            VersionNegotiate {
+                random,
+                dst_cid,
+                src_cid,
+            } => Header::VersionNegotiate {
+                random,
+                dst_cid,
+                src_cid,
+            },
+            Initial { .. } => unreachable!(),
+        };
+
+        let header_len = buf.position() as usize;
+        let mut bytes = buf.into_inner();
+        Ok(Packet {
+            header,
+            header_data: bytes.split_to(header_len).freeze(),
+            payload: bytes,
+        })
+    }
+
+    fn decrypt_header(
+        buf: &mut io::Cursor<BytesMut>,
+        header_crypto: &dyn crypto::HeaderKey,
+    ) -> Result<PacketNumber, PacketDecodeError> {
+        let packet_length = buf.get_ref().len();
+        let pn_offset = buf.position() as usize;
+        if packet_length < pn_offset + 4 + header_crypto.sample_size() {
+            return Err(PacketDecodeError::InvalidHeader(
+                "packet too short to extract header protection sample",
+            ));
+        }
+
+        header_crypto.decrypt(pn_offset, buf.get_mut());
+
+        let len = PacketNumber::decode_len(buf.get_ref()[0]);
+        PacketNumber::decode(len, buf)
+    }
+}
+
+pub(crate) struct Packet {
+    pub(crate) header: Header,
+    pub(crate) header_data: Bytes,
+    pub(crate) payload: BytesMut,
+}
+
+impl Packet {
+    pub(crate) fn reserved_bits_valid(&self) -> bool {
+        let mask = match self.header {
+            Header::Short { .. } => SHORT_RESERVED_BITS,
+            _ => LONG_RESERVED_BITS,
+        };
+        self.header_data[0] & mask == 0
+    }
+}
+
+pub(crate) struct InitialPacket {
+    pub(crate) header: InitialHeader,
+    pub(crate) header_data: Bytes,
+    pub(crate) payload: BytesMut,
+}
+
+impl From<InitialPacket> for Packet {
+    fn from(x: InitialPacket) -> Self {
+        Self {
+            header: Header::Initial(x.header),
+            header_data: x.header_data,
+            payload: x.payload,
+        }
+//! QUIC connection transport parameters
+//!
+//! The `TransportParameters` type is used to represent the transport parameters
+//! negotiated by peers while establishing a QUIC connection. This process
+//! happens as part of the establishment of the TLS session. As such, the types
+//! contained in this modules should generally only be referred to by custom
+//! implementations of the `crypto::Session` trait.
+
+use std::{
+    convert::TryFrom,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
+};
+
+use bytes::{Buf, BufMut};
+use rand::{Rng as _, RngCore, seq::SliceRandom as _};
+use thiserror::Error;
+
+use crate::{
+    LOC_CID_COUNT, MAX_CID_SIZE, MAX_STREAM_COUNT, RESET_TOKEN_SIZE, ResetToken, Side,
+    TIMER_GRANULARITY, TransportError, VarInt,
+    cid_generator::ConnectionIdGenerator,
+    cid_queue::CidQueue,
+    coding::{BufExt, BufMutExt, UnexpectedEnd},
+    config::{EndpointConfig, ServerConfig, TransportConfig},
+    shared::ConnectionId,
+};
+
+// Apply a given macro to a list of all the transport parameters having integer types, along with
+// their codes and default values. Using this helps us avoid error-prone duplication of the
+// contained information across decoding, encoding, and the `Default` impl. Whenever we want to do
+// something with transport parameters, we'll handle the bulk of cases by writing a macro that
+// takes a list of arguments in this form, then passing it to this macro.
+macro_rules! apply_params {
+    ($macro:ident) => {
+        $macro! {
+            // #[doc] name (id) = default,
+            /// Milliseconds, disabled if zero
+            max_idle_timeout(MaxIdleTimeout) = 0,
+            /// Limits the size of UDP payloads that the endpoint is willing to receive
+            max_udp_payload_size(MaxUdpPayloadSize) = 65527,
+
+            /// Initial value for the maximum amount of data that can be sent on the connection
+            initial_max_data(InitialMaxData) = 0,
+            /// Initial flow control limit for locally-initiated bidirectional streams
+            initial_max_stream_data_bidi_local(InitialMaxStreamDataBidiLocal) = 0,
+            /// Initial flow control limit for peer-initiated bidirectional streams
+            initial_max_stream_data_bidi_remote(InitialMaxStreamDataBidiRemote) = 0,
+            /// Initial flow control limit for unidirectional streams
+            initial_max_stream_data_uni(InitialMaxStreamDataUni) = 0,
+
+            /// Initial maximum number of bidirectional streams the peer may initiate
+            initial_max_streams_bidi(InitialMaxStreamsBidi) = 0,
+            /// Initial maximum number of unidirectional streams the peer may initiate
+            initial_max_streams_uni(InitialMaxStreamsUni) = 0,
+
+            /// Exponent used to decode the ACK Delay field in the ACK frame
+            ack_delay_exponent(AckDelayExponent) = 3,
+            /// Maximum amount of time in milliseconds by which the endpoint will delay sending
+            /// acknowledgments
+            max_ack_delay(MaxAckDelay) = 25,
+            /// Maximum number of connection IDs from the peer that an endpoint is willing to store
+            active_connection_id_limit(ActiveConnectionIdLimit) = 2,
+        }
+    };
+}
+
+macro_rules! make_struct {
+    {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
+        /// Transport parameters used to negotiate connection-level preferences between peers
+        #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+        pub struct TransportParameters {
+            $($(#[$doc])* pub(crate) $name : VarInt,)*
+
+            /// Does the endpoint support active connection migration
+            pub(crate) disable_active_migration: bool,
+            /// Maximum size for datagram frames
+            pub(crate) max_datagram_frame_size: Option<VarInt>,
+            /// The value that the endpoint included in the Source Connection ID field of the first
+            /// Initial packet it sends for the connection
+            pub(crate) initial_src_cid: Option<ConnectionId>,
+            /// The endpoint is willing to receive QUIC packets containing any value for the fixed
+            /// bit
+            pub(crate) grease_quic_bit: bool,
+
+            /// Minimum amount of time in microseconds by which the endpoint is able to delay
+            /// sending acknowledgments
+            ///
+            /// If a value is provided, it implies that the endpoint supports QUIC Acknowledgement
+            /// Frequency
+            pub(crate) min_ack_delay: Option<VarInt>,
+
+            // Server-only
+            /// The value of the Destination Connection ID field from the first Initial packet sent
+            /// by the client
+            pub(crate) original_dst_cid: Option<ConnectionId>,
+            /// The value that the server included in the Source Connection ID field of a Retry
+            /// packet
+            pub(crate) retry_src_cid: Option<ConnectionId>,
+            /// Token used by the client to verify a stateless reset from the server
+            pub(crate) stateless_reset_token: Option<ResetToken>,
+            /// The server's preferred address for communication after handshake completion
+            pub(crate) preferred_address: Option<PreferredAddress>,
+            /// The randomly generated reserved transport parameter to sustain future extensibility
+            /// of transport parameter extensions.
+            /// When present, it is included during serialization but ignored during deserialization.
+            pub(crate) grease_transport_parameter: Option<ReservedTransportParameter>,
+
+            /// Defines the order in which transport parameters are serialized.
+            ///
+            /// This field is initialized only for outgoing `TransportParameters` instances and
+            /// is set to `None` for `TransportParameters` received from a peer.
+            pub(crate) write_order: Option<[u8; TransportParameterId::SUPPORTED.len()]>,
+        }
+
+        // We deliberately don't implement the `Default` trait, since that would be public, and
+        // downstream crates should never construct `TransportParameters` except by decoding those
+        // supplied by a peer.
+        impl TransportParameters {
+            /// Standard defaults, used if the peer does not supply a given parameter.
+            pub(crate) fn default() -> Self {
+                Self {
+                    $($name: VarInt::from_u32($default),)*
+
+                    disable_active_migration: false,
+                    max_datagram_frame_size: None,
+                    initial_src_cid: None,
+                    grease_quic_bit: false,
+                    min_ack_delay: None,
+
+                    original_dst_cid: None,
+                    retry_src_cid: None,
+                    stateless_reset_token: None,
+                    preferred_address: None,
+                    grease_transport_parameter: None,
+                    write_order: None,
+                }
+            }
+        }
+    }
+}
+
+apply_params!(make_struct);
+
+impl TransportParameters {
+    pub(crate) fn new(
+        config: &TransportConfig,
+        endpoint_config: &EndpointConfig,
+        cid_gen: &dyn ConnectionIdGenerator,
+        initial_src_cid: ConnectionId,
+        server_config: Option<&ServerConfig>,
+        rng: &mut impl RngCore,
+    ) -> Self {
+        Self {
+            initial_src_cid: Some(initial_src_cid),
+            initial_max_streams_bidi: config.max_concurrent_bidi_streams,
+            initial_max_streams_uni: config.max_concurrent_uni_streams,
+            initial_max_data: config.receive_window,
+            initial_max_stream_data_bidi_local: config.stream_receive_window,
+            initial_max_stream_data_bidi_remote: config.stream_receive_window,
+            initial_max_stream_data_uni: config.stream_receive_window,
+            max_udp_payload_size: endpoint_config.max_udp_payload_size,
+            max_idle_timeout: config.max_idle_timeout.unwrap_or(VarInt(0)),
+            disable_active_migration: server_config.is_some_and(|c| !c.migration),
+            active_connection_id_limit: if cid_gen.cid_len() == 0 {
+                2 // i.e. default, i.e. unsent
+            } else {
+                CidQueue::LEN as u32
+            }
+            .into(),
+            max_datagram_frame_size: config
+                .datagram_receive_buffer_size
+                .map(|x| (x.min(u16::MAX.into()) as u16).into()),
+            grease_quic_bit: endpoint_config.grease_quic_bit,
+            min_ack_delay: Some(
+                VarInt::from_u64(u64::try_from(TIMER_GRANULARITY.as_micros()).unwrap()).unwrap(),
+            ),
+            grease_transport_parameter: Some(ReservedTransportParameter::random(rng)),
+            write_order: Some({
+                let mut order = std::array::from_fn(|i| i as u8);
+                order.shuffle(rng);
+                order
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// Check that these parameters are legal when resuming from
+    /// certain cached parameters
+    pub(crate) fn validate_resumption_from(&self, cached: &Self) -> Result<(), TransportError> {
+        if cached.active_connection_id_limit > self.active_connection_id_limit
+            || cached.initial_max_data > self.initial_max_data
+            || cached.initial_max_stream_data_bidi_local > self.initial_max_stream_data_bidi_local
+            || cached.initial_max_stream_data_bidi_remote > self.initial_max_stream_data_bidi_remote
+            || cached.initial_max_stream_data_uni > self.initial_max_stream_data_uni
+            || cached.initial_max_streams_bidi > self.initial_max_streams_bidi
+            || cached.initial_max_streams_uni > self.initial_max_streams_uni
+            || cached.max_datagram_frame_size > self.max_datagram_frame_size
+            || cached.grease_quic_bit && !self.grease_quic_bit
+        {
+            return Err(TransportError::PROTOCOL_VIOLATION(
+                "0-RTT accepted with incompatible transport parameters",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Maximum number of CIDs to issue to this peer
+    ///
+    /// Consider both a) the active_connection_id_limit from the other end; and
+    /// b) LOC_CID_COUNT used locally
+    pub(crate) fn issue_cids_limit(&self) -> u64 {
+        self.active_connection_id_limit.0.min(LOC_CID_COUNT)
+    }
+}
+
+/// A server's preferred address
+///
+/// This is communicated as a transport parameter during TLS session establishment.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct PreferredAddress {
+    pub(crate) address_v4: Option<SocketAddrV4>,
+    pub(crate) address_v6: Option<SocketAddrV6>,
+    pub(crate) connection_id: ConnectionId,
+    pub(crate) stateless_reset_token: ResetToken,
+}
+
+impl PreferredAddress {
+    fn wire_size(&self) -> u16 {
+        4 + 2 + 16 + 2 + 1 + self.connection_id.len() as u16 + 16
+    }
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, binary_heap::PeekMut},
+    mem,
+};
+
+use bytes::{Buf, Bytes, BytesMut};
+
+use crate::range_set::RangeSet;
+
+/// Helper to assemble unordered stream frames into an ordered stream
+#[derive(Debug, Default)]
+pub(super) struct Assembler {
+    state: State,
+    data: BinaryHeap<Buffer>,
+    /// Total number of buffered bytes, including duplicates in ordered mode.
+    buffered: usize,
+    /// Estimated number of allocated bytes, will never be less than `buffered`.
+    allocated: usize,
+    /// Number of bytes read by the application. When only ordered reads have been used, this is the
+    /// length of the contiguous prefix of the stream which has been consumed by the application,
+    /// aka the stream offset.
+    bytes_read: u64,
+    end: u64,
+}
+
+impl Assembler {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reset to the initial state
+    pub(super) fn reinit(&mut self) {
+        let old_data = mem::take(&mut self.data);
+        *self = Self::default();
+        self.data = old_data;
+        self.data.clear();
+    }
+
+    pub(super) fn ensure_ordering(&mut self, ordered: bool) -> Result<(), IllegalOrderedRead> {
+        if ordered && !self.state.is_ordered() {
+            return Err(IllegalOrderedRead);
+        } else if !ordered && self.state.is_ordered() {
+            // Enter unordered mode
+            if !self.data.is_empty() {
+                // Get rid of possible duplicates
+                self.defragment();
+            }
+            let mut recvd = RangeSet::new();
+            recvd.insert(0..self.bytes_read);
+            for chunk in &self.data {
+                recvd.insert(chunk.offset..chunk.offset + chunk.bytes.len() as u64);
+            }
+            self.state = State::Unordered { recvd };
+        }
+        Ok(())
+    }
+
+    /// Get the the next chunk
+    pub(super) fn read(&mut self, max_length: usize, ordered: bool) -> Option<Chunk> {
+        loop {
+            let mut chunk = self.data.peek_mut()?;
+
+            if ordered {
+                if chunk.offset > self.bytes_read {
+                    // Next chunk is after current read index
+                    return None;
+                } else if (chunk.offset + chunk.bytes.len() as u64) <= self.bytes_read {
+                    // Next chunk is useless as the read index is beyond its end
+                    self.buffered -= chunk.bytes.len();
+                    self.allocated -= chunk.allocation_size;
+                    PeekMut::pop(chunk);
+                    continue;
+                }
+
+                // Determine `start` and `len` of the slice of useful data in chunk
+                let start = (self.bytes_read - chunk.offset) as usize;
+                if start > 0 {
+                    chunk.bytes.advance(start);
+                    chunk.offset += start as u64;
+                    self.buffered -= start;
+                }
+            }
+
+            return Some(if max_length < chunk.bytes.len() {
+                self.bytes_read += max_length as u64;
+                let offset = chunk.offset;
+                chunk.offset += max_length as u64;
+                self.buffered -= max_length;
+                Chunk::new(offset, chunk.bytes.split_to(max_length))
+            } else {
+                self.bytes_read += chunk.bytes.len() as u64;
+                self.buffered -= chunk.bytes.len();
+                self.allocated -= chunk.allocation_size;
+                let chunk = PeekMut::pop(chunk);
+                Chunk::new(chunk.offset, chunk.bytes)
+            });
+        }
+    }
+
+    /// Copy fragmented chunk data to new chunks backed by a single buffer
+    ///
+    /// This makes sure we're not unnecessarily holding on to many larger allocations.
+    /// We merge contiguous chunks in the process of doing so.
+    fn defragment(&mut self) {
+        let new = BinaryHeap::with_capacity(self.data.len());
+        let old = mem::replace(&mut self.data, new);
+        let mut buffers = old.into_sorted_vec();
+        self.buffered = 0;
+        let mut fragmented_buffered = 0;
+        let mut offset = 0;
+        for chunk in buffers.iter_mut().rev() {
+            chunk.try_mark_defragment(offset);
+            let size = chunk.bytes.len();
+            offset = chunk.offset + size as u64;
+            self.buffered += size;
+            if !chunk.defragmented {
+                fragmented_buffered += size;
+            }
+        }
+        self.allocated = self.buffered;
+        let mut buffer = BytesMut::with_capacity(fragmented_buffered);
+        let mut offset = 0;
+        for chunk in buffers.into_iter().rev() {
+            if chunk.defragmented {
+                // bytes might be empty after try_mark_defragment
+                if !chunk.bytes.is_empty() {
+                    self.data.push(chunk);
+                }
+                continue;
+            }
+            // Overlap is resolved by try_mark_defragment
+            if chunk.offset != offset + (buffer.len() as u64) {
+                if !buffer.is_empty() {
+                    self.data
+                        .push(Buffer::new_defragmented(offset, buffer.split().freeze()));
+                }
+                offset = chunk.offset;
+            }
+            buffer.extend_from_slice(&chunk.bytes);
+        }
+        if !buffer.is_empty() {
+            self.data
+                .push(Buffer::new_defragmented(offset, buffer.split().freeze()));
+        }
+    }
+
+    // Note: If a packet contains many frames from the same stream, the estimated over-allocation
+    // will be much higher because we are counting the same allocation multiple times.
+    pub(super) fn insert(&mut self, mut offset: u64, mut bytes: Bytes, allocation_size: usize) {
+        debug_assert!(
+            bytes.len() <= allocation_size,
+            "allocation_size less than bytes.len(): {:?} < {:?}",
+            allocation_size,
+            bytes.len()
+        );
+        self.end = self.end.max(offset + bytes.len() as u64);
+        if let State::Unordered { ref mut recvd } = self.state {
+            // Discard duplicate data
+            for duplicate in recvd.replace(offset..offset + bytes.len() as u64) {
+                if duplicate.start > offset {
+                    let buffer = Buffer::new(
+                        offset,
+                        bytes.split_to((duplicate.start - offset) as usize),
+                        allocation_size,
+                    );
+                    self.buffered += buffer.bytes.len();
+                    self.allocated += buffer.allocation_size;
+                    self.data.push(buffer);
+                    offset = duplicate.start;
+                }
+                bytes.advance((duplicate.end - offset) as usize);
+                offset = duplicate.end;
+            }
+        } else if offset < self.bytes_read {
+            if (offset + bytes.len() as u64) <= self.bytes_read {
+                return;
+            } else {
+                let diff = self.bytes_read - offset;
+                offset += diff;
+                bytes.advance(diff as usize);
+            }
+        }
+
+        if bytes.is_empty() {
+            return;
+        }
+        let buffer = Buffer::new(offset, bytes, allocation_size);
+        self.buffered += buffer.bytes.len();
+        self.allocated += buffer.allocation_size;
+        self.data.push(buffer);
+        // `self.buffered` also counts duplicate bytes, therefore we use
+        // `self.end - self.bytes_read` as an upper bound of buffered unique
+        // bytes. This will cause a defragmentation if the amount of duplicate
+        // bytes exceedes a proportion of the receive window size.
+        let buffered = self.buffered.min((self.end - self.bytes_read) as usize);
+        let over_allocation = self.allocated - buffered;
+        // Rationale: on the one hand, we want to defragment rarely, ideally never
+        // in non-pathological scenarios. However, a pathological or malicious
+        // peer could send us one-byte frames, and since we use reference-counted
+        // buffers in order to prevent copying, this could result in keeping a lot
+        // of memory allocated. This limits over-allocation in proportion to the
+        // buffered data. The constants are chosen somewhat arbitrarily and try to
+        // balance between defragmentation overhead and over-allocation.
+        let threshold = 32768.max(buffered * 3 / 2);
+        if over_allocation > threshold {
+            self.defragment()
+        }
+    }
+
+    /// Number of bytes consumed by the application
+    pub(super) fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// Discard all buffered data
+    pub(super) fn clear(&mut self) {
+        self.data.clear();
+        self.buffered = 0;
+        self.allocated = 0;

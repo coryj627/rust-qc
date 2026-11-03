@@ -1,0 +1,1090 @@
+//! A fixed-capacity hash table where the iteration order is independent of the hash of the keys.
+use core::{
+    borrow::Borrow,
+    fmt,
+    hash::{BuildHasher, Hash},
+    mem,
+    num::NonZeroU32,
+    ops, slice,
+};
+
+use hash32::{BuildHasherDefault, FnvHasher};
+
+use crate::Vec;
+
+/// An [`IndexMap`] using the default FNV hasher.
+///
+/// A list of all Methods and Traits available for `FnvIndexMap` can be found in
+/// the [`IndexMap`] documentation.
+///
+/// # Examples
+/// ```
+/// use heapless::index_map::FnvIndexMap;
+///
+/// // A hash map with a capacity of 16 key-value pairs allocated on the stack
+/// let mut book_reviews = FnvIndexMap::<_, _, 16>::new();
+///
+/// // review some books.
+/// book_reviews
+///     .insert("Adventures of Huckleberry Finn", "My favorite book.")
+///     .unwrap();
+/// book_reviews
+///     .insert("Grimms' Fairy Tales", "Masterpiece.")
+///     .unwrap();
+/// book_reviews
+///     .insert("Pride and Prejudice", "Very enjoyable.")
+///     .unwrap();
+/// book_reviews
+///     .insert("The Adventures of Sherlock Holmes", "Eye lyked it alot.")
+///     .unwrap();
+///
+/// // check for a specific one.
+/// if !book_reviews.contains_key("Les Misérables") {
+///     println!(
+///         "We've got {} reviews, but Les Misérables ain't one.",
+///         book_reviews.len()
+///     );
+/// }
+///
+/// // oops, this review has a lot of spelling mistakes, let's delete it.
+/// book_reviews.remove("The Adventures of Sherlock Holmes");
+///
+/// // look up the values associated with some keys.
+/// let to_find = ["Pride and Prejudice", "Alice's Adventure in Wonderland"];
+/// for book in &to_find {
+///     match book_reviews.get(book) {
+///         Some(review) => println!("{}: {}", book, review),
+///         None => println!("{} is unreviewed.", book),
+///     }
+/// }
+///
+/// // iterate over everything.
+/// for (book, review) in &book_reviews {
+///     println!("{}: \"{}\"", book, review);
+/// }
+/// ```
+pub type FnvIndexMap<K, V, const N: usize> = IndexMap<K, V, BuildHasherDefault<FnvHasher>, N>;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct HashValue(u16);
+
+impl HashValue {
+    fn desired_pos(&self, mask: usize) -> usize {
+        usize::from(self.0) & mask
+    }
+
+    fn probe_distance(&self, mask: usize, current: usize) -> usize {
+        current.wrapping_sub(self.desired_pos(mask)) & mask
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct Bucket<K, V> {
+    hash: HashValue,
+    key: K,
+    value: V,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq)]
+pub struct Pos {
+    // compact representation of `{ hash_value: u16, index: u16 }`
+    // To get the most from `NonZero` we store the *value minus 1*. This way `None::Option<Pos>`
+    // is equivalent to the very unlikely value of  `{ hash_value: 0xffff, index: 0xffff }` instead
+    // the more likely of `{ hash_value: 0x00, index: 0x00 }`
+    nz: NonZeroU32,
+}
+
+impl Pos {
+    fn new(index: usize, hash: HashValue) -> Self {
+        Self {
+            nz: unsafe {
+                NonZeroU32::new_unchecked(
+                    ((u32::from(hash.0) << 16) + index as u32).wrapping_add(1),
+                )
+            },
+        }
+    }
+
+    fn hash(&self) -> HashValue {
+        HashValue((self.nz.get().wrapping_sub(1) >> 16) as u16)
+    }
+
+    fn index(&self) -> usize {
+        self.nz.get().wrapping_sub(1) as u16 as usize
+    }
+}
+
+enum Insert<K, V> {
+    Success(Inserted<V>),
+    Full((K, V)),
+}
+struct Inserted<V> {
+    index: usize,
+    old_value: Option<V>,
+}
+
+macro_rules! probe_loop {
+    ($probe_var: ident < $len: expr, $body: expr) => {
+        loop {
+            if $probe_var < $len {
+                $body
+                    $probe_var += 1;
+            } else {
+                $probe_var = 0;
+            }
+        }
+    }
+}
+
+struct CoreMap<K, V, const N: usize> {
+    entries: Vec<Bucket<K, V>, N, usize>,
+    indices: [Option<Pos>; N],
+}
+
+impl<K, V, const N: usize> CoreMap<K, V, N> {
+    const fn new() -> Self {
+        const INIT: Option<Pos> = None;
+
+        Self {
+            entries: Vec::new(),
+            indices: [INIT; N],
+        }
+    }
+}
+
+impl<K, V, const N: usize> CoreMap<K, V, N>
+where
+    K: Eq + Hash,
+{
+    fn capacity() -> usize {
+        N
+    }
+
+    fn mask() -> usize {
+        Self::capacity() - 1
+    }
+
+    fn find<Q>(&self, hash: HashValue, query: &Q) -> Option<(usize, usize)>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Eq,
+    {
+        let mut probe = hash.desired_pos(Self::mask());
+        let mut dist = 0;
+
+        probe_loop!(probe < self.indices.len(), {
+            if let Some(pos) = self.indices[probe] {
+                let entry_hash = pos.hash();
+                // NOTE(i) we use unchecked indexing below
+                let i = pos.index();
+                debug_assert!(i < self.entries.len());
+
+                if dist > entry_hash.probe_distance(Self::mask(), probe) {
+                    // give up when probe distance is too long
+                    return None;
+                } else if entry_hash == hash
+                    && unsafe { self.entries.get_unchecked(i).key.borrow() == query }
+                {
+                    return Some((probe, i));
+                }
+            } else {
+                return None;
+            }
+
+            dist += 1;
+        });
+    }
+
+    fn insert(&mut self, hash: HashValue, key: K, value: V) -> Insert<K, V> {
+        let mut probe = hash.desired_pos(Self::mask());
+        let mut dist = 0;
+
+        probe_loop!(probe < self.indices.len(), {
+            let pos = &mut self.indices[probe];
+
+            if let Some(pos) = *pos {
+                let entry_hash = pos.hash();
+                // NOTE(i) we use unchecked indexing below
+                let i = pos.index();
+                debug_assert!(i < self.entries.len());
+
+                let their_dist = entry_hash.probe_distance(Self::mask(), probe);
+
+                if their_dist < dist {
+                    if self.entries.is_full() {
+                        return Insert::Full((key, value));
+                    }
+                    // robin hood: steal the spot if it's better for us
+                    let index = self.entries.len();
+                    unsafe { self.entries.push_unchecked(Bucket { hash, key, value }) };
+                    Self::insert_phase_2(&mut self.indices, probe, Pos::new(index, hash));
+                    return Insert::Success(Inserted {
+                        index,
+                        old_value: None,
+                    });
+                } else if entry_hash == hash && unsafe { self.entries.get_unchecked(i).key == key }
+                {
+                    return Insert::Success(Inserted {
+                        index: i,
+                        old_value: Some(mem::replace(
+                            unsafe { &mut self.entries.get_unchecked_mut(i).value },
+                            value,
+                        )),
+                    });
+                }
+            } else {
+                if self.entries.is_full() {
+                    return Insert::Full((key, value));
+                }
+                // empty bucket, insert here
+                let index = self.entries.len();
+                *pos = Some(Pos::new(index, hash));
+                unsafe { self.entries.push_unchecked(Bucket { hash, key, value }) };
+                return Insert::Success(Inserted {
+                    index,
+                    old_value: None,
+                });
+            }
+            dist += 1;
+        });
+    }
+
+    // phase 2 is post-insert where we forward-shift `Pos` in the indices.
+    fn insert_phase_2(indices: &mut [Option<Pos>; N], mut probe: usize, mut old_pos: Pos) -> usize {
+        probe_loop!(probe < indices.len(), {
+            let pos = unsafe { indices.get_unchecked_mut(probe) };
+
+            let mut is_none = true; // work around lack of NLL
+            if let Some(pos) = pos.as_mut() {
+                old_pos = mem::replace(pos, old_pos);
+                is_none = false;
+            }
+
+            if is_none {
+                *pos = Some(old_pos);
+                return probe;
+            }
+        });
+    }
+
+    fn remove_found(&mut self, probe: usize, found: usize) -> (K, V) {
+        // index `probe` and entry `found` is to be removed
+        // use swap_remove, but then we need to update the index that points
+        // to the other entry that has to move
+        self.indices[probe] = None;
+        let entry = unsafe { self.entries.swap_remove_unchecked(found) };
+
+        // correct index that points to the entry that had to swap places
+        if let Some(entry) = self.entries.get(found) {
+            // was not last element
+            // examine new element in `found` and find it in indices
+            let mut probe = entry.hash.desired_pos(Self::mask());
+
+            probe_loop!(probe < self.indices.len(), {
+                if let Some(pos) = self.indices[probe] {
+                    if pos.index() >= self.entries.len() {
+                        // found it
+                        self.indices[probe] = Some(Pos::new(found, entry.hash));
+                        break;
+                    }
+                }
+            });
+        }
+
+        self.backward_shift_after_removal(probe);
+
+        (entry.key, entry.value)
+    }
+
+    fn retain_in_order<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&mut K, &mut V) -> bool,
+    {
+        const INIT: Option<Pos> = None;
+
+        self.entries
+            .retain_mut(|entry| keep(&mut entry.key, &mut entry.value));
+
+        if self.entries.len() < self.indices.len() {
+            for index in self.indices.iter_mut() {
+                *index = INIT;
+            }
+
+            for (index, entry) in self.entries.iter().enumerate() {
+                let mut probe = entry.hash.desired_pos(Self::mask());
+                let mut dist = 0;
+
+                probe_loop!(probe < self.indices.len(), {
+                    let pos = &mut self.indices[probe];
+
+                    if let Some(pos) = *pos {
+                        let entry_hash = pos.hash();
+
+                        // robin hood: steal the spot if it's better for us
+                        let their_dist = entry_hash.probe_distance(Self::mask(), probe);
+                        if their_dist < dist {
+                            Self::insert_phase_2(
+                                &mut self.indices,
+                                probe,
+                                Pos::new(index, entry.hash),
+                            );
+                            break;
+                        }
+                    } else {
+                        *pos = Some(Pos::new(index, entry.hash));
+                        break;
+                    }
+                    dist += 1;
+                });
+            }
+        }
+    }
+
+    fn backward_shift_after_removal(&mut self, probe_at_remove: usize) {
+        // backward shift deletion in self.indices
+        // after probe, shift all non-ideally placed indices backward
+        let mut last_probe = probe_at_remove;
+        let mut probe = probe_at_remove + 1;
+
+        probe_loop!(probe < self.indices.len(), {
+            if let Some(pos) = self.indices[probe] {
+                let entry_hash = pos.hash();
+
+                if entry_hash.probe_distance(Self::mask(), probe) > 0 {
+                    unsafe { *self.indices.get_unchecked_mut(last_probe) = self.indices[probe] }
+                    self.indices[probe] = None;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+            last_probe = probe;
+        });
+    }
+}
+
+impl<K, V, const N: usize> Clone for CoreMap<K, V, N>
+where
+    K: Clone,
+    V: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            indices: self.indices,
+        }
+    }
+}
+
+/// A view into an entry in the map
+pub enum Entry<'a, K, V, const N: usize> {
+    /// The entry corresponding to the key `K` exists in the map
+    Occupied(OccupiedEntry<'a, K, V, N>),
+    /// The entry corresponding to the key `K` does not exist in the map
+    Vacant(VacantEntry<'a, K, V, N>),
+}
+
+impl<'a, K, V, const N: usize> Entry<'a, K, V, N>
+where
+    K: Eq + Hash,
+{
+    /// Ensures a value is in the entry by inserting the default if empty, and
+    /// returns a mutable reference to the value in the entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::index_map::FnvIndexMap;
+    ///
+    /// // A hash map with a capacity of 16 key-value pairs allocated on the stack
+    /// let mut book_reviews = FnvIndexMap::<_, _, 16>::new();
+    /// let result = book_reviews
+    ///     .entry("Adventures of Huckleberry Finn")
+    ///     .or_insert("My favorite book.");
+    ///
+    /// assert_eq!(result, Ok(&mut "My favorite book."));
+    /// assert_eq!(
+    ///     book_reviews["Adventures of Huckleberry Finn"],
+    ///     "My favorite book."
+    /// );
+    /// ```
+    pub fn or_insert(self, default: V) -> Result<&'a mut V, V> {
+        match self {
+            Self::Occupied(entry) => Ok(entry.into_mut()),
+            Self::Vacant(entry) => entry.insert(default),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting the result of the default
+    /// function if empty, and returns a mutable reference to the value in the
+    /// entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::index_map::FnvIndexMap;
+    ///
+    /// // A hash map with a capacity of 16 key-value pairs allocated on the stack
+    /// let mut book_reviews = FnvIndexMap::<_, _, 16>::new();
+    /// let s = "Masterpiece.".to_string();
+    ///
+    /// book_reviews
+    ///     .entry("Grimms' Fairy Tales")
+    ///     .or_insert_with(|| s);
+    ///
+    /// assert_eq!(
+    ///     book_reviews["Grimms' Fairy Tales"],
+    ///     "Masterpiece.".to_string()
+    /// );
+    /// ```
+    pub fn or_insert_with<F: FnOnce() -> V>(self, default: F) -> Result<&'a mut V, V> {
+        match self {
+            Self::Occupied(entry) => Ok(entry.into_mut()),
+            Self::Vacant(entry) => entry.insert(default()),
+        }
+    }
+
+    /// Ensures a value is in the entry by inserting, if empty, the result of
+    /// the default function. This method allows for generating key-derived
+    /// values for insertion by providing the default function a reference to
+    /// the key that was moved during the `.entry(key)` method call.
+    ///
+    /// The reference to the moved key is provided so that cloning or copying
+    /// the key is unnecessary, unlike with `.or_insert_with(|| ... )`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::index_map::FnvIndexMap;
+    ///
+    /// // A hash map with a capacity of 16 key-value pairs allocated on the stack
+    /// let mut book_reviews = FnvIndexMap::<_, _, 16>::new();
+    ///
+    /// book_reviews
+    ///     .entry("Pride and Prejudice")
+    ///     .or_insert_with_key(|key| key.chars().count());
+    ///
+    /// assert_eq!(book_reviews["Pride and Prejudice"], 19);
+    /// ```
+    pub fn or_insert_with_key<F: FnOnce(&K) -> V>(self, default: F) -> Result<&'a mut V, V> {
+        match self {
+            Self::Occupied(entry) => Ok(entry.into_mut()),
+            Self::Vacant(entry) => {
+                let value = default(entry.key());
+                entry.insert(value)
+            }
+        }
+    }
+
+    /// Returns a reference to this entry's key.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::index_map::FnvIndexMap;
+    ///
+    /// // A hash map with a capacity of 16 key-value pairs allocated on the stack
+    /// let mut book_reviews = FnvIndexMap::<&str, &str, 16>::new();
+    /// assert_eq!(
+    ///     book_reviews
+    ///         .entry("The Adventures of Sherlock Holmes")
+    ///         .key(),
+    ///     &"The Adventures of Sherlock Holmes"
+    /// );
+    /// ```
+    pub fn key(&self) -> &K {
+        match *self {
+            Self::Occupied(ref entry) => entry.key(),
+            Self::Vacant(ref entry) => entry.key(),
+        }
+    }
+
+    /// Provides in-place mutable access to an occupied entry before any
+    /// potential inserts into the map.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::index_map::FnvIndexMap;
+    ///
+    /// // A hash map with a capacity of 16 key-value pairs allocated on the stack
+    /// let mut book_reviews = FnvIndexMap::<_, _, 16>::new();
+    ///
+    /// book_reviews
+    ///     .entry("Grimms' Fairy Tales")
+    ///     .and_modify(|e| *e = "Masterpiece.")
+    ///     .or_insert("Very enjoyable.");
+    /// assert_eq!(book_reviews["Grimms' Fairy Tales"], "Very enjoyable.");
+    /// ```
+    pub fn and_modify<F>(self, f: F) -> Self
+    where
+        F: FnOnce(&mut V),
+    {
+        match self {
+            Self::Occupied(mut entry) => {
+                f(entry.get_mut());
+                Self::Occupied(entry)
+            }
+            Self::Vacant(entry) => Self::Vacant(entry),
+        }
+    }
+}
+
+impl<'a, K, V, const N: usize> Entry<'a, K, V, N>
+where
+    K: Eq + Hash,
+    V: Default,
+{
+    /// Ensures a value is in the entry by inserting the default value if empty,
+    /// and returns a mutable reference to the value in the entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # fn main() {
+    /// use heapless::index_map::FnvIndexMap;
+    ///
+    /// let mut book_reviews = FnvIndexMap::<&str, Option<&str>, 16>::new();
+    ///
+    /// book_reviews.entry("Pride and Prejudice").or_default();
+    ///
+    /// assert_eq!(book_reviews["Pride and Prejudice"], None);
+    /// # }
+    /// ```
+    #[inline]
+    pub fn or_default(self) -> Result<&'a mut V, V> {
+        match self {
+            Self::Occupied(entry) => Ok(entry.into_mut()),
+            Self::Vacant(entry) => entry.insert(Default::default()),
+        }
+    }
+}
+
+/// An occupied entry which can be manipulated
+pub struct OccupiedEntry<'a, K, V, const N: usize> {
+    key: K,
+    probe: usize,
+    pos: usize,
+    core: &'a mut CoreMap<K, V, N>,
+}
+
+impl<'a, K, V, const N: usize> OccupiedEntry<'a, K, V, N>
+where
+    K: Eq + Hash,
+{
+    /// Gets a reference to the key that this entity corresponds to
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    /// Removes this entry from the map and yields its corresponding key and value
+    pub fn remove_entry(self) -> (K, V) {
+        self.core.remove_found(self.probe, self.pos)
+    }
+
+    /// Gets a reference to the value associated with this entry
+    pub fn get(&self) -> &V {
+        // SAFETY: Already checked existence at instantiation and the only mutable reference
+        // to the map is internally held.
+        unsafe { &self.core.entries.get_unchecked(self.pos).value }
+    }
+
+    /// Gets a mutable reference to the value associated with this entry
+    pub fn get_mut(&mut self) -> &mut V {
+        // SAFETY: Already checked existence at instantiation and the only mutable reference
+        // to the map is internally held.
+        unsafe { &mut self.core.entries.get_unchecked_mut(self.pos).value }
+    }
+
+    /// Consumes this entry and yields a reference to the underlying value
+    pub fn into_mut(self) -> &'a mut V {
+        // SAFETY: Already checked existence at instantiation and the only mutable reference
+        // to the map is internally held.
+        unsafe { &mut self.core.entries.get_unchecked_mut(self.pos).value }
+    }
+
+    /// Overwrites the underlying map's value with this entry's value
+    pub fn insert(self, value: V) -> V {
+        // SAFETY: Already checked existence at instantiation and the only mutable reference
+        // to the map is internally held.
+        unsafe {
+            mem::replace(
+                &mut self.core.entries.get_unchecked_mut(self.pos).value,
+                value,
+            )
+        }
+    }
+
+    /// Removes this entry from the map and yields its value
+    pub fn remove(self) -> V {
+        self.remove_entry().1
+    }
+}
+
+/// A view into an empty slot in the underlying map
+pub struct VacantEntry<'a, K, V, const N: usize> {
+    key: K,
+    hash_val: HashValue,
+    core: &'a mut CoreMap<K, V, N>,
+}
+impl<'a, K, V, const N: usize> VacantEntry<'a, K, V, N>
+where
+    K: Eq + Hash,
+{
+    /// Get the key associated with this entry
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    /// Consumes this entry to yield to key associated with it
+    pub fn into_key(self) -> K {
+        self.key
+    }
+
+    /// Inserts this entry into to underlying map, yields a mutable reference to the inserted value.
+    /// If the map is at capacity the value is returned instead.
+    pub fn insert(self, value: V) -> Result<&'a mut V, V> {
+        if self.core.entries.is_full() {
+//! A fixed capacity map/dictionary that performs lookups via linear search.
+//!
+//! Note that as this map doesn't use hashing so most operations are *O*(n) instead of *O*(1).
+
+use core::{borrow::Borrow, fmt, mem, ops, slice};
+
+use crate::vec::{OwnedVecStorage, Vec, VecInner, ViewVecStorage};
+
+mod storage {
+    use crate::vec::{OwnedVecStorage, VecStorage, ViewVecStorage};
+
+    use super::{LinearMapInner, LinearMapView};
+
+    /// Trait defining how data for a [`LinearMap`](super::LinearMap) is stored.
+    ///
+    /// There's two implementations available:
+    ///
+    /// - [`OwnedStorage`]: stores the data in an array whose size is known at compile time.
+    /// - [`ViewStorage`]: stores the data in an unsized slice
+    ///
+    /// This allows [`LinearMap`] to be generic over either sized or unsized storage. The [`linear_map`](super)
+    /// module contains a [`LinearMapInner`] struct that's generic on [`LinearMapStorage`],
+    /// and two type aliases for convenience:
+    ///
+    /// - [`LinearMap<N>`](crate::linear_map::LinearMap) = `LinearMapInner<OwnedStorage<u8, N>>`
+    /// - [`LinearMapView<T>`](crate::linear_map::LinearMapView) = `LinearMapInner<ViewStorage<u8>>`
+    ///
+    /// `LinearMap` can be unsized into `StrinsgView`, either by unsizing coercions such as `&mut LinearMap -> &mut LinearMapView` or
+    /// `Box<LinearMap> -> Box<LinearMapView>`, or explicitly with [`.as_view()`](crate::linear_map::LinearMap::as_view) or [`.as_mut_view()`](crate::linear_map::LinearMap::as_mut_view).
+    ///
+    /// This trait is sealed, so you cannot implement it for your own types. You can only use
+    /// the implementations provided by this crate.
+    ///
+    /// [`LinearMapInner`]: super::LinearMapInner
+    /// [`LinearMap`]: super::LinearMap
+    /// [`OwnedStorage`]: super::OwnedStorage
+    /// [`ViewStorage`]: super::ViewStorage
+    pub trait LinearMapStorage<K, V>: LinearMapStorageSealed<K, V> {}
+    pub trait LinearMapStorageSealed<K, V>: VecStorage<(K, V)> {
+        fn as_linear_map_view(this: &LinearMapInner<K, V, Self>) -> &LinearMapView<K, V>
+        where
+            Self: LinearMapStorage<K, V>;
+        fn as_linear_map_mut_view(
+            this: &mut LinearMapInner<K, V, Self>,
+        ) -> &mut LinearMapView<K, V>
+        where
+            Self: LinearMapStorage<K, V>;
+    }
+
+    impl<K, V, const N: usize> LinearMapStorage<K, V> for OwnedVecStorage<(K, V), N> {}
+    impl<K, V, const N: usize> LinearMapStorageSealed<K, V> for OwnedVecStorage<(K, V), N> {
+        fn as_linear_map_view(this: &LinearMapInner<K, V, Self>) -> &LinearMapView<K, V>
+        where
+            Self: LinearMapStorage<K, V>,
+        {
+            this
+        }
+        fn as_linear_map_mut_view(this: &mut LinearMapInner<K, V, Self>) -> &mut LinearMapView<K, V>
+        where
+            Self: LinearMapStorage<K, V>,
+        {
+            this
+        }
+    }
+
+    impl<K, V> LinearMapStorage<K, V> for ViewVecStorage<(K, V)> {}
+
+    impl<K, V> LinearMapStorageSealed<K, V> for ViewVecStorage<(K, V)> {
+        fn as_linear_map_view(this: &LinearMapInner<K, V, Self>) -> &LinearMapView<K, V>
+        where
+            Self: LinearMapStorage<K, V>,
+        {
+            this
+        }
+        fn as_linear_map_mut_view(this: &mut LinearMapInner<K, V, Self>) -> &mut LinearMapView<K, V>
+        where
+            Self: LinearMapStorage<K, V>,
+        {
+            this
+        }
+    }
+}
+
+pub use storage::LinearMapStorage;
+/// Implementation of [`LinearMapStorage`] that stores the data in an array whose size is known at compile time.
+pub type OwnedStorage<K, V, const N: usize> = OwnedVecStorage<(K, V), N>;
+/// Implementation of [`LinearMapStorage`] that stores the data in an unsized slice.
+pub type ViewStorage<K, V> = ViewVecStorage<(K, V)>;
+
+/// Base struct for [`LinearMap`] and [`LinearMapView`]
+pub struct LinearMapInner<K, V, S: LinearMapStorage<K, V> + ?Sized> {
+    pub(crate) buffer: VecInner<(K, V), usize, S>,
+}
+
+/// A fixed capacity map/dictionary that performs lookups via linear search.
+///
+/// Note that as this map doesn't use hashing so most operations are *O*(n) instead of *O*(1).
+pub type LinearMap<K, V, const N: usize> = LinearMapInner<K, V, OwnedStorage<K, V, N>>;
+
+/// A dynamic capacity map/dictionary that performs lookups via linear search.
+///
+/// Note that as this map doesn't use hashing so most operations are *O*(n) instead of *O*(1).
+pub type LinearMapView<K, V> = LinearMapInner<K, V, ViewStorage<K, V>>;
+
+impl<K, V, const N: usize> LinearMap<K, V, N> {
+    /// Creates an empty `LinearMap`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// // allocate the map on the stack
+    /// let mut map: LinearMap<&str, isize, 8> = LinearMap::new();
+    ///
+    /// // allocate the map in a static variable
+    /// static mut MAP: LinearMap<&str, isize, 8> = LinearMap::new();
+    /// ```
+    pub const fn new() -> Self {
+        Self { buffer: Vec::new() }
+    }
+}
+
+impl<K, V, S: LinearMapStorage<K, V> + ?Sized> LinearMapInner<K, V, S>
+where
+    K: Eq,
+{
+    /// Get a reference to the `LinearMap`, erasing the `N` const-generic.
+    pub fn as_view(&self) -> &LinearMapView<K, V> {
+        S::as_linear_map_view(self)
+    }
+
+    /// Get a mutable reference to the `LinearMap`, erasing the `N` const-generic.
+    pub fn as_mut_view(&mut self) -> &mut LinearMapView<K, V> {
+        S::as_linear_map_mut_view(self)
+    }
+
+    /// Returns the number of elements that the map can hold.
+    ///
+    /// Computes in *O*(1) time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let map: LinearMap<&str, isize, 8> = LinearMap::new();
+    /// assert_eq!(map.capacity(), 8);
+    /// ```
+    pub fn capacity(&self) -> usize {
+        self.buffer.capacity()
+    }
+
+    /// Clears the map, removing all key-value pairs.
+    ///
+    /// Computes in *O*(1) time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// map.insert(1, "a").unwrap();
+    /// map.clear();
+    /// assert!(map.is_empty());
+    /// ```
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+    }
+
+    /// Returns true if the map contains a value for the specified key.
+    ///
+    /// Computes in *O*(n) time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// map.insert(1, "a").unwrap();
+    /// assert_eq!(map.contains_key(&1), true);
+    /// assert_eq!(map.contains_key(&2), false);
+    /// ```
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// Returns a reference to the value corresponding to the key.
+    ///
+    /// Computes in *O*(n) time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// map.insert(1, "a").unwrap();
+    /// assert_eq!(map.get(&1), Some(&"a"));
+    /// assert_eq!(map.get(&2), None);
+    /// ```
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        self.iter()
+            .find(|&(k, _)| k.borrow() == key)
+            .map(|(_, v)| v)
+    }
+
+    /// Returns a mutable reference to the value corresponding to the key.
+    ///
+    /// Computes in *O*(n) time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// map.insert(1, "a").unwrap();
+    /// if let Some(x) = map.get_mut(&1) {
+    ///     *x = "b";
+    /// }
+    /// assert_eq!(map[&1], "b");
+    /// ```
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        self.iter_mut()
+            .find(|&(k, _)| k.borrow() == key)
+            .map(|(_, v)| v)
+    }
+
+    /// Returns the number of elements in this map.
+    ///
+    /// Computes in *O*(1) time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut a: LinearMap<_, _, 8> = LinearMap::new();
+    /// assert_eq!(a.len(), 0);
+    /// a.insert(1, "a").unwrap();
+    /// assert_eq!(a.len(), 1);
+    /// ```
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Inserts a key-value pair into the map.
+    ///
+    /// If the map did not have this key present, `None` is returned.
+    ///
+    /// If the map did have this key present, the value is updated, and the old value is returned.
+    ///
+    /// Computes in *O*(n) time
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// assert_eq!(map.insert(37, "a").unwrap(), None);
+    /// assert_eq!(map.is_empty(), false);
+    ///
+    /// map.insert(37, "b").unwrap();
+    /// assert_eq!(map.insert(37, "c").unwrap(), Some("b"));
+    /// assert_eq!(map[&37], "c");
+    /// ```
+    pub fn insert(&mut self, key: K, mut value: V) -> Result<Option<V>, (K, V)> {
+        if let Some((_, v)) = self.iter_mut().find(|&(k, _)| *k == key) {
+            mem::swap(v, &mut value);
+            return Ok(Some(value));
+        }
+
+        self.buffer.push((key, value))?;
+        Ok(None)
+    }
+
+    /// Returns true if the map contains no elements.
+    ///
+    /// Computes in *O*(1) time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut a: LinearMap<_, _, 8> = LinearMap::new();
+    /// assert!(a.is_empty());
+    /// a.insert(1, "a").unwrap();
+    /// assert!(!a.is_empty());
+    /// ```
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns true if the map is full.
+    ///
+    /// Computes in *O*(1) time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut a: LinearMap<_, _, 4> = LinearMap::new();
+    /// assert!(!a.is_full());
+    /// a.insert(1, "a").unwrap();
+    /// a.insert(2, "b").unwrap();
+    /// a.insert(3, "c").unwrap();
+    /// a.insert(4, "d").unwrap();
+    /// assert!(a.is_full());
+    /// ```
+    pub fn is_full(&self) -> bool {
+        self.len() == self.capacity()
+    }
+
+    /// An iterator visiting all key-value pairs in arbitrary order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// map.insert("a", 1).unwrap();
+    /// map.insert("b", 2).unwrap();
+    /// map.insert("c", 3).unwrap();
+    ///
+    /// for (key, val) in map.iter() {
+    ///     println!("key: {} val: {}", key, val);
+    /// }
+    /// ```
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        Iter {
+            iter: self.buffer.as_slice().iter(),
+        }
+    }
+
+    /// An iterator visiting all key-value pairs in arbitrary order,
+    /// with mutable references to the values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// map.insert("a", 1).unwrap();
+    /// map.insert("b", 2).unwrap();
+    /// map.insert("c", 3).unwrap();
+    ///
+    /// // Update all values
+    /// for (_, val) in map.iter_mut() {
+    ///     *val = 2;
+    /// }
+    ///
+    /// for (key, val) in &map {
+    ///     println!("key: {} val: {}", key, val);
+    /// }
+    /// ```
+    pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
+        IterMut {
+            iter: self.buffer.as_mut_slice().iter_mut(),
+        }
+    }
+
+    /// An iterator visiting all keys in arbitrary order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// map.insert("a", 1).unwrap();
+    /// map.insert("b", 2).unwrap();
+    /// map.insert("c", 3).unwrap();
+    ///
+    /// for key in map.keys() {
+    ///     println!("{}", key);
+    /// }
+    /// ```
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.iter().map(|(k, _)| k)
+    }
+
+    /// Removes a key from the map, returning the value at
+    /// the key if the key was previously in the map.
+    ///
+    /// Computes in *O*(n) time
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// map.insert(1, "a").unwrap();
+    /// assert_eq!(map.remove(&1), Some("a"));
+    /// assert_eq!(map.remove(&1), None);
+    /// ```
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        let idx = self
+            .keys()
+            .enumerate()
+            .find(|&(_, k)| k.borrow() == key)
+            .map(|(idx, _)| idx);
+
+        idx.map(|idx| self.buffer.swap_remove(idx).1)
+    }
+
+    /// An iterator visiting all values in arbitrary order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// map.insert("a", 1).unwrap();
+    /// map.insert("b", 2).unwrap();
+    /// map.insert("c", 3).unwrap();
+    ///
+    /// for val in map.values() {
+    ///     println!("{}", val);

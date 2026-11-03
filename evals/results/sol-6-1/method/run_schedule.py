@@ -9,7 +9,9 @@ Other failures stop new dispatch. Already-running independent tasks may finish.
 import argparse
 import asyncio
 import json
+import os
 import sys
+import time
 from pathlib import Path
 
 
@@ -20,12 +22,31 @@ async def dispatch(args):
     blocked = set(args.exclude_project)
     stop = asyncio.Event()
     decisions = []
+    claims = scratch / "dispatch-claims"
+    claims.mkdir(exist_ok=True)
+    ledger = scratch / f"dispatch-{args.schedule.stem}-{os.getpid()}.json"
+
+    def refresh_blocks():
+        for row in rows:
+            metadata_path = scratch / "private" / row["run_id"] / "metadata.json"
+            if not metadata_path.exists():
+                continue
+            try:
+                metadata = json.loads(metadata_path.read_text())
+            except json.JSONDecodeError:
+                continue  # A live runner may be replacing its snapshot.
+            if (metadata.get("error") or {}).get("codexErrorInfo") == "cyberPolicy":
+                blocked.add(row.get("project"))
+
     for row in rows:
         private = scratch / "private" / row["run_id"]
         if private.exists():
             metadata_path = private / "metadata.json"
             if metadata_path.exists():
-                metadata = json.loads(metadata_path.read_text())
+                try:
+                    metadata = json.loads(metadata_path.read_text())
+                except json.JSONDecodeError:
+                    metadata = {}
                 if (metadata.get("error") or {}).get("codexErrorInfo") == "cyberPolicy":
                     blocked.add(row.get("project"))
             decisions.append({"run_id": row["run_id"], "dispatch": "already_attempted"})
@@ -34,11 +55,25 @@ async def dispatch(args):
 
     async def worker():
         while not queue.empty() and not stop.is_set():
+            refresh_blocks()
+            if (scratch / "STOP-RESOURCE-LIMIT.json").exists():
+                stop.set()
+                break
             row = queue.get_nowait()
             run = row["run_id"]
             if row.get("project") in blocked:
                 decisions.append({"run_id": run, "dispatch": "not_started",
                                   "reason": "project_provider_policy_block"})
+                queue.task_done()
+                continue
+            if (scratch / "private" / run).exists():
+                decisions.append({"run_id": run, "dispatch": "already_attempted"})
+                queue.task_done()
+                continue
+            try:
+                (claims / run).mkdir()
+            except FileExistsError:
+                decisions.append({"run_id": run, "dispatch": "claimed_by_other_dispatcher"})
                 queue.task_done()
                 continue
             command = [
@@ -53,6 +88,8 @@ async def dispatch(args):
                 process = await asyncio.create_subprocess_exec(
                     *command, stdout=log, stderr=asyncio.subprocess.STDOUT,
                 )
+                decisions.append({"run_id": run, "dispatch": "started", "unix": time.time()})
+                ledger.write_text(json.dumps(decisions, indent=2) + "\n")
                 print(f"STARTED {run} {row.get('project', '')}", flush=True)
                 code = await process.wait()
             metadata_path = scratch / "private" / run / "metadata.json"
@@ -65,18 +102,23 @@ async def dispatch(args):
                 blocked.add(row.get("project"))
             elif code:
                 stop.set()
+                failure_text = json.dumps(metadata.get("error") or {}).lower()
+                log_text = (scratch / f"{run}-supervisor.log").read_text().lower()
+                indicators = ("usagelimit", "usage limit", "rate limit", "ratelimit",
+                              "insufficient_quota", "no space left", "disk quota")
+                if any(term in failure_text or term in log_text for term in indicators):
+                    (scratch / "STOP-RESOURCE-LIMIT.json").write_text(json.dumps({
+                        "run_id": run, "failure_kind": failure,
+                        "reason": "usage_or_disk_limit", "unix": time.time(),
+                    }, indent=2) + "\n")
             queue.task_done()
-            (scratch / f"dispatch-{args.schedule.stem}.json").write_text(
-                json.dumps(decisions, indent=2) + "\n"
-            )
+            ledger.write_text(json.dumps(decisions, indent=2) + "\n")
     await asyncio.gather(*(worker() for _ in range(args.workers)))
     while not queue.empty():
         row = queue.get_nowait()
         decisions.append({"run_id": row["run_id"], "dispatch": "not_started",
                           "reason": "dispatch_stopped_after_failure"})
-    (scratch / f"dispatch-{args.schedule.stem}.json").write_text(
-        json.dumps(decisions, indent=2) + "\n"
-    )
+    ledger.write_text(json.dumps(decisions, indent=2) + "\n")
     print("STOPPED AFTER FAILURE" if stop.is_set() else "SCHEDULE FINISHED", flush=True)
     return int(stop.is_set())
 

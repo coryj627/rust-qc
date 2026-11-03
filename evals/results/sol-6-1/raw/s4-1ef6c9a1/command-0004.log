@@ -1,0 +1,333 @@
+wc: /work/crate/src/{sync,future}/{base_cache,cache,value_initializer}.rs: No such file or directory
+// License and Copyright Notice:
+//
+// Some of the code and doc comments in this module were ported or copied from
+// a Java class `com.github.benmanes.caffeine.cache.TimerWheel` of Caffeine.
+// https://github.com/ben-manes/caffeine/blob/master/caffeine/src/main/java/com/github/benmanes/caffeine/cache/TimerWheel.java
+//
+// The original code/comments from Caffeine are licensed under the Apache License,
+// Version 2.0 <https://github.com/ben-manes/caffeine/blob/master/LICENSE>
+//
+// Copyrights of the original code/comments are retained by their contributors.
+// For full authorship information, see the version control history of
+// https://github.com/ben-manes/caffeine/
+
+use std::{ptr::NonNull, time::Duration};
+
+use super::{
+    concurrent::{arc::MiniArc, entry_info::EntryInfo, DeqNodes},
+    deque::{DeqNode, Deque},
+    time::Instant,
+};
+
+use parking_lot::Mutex;
+
+const BUCKET_COUNTS: &[u64] = &[
+    64, // roughly seconds
+    64, // roughly minutes
+    32, // roughly hours
+    4,  // roughly days
+    1,  // overflow (> ~6.5 days)
+];
+
+const OVERFLOW_QUEUE_INDEX: usize = BUCKET_COUNTS.len() - 1;
+const NUM_LEVELS: usize = OVERFLOW_QUEUE_INDEX - 1;
+
+const DAY: Duration = Duration::from_secs(60 * 60 * 24);
+
+const SPANS: &[u64] = &[
+    aligned_duration(Duration::from_secs(1)),       // 1.07s
+    aligned_duration(Duration::from_secs(60)),      // 1.14m
+    aligned_duration(Duration::from_secs(60 * 60)), // 1.22h
+    aligned_duration(DAY),                          // 1.63d
+    BUCKET_COUNTS[3] * aligned_duration(DAY),       // 6.5d
+    BUCKET_COUNTS[3] * aligned_duration(DAY),       // 6.5d
+];
+
+const SHIFT: &[u64] = &[
+    SPANS[0].trailing_zeros() as u64,
+    SPANS[1].trailing_zeros() as u64,
+    SPANS[2].trailing_zeros() as u64,
+    SPANS[3].trailing_zeros() as u64,
+    SPANS[4].trailing_zeros() as u64,
+];
+
+/// Returns the next power of two of the duration in nanoseconds.
+const fn aligned_duration(duration: Duration) -> u64 {
+    // NOTE: as_nanos() returns u128, so convert it to u64 by using `as`.
+    // We cannot call TryInto::try_into() here because it is not a const fn.
+    (duration.as_nanos() as u64).next_power_of_two()
+}
+
+/// A timer node stored in a bucket of a timer wheel.
+pub(crate) enum TimerNode<K> {
+    /// A sentinel node that is used to mark the end of a timer wheel bucket.
+    Sentinel,
+    /// A timer entry that is holding Arc pointers to the data structures in a cache
+    /// entry.
+    Entry {
+        /// The position (level and index) of the timer wheel bucket.
+        pos: Option<(u8, u8)>,
+        /// An Arc pointer to the `EntryInfo` of the cache entry (`ValueEntry`).
+        entry_info: MiniArc<EntryInfo<K>>,
+        /// An Arc pointer to the `DeqNodes` of the cache entry (`ValueEntry`).
+        deq_nodes: MiniArc<Mutex<DeqNodes<K>>>,
+    },
+}
+
+impl<K> TimerNode<K> {
+    fn new(
+        entry_info: MiniArc<EntryInfo<K>>,
+        deq_nodes: MiniArc<Mutex<DeqNodes<K>>>,
+        level: usize,
+        index: usize,
+    ) -> Self {
+        Self::Entry {
+            pos: Some((level as u8, index as u8)),
+            entry_info,
+            deq_nodes,
+        }
+    }
+
+    /// Returns the position (level and index) of the timer wheel bucket.
+    fn position(&self) -> Option<(usize, usize)> {
+        if let Self::Entry { pos, .. } = &self {
+            pos.map(|(level, index)| (level as usize, index as usize))
+        } else {
+            unreachable!()
+        }
+    }
+
+    fn set_position(&mut self, level: usize, index: usize) {
+        if let Self::Entry { pos, .. } = self {
+            *pos = Some((level as u8, index as u8));
+        } else {
+            unreachable!()
+        }
+    }
+
+    fn unset_position(&mut self) {
+        if let Self::Entry { pos, .. } = self {
+            *pos = None;
+        } else {
+            unreachable!()
+        }
+    }
+
+    fn is_sentinel(&self) -> bool {
+        matches!(self, Self::Sentinel)
+    }
+
+    pub(crate) fn entry_info(&self) -> &MiniArc<EntryInfo<K>> {
+        if let Self::Entry { entry_info, .. } = &self {
+            entry_info
+        } else {
+            unreachable!()
+        }
+    }
+
+    fn unset_timer_node_in_deq_nodes(&self) {
+        if let Self::Entry { deq_nodes, .. } = &self {
+            deq_nodes.lock().set_timer_node(None);
+        } else {
+            unreachable!();
+        }
+    }
+}
+
+type Bucket<K> = Deque<TimerNode<K>>;
+
+#[must_use = "this `ReschedulingResult` may be an `Removed` variant, which should be handled"]
+pub(crate) enum ReschedulingResult<K> {
+    /// The timer event was rescheduled.
+    Rescheduled,
+    /// The timer event was not rescheduled because the entry has no expiration time.
+    Removed(Box<DeqNode<TimerNode<K>>>),
+}
+
+/// A hierarchical timer wheel to add, remove, and fire expiration events in
+/// amortized O(1) time.
+///
+/// The expiration events are deferred until the timer is advanced, which is
+/// performed as part of the cache's housekeeping cycle.
+pub(crate) struct TimerWheel<K> {
+    /// The hierarchical timer wheels.
+    wheels: Box<[Box<[Bucket<K>]>]>,
+    /// The time when this `TimerWheel` was created.
+    origin: Instant,
+    /// The time when this `TimerWheel` was last advanced.
+    current: Instant,
+}
+
+#[cfg(feature = "future")]
+// TODO: https://github.com/moka-rs/moka/issues/54
+#[allow(clippy::non_send_fields_in_send_ty)]
+// Multi-threaded async runtimes require base_cache::Inner to be Send, but it will
+// not be without this `unsafe impl`. This is because DeqNodes have NonNull
+// pointers.
+unsafe impl<K> Send for TimerWheel<K> {}
+
+impl<K> TimerWheel<K> {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            wheels: Box::default(), // Empty.
+            origin: now,
+            current: now,
+        }
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        !self.wheels.is_empty()
+    }
+
+    pub(crate) fn enable(&mut self) {
+        assert!(!self.is_enabled());
+
+        // Populate each bucket with a queue having a sentinel node.
+        self.wheels = BUCKET_COUNTS
+            .iter()
+            .map(|b| {
+                (0..*b)
+                    .map(|_| {
+                        let mut deq = Deque::new(super::CacheRegion::Other);
+                        deq.push_back(Box::new(DeqNode::new(TimerNode::Sentinel)));
+                        deq
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+    }
+
+    /// Schedules a timer event for the node.
+    pub(crate) fn schedule(
+        &mut self,
+        entry_info: MiniArc<EntryInfo<K>>,
+        deq_nodes: MiniArc<Mutex<DeqNodes<K>>>,
+    ) -> Option<NonNull<DeqNode<TimerNode<K>>>> {
+        debug_assert!(self.is_enabled());
+
+        if let Some(t) = entry_info.expiration_time() {
+            let (level, index) = self.bucket_indices(t);
+            let node = Box::new(DeqNode::new(TimerNode::new(
+                entry_info, deq_nodes, level, index,
+            )));
+            let node = self.wheels[level][index].push_back(node);
+            Some(node)
+        } else {
+            None
+        }
+    }
+
+    fn schedule_existing_node(
+        &mut self,
+        mut node: NonNull<DeqNode<TimerNode<K>>>,
+    ) -> ReschedulingResult<K> {
+        debug_assert!(self.is_enabled());
+
+        // Since cache entry's ValueEntry has a pointer to this node, we must reuse
+        // the node.
+        //
+        // SAFETY on `node.as_mut()`: The self (`TimerWheel`) is the only owner of
+        // the node, and we have `&mut self` here. We are the only one who can mutate
+        // the node.
+        if let entry @ TimerNode::Entry { .. } = &mut unsafe { node.as_mut() }.element {
+            if let Some(t) = entry.entry_info().expiration_time() {
+                let (level, index) = self.bucket_indices(t);
+                entry.set_position(level, index);
+                let node = unsafe { Box::from_raw(node.as_ptr()) };
+                self.wheels[level][index].push_back(node);
+                ReschedulingResult::Rescheduled
+            } else {
+                entry.unset_position();
+                entry.unset_timer_node_in_deq_nodes();
+                ReschedulingResult::Removed(unsafe { Box::from_raw(node.as_ptr()) })
+            }
+        } else {
+            unreachable!()
+        }
+    }
+
+    /// Reschedules an active timer event for the node.
+    pub(crate) fn reschedule(
+        &mut self,
+        node: NonNull<DeqNode<TimerNode<K>>>,
+    ) -> ReschedulingResult<K> {
+        debug_assert!(self.is_enabled());
+        unsafe { self.unlink_timer(node) };
+        self.schedule_existing_node(node)
+    }
+
+use crate::common::time::Instant;
+
+use portable_atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
+/// `AtomicInstant` is a wrapper around `AtomicU64` that provides thread-safe access
+/// to an `Instant`.
+///
+/// `u64::MAX` is used to represent an unset `Instant`.
+#[derive(Debug)]
+pub(crate) struct AtomicInstant {
+    instant: AtomicU64,
+}
+
+impl Default for AtomicInstant {
+    /// Creates a new `AtomicInstant` with an unset `Instant`.
+    fn default() -> Self {
+        Self {
+            instant: AtomicU64::new(u64::MAX),
+        }
+    }
+}
+
+impl AtomicInstant {
+    /// Creates a new `AtomicInstant` with the given `Instant`.
+    pub(crate) fn new(instant: Instant) -> Self {
+        // Ensure the `Instant` is not `u64::MAX`, which means unset.
+        debug_assert!(instant.as_nanos() != u64::MAX);
+
+        Self {
+            instant: AtomicU64::new(instant.as_nanos()),
+        }
+    }
+
+    /// Clears the `Instant`.
+    pub(crate) fn clear(&self) {
+        self.instant.store(u64::MAX, Ordering::Release);
+    }
+
+    /// Returns `true` if the `Instant` is set.
+    pub(crate) fn is_set(&self) -> bool {
+        self.instant.load(Ordering::Acquire) != u64::MAX
+    }
+
+    /// Returns the `Instant` if it is set, otherwise `None`.
+    pub(crate) fn instant(&self) -> Option<Instant> {
+        let ts = self.instant.load(Ordering::Acquire);
+        if ts == u64::MAX {
+            None
+        } else {
+            Some(Instant::from_nanos(ts))
+        }
+    }
+
+    /// Sets the `Instant`.
+    pub(crate) fn set_instant(&self, instant: Instant) {
+        // Ensure the `Instant` is not `u64::MAX`, which means unset.
+        debug_assert!(instant.as_nanos() != u64::MAX);
+
+        self.instant.store(instant.as_nanos(), Ordering::Release);
+    }
+}
+test src/sync/cache.rs - sync::cache::Cache<K,V,S>::entry_by_ref (line 849) ... ok
+test src/sync/cache.rs - sync::cache::Cache<K,V,S>::entry_count (line 647) ... ok
+test src/sync/cache.rs - sync::cache::Cache<K,V,S>::get_with (line 884) ... ok
+test src/sync/cache.rs - sync::cache::Cache<K,V,S>::iter (line 1745) ... ok
+test src/sync/cache.rs - sync::cache::Cache<K,V,S>::optionally_get_with (line 1106) ... ok
+test src/sync/cache.rs - sync::cache::Cache<K,V,S>::try_get_with (line 1297) ... ok
+test src/sync/entry_selector.rs - sync::entry_selector::OwnedKeyEntrySelector<'a,K,V,S>::and_compute_with (line 82) ... ok
+test src/sync/entry_selector.rs - sync::entry_selector::OwnedKeyEntrySelector<'a,K,V,S>::and_upsert_with (line 248) ... ok
+test src/sync/entry_selector.rs - sync::entry_selector::OwnedKeyEntrySelector<'a,K,V,S>::or_default (line 306) ... ok
+test src/sync/entry_selector.rs - sync::entry_selector::OwnedKeyEntrySelector<'a,K,V,S>::or_insert (line 338) ... ok

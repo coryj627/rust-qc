@@ -3,7 +3,7 @@
 
 import unittest
 
-from prepare_grading import passages
+from prepare_grading import passages, verifier_text
 
 
 class PassageTests(unittest.TestCase):
@@ -16,6 +16,19 @@ class PassageTests(unittest.TestCase):
     def test_inner_fence_does_not_end_longer_fence(self):
         text = "````text\n```\n\nevidence\n````\n\nAfter\n"
         self.assertEqual(passages(text), ["````text\n```\n\nevidence\n````\n\n", "After\n"])
+
+    def test_normalizes_labels_and_logs_count_footer_without_erasing_claim(self):
+        text = ('1. **High — Overflow.** Source evidence.\n\n'
+                '**1 finding. Last `./clock`: 2 minutes.**\n')
+        result, edits = verifier_text(text)
+        self.assertEqual(result, 'Overflow. Source evidence.\n\n')
+        self.assertEqual([e["action"] for e in edits], ["replace", "drop"])
+
+    def test_verifier_formatting_preserves_code_exactly(self):
+        code = '```text\n1. **High — literal code evidence**\n```\n'
+        self.assertEqual(verifier_text(code), (code, []))
+        inline = 'Evidence: `let a = **ptr;` is unchanged.\n'
+        self.assertEqual(verifier_text(inline), (inline, []))
 
 
 if __name__ == "__main__":
