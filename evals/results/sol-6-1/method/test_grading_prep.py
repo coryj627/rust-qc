@@ -38,6 +38,27 @@ class PassageTests(unittest.TestCase):
                          "Nine runtime defects were reproduced, including a use-after-free.\n")
         self.assertEqual(edits[0]["reason"], "report_count_removed_before_control_insertion")
 
+    def test_functional_summary_counts_are_logged_without_erasing_evidence(self):
+        text = ("The existing tests pass, but targeted checks confirmed "
+                "**15 Major findings and four Minor findings**. "
+                "The parser emits 600 references instead of 599.\n\n"
+                "**Finding count: 19 — 15 Major, four Minor.** "
+                "Coverage used ordinary regressions. Last clock reading: 851 seconds.\n")
+        clean, edits = verifier_text(text, functional=True)
+        self.assertNotIn("15 Major", clean)
+        self.assertNotIn("four Minor", clean)
+        self.assertNotIn("Finding count: 19", clean)
+        self.assertIn("The parser emits 600 references instead of 599.", clean)
+        self.assertIn("Coverage used ordinary regressions.", clean)
+        self.assertTrue(any(e["reason"] == "functional_report_count_normalization"
+                            for e in edits))
+        self.assertIn("15 Major findings and four Minor findings", verifier_text(text)[0])
+        self.assertIn("Finding count: 19", verifier_text(text)[0])
+
+    def test_functional_count_normalization_preserves_fenced_probe_bytes(self):
+        text = '```text\nFinding count: 19 — 15 Major, four Minor.\n```\n'
+        self.assertEqual(verifier_text(text, functional=True), (text, []))
+
 
 if __name__ == "__main__":
     unittest.main()

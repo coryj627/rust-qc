@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Prepare independent negative-control authors without reports or arm mappings."""
 
+import argparse
 import json
 import subprocess
-import sys
 from pathlib import Path
 
 import yaml
@@ -11,7 +11,12 @@ from prepare_audits import CLOCK, load_module
 
 
 def main():
-    scratch = Path(sys.argv[1]).resolve()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("scratch", type=Path)
+    parser.add_argument("--functional-review", action="store_true",
+                        help="Restrict new controls to the v2 functional-review scope")
+    args = parser.parse_args()
+    scratch = args.scratch.resolve()
     schedule = scratch / "controls-schedule.json"
     if schedule.exists():
         raise SystemExit("Refusing to replace a control-author schedule")
@@ -29,11 +34,21 @@ def main():
         (work / "known-defects.json").write_text(json.dumps(known, indent=2) + "\n")
         (work / "clock").write_text(CLOCK)
         (work / "clock").chmod(0o755)
+        scope = """
+All seven controls must concern ordinary functional correctness, documented
+contracts, error handling or public-API boundary behavior. Security testing is
+not required or requested. Do not perform a dedicated security assessment,
+threat modeling, exploitability analysis, exploit development or resource-
+exhaustion investigations. Avoid claims needing that work to settle. Use small
+ordinary regression probes or decisive source evidence. The supplied known key
+contains only the eligible functional entries; it is not an exhaustive bug list.
+""" if args.functional_review else ""
         prompt = f"""You are an independent negative-control author for {name}.
 No audit outputs, treatment mappings, skill rules or other authors' work are
 available. Your only source is this baseline in /work/crate, with audited code
 at /work/{path}. /work/known-defects.json lists known real defects solely so that
 you do not accidentally relabel one as false. No skills are available.
+{scope}
 
 Create exactly TWO plausible but false defect descriptions for a defect-key
 control, and FIVE separate plausible but false audit findings for a verifier
