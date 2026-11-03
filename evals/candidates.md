@@ -1,23 +1,23 @@
-# Proposed projects for answer-key evaluation (issue 2)
+# Projects for answer-key evaluation
 
-Status: proposal for approval. Nothing is committed and no issues are open. 10 projects, 76 candidate key bugs.
+The 10 projects chosen for issue #2, with 76 candidate key bugs. Each project is tracked in its own issue, which builds the key and runs the evaluation.
 
 ## The list
 
 Size is total lines / code lines / `unsafe` count in the audited path at the baseline, measured from the tag. Code lines exclude blank and comment-only lines. Inline test modules are counted.
 
-| Crate | Baseline | Domain | Size | Key | Kinds |
-|---|---|---|---|---|---|
-| h2 | `v0.4.12` (2025-08-06) | Async network service and client | 25,593 / 18,009 / 1 | 8 | crash 1, resource 3, wrong 4 |
-| quinn-proto | `quinn-proto-0.11.13` (2025-08-27) | Network protocol, second network project (sans-IO, not async) | 29,024 / 21,959 / 5 | 8 | crash 3, resource 3, wrong 2 |
-| just | `1.50.0` (2026-04-19) | CLI tool | 22,954 / 19,936 / 3 | 8 | crash 3, resource 2, wrong 3 |
-| heapless | `v0.9.1` (2025-08-20) | Embedded / `no_std` | 17,537 / 10,339 / 254 | 7 | soundness 6, wrong 1 |
-| git2 | `git2-0.20.2` (2025-05-05) | FFI binding | 26,952 / 19,270 / 936 | 8 | crash 3, soundness 4, wrong 1 |
-| mlua | `v0.11.4` (2025-09-28) | FFI binding, heavy `unsafe` | 20,923 / 15,133 / 472 | 8 | crash 2, soundness 2, resource 1, wrong 3 |
-| zip | `v5.1.1` (2025-09-11) | Parser / file format | 13,256 / 10,315 / 24 | 8 | crash 2, resource 2, wrong 4 |
-| pulldown-cmark | `v0.13.0` (2025-02-12) | Parser / file format | 13,648 / 11,398 / 4 | 8 | crash 1, resource 4, wrong 3 |
-| moka | `v0.12.11` (2025-09-23) | Concurrency / data structure | 34,259 / 21,757 / 138 | 5 | soundness 2, resource 1, wrong 2 |
-| simd-json | `v0.16.0` (2025-09-11) | Heavy `unsafe`, parser | 26,677 / 21,575 / 492 | 8 | crash 1, soundness 2, resource 1, wrong 4 |
+| Crate | Issue | Baseline | Domain | Size | Key | Kinds |
+|---|---|---|---|---|---|---|
+| h2 | #12 | `v0.4.12` (2025-08-06) | Async network service and client | 25,593 / 18,009 / 1 | 8 | crash 1, resource 3, wrong 4 |
+| quinn-proto | #13 | `quinn-proto-0.11.13` (2025-08-27) | Network protocol, second network project (sans-IO, not async) | 29,024 / 21,959 / 5 | 8 | crash 3, resource 3, wrong 2 |
+| just | #14 | `1.50.0` (2026-04-19) | CLI tool | 22,954 / 19,936 / 3 | 8 | crash 3, resource 2, wrong 3 |
+| heapless | #15 | `v0.9.1` (2025-08-20) | Embedded / `no_std` | 17,537 / 10,339 / 254 | 7 | soundness 6, wrong 1 |
+| git2 | #16 | `git2-0.20.2` (2025-05-05) | FFI binding | 26,952 / 19,270 / 936 | 8 | crash 3, soundness 4, wrong 1 |
+| mlua | #17 | `v0.11.4` (2025-09-28) | FFI binding, heavy `unsafe` | 20,923 / 15,133 / 472 | 8 | crash 2, soundness 2, resource 1, wrong 3 |
+| zip | #18 | `v5.1.1` (2025-09-11) | Parser / file format | 13,256 / 10,315 / 24 | 8 | crash 2, resource 2, wrong 4 |
+| pulldown-cmark | #19 | `v0.13.0` (2025-02-12) | Parser / file format | 13,648 / 11,398 / 4 | 8 | crash 1, resource 4, wrong 3 |
+| moka | #20 | `v0.12.11` (2025-09-23) | Concurrency / data structure | 34,259 / 21,757 / 138 | 5 | soundness 2, resource 1, wrong 2 |
+| simd-json | #21 | `v0.16.0` (2025-09-11) | Heavy `unsafe`, parser | 26,677 / 21,575 / 492 | 8 | crash 1, soundness 2, resource 1, wrong 4 |
 
 Kinds: crash = crash or panic from input; soundness = undefined behaviour from safe code; resource = resource exhaustion; wrong = wrong behaviour.
 
@@ -271,7 +271,7 @@ Excluded before vetting: memchr, jiff, ripgrep, fd and dua-cli, which the skill 
 3. **Agent files.** No chosen baseline contains `AGENTS.md`, `CLAUDE.md` or similar, so the audit agents will not load project instructions. moka's tip does contain them, so build from the tag, not the tip.
 4. **Unpinned dependencies.** h2, heapless, mlua, zip, moka and simd-json have no `Cargo.lock` at the tag. A fresh resolve can pull in later fixes or break the build, so pin by date when building each key.
 
-## Proposed key format
+## Key format
 
 One YAML file per project. `confirmed_at_baseline` starts at `read` and moves to `reproduced` when the key-building step shows the bug in a container. `match_rule` is what lets graders score blind. Runs must name the skill version, since the README says earlier results predate versioning.
 
@@ -301,7 +301,7 @@ runs:
     bugs_found: []
 ```
 
-## Follow-up issues, after approval
+## Follow-up issues
 
 One per project. Each builds the key, reproduces each bug in a container, and runs the method from issue 2. That is the point where the build criterion and bug presence get tested for real, and an entry that fails to reproduce is dropped or replaced from the reserves named in the vetting data.
 
