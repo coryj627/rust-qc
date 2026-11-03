@@ -90,7 +90,7 @@ Every case ran twice from the same prompt, once following the skill and once wit
 
 Limits: each version ran once or twice per case, and the two final alacritty runs differed by more than the gap between using the skill and not. The graders are the same model family as the agents they graded. No person who writes Rust has reviewed the rules yet. For an audit that matters, run it twice and merge the findings.
 
-Version: these results were measured on unnumbered development versions before 1.0.0. Version 1.0.0 is the final development version plus script fixes, packaging and the warning about running audited code, so none of its rule changes has been measured separately.
+Version: these results were measured on unnumbered development versions before 1.0.0. Those versions are not in this repository, so it cannot show the exact text each run used. Since the skill's first commit (`4478e95`), the rules have changed only by the warning about running audited code and the wording of the gate's stop conditions. No result here measures those changes or the script fixes made since that commit.
 
 ## Sources
 
