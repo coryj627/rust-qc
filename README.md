@@ -49,7 +49,7 @@ The skill never installs toolchains or tools on its own.
   - notes on the exemplar crates
 - `.agents/skills/rust-qc/scripts/check.sh`: the verification gate.
 - `.agents/skills/rust-qc/scripts/audit_scan.py`: a scan for problems clippy cannot see.
-- `tests/`: fixture tests for the scan.
+- `tests/`: tests for both scripts.
 
 ## The scripts
 
@@ -58,11 +58,11 @@ The skill never installs toolchains or tools on its own.
 - `--target` lints and documents code behind a platform gate, such as Windows-only code checked from Linux.
 - `--features` replaces `--all-features` for crates whose features cannot all be enabled together.
 
-It exits 0 when every step passes, 1 when any step fails, and 2 when a precondition is missing.
+It exits 0 when every step passes, 1 when any step fails, and 2 when a precondition is missing. A toolchain the project pins but you have not installed counts as missing, because the script turns off rustup's automatic downloads.
 
-`python3 -I audit_scan.py <crate-root>` reports glob re-exports, weasel-word type names, ASCII-art comments, design-history docs, parameter tables, bare TODOs, empty `expect` messages and print macros in library code. It skips benchmark, fuzz and data folders, and treats tests and examples as non-production code.
+`python3 -I audit_scan.py <crate-root>` reports glob re-exports, weasel-word type names, ASCII-art comments, design-history docs, parameter tables, bare TODOs, empty `expect` messages and print macros in library code. It skips benchmark, fuzz and data folders, and treats tests and examples as non-production code. Inside `src/` it skips only test data and treats only `tests` as non-production, because folder names there are module names. A workspace member whose own folder is named like a skipped folder, such as `crates/data`, is still skipped.
 
-Run the scan's fixture tests from the repository root with `python3 -I tests/test_audit_scan.py`.
+Run the tests from the repository root with `python3 -I tests/test_audit_scan.py` and `python3 -I tests/test_check.py`. The second uses stub commands, so it needs no Rust toolchain.
 
 ## How it was tested
 

@@ -28,6 +28,10 @@ SKIP_DIRS = {
 }
 # Scanned, but production-only rules are skipped.
 NON_PRODUCTION_DIRS = {"tests", "examples", "testprograms", "build"}
+# Inside `src/`, folders are modules, so names like `data` and `build` mean
+# nothing special. Only these still mark test data or test code there.
+SKIP_DIRS_IN_SRC = {"testdata", "fixtures", "haystacks", "snapshots"}
+NON_PRODUCTION_DIRS_IN_SRC = {"tests"}
 # Files that hold test code by convention (declared as `#[cfg(test)] mod tests;`).
 TEST_FILE_STEMS = ("tests", "test", "testutil", "test_util", "test_utils")
 
@@ -59,9 +63,19 @@ class Finding:
     message: str
 
 
+def split_at_src(rel: Path):
+    """Returns the folders of a relative path outside and inside its first `src/`."""
+    folders = rel.parts[:-1]
+    if "src" not in folders:
+        return set(folders), set()
+    i = folders.index("src")
+    return set(folders[:i]), set(folders[i + 1:])
+
+
 def rust_files(root: Path):
     for path in sorted(root.rglob("*.rs")):
-        if not any(part in SKIP_DIRS for part in path.relative_to(root).parts):
+        outside, inside = split_at_src(path.relative_to(root))
+        if not (outside & SKIP_DIRS or inside & SKIP_DIRS_IN_SRC):
             yield path
 
 
@@ -94,9 +108,10 @@ def scan_file(root: Path, path: Path, is_library: bool):
     rel = path.relative_to(root)
     lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     mask = test_line_mask(lines)
-    production = not any(part in NON_PRODUCTION_DIRS for part in rel.parts) and (
-        path.stem not in TEST_FILE_STEMS
-    )
+    outside, inside = split_at_src(rel)
+    production = not (
+        outside & NON_PRODUCTION_DIRS or inside & NON_PRODUCTION_DIRS_IN_SRC
+    ) and path.stem not in TEST_FILE_STEMS
     library_source = (
         is_library
         and production

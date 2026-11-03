@@ -137,7 +137,7 @@ Run before declaring create or modify work done, and as the first step of an aud
 scripts/check.sh [--audit] [--target TRIPLE] [--features LIST] <crate-root>
 ```
 
-It stops immediately if `cargo`, rustfmt, clippy, or a requested target is missing, then runs every step and reports each:
+It stops immediately if `cargo`, rustfmt, clippy, the project's pinned toolchain, or a requested target is missing, then runs every step and reports each:
 
 1. `cargo fmt --all --check`
 2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`
