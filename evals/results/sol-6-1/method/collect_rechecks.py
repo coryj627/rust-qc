@@ -11,6 +11,8 @@ from collect_grades import VERDICTS, completed, objects
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("scratch", type=Path)
+    parser.add_argument("--output", type=Path,
+                        help="Explicit destination for a separate study's diagnostic")
     args = parser.parse_args()
     scratch = args.scratch.resolve()
     selection = json.loads((scratch / "recheck-selection.json").read_text())
@@ -44,7 +46,7 @@ def main():
               "judgments_rechecked": count, "disagreements": disagreements,
               "disagreement_rate": disagreements / count if count else None,
               "interpretation": "Independent diagnostic; original scores are retained unchanged"}
-    output = Path(__file__).resolve().parent.parent / "key_recheck.json"
+    output = args.output or Path(__file__).resolve().parent.parent / "key_recheck.json"
     output.write_text(json.dumps(result, indent=2) + "\n")
     print(f"Rechecked {count} judgments; {disagreements} disagreements; {len(gaps)} missing cells")
 

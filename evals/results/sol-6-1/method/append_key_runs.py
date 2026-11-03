@@ -9,7 +9,7 @@ from pathlib import Path
 import yaml
 
 
-def entries(root):
+def entries(root, result_prefix="results/sol-6-1"):
     with (root / "runs.tsv").open() as stream:
         runs = list(csv.DictReader(stream, delimiter="\t"))
     scores = json.loads((root / "key_scores.json").read_text())
@@ -23,18 +23,22 @@ def entries(root):
         if not selected or any(s["runs"].get(run["run"]) not in {"found", "partial", "missed"}
                                for s in selected):
             continue
-        result.setdefault(run["project"], []).append({
+        entry = {
             "run_id": run["run"], "stage": int(run["stage"]),
             "skill_version": run["skill_version"], "arm": run["arm"],
             "model": run["model"], "reasoning_effort": run["effort"],
             "time_budget_minutes": float(run["budget_minutes"]),
             "minutes_used": float(run["minutes"]),
-            "report": f"results/sol-6-1/{run['report']}",
-            "grading": "results/sol-6-1/key_scores.json",
-            "unredacted_recheck": "results/sol-6-1/key_recheck.json",
+            "report": f"{result_prefix}/{run['report']}",
+            "grading": f"{result_prefix}/key_scores.json",
+            "unredacted_recheck": f"{result_prefix}/key_recheck.json",
             "bugs_found": [s["bug"] for s in selected if s["runs"][run["run"]] == "found"],
             "bugs_partial": [s["bug"] for s in selected if s["runs"][run["run"]] == "partial"],
-        })
+        }
+        if run.get("condition"):
+            entry.update(condition=run["condition"],
+                         eligible_bug_ids=[s["bug"] for s in selected])
+        result.setdefault(run["project"], []).append(entry)
     return result
 
 
@@ -63,11 +67,18 @@ def append(path, additions, apply=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--results-root", type=Path,
+                        default=Path(__file__).resolve().parent.parent,
+                        help="Dataset beneath evals/results; default is the original Sol study")
     args = parser.parse_args()
-    root = Path(__file__).resolve().parent.parent
-    keys = root.parent.parent / "keys"
+    root = args.results_root.resolve()
+    evaluation = Path(__file__).resolve().parents[3]
+    if not root.is_relative_to(evaluation / "results"):
+        parser.error("--results-root must be beneath evals/results")
+    keys = evaluation / "keys"
+    prefix = root.relative_to(evaluation).as_posix()
     counts = {project: append(keys / f"{project}.yaml", rows, args.apply)
-              for project, rows in entries(root).items()}
+              for project, rows in entries(root, prefix).items()}
     print(json.dumps({"applied": args.apply, "appended_rows": counts}, indent=2))
 
 
