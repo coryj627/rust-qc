@@ -52,7 +52,8 @@ def verifier_text(text, *, functional=False):
                       and not marker[2].strip()):
                     fence = None
             continue
-        if re.match(r"^\*{0,2}\d+ findings?\..*clock", line, re.IGNORECASE):
+        if not functional and re.match(
+                r"^\*{0,2}\d+ findings?\..*clock", line, re.IGNORECASE):
             edits.append({"line": number, "action": "drop", "before": line,
                           "reason": "finding_count_and_clock_footer"})
             continue

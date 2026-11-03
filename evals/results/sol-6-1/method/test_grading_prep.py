@@ -71,6 +71,17 @@ class PassageTests(unittest.TestCase):
                 self.assertEqual(edits[0]["after"], "Boundary result.\n")
                 self.assertRegex(verifier_text(text)[0], r"^[12][.]")
 
+    def test_functional_clock_footer_keeps_coverage_and_environment_limits(self):
+        text = ("**19 findings.** Coverage used source inspection; the doctest SIGKILL "
+                "is environment-blocked. Miri was not checked. Last clock: 769.5 seconds.\n")
+        clean, edits = verifier_text(text, functional=True)
+        self.assertIn("Coverage used source inspection", clean)
+        self.assertIn("doctest SIGKILL is environment-blocked", clean)
+        self.assertIn("Miri was not checked", clean)
+        self.assertNotIn("19 findings", clean)
+        self.assertFalse(any(e["action"] == "drop" for e in edits))
+        self.assertEqual(verifier_text(text)[0], "")
+
 
 if __name__ == "__main__":
     unittest.main()
