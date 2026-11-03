@@ -1,0 +1,2 @@
+
+Use the `rust-qc` skill at `/work/skill` for this Rust review. Read its `SKILL.md` and follow the applicable references and code-quality checks within the review scope above. In particular, its check script can be run with `sandbox_exec` using `bash /work/skill/scripts/check.sh --audit /work/crate`. The review scope, time budget, sandbox restrictions and report instructions in this brief take precedence over broader suggestions in the skill.
