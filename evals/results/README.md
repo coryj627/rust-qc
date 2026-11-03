@@ -61,5 +61,26 @@ The verified union holds 623 real items, against 87 reproduced key bugs, so most
 - `reports/<project>/<arm>-<run>.md`: each run's report as returned, with workspace paths shortened.
 - `method/`: the briefs each kind of agent received, and the scripts that built the workspaces and checked the transcripts.
 - `score.py`: prints every table above. Run it with `python3 -I evals/results/score.py`.
+- `raw/`: the underlying data, described below.
+
+### Raw data
+
+`method/export_dataset.py` built `raw/` from the evaluation's working files.
+
+- `grades.json`: both key graders' scores for each lettered report. `runs.tsv` maps letters to runs.
+- `findings.json`: each verifier's union of findings, as collected from its final message.
+- `redacted-reports/<project>/report-<letter>.md`: the reports as graders and verifiers saw them.
+- `grader-keys/<project>/key.yaml`: the trimmed keys the graders saw.
+- `transcripts/`: what each of the 70 agents said and did, as gzipped JSON lines. There is one file per audit (`audit/<run>`), key grader (`key-grader/<project>-<n>`) and verifier (`verifier/<project>`).
+- `probes/<run>/`: source and logs each agent left outside its crate, up to 256 KiB a file. `v-<project>` folders are the verifiers'.
+- `timing/<run>/`: each run's clock readings and sandbox slot waits.
+
+Some data is left out on purpose:
+
+- **Removed from transcripts:** thinking, request records, harness attachments and system reminders, which carry the host's private user context.
+- **Replaced with placeholders:** local paths, the host's `PATH` and the session id.
+- **Not exported:** build output, whole-crate copies, generated inputs, and the transcripts of the agents that built the keys. Every file an agent wrote through a tool call is still in its transcript.
+
+The union's findings and probes target old releases. They were not checked against current releases or reported upstream, so some may still apply.
 
 Each key's `runs` list in `../keys/` records the skill version, arm, model and bugs found for that project.

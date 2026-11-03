@@ -1,0 +1,3 @@
+cd /work/tmp/probe; printf '##### differential\n'; timeout 200 cargo test --offline --test diff 2>&1 | grep -E '^error|^test |panicked|left|right|test result' | cut -c1-170 | head -25
+cd /work/crate; printf '\n##### crate tests\n'; timeout 400 cargo test --locked --features=alloc,defmt,mpmc_large,portable-atomic-critical-section,serde,ufmt,bytes 2>&1 | grep -E '^error|FAILED|failed|panicked|test result' | cut -c1-170 | head -25
+printf '\n##### crate lib miri (no pool)\n'; MIRIFLAGS="-Zmiri-disable-isolation" timeout 280 cargo +nightly-2026-10-01 miri test --locked --lib -- vec:: string:: deque:: binary_heap:: history_buf:: linear_map:: sorted_linked_list:: c_string:: 2>&1 | grep -E '^error|Undefined|FAILED|failed|test result|^ *--> /work' | cut -c1-170 | head -15

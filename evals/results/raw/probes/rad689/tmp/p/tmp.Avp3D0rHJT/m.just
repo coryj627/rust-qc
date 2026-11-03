@@ -1,0 +1,2 @@
+bar:
+  @echo mod-bar
