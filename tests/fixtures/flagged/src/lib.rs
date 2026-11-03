@@ -11,3 +11,5 @@ pub fn f(x: Option<u8>) -> u8 {
     println!("hi"); // EXPECT PANIC-6
     x.expect("") // EXPECT PANIC-2
 }
+pub mod build;
+pub mod data;

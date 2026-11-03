@@ -11,12 +11,18 @@ SCAN = HERE.parent / ".agents" / "skills" / "rust-qc" / "scripts" / "audit_scan.
 def scan(fixture):
     out = subprocess.run([sys.executable, "-I", str(SCAN), str(HERE / "fixtures" / fixture)],
                          capture_output=True, text=True, check=False)
-    return {(m.group(1), int(m.group(2))) for m in re.finditer(r"^(\S+) \S+:(\d+)$", out.stdout, re.M)}
+    if out.returncode != 0:
+        sys.exit(f"{fixture}: scan exited {out.returncode}\n{out.stderr}")
+    return {(m.group(1), m.group(2), int(m.group(3)))
+            for m in re.finditer(r"^(\S+) (\S+):(\d+)$", out.stdout, re.M)}
 
 
 def expected(fixture):
-    lines = (HERE / "fixtures" / fixture / "src" / "lib.rs").read_text().splitlines()
-    return {(m.group(1), i + 1) for i, l in enumerate(lines) for m in [re.search(r"EXPECT (\S+)", l)] if m}
+    root = HERE / "fixtures" / fixture
+    return {(m.group(1), path.relative_to(root).as_posix(), i + 1)
+            for path in (root / "src").rglob("*.rs")
+            for i, line in enumerate(path.read_text().splitlines())
+            for m in [re.search(r"EXPECT (\S+)", line)] if m}
 
 
 failures = []
