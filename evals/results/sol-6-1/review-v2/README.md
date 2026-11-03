@@ -1,8 +1,9 @@
 # Correctness-review v2
 
-The readiness pilot completed normally. A separately frozen 52-review comparison
-is now running with the approved, narrower v2 prompts; it has no scored outcome
-yet. The [comparison plan](comparison-plan.json), [analysis protocol](protocol.md)
+The readiness pilot and the separately frozen 52-attempt review batch have closed.
+The batch produced 51 valid reports and one preserved capacity failure, with no
+policy block. Independent controls and blind grading are underway; there is no
+scored outcome yet. The [comparison plan](comparison-plan.json), [analysis protocol](protocol.md)
 and [workspace preparation](comparison-preparation.json) precede its dispatch.
 No dedicated security assessment, threat modeling, exploitability analysis or
 exploit development is requested. The pilot's complete
@@ -46,10 +47,13 @@ Status: completed in 15.867 measured active minutes with no provider error, 47 s
 
 ## Comparison progress
 
-At 20:12 UTC on 2026-11-03, ten primary reviews had completed, two were still
-running, one had failed with `serverOverloaded`, and 39 had not started. No v2
-`cyberPolicy` error or usage/disk stop had been recorded. These are execution
-counts, not verified findings or an effect estimate.
+The primary batch closed at 23:26 UTC on 2026-11-03: 39 detailed and 12 short
+reviews completed with valid evidence. All 52 attempted workspaces passed the
+post-run sole-skill and archived-skill byte checks. The 51 completed reports
+passed provenance, host-execution and grading-input presentation checks across
+1,905 sandbox commands. There was no v2 `cyberPolicy` error or usage/disk stop.
+See the [completion gate](primary-completion.json). These are execution checks,
+not verified findings or an effect estimate.
 
 The dispatcher stopped new work after the capacity error. Its missing final
 report remains a gap. The prospective [recovery and missingness
@@ -62,10 +66,9 @@ with explicit gaps if the remaining queue completes cleanly. Eligibility, task
 wording, full budgets, model and effort are unchanged by this infrastructure
 departure.
 
-The two active reviews and the next originally scheduled review subsequently
-completed normally. All thirteen completed reports passed provenance and host
-execution checks; all fourteen finished workspaces passed the post-run sole-skill
-and archived-skill byte checks. The [recovery record](capacity-recovery-outcome.json)
-also confirms the original schedule and all 52 prompt hashes were preserved.
-Three workers then resumed the remaining 38 original tasks. The capacity failure
-remains missing, with no replacement; grading has not started.
+The [recovery record](capacity-recovery-outcome.json) and completion gate confirm
+that the original schedule and all 52 prompt hashes were preserved. The capacity
+failure remains missing, with no replacement. Ten fresh control authors now work
+from source without review outputs; two blind key graders and one independent
+verifier per cell follow after control validation. Main and short paired effects
+can include at most nine and three projects respectively.
