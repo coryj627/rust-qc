@@ -1,0 +1,456 @@
+// ===== Build a codec from raw bytes =====
+
+#[macro_export]
+macro_rules! raw_codec {
+    (
+        $(
+            $fn:ident => [$($chunk:expr,)+];
+        )*
+    ) => {{
+        let mut b = $crate::prelude::mock_io::Builder::new();
+
+        $({
+            let mut chunk = vec![];
+
+            $(
+                $crate::raw::Chunk::push(&$chunk, &mut chunk);
+            )+
+
+            b.$fn(&chunk[..]);
+        })*
+
+        $crate::Codec::new(b.build())
+    }}
+}
+
+pub trait Chunk {
+    fn push(&self, dst: &mut Vec<u8>);
+}
+
+impl Chunk for u8 {
+    fn push(&self, dst: &mut Vec<u8>) {
+        dst.push(*self);
+    }
+}
+
+impl<'a> Chunk for &'a [u8] {
+    fn push(&self, dst: &mut Vec<u8>) {
+        dst.extend(*self)
+    }
+}
+
+impl<'a> Chunk for &'a str {
+    fn push(&self, dst: &mut Vec<u8>) {
+        dst.extend(self.as_bytes())
+    }
+}
+
+impl Chunk for Vec<u8> {
+    fn push(&self, dst: &mut Vec<u8>) {
+        dst.extend(self.iter())
+    }
+}
+use crate::codec::SendError;
+use crate::frame::{Reason, StreamId};
+
+use bytes::Bytes;
+use std::fmt;
+use std::io;
+
+/// Either an H2 reason  or an I/O error
+#[derive(Clone, Debug)]
+pub enum Error {
+    Reset(StreamId, Reason, Initiator),
+    GoAway(Bytes, Reason, Initiator),
+    Io(io::ErrorKind, Option<String>),
+}
+
+pub struct GoAway {
+    pub debug_data: Bytes,
+    pub reason: Reason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Initiator {
+    User,
+    Library,
+    Remote,
+}
+
+impl Error {
+    pub(crate) fn is_local(&self) -> bool {
+        match *self {
+            Self::Reset(_, _, initiator) | Self::GoAway(_, _, initiator) => initiator.is_local(),
+            Self::Io(..) => true,
+        }
+    }
+
+    pub(crate) fn user_go_away(reason: Reason) -> Self {
+        Self::GoAway(Bytes::new(), reason, Initiator::User)
+    }
+
+    pub(crate) fn library_reset(stream_id: StreamId, reason: Reason) -> Self {
+        Self::Reset(stream_id, reason, Initiator::Library)
+    }
+
+    pub(crate) fn library_go_away(reason: Reason) -> Self {
+        Self::GoAway(Bytes::new(), reason, Initiator::Library)
+    }
+
+    pub(crate) fn library_go_away_data(reason: Reason, debug_data: impl Into<Bytes>) -> Self {
+        Self::GoAway(debug_data.into(), reason, Initiator::Library)
+    }
+
+    pub(crate) fn remote_reset(stream_id: StreamId, reason: Reason) -> Self {
+        Self::Reset(stream_id, reason, Initiator::Remote)
+    }
+
+    pub(crate) fn remote_go_away(debug_data: Bytes, reason: Reason) -> Self {
+        Self::GoAway(debug_data, reason, Initiator::Remote)
+    }
+}
+
+impl Initiator {
+    fn is_local(&self) -> bool {
+        match *self {
+            Self::User | Self::Library => true,
+            Self::Remote => false,
+        }
+    }
+
+    pub(crate) fn is_library(&self) -> bool {
+        matches!(self, Self::Library)
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Self::Reset(_, reason, _) | Self::GoAway(_, reason, _) => reason.fmt(fmt),
+            Self::Io(_, Some(ref inner)) => inner.fmt(fmt),
+            Self::Io(kind, None) => io::Error::from(kind).fmt(fmt),
+        }
+    }
+}
+
+impl From<io::ErrorKind> for Error {
+    fn from(src: io::ErrorKind) -> Self {
+        Error::Io(src, None)
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(src: io::Error) -> Self {
+        Error::Io(src.kind(), src.get_ref().map(|inner| inner.to_string()))
+    }
+}
+
+impl From<Error> for SendError {
+    fn from(src: Error) -> Self {
+        Self::Connection(src)
+    }
+}
+use super::StreamId;
+
+use bytes::BufMut;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Head {
+    kind: Kind,
+    flag: u8,
+    stream_id: StreamId,
+}
+
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Kind {
+    Data = 0,
+    Headers = 1,
+    Priority = 2,
+    Reset = 3,
+    Settings = 4,
+    PushPromise = 5,
+    Ping = 6,
+    GoAway = 7,
+    WindowUpdate = 8,
+    Continuation = 9,
+    Unknown,
+}
+
+// ===== impl Head =====
+
+impl Head {
+    pub fn new(kind: Kind, flag: u8, stream_id: StreamId) -> Head {
+        Head {
+            kind,
+            flag,
+            stream_id,
+        }
+    }
+
+    /// Parse an HTTP/2 frame header
+    pub fn parse(header: &[u8]) -> Head {
+        let (stream_id, _) = StreamId::parse(&header[5..]);
+
+        Head {
+            kind: Kind::new(header[3]),
+            flag: header[4],
+            stream_id,
+        }
+    }
+
+    pub fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+
+    pub fn flag(&self) -> u8 {
+        self.flag
+    }
+
+    pub fn encode_len(&self) -> usize {
+        super::HEADER_LEN
+    }
+
+    pub fn encode<T: BufMut>(&self, payload_len: usize, dst: &mut T) {
+        debug_assert!(self.encode_len() <= dst.remaining_mut());
+
+        dst.put_uint(payload_len as u64, 3);
+        dst.put_u8(self.kind as u8);
+        dst.put_u8(self.flag);
+        dst.put_u32(self.stream_id.into());
+    }
+}
+
+// ===== impl Kind =====
+
+impl Kind {
+    pub fn new(byte: u8) -> Kind {
+        match byte {
+            0 => Kind::Data,
+            1 => Kind::Headers,
+            2 => Kind::Priority,
+            3 => Kind::Reset,
+            4 => Kind::Settings,
+            5 => Kind::PushPromise,
+            6 => Kind::Ping,
+            7 => Kind::GoAway,
+            8 => Kind::WindowUpdate,
+            9 => Kind::Continuation,
+            _ => Kind::Unknown,
+        }
+    }
+}
+#[macro_export]
+macro_rules! assert_closed {
+    ($transport:expr) => {{
+        use futures::StreamExt;
+
+        assert!($transport.next().await.is_none());
+    }};
+}
+
+#[macro_export]
+macro_rules! assert_headers {
+    ($frame:expr) => {{
+        match $frame {
+            h2::frame::Frame::Headers(v) => v,
+            f => panic!("expected HEADERS; actual={:?}", f),
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! assert_data {
+    ($frame:expr) => {{
+        match $frame {
+            h2::frame::Frame::Data(v) => v,
+            f => panic!("expected DATA; actual={:?}", f),
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! assert_ping {
+    ($frame:expr) => {{
+        match $frame {
+            h2::frame::Frame::Ping(v) => v,
+            f => panic!("expected PING; actual={:?}", f),
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! assert_settings {
+    ($frame:expr) => {{
+        match $frame {
+            h2::frame::Frame::Settings(v) => v,
+            f => panic!("expected SETTINGS; actual={:?}", f),
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! assert_go_away {
+    ($frame:expr) => {{
+        match $frame {
+            h2::frame::Frame::GoAway(v) => v,
+            f => panic!("expected GO_AWAY; actual={:?}", f),
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! poll_err {
+    ($transport:expr) => {{
+        use futures::StreamExt;
+        match $transport.next().await {
+            Some(Err(e)) => e,
+            frame => panic!("expected error; actual={:?}", frame),
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! poll_frame {
+    ($type: ident, $transport:expr) => {{
+        use futures::StreamExt;
+        use h2::frame::Frame;
+
+        match $transport.next().await {
+            Some(Ok(Frame::$type(frame))) => frame,
+            frame => panic!("unexpected frame; actual={:?}", frame),
+        }
+    }};
+}
+
+#[macro_export]
+macro_rules! assert_default_settings {
+    ($settings: expr) => {{
+        assert_frame_eq($settings, frame::Settings::default());
+    }};
+}
+
+use h2::frame::Frame;
+
+#[track_caller]
+pub fn assert_frame_eq<T: Into<Frame>, U: Into<Frame>>(t: T, u: U) {
+    let actual: Frame = t.into();
+    let expected: Frame = u.into();
+    match (actual, expected) {
+        (Frame::Data(a), Frame::Data(b)) => {
+            assert_eq!(
+                a.payload().len(),
+                b.payload().len(),
+                "assert_frame_eq data payload len"
+            );
+            assert_eq!(a, b, "assert_frame_eq");
+        }
+        (a, b) => {
+            assert_eq!(a, b, "assert_frame_eq");
+        }
+    }
+}
+/work/crate/src/proto/streams/send.rs:426:    pub fn apply_remote_settings<B>(
+/work/crate/src/proto/streams/send.rs:455:        if let Some(val) = settings.initial_window_size() {
+/work/crate/src/proto/streams/send.rs:489:                            .dec_send_window(dec)
+/work/crate/src/proto/streams/send.rs:498:                        let window_size = stream.send_flow.window_size();
+/work/crate/src/proto/streams/prioritize.rs:428:            stream.send_flow.window_size() - stream.send_flow.available().as_size(),
+/work/crate/src/proto/streams/prioritize.rs:436:            window = stream.send_flow.window_size(),
+/work/crate/src/proto/streams/prioritize.rs:778:                            debug_assert!(len <= self.flow.window_size());
+/work/crate/src/proto/streams/prioritize.rs:783:                            if len > 0 && len > stream.send_flow.window_size() {
+        let mut stream = h2.drive(util::wait_for_capacity(stream, 5)).await;
+
+        stream.send_data("".into(), true).unwrap();
+
+        // Wait for the connection to close
+        h2.await.unwrap();
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn window_size_does_not_underflow() {
+    h2_support::trace_init!();
+    let (io, mut client) = mock::new();
+
+    let client = async move {
+        let settings = client.assert_server_handshake().await;
+        assert_default_settings!(settings);
+
+        // Invalid HEADERS frame (missing mandatory fields).
+        client.send_bytes(&[0, 0, 0, 1, 5, 0, 0, 0, 1]).await;
+
+        client
+            .send_frame(frames::settings().initial_window_size(1329018135))
+            .await;
+
+        client
+            .send_frame(frames::settings().initial_window_size(3809661))
+            .await;
+
+        client
+            .send_frame(frames::settings().initial_window_size(1467177332))
+            .await;
+
+        client
+            .send_frame(frames::settings().initial_window_size(3844989))
+            .await;
+    };
+
+    let srv = async move {
+        let builder = server::Builder::new();
+        let mut srv = builder.handshake::<_, Bytes>(io).await.expect("handshake");
+
+        poll_fn(move |cx| srv.poll_closed(cx)).await.unwrap();
+    };
+
+    join(client, srv).await;
+}
+
+#[tokio::test]
+async fn reclaim_reserved_capacity() {
+    use futures::channel::oneshot;
+
+    h2_support::trace_init!();
+
+    let (io, mut srv) = mock::new();
+    let (depleted_tx, depleted_rx) = oneshot::channel();
+
+    let mock = async move {
+        let settings = srv.assert_client_handshake().await;
+[package]
+name = "h2-support"
+version = "0.1.0"
+authors = ["Carl Lerche <<email>>"]
+publish = false
+edition = "2018"
+
+[dependencies]
+h2 = { path = "../..", features = ["stream", "unstable"] }
+
+atty = "0.2"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+tracing-tree = "0.2"
+futures = { version = "0.3", default-features = false }
+http = "1"
+tokio = { version = "1", features = ["time"] }
+tokio-test = "0.4"
+109:mod codec;
+110:mod error;
+111:mod hpack;
+114:mod proto;
+118:pub mod proto;
+121:mod frame;
+125:pub mod frame;
+127:pub mod client;
+128:pub mod ext;
+129:pub mod server;
+130:mod share;
+134:pub mod fuzz_bridge;

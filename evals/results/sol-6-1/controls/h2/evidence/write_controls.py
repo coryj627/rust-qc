@@ -1,0 +1,85 @@
+from pathlib import Path
+import json
+
+integration_command = 'cd /work/tmp/control-probe-crate && RUSTUP_AUTO_INSTALL=0 CARGO_NET_OFFLINE=true CARGO_HOME=/work/.cargo-home CARGO_TARGET_DIR=/target/control-probes cargo test --locked -p h2-tests --test negative_controls -- --nocapture > /work/prepared/evidence/logs/integration-probes.log 2>&1'
+unit_command = 'cd /work/tmp/control-probe-crate && RUSTUP_AUTO_INSTALL=0 CARGO_NET_OFFLINE=true CARGO_HOME=/work/.cargo-home CARGO_TARGET_DIR=/target/control-probes cargo test --locked -p h2 --lib negative_control_probe -- --nocapture > /work/prepared/evidence/logs/unit-probes.log 2>&1'
+
+def refutation(evidence, refs, unit=False):
+    return {'method': 'ran', 'evidence': evidence, 'commands': [unit_command if unit else integration_command], 'source_refs': refs}
+
+controls = {
+    'project': 'h2',
+    'decoys': [
+        {
+            'id': 'decoy-1',
+            'kind': 'wrong-behavior',
+            'summary': 'The connection-wide partial header block accepts CONTINUATION frames from a different stream: HEADERS on stream 1 without END_HEADERS followed by END_HEADERS CONTINUATION on stream 3 is merged and delivered as stream 1 headers instead of rejecting the connection.',
+            'location': ['src/codec/framed_read.rs:283', 'src/codec/framed_read.rs:292'],
+            'match_rule': 'Identify cross-stream header-block splicing caused by accepting a CONTINUATION whose stream ID differs from the pending HEADERS stream, with the continuation payload incorporated into that pending header block instead of a connection PROTOCOL_ERROR.',
+            'refutation': refutation(
+                'decode_frame compares partial.frame.stream_id() against head.stream_id() at line 292 and immediately returns library_go_away(PROTOCOL_ERROR) on a mismatch, before extending or decoding the partial payload. The decoy_1_cross_stream_continuation_is_rejected probe supplied HEADERS(1) and CONTINUATION(3) and observed a connection GoAway(PROTOCOL_ERROR); the otherwise identical CONTINUATION(1) completed successfully. Source: evidence/probes/negative_controls.rs:6. Passing execution: evidence/logs/integration-probes.log.',
+                ['src/codec/framed_read.rs:283', 'src/codec/framed_read.rs:292', 'src/codec/framed_read.rs:294', 'src/codec/framed_read.rs:314'])
+        },
+        {
+            'id': 'decoy-2',
+            'kind': 'wrong-behavior',
+            'summary': 'FlowControl::release_capacity does not validate the stream\'s outstanding received-byte count before crediting the connection and stream windows. Releasing six bytes after receiving five, or releasing the same bytes twice, succeeds and creates receive-window credit for data that was never consumed.',
+            'location': ['src/share.rs:532', 'src/proto/streams/recv.rs:396'],
+            'match_rule': 'Identify successful excess or repeated receive-capacity release through the public FlowControl::release_capacity API, claiming that missing outstanding-byte validation permits artificial stream and connection receive-window credit.',
+            'refutation': refutation(
+                'Recv::release_capacity returns ReleaseCapacityTooBig when capacity exceeds stream.in_flight_recv_data at lines 404-405, before release_connection_capacity or any stream mutation. A successful release decrements that outstanding count at line 411, so it cannot be reused. The public wrapper additionally rejects usize inputs above MAX_WINDOW_SIZE before narrowing. The decoy_2_over_release_is_rejected_without_changing_capacity probe used an in-memory public client connection receiving five bytes: release(6) failed with unchanged used and available capacity; release(5) succeeded; a subsequent release(1) failed with unchanged capacity; usize::MAX also failed. The test then observed normal stream cancellation and connection shutdown. Source: evidence/probes/negative_controls.rs:33. Passing execution: evidence/logs/integration-probes.log.',
+                ['src/share.rs:532', 'src/share.rs:533', 'src/proto/streams/recv.rs:404', 'src/proto/streams/recv.rs:408', 'src/proto/streams/recv.rs:411'])
+        }
+    ],
+    'false_findings': [
+        {
+            'id': 'false-1',
+            'title': 'CONTINUATION decoding loses pseudo-header ordering state',
+            'location': 'src/frame/headers.rs:853',
+            'body': 'HeaderBlock::load uses a local reg flag to decide whether a pseudo-header follows an ordinary header. That flag is reset for each fragment, so a peer can put an ordinary field such as x: y in HEADERS and move :method into the following CONTINUATION on the same stream. The completed block is accepted rather than rejected for a pseudo-header appearing after regular fields, allowing a request with an illegal header order to reach the server handler.',
+            'refutation': refutation(
+                'The local flag is reconstructed from persistent decoded fields: let mut reg = !self.fields.is_empty() at line 853. Every accepted regular field sets reg = true and is retained in self.fields; set_pseudo marks a block malformed when reg is true, and line 937 returns MalformedMessage. The codec maps that result to a stream PROTOCOL_ERROR, including on the CONTINUATION path. The false_1_pseudo_after_regular_header_is_rejected probe sent literal x: y followed by indexed :method GET both in one HEADERS frame and split across HEADERS/CONTINUATION. Both yielded Reset(stream 1, PROTOCOL_ERROR) rather than decoded HEADERS. Source: evidence/probes/negative_controls.rs:74. Passing execution: evidence/logs/integration-probes.log.',
+                ['src/frame/headers.rs:853', 'src/frame/headers.rs:859', 'src/frame/headers.rs:908', 'src/frame/headers.rs:914', 'src/frame/headers.rs:935', 'src/codec/framed_read.rs:173', 'src/codec/framed_read.rs:345'])
+        },
+        {
+            'id': 'false-2',
+            'title': 'HPACK table size updates can exceed the default decoder ceiling',
+            'location': 'src/hpack/decoder.rs:253',
+            'body': 'With the default 4096-byte receive table limit, a peer can begin a HEADERS block with an HPACK dynamic table size update to 4097 and then send ordinary indexed headers. process_size_update applies the peer\'s requested size without checking it against the decoder ceiling, so the block is accepted and the peer can make the decoder retain a table larger than the permitted limit.',
+            'refutation': refutation(
+                'Decoder::new stores the configured limit in last_max_update. process_size_update checks new_size > self.last_max_update and returns InvalidMaxDynamicSize at lines 256-257 before table.set_max_size at line 266. The codec starts with DEFAULT_SETTINGS_HEADER_TABLE_SIZE = 4096. The false_2_hpack_update_above_decoder_limit_is_rejected probe sent HPACK bytes 3f e2 1f (4097) followed by indexed GET and observed connection rejection, not HEADERS; bytes 3f e1 1f (4096) followed by the same GET were accepted. The current codec maps this decoder error to GoAway(PROTOCOL_ERROR); the refutation asserts rejection, not a different error-code mapping. Source: evidence/probes/negative_controls.rs:98. Passing execution: evidence/logs/integration-probes.log.',
+                ['src/frame/settings.rs:41', 'src/codec/framed_read.rs:63', 'src/hpack/decoder.rs:155', 'src/hpack/decoder.rs:256', 'src/hpack/decoder.rs:266', 'src/codec/framed_read.rs:178'])
+        },
+        {
+            'id': 'false-3',
+            'title': 'SETTINGS_MAX_FRAME_SIZE rejects the legal minimum value',
+            'location': 'src/frame/settings.rs:183',
+            'body': 'Settings::load treats the lower MAX_FRAME_SIZE bound as exclusive. A peer that explicitly sends SETTINGS_MAX_FRAME_SIZE = 16384 therefore receives a connection PROTOCOL_ERROR even though this is the legal minimum and default frame size. This breaks otherwise valid handshakes with peers that explicitly advertise the default instead of omitting the setting.',
+            'refutation': refutation(
+                'The lower and upper comparisons are both inclusive: DEFAULT_MAX_FRAME_SIZE <= val && val <= MAX_MAX_FRAME_SIZE at line 183; DEFAULT_MAX_FRAME_SIZE is 16384. The false_3_settings_max_frame_size_endpoints_are_accepted probe decoded actual SETTINGS wire frames with 16384 and 16777215 and asserted the exact stored max_frame_size. Adjacent values 16383 and 16777216 were rejected with connection PROTOCOL_ERROR. This directly disproves the alleged lower-bound exclusion at the parser invoked during handshakes. Source: evidence/probes/negative_controls.rs:116. Passing execution: evidence/logs/integration-probes.log.',
+                ['src/frame/settings.rs:47', 'src/frame/settings.rs:53', 'src/frame/settings.rs:182', 'src/frame/settings.rs:183', 'src/codec/framed_read.rs:201'])
+        },
+        {
+            'id': 'false-4',
+            'title': 'Reducing INITIAL_WINDOW_SIZE converts a negative send window into huge credit',
+            'location': 'src/proto/streams/flow_control.rs:202',
+            'body': 'After a sender transmits five bytes on a stream with the default 65535-byte initial window, receiving SETTINGS_INITIAL_WINDOW_SIZE = 0 leaves the stream window at -5. Window::as_size casts that signed value to the unsigned WindowSize, exposing 4294967291 bytes of credit. The scheduler can consequently send buffered DATA before any WINDOW_UPDATE has restored a positive stream window, violating the peer\'s flow-control limit.',
+            'refutation': refutation(
+                'Window is backed by i32, and Window::as_size explicitly returns 0 for every negative value at lines 202-206. FlowControl::window_size calls that method. Remote SETTINGS reductions call dec_send_window and reclaim allocations above this clamped size; the DATA scheduler also requeues a nonempty frame when len exceeds stream.send_flow.window_size(). The false_4_negative_send_window_clamps_and_recovers unit probe performed the stated 65535 -> send(5) -> decrease(65535) sequence: the signed window was -5 and exposed capacity was 0. WINDOW_UPDATE(5) exposed 0, and one further byte exposed 1. This unit probe verifies the numeric invariant; scheduler enforcement is confirmed by the cited source, not an end-to-end wire test. Source: evidence/probes/flow_control_probe.rs:7. Passing execution: evidence/logs/unit-probes.log.',
+                ['src/proto/streams/flow_control.rs:60', 'src/proto/streams/flow_control.rs:139', 'src/proto/streams/flow_control.rs:199', 'src/proto/streams/flow_control.rs:202', 'src/proto/streams/send.rs:487', 'src/proto/streams/send.rs:498', 'src/proto/streams/prioritize.rs:783'],
+                unit=True)
+        },
+        {
+            'id': 'false-5',
+            'title': 'An unrelated PING acknowledgement cancels the pending shutdown probe',
+            'location': 'src/proto/ping_pong.rs:103',
+            'body': 'During graceful shutdown, recv_ping removes pending_ping with take() before comparing the incoming ACK payload. If an unrelated PING ACK arrives before the legitimate shutdown ACK, the mismatch discards the saved shutdown probe. The later matching ACK is then treated as unsolicited, so the graceful-shutdown state machine never observes completion of its outstanding shutdown PING.',
+            'refutation': refutation(
+                'The payload mismatch branch restores exactly the removed PendingPing with self.pending_ping = Some(pending) at line 115. Only a matching payload returns ReceivedPing::Shutdown. The false_5_unrelated_ack_preserves_shutdown_ping unit probe created a shutdown ping, set its sent flag to model the transmitted state, then passed an ACK with a different payload. It returned Unknown while retaining both shutdown payload and sent flag. A subsequent matching shutdown ACK returned Shutdown and consumed the pending ping. This exercises the receive state directly rather than a complete graceful-shutdown connection. Source: evidence/probes/ping_pong_probe.rs:7. Passing execution: evidence/logs/unit-probes.log.',
+                ['src/proto/ping_pong.rs:90', 'src/proto/ping_pong.rs:103', 'src/proto/ping_pong.rs:104', 'src/proto/ping_pong.rs:111', 'src/proto/ping_pong.rs:115', 'src/proto/ping_pong.rs:129'],
+                unit=True)
+        }
+    ]
+}
+Path('/work/prepared/controls.json').write_text(json.dumps(controls, indent=2)+'\n')
+print('Wrote 2 decoys and 5 false findings.')

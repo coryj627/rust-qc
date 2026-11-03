@@ -3,8 +3,9 @@
 The repository checks pass. In the corrected discovery trial, Sol loaded the
 skill for all five intended Rust tasks and skipped it for all three excluded
 tasks. These eight small cases do not establish whether the skill improves bug
-finding or code quality. The keyed audits and writing/changing evaluation are
-still in progress.
+finding or code quality. Audit dispatch has ended with only one valid report;
+neither audit cell supports a paired comparison. All 24 writing/changing runs
+have completed; hidden-test assessment and blind grading are in progress.
 
 Every evaluation agent uses **`gpt-6.1-sol`, high reasoning effort**. The skill is
 the `v1.0.0` archive at `1174a565010aa2716c5a6e203cf2dccbac2b4d62`; evaluation
@@ -53,13 +54,27 @@ See [per-run results](stage2/results.json), [verbatim reports](reports/),
   permissions to agents using writable containers. All eight were invalidated,
   retained in [invalid-attempts](invalid-attempts/), and rerun from pristine
   workspaces after a write-canary and blocked-host-access preflight.
-- Two initial pulldown-cmark keyed audits were terminated by the model service
-  with `cyberPolicy` errors. They produced no final reports and cannot be scored
-  as successful audits or as zero bugs found. No retry or prompt workaround has
-  been attempted.
+- Across the two audit cells, 14 attempts ended with service `cyberPolicy`
+  errors, and 33 further audits were not dispatched for blocked projects. These
+  are missing observations, not zero scores. No retry or prompt workaround was
+  attempted. One main-cell moka report completed with valid inputs; its two key graders
+  agree on four of five known bugs. An unredacted random recheck downgraded one
+  of two sampled judgments from found to partial; original grades and the
+  disagreement are retained. Independent verification is still running. No short-cell report is valid for scoring.
+- The upstream just source contained its own `SKILL.md`. It was not in the
+  skill catalog but was readable, violating the requested sole-skill boundary.
+  All six affected audits and the original just case/control authors were
+  invalidated. Four of those audit reports had completed; two overlap the service
+  failures above. Fresh author inputs exclude the bundled skill, and all later
+  model runs enforce a source-tree skill scan. No coding treatment used the
+  invalid case. See the [input review](method/source-skill-isolation-review.json).
+- The first h2 control author hit a 64 KiB transport-reader limit. It is retained
+  as a harness failure; a fresh author completed after the reader was fixed and
+  tested. This was unrelated to usage or disk limits.
 - All execution is aarch64 Linux; x86-only behavior cannot be executed natively.
-- No statistical skill-versus-baseline result, decoy rate, verifier control
-  rate or skill-change recommendation is available yet.
+- All six valid coding cases and rubrics were frozen at `08dc878` before the
+  first treatment. No statistical skill-versus-baseline result, decoy rate,
+  verifier control rate or skill-change recommendation is available yet.
 
 ## Reproducibility and privacy
 
@@ -73,7 +88,9 @@ and host-execution checks; the checkers also detect a seeded host-build violatio
 The export includes final reports, model-visible tool inputs/outputs, prompts and
 run metadata. It excludes authentication, profiles, raw session files, reasoning,
 transport deltas, server logs and thread identifiers. Host paths, email addresses
-and token-like strings are scrubbed. The scans for the current valid and invalid
-Stage 2 exports found no remaining configured privacy-pattern hits; scan records
-are under `export-scans/` in each dataset. Publication will be checked again when
-the remaining results are added.
+and token-like strings are scrubbed. The expanded scan covers transcripts,
+reports, returned artifacts, control bundles and Stage 5 evidence. Current matches
+are reviewed container PATH values and public source fixture data; no unreviewed
+configured privacy-pattern hit remains. Scan records and file-hash-bound reviews
+are under `export-scans/`. Publication will be checked again when the remaining
+results are added.

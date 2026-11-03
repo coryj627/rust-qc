@@ -1,0 +1,653 @@
+
+    /// Reset information about terminal damage.
+    fn reset(&mut self, num_cols: usize) {
+        self.full = false;
+        self.lines.iter_mut().for_each(|line| line.reset(num_cols));
+    }
+}
+
+pub struct Term<T> {
+    /// Terminal focus controlling the cursor shape.
+    pub is_focused: bool,
+
+    /// Cursor for keyboard selection.
+    pub vi_mode_cursor: ViModeCursor,
+
+    pub selection: Option<Selection>,
+
+    /// Currently active grid.
+    ///
+    /// Tracks the screen buffer currently in use. While the alternate screen buffer is active,
+    /// this will be the alternate grid. Otherwise it is the primary screen buffer.
+    grid: Grid<Cell>,
+
+    /// Currently inactive grid.
+    ///
+    /// Opposite of the active grid. While the alternate screen buffer is active, this will be the
+    /// primary grid. Otherwise it is the alternate screen buffer.
+    inactive_grid: Grid<Cell>,
+
+    /// Index into `charsets`, pointing to what ASCII is currently being mapped to.
+    active_charset: CharsetIndex,
+
+    /// Tabstops.
+    tabs: TabStops,
+
+    /// Mode flags.
+    mode: TermMode,
+
+    /// Scroll region.
+    ///
+    /// Range going from top to bottom of the terminal, indexed from the top of the viewport.
+    scroll_region: Range<Line>,
+
+    /// Modified terminal colors.
+    colors: Colors,
+
+    /// Current style of the cursor.
+    cursor_style: Option<CursorStyle>,
+
+    /// Proxy for sending events to the event loop.
+    event_proxy: T,
+
+    /// Current title of the window.
+    title: Option<String>,
+
+    /// Stack of saved window titles. When a title is popped from this stack, the `title` for the
+    /// term is set.
+    title_stack: Vec<Option<String>>,
+
+    /// The stack for the keyboard modes.
+    keyboard_mode_stack: Vec<KeyboardModes>,
+
+    /// Currently inactive keyboard mode stack.
+    inactive_keyboard_mode_stack: Vec<KeyboardModes>,
+
+    /// Information about damaged cells.
+    damage: TermDamageState,
+
+    /// Config directly for the terminal.
+    config: Config,
+}
+
+/// Configuration options for the [`Term`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    /// The maximum amount of scrolling history.
+    pub scrolling_history: usize,
+
+    /// Default cursor style to reset the cursor to.
+    pub default_cursor_style: CursorStyle,
+
+    /// Cursor style for Vi mode.
+    pub vi_mode_cursor_style: Option<CursorStyle>,
+
+    /// The characters which terminate semantic selection.
+    ///
+    /// The default value is [`SEMANTIC_ESCAPE_CHARS`].
+    pub semantic_escape_chars: String,
+
+    /// Whether to enable kitty keyboard protocol.
+    pub kitty_keyboard: bool,
+
+    /// OSC52 support mode.
+    pub osc52: Osc52,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            scrolling_history: 10000,
+            semantic_escape_chars: SEMANTIC_ESCAPE_CHARS.to_owned(),
+            default_cursor_style: Default::default(),
+            vi_mode_cursor_style: Default::default(),
+            kitty_keyboard: Default::default(),
+            osc52: Default::default(),
+        }
+    }
+}
+
+/// OSC 52 behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all = "lowercase"))]
+pub enum Osc52 {
+    /// The handling of the escape sequence is disabled.
+    Disabled,
+    /// Only copy sequence is accepted.
+    ///
+    /// This option is the default as a compromise between entirely
+    /// disabling it (the most secure) and allowing `paste` (the less secure).
+    #[default]
+    OnlyCopy,
+    /// Only paste sequence is accepted.
+    OnlyPaste,
+    /// Both are accepted.
+    CopyPaste,
+}
+
+impl<T> Term<T> {
+    #[inline]
+    pub fn scroll_display(&mut self, scroll: Scroll)
+    where
+        T: EventListener,
+    {
+        let old_display_offset = self.grid.display_offset();
+        self.grid.scroll_display(scroll);
+        self.event_proxy.send_event(Event::MouseCursorDirty);
+
+        // Clamp vi mode cursor to the viewport.
+        let viewport_start = -(self.grid.display_offset() as i32);
+        let viewport_end = viewport_start + self.bottommost_line().0;
+        let vi_cursor_line = &mut self.vi_mode_cursor.point.line.0;
+        *vi_cursor_line = cmp::min(viewport_end, cmp::max(viewport_start, *vi_cursor_line));
+        self.vi_mode_recompute_selection();
+
+        // Damage everything if display offset changed.
+        if old_display_offset != self.grid().display_offset() {
+            self.mark_fully_damaged();
+        }
+    }
+
+    pub fn new<D: Dimensions>(config: Config, dimensions: &D, event_proxy: T) -> Term<T> {
+        let num_cols = dimensions.columns();
+        let num_lines = dimensions.screen_lines();
+
+        let history_size = config.scrolling_history;
+        let grid = Grid::new(num_lines, num_cols, history_size);
+        let inactive_grid = Grid::new(num_lines, num_cols, 0);
+
+        let tabs = TabStops::new(grid.columns());
+
+        let scroll_region = Line(0)..Line(grid.screen_lines() as i32);
+
+        // Initialize terminal damage, covering the entire terminal upon launch.
+        let damage = TermDamageState::new(num_cols, num_lines);
+
+        Term {
+            inactive_grid,
+            scroll_region,
+            event_proxy,
+            damage,
+            config,
+            grid,
+            tabs,
+            inactive_keyboard_mode_stack: Default::default(),
+            keyboard_mode_stack: Default::default(),
+            active_charset: Default::default(),
+            vi_mode_cursor: Default::default(),
+            cursor_style: Default::default(),
+            colors: color::Colors::default(),
+            title_stack: Default::default(),
+            is_focused: Default::default(),
+            selection: Default::default(),
+            title: Default::default(),
+            mode: Default::default(),
+        }
+    }
+
+    /// Collect the information about the changes in the lines, which
+    /// could be used to minimize the amount of drawing operations.
+    ///
+    /// The user controlled elements, like `Vi` mode cursor and `Selection` are **not** part of the
+    /// collected damage state. Those could easily be tracked by comparing their old and new
+    /// value between adjacent frames.
+    ///
+    /// After reading damage [`reset_damage`] should be called.
+    ///
+    /// [`reset_damage`]: Self::reset_damage
+    #[must_use]
+    pub fn damage(&mut self) -> TermDamage<'_> {
+        // Ensure the entire terminal is damaged after entering insert mode.
+        // Leaving is handled in the ansi handler.
+        if self.mode.contains(TermMode::INSERT) {
+            self.mark_fully_damaged();
+        }
+
+        let previous_cursor = mem::replace(&mut self.damage.last_cursor, self.grid.cursor.point);
+
+        if self.damage.full {
+            return TermDamage::Full;
+        }
+
+        // Add information about old cursor position and new one if they are not the same, so we
+        // cover everything that was produced by `Term::input`.
+        if self.damage.last_cursor != previous_cursor {
+            // Cursor coordinates are always inside viewport even if you have `display_offset`.
+            let point = Point::new(previous_cursor.line.0 as usize, previous_cursor.column);
+            self.damage.damage_point(point);
+        }
+
+        // Always damage current cursor.
+        self.damage_cursor();
+
+        // NOTE: damage which changes all the content when the display offset is non-zero (e.g.
+        // scrolling) is handled via full damage.
+        let display_offset = self.grid().display_offset();
+        TermDamage::Partial(TermDamageIterator::new(&self.damage.lines, display_offset))
+    }
+
+    /// Resets the terminal damage information.
+    pub fn reset_damage(&mut self) {
+        self.damage.reset(self.columns());
+    }
+
+    #[inline]
+    fn mark_fully_damaged(&mut self) {
+        self.damage.full = true;
+    }
+
+    /// Set new options for the [`Term`].
+    pub fn set_options(&mut self, options: Config)
+    where
+        T: EventListener,
+    {
+        let old_config = mem::replace(&mut self.config, options);
+
+        let title_event = match &self.title {
+            Some(title) => Event::Title(title.clone()),
+            None => Event::ResetTitle,
+        };
+
+        self.event_proxy.send_event(title_event);
+
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            self.inactive_grid.update_history(self.config.scrolling_history);
+        } else {
+            self.grid.update_history(self.config.scrolling_history);
+        }
+
+        if self.config.kitty_keyboard != old_config.kitty_keyboard {
+            self.keyboard_mode_stack = Vec::new();
+            self.inactive_keyboard_mode_stack = Vec::new();
+            self.mode.remove(TermMode::KITTY_KEYBOARD_PROTOCOL);
+        }
+
+        // Damage everything on config updates.
+        self.mark_fully_damaged();
+    }
+
+    /// Convert the active selection to a String.
+    pub fn selection_to_string(&self) -> Option<String> {
+        let selection_range = self.selection.as_ref().and_then(|s| s.to_range(self))?;
+714:    pub fn swap_alt(&mut self) {
+720:            self.grid.saved_cursor = self.grid.cursor.clone();
+798:        self.set_scrolling_region(1, None);
+1622:        self.grid.saved_cursor = self.grid.cursor.clone();
+1630:        self.grid.cursor = self.grid.saved_cursor.clone();
+1835:    fn reset_state(&mut self) {
+1948:                    self.swap_alt();
+2008:                    self.swap_alt();
+2152:    fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
+2510:mod tests {
+3239:        term.swap_alt();
+3279:        term.reset_state();
+            grid[Line(i)][Column(0)].c = '"';
+
+            for j in 1..4 {
+                grid[Line(i)][Column(j)].c = 'a';
+            }
+
+            grid[Line(i)][Column(4)].c = '"';
+        }
+        grid[Line(2)][Column(2)].c = ' ';
+        grid[Line(2)][Column(4)].flags.insert(Flags::WRAPLINE);
+        grid[Line(3)][Column(4)].c = ' ';
+
+        term.selection = Some(Selection::new(
+            SelectionType::Block,
+            Point { line: Line(0), column: Column(3) },
+            Side::Left,
+        ));
+
+        // The same column.
+        if let Some(s) = term.selection.as_mut() {
+            s.update(Point { line: Line(3), column: Column(3) }, Side::Right);
+        }
+        assert_eq!(term.selection_to_string(), Some(String::from("\na\na\na")));
+
+        // The first column.
+        if let Some(s) = term.selection.as_mut() {
+            s.update(Point { line: Line(3), column: Column(0) }, Side::Left);
+        }
+        assert_eq!(term.selection_to_string(), Some(String::from("\n\"aa\n\"a\n\"aa")));
+
+        // The last column.
+        if let Some(s) = term.selection.as_mut() {
+            s.update(Point { line: Line(3), column: Column(4) }, Side::Right);
+        }
+        assert_eq!(term.selection_to_string(), Some(String::from("\na\"\na\"\na")));
+    }
+
+    /// Check that the grid can be serialized back and forth losslessly.
+    ///
+    /// This test is in the term module as opposed to the grid since we want to
+    /// test this property with a T=Cell.
+    #[test]
+    #[cfg(feature = "serde")]
+    fn grid_serde() {
+        let grid: Grid<Cell> = Grid::new(24, 80, 0);
+        let serialized = serde_json::to_string(&grid).expect("ser");
+        let deserialized = serde_json::from_str::<Grid<Cell>>(&serialized).expect("de");
+
+        assert_eq!(deserialized, grid);
+    }
+
+    #[test]
+    fn input_line_drawing_character() {
+        let size = TermSize::new(7, 17);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let cursor = Point::new(Line(0), Column(0));
+        term.configure_charset(CharsetIndex::G0, StandardCharset::SpecialCharacterAndLineDrawing);
+        term.input('a');
+
+        assert_eq!(term.grid()[cursor].c, '▒');
+    }
+
+    #[test]
+    fn clearing_viewport_keeps_history_position() {
+        let size = TermSize::new(10, 20);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        // Create 10 lines of scrollback.
+        for _ in 0..29 {
+            term.newline();
+        }
+
+        // Change the display area.
+        term.scroll_display(Scroll::Top);
+
+        assert_eq!(term.grid.display_offset(), 10);
+
+        // Clear the viewport.
+        term.clear_screen(ansi::ClearMode::All);
+
+        assert_eq!(term.grid.display_offset(), 10);
+    }
+
+    #[test]
+    fn clearing_viewport_with_vi_mode_keeps_history_position() {
+        let size = TermSize::new(10, 20);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        // Create 10 lines of scrollback.
+        for _ in 0..29 {
+            term.newline();
+        }
+
+        // Enable vi mode.
+        term.toggle_vi_mode();
+
+        // Change the display area and the vi cursor position.
+        term.scroll_display(Scroll::Top);
+        term.vi_mode_cursor.point = Point::new(Line(-5), Column(3));
+
+        assert_eq!(term.grid.display_offset(), 10);
+
+        // Clear the viewport.
+        term.clear_screen(ansi::ClearMode::All);
+
+        assert_eq!(term.grid.display_offset(), 10);
+        assert_eq!(term.vi_mode_cursor.point, Point::new(Line(-5), Column(3)));
+    }
+
+    #[test]
+    fn clearing_scrollback_resets_display_offset() {
+        let size = TermSize::new(10, 20);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        // Create 10 lines of scrollback.
+        for _ in 0..29 {
+            term.newline();
+        }
+
+        // Change the display area.
+        term.scroll_display(Scroll::Top);
+
+        assert_eq!(term.grid.display_offset(), 10);
+
+        // Clear the scrollback buffer.
+        term.clear_screen(ansi::ClearMode::Saved);
+
+        assert_eq!(term.grid.display_offset(), 0);
+    }
+
+    #[test]
+    fn clearing_scrollback_sets_vi_cursor_into_viewport() {
+        let size = TermSize::new(10, 20);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        // Create 10 lines of scrollback.
+        for _ in 0..29 {
+            term.newline();
+        }
+
+        // Enable vi mode.
+        term.toggle_vi_mode();
+
+        // Change the display area and the vi cursor position.
+        term.scroll_display(Scroll::Top);
+        term.vi_mode_cursor.point = Point::new(Line(-5), Column(3));
+
+        assert_eq!(term.grid.display_offset(), 10);
+
+        // Clear the scrollback buffer.
+        term.clear_screen(ansi::ClearMode::Saved);
+        // No damage when scrolled into viewport.
+        for idx in 0..term.columns() {
+            term.goto(idx as i32, idx);
+        }
+        let mut damaged_lines = match term.damage() {
+            TermDamage::Full => panic!("Expected partial damage, however got Full"),
+            TermDamage::Partial(damaged_lines) => damaged_lines,
+        };
+        assert_eq!(damaged_lines.next(), None);
+
+        // Scroll back into the viewport, so we have 2 visible lines which terminal can write
+        // to.
+        term.scroll_display(Scroll::Delta(-2));
+        term.reset_damage();
+
+        term.goto(0, 0);
+        term.goto(1, 0);
+        term.goto(2, 0);
+        let display_offset = term.grid().display_offset();
+        let mut damaged_lines = match term.damage() {
+            TermDamage::Full => panic!("Expected partial damage, however got Full"),
+            TermDamage::Partial(damaged_lines) => damaged_lines,
+        };
+        assert_eq!(
+            damaged_lines.next(),
+            Some(LineDamageBounds { line: display_offset, left: 0, right: 0 })
+        );
+        assert_eq!(
+            damaged_lines.next(),
+            Some(LineDamageBounds { line: display_offset + 1, left: 0, right: 0 })
+        );
+        assert_eq!(damaged_lines.next(), None);
+    }
+
+    #[test]
+    fn damage_cursor_movements() {
+        let size = TermSize::new(10, 10);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        let num_cols = term.columns();
+        // Reset terminal for partial damage tests since it's initialized as fully damaged.
+        term.reset_damage();
+
+        term.goto(1, 1);
+
+        // NOTE While we can use `[Term::damage]` to access terminal damage information, in the
+        // following tests we will be accessing `term.damage.lines` directly to avoid adding extra
+        // damage information (like cursor and Vi cursor), which we're not testing.
+
+        assert_eq!(term.damage.lines[0], LineDamageBounds { line: 0, left: 0, right: 0 });
+        assert_eq!(term.damage.lines[1], LineDamageBounds { line: 1, left: 1, right: 1 });
+        term.damage.reset(num_cols);
+
+        term.move_forward(3);
+        assert_eq!(term.damage.lines[1], LineDamageBounds { line: 1, left: 1, right: 4 });
+        term.damage.reset(num_cols);
+
+        term.move_backward(8);
+        assert_eq!(term.damage.lines[1], LineDamageBounds { line: 1, left: 0, right: 4 });
+        term.goto(5, 5);
+        term.damage.reset(num_cols);
+
+        term.backspace();
+        term.backspace();
+        assert_eq!(term.damage.lines[5], LineDamageBounds { line: 5, left: 3, right: 5 });
+        term.damage.reset(num_cols);
+
+        term.move_up(1);
+        assert_eq!(term.damage.lines[5], LineDamageBounds { line: 5, left: 3, right: 3 });
+        assert_eq!(term.damage.lines[4], LineDamageBounds { line: 4, left: 3, right: 3 });
+        term.damage.reset(num_cols);
+
+        term.move_down(1);
+        term.move_down(1);
+        assert_eq!(term.damage.lines[4], LineDamageBounds { line: 4, left: 3, right: 3 });
+        assert_eq!(term.damage.lines[5], LineDamageBounds { line: 5, left: 3, right: 3 });
+        assert_eq!(term.damage.lines[6], LineDamageBounds { line: 6, left: 3, right: 3 });
+        term.damage.reset(num_cols);
+
+        term.wrapline();
+        assert_eq!(term.damage.lines[6], LineDamageBounds { line: 6, left: 3, right: 3 });
+        assert_eq!(term.damage.lines[7], LineDamageBounds { line: 7, left: 0, right: 0 });
+        term.move_forward(3);
+        term.move_up(1);
+        term.damage.reset(num_cols);
+
+        term.linefeed();
+        assert_eq!(term.damage.lines[6], LineDamageBounds { line: 6, left: 3, right: 3 });
+        assert_eq!(term.damage.lines[7], LineDamageBounds { line: 7, left: 3, right: 3 });
+        term.damage.reset(num_cols);
+
+        term.carriage_return();
+        assert_eq!(term.damage.lines[7], LineDamageBounds { line: 7, left: 0, right: 3 });
+        term.damage.reset(num_cols);
+
+        term.erase_chars(5);
+        assert_eq!(term.damage.lines[7], LineDamageBounds { line: 7, left: 0, right: 5 });
+        term.damage.reset(num_cols);
+
+        term.delete_chars(3);
+        let right = term.columns() - 1;
+        assert_eq!(term.damage.lines[7], LineDamageBounds { line: 7, left: 0, right });
+        term.move_forward(term.columns());
+        term.damage.reset(num_cols);
+
+        term.move_backward_tabs(1);
+        assert_eq!(term.damage.lines[7], LineDamageBounds { line: 7, left: 8, right });
+        term.save_cursor_position();
+        term.goto(1, 1);
+        term.damage.reset(num_cols);
+
+        term.restore_cursor_position();
+        assert_eq!(term.damage.lines[1], LineDamageBounds { line: 1, left: 1, right: 1 });
+        assert_eq!(term.damage.lines[7], LineDamageBounds { line: 7, left: 8, right: 8 });
+        term.damage.reset(num_cols);
+
+        term.clear_line(ansi::LineClearMode::All);
+        assert_eq!(term.damage.lines[7], LineDamageBounds { line: 7, left: 0, right });
+        term.damage.reset(num_cols);
+
+        term.clear_line(ansi::LineClearMode::Left);
+        assert_eq!(term.damage.lines[7], LineDamageBounds { line: 7, left: 0, right: 8 });
+        term.damage.reset(num_cols);
+
+        term.clear_line(ansi::LineClearMode::Right);
+        assert_eq!(term.damage.lines[7], LineDamageBounds { line: 7, left: 8, right });
+        term.damage.reset(num_cols);
+
+        term.reverse_index();
+        assert_eq!(term.damage.lines[7], LineDamageBounds { line: 7, left: 8, right: 8 });
+        assert_eq!(term.damage.lines[6], LineDamageBounds { line: 6, left: 8, right: 8 });
+    }
+
+    #[test]
+    fn full_damage() {
+        let size = TermSize::new(100, 10);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        assert!(term.damage.full);
+        for _ in 0..20 {
+            term.newline();
+        }
+        term.reset_damage();
+
+        term.clear_screen(ansi::ClearMode::Above);
+        assert!(term.damage.full);
+        term.reset_damage();
+
+        term.scroll_display(Scroll::Top);
+        assert!(term.damage.full);
+        term.reset_damage();
+
+        // Sequential call to scroll display without doing anything shouldn't damage.
+        term.scroll_display(Scroll::Top);
+        assert!(!term.damage.full);
+        term.reset_damage();
+
+alacritty_terminal/tests/ref.rs
+[package]
+name = "alacritty_terminal"
+version = "0.25.0"
+authors = ["Christian Duerr <<email>>", "Joe Wilm <<email>>"]
+license = "Apache-2.0"
+description = "Library for writing terminal emulators"
+readme = "../README.md"
+homepage = "https://alacritty.org"
+repository = "https://github.com/alacritty/alacritty"
+edition = "2021"
+rust-version = "1.74.0"
+
+[features]
+default = ["serde"]
+serde = ["dep:serde", "bitflags/serde", "vte/serde"]
+
+[dependencies]
+base64 = "0.22.0"
+bitflags = "2.4.1"
+home = "0.5.5"
+libc = "0.2"
+log = "0.4"
+parking_lot = "0.12.0"
+polling = "3.0.0"
+regex-automata = "0.4.3"
+unicode-width = "0.1"
+vte = { version = "0.13.0", default-features = false, features = ["ansi"] }
+serde = { version = "1", features = ["derive", "rc"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix-openpty = "0.1.1"
+signal-hook = "0.3.10"
+
+[target.'cfg(windows)'.dependencies]
+piper = "0.2.1"
+miow = "0.6.0"
+windows-sys = { version = "0.59.0", features = [
+    "Win32_System_Console",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+]}
+
+[dev-dependencies]
+serde_json = "1.0.0"
+format_code_in_doc_comments = true
+match_block_trailing_comma = true
+condense_wildcard_suffixes = true
+use_field_init_shorthand = true
+normalize_doc_attributes = true
+overflow_delimited_expr = true
+imports_granularity = "Module"
+use_small_heuristics = "Max"
+normalize_comments = true
+reorder_impl_items = true
+use_try_shorthand = true
+newline_style = "Unix"
+format_strings = true
+wrap_comments = true
+comment_width = 100

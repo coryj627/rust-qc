@@ -24,7 +24,7 @@ def main():
                 rows[row["run_id"]] = dict(row, role="audit" if stage in (3, 4) else "treatment")
     for pattern in ("controls-schedule.json", "grading-*.json", "assessment-*.json",
                     "quality-*.json", "adjudication-*.json", "recheck-s[34]-*.json",
-                    "reconciliation-*.json"):
+                    "reconciliation-*.json", "recommendations-schedule.json"):
         for schedule in scratch.glob(pattern):
             for row in json.loads(schedule.read_text()):
                 rows[row["run_id"]] = dict(row, stage=row.get("stage", "preparation-or-grading"))
@@ -57,7 +57,7 @@ def main():
     fields = ["run", "stage", "role", "project", "arm", "letter", "skill_version",
               "requested_model", "requested_effort", "model", "effort", "budget_minutes", "minutes",
               "slot_wait_seconds", "status", "failure_kind", "killed_commands",
-              "report", "validity", "absence_reason"]
+              "report", "absence_reason", "validity"]
     with (output / "runs.tsv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields, delimiter="\t", lineterminator="\n")
         writer.writeheader()

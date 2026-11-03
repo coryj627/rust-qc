@@ -62,6 +62,15 @@ def main():
     quality = json.loads((HERE / "quality_scores.json").read_text())
     result = {"caveat": "Exact sign-flip p-values are uncorrected; incomplete cells are excluded.",
               "stages": {}, "controls": {}}
+    recheck_path = HERE / "key_recheck.json"
+    if recheck_path.exists():
+        recheck = json.loads(recheck_path.read_text())
+        result["unredacted_recheck"] = {
+            name: recheck[name] for name in (
+                "population_size", "sample_size", "judgments_rechecked",
+                "disagreements", "disagreement_rate", "interpretation", "gaps",
+            )
+        }
     for stage in (3, 4):
         table = {}
         for name, reproduced, wanted in [

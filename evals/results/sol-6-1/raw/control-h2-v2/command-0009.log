@@ -1,0 +1,673 @@
+use futures::{FutureExt, TryFuture};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
+
+/// Future extension helpers that are useful for tests
+pub trait TestFuture: Future {
+    /// Drive `other` by polling `self`.
+    ///
+    /// `self` must not resolve before `other` does.
+    fn drive<T>(&mut self, other: T) -> Drive<'_, Self, T>
+    where
+        T: Future,
+        Self: Future + Sized,
+    {
+        Drive {
+            driver: self,
+            future: other.wakened(),
+        }
+    }
+
+    fn wakened(self) -> Wakened<Self>
+    where
+        Self: Sized,
+    {
+        Wakened {
+            future: Box::pin(self),
+            woken: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
+
+/// Wraps futures::future::join to ensure that the futures are only polled if they are woken.
+pub fn join<Fut1, Fut2>(
+    future1: Fut1,
+    future2: Fut2,
+) -> futures::future::Join<Wakened<Fut1>, Wakened<Fut2>>
+where
+    Fut1: Future,
+    Fut2: Future,
+{
+    futures::future::join(future1.wakened(), future2.wakened())
+}
+
+/// Wraps futures::future::join3 to ensure that the futures are only polled if they are woken.
+pub fn join3<Fut1, Fut2, Fut3>(
+    future1: Fut1,
+    future2: Fut2,
+    future3: Fut3,
+) -> futures::future::Join3<Wakened<Fut1>, Wakened<Fut2>, Wakened<Fut3>>
+where
+    Fut1: Future,
+    Fut2: Future,
+    Fut3: Future,
+{
+    futures::future::join3(future1.wakened(), future2.wakened(), future3.wakened())
+}
+
+/// Wraps futures::future::join4 to ensure that the futures are only polled if they are woken.
+pub fn join4<Fut1, Fut2, Fut3, Fut4>(
+    future1: Fut1,
+    future2: Fut2,
+    future3: Fut3,
+    future4: Fut4,
+) -> futures::future::Join4<Wakened<Fut1>, Wakened<Fut2>, Wakened<Fut3>, Wakened<Fut4>>
+where
+    Fut1: Future,
+    Fut2: Future,
+    Fut3: Future,
+    Fut4: Future,
+{
+    futures::future::join4(
+        future1.wakened(),
+        future2.wakened(),
+        future3.wakened(),
+        future4.wakened(),
+    )
+}
+
+/// Wraps futures::future::try_join to ensure that the futures are only polled if they are woken.
+pub fn try_join<Fut1, Fut2>(
+    future1: Fut1,
+    future2: Fut2,
+) -> futures::future::TryJoin<Wakened<Fut1>, Wakened<Fut2>>
+where
+    Fut1: futures::future::TryFuture + Future,
+    Fut2: Future,
+    Wakened<Fut1>: futures::future::TryFuture,
+    Wakened<Fut2>: futures::future::TryFuture<Error = <Wakened<Fut1> as TryFuture>::Error>,
+{
+    futures::future::try_join(future1.wakened(), future2.wakened())
+}
+
+/// Wraps futures::future::select to ensure that the futures are only polled if they are woken.
+pub fn select<A, B>(future1: A, future2: B) -> futures::future::Select<Wakened<A>, Wakened<B>>
+where
+    A: Future + Unpin,
+    B: Future + Unpin,
+{
+    futures::future::select(future1.wakened(), future2.wakened())
+}
+
+/// Wraps futures::future::join_all to ensure that the futures are only polled if they are woken.
+pub fn join_all<I>(iter: I) -> futures::future::JoinAll<Wakened<I::Item>>
+where
+    I: IntoIterator,
+    I::Item: Future,
+{
+    futures::future::join_all(iter.into_iter().map(|f| f.wakened()))
+}
+
+/// A future that only polls the inner future if it has been woken (after the initial poll).
+pub struct Wakened<T> {
+    future: Pin<Box<T>>,
+    woken: Arc<AtomicBool>,
+}
+
+/// A future that only polls the inner future if it has been woken (after the initial poll).
+impl<T> Future for Wakened<T>
+where
+    T: Future,
+{
+    type Output = T::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if !this.woken.load(std::sync::atomic::Ordering::SeqCst) {
+            return Poll::Pending;
+        }
+        this.woken.store(false, std::sync::atomic::Ordering::SeqCst);
+        let my_waker = IfWokenWaker {
+            inner: cx.waker().clone(),
+            wakened: this.woken.clone(),
+        };
+        let my_waker = Arc::new(my_waker).into();
+        let mut cx = Context::from_waker(&my_waker);
+        this.future.as_mut().poll(&mut cx)
+    }
+}
+
+impl Wake for IfWokenWaker {
+    fn wake(self: Arc<Self>) {
+        self.wakened
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.wake_by_ref();
+    }
+}
+
+struct IfWokenWaker {
+    inner: Waker,
+    wakened: Arc<AtomicBool>,
+}
+
+impl<T: Future> TestFuture for T {}
+
+// ===== Drive ======
+
+/// Drive a future to completion while also polling the driver
+///
+/// This is useful for H2 futures that also require the connection to be polled.
+pub struct Drive<'a, T, U> {
+    driver: &'a mut T,
+    future: Wakened<U>,
+}
+
+impl<'a, T, U> Future for Drive<'a, T, U>
+where
+    T: Future + Unpin,
+    U: Future,
+{
+    type Output = U::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut looped = false;
+        loop {
+            match self.future.poll_unpin(cx) {
+                Poll::Ready(val) => return Poll::Ready(val),
+                Poll::Pending => {}
+            }
+
+            match self.driver.poll_unpin(cx) {
+                Poll::Ready(_) => {
+                    if looped {
+                        // Try polling the future one last time
+                        panic!("driver resolved before future")
+                    } else {
+                        looped = true;
+                        continue;
+                    }
+                }
+                Poll::Pending => {}
+            }
+
+            return Poll::Pending;
+        }
+    }
+}
+    pub fn apply_remote_settings<B>(
+        &mut self,
+        settings: &frame::Settings,
+        buffer: &mut Buffer<Frame<B>>,
+        store: &mut Store,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), Error> {
+        if let Some(val) = settings.is_extended_connect_protocol_enabled() {
+            self.is_extended_connect_protocol_enabled = val;
+        }
+
+        // Applies an update to the remote endpoint's initial window size.
+        //
+        // Per RFC 7540 §6.9.2:
+        //
+        // In addition to changing the flow-control window for streams that are
+        // not yet active, a SETTINGS frame can alter the initial flow-control
+        // window size for streams with active flow-control windows (that is,
+        // streams in the "open" or "half-closed (remote)" state). When the
+        // value of SETTINGS_INITIAL_WINDOW_SIZE changes, a receiver MUST adjust
+        // the size of all stream flow-control windows that it maintains by the
+        // difference between the new value and the old value.
+        //
+        // A change to `SETTINGS_INITIAL_WINDOW_SIZE` can cause the available
+        // space in a flow-control window to become negative. A sender MUST
+        // track the negative flow-control window and MUST NOT send new
+        // flow-controlled frames until it receives WINDOW_UPDATE frames that
+        // cause the flow-control window to become positive.
+        if let Some(val) = settings.initial_window_size() {
+            let old_val = self.init_window_sz;
+            self.init_window_sz = val;
+
+            match val.cmp(&old_val) {
+                Ordering::Less => {
+                    // We must decrease the (remote) window on every open stream.
+                    let dec = old_val - val;
+                    tracing::trace!("decrementing all windows; dec={}", dec);
+
+                    let mut total_reclaimed = 0;
+                    store.try_for_each(|mut stream| {
+                        let stream = &mut *stream;
+
+                        if stream.state.is_send_closed() && stream.buffered_send_data == 0 {
+                            tracing::trace!(
+                                "skipping send-closed stream; id={:?}; flow={:?}",
+                                stream.id,
+                                stream.send_flow
+                            );
+
+                            return Ok(());
+                        }
+
+                        tracing::trace!(
+                            "decrementing stream window; id={:?}; decr={}; flow={:?}",
+                            stream.id,
+                            dec,
+                            stream.send_flow
+                        );
+
+                        // TODO: this decrement can underflow based on received frames!
+                        stream
+                            .send_flow
+                            .dec_send_window(dec)
+                            .map_err(proto::Error::library_go_away)?;
+
+                        // It's possible that decreasing the window causes
+                        // `window_size` (the stream-specific window) to fall below
+                        // `available` (the portion of the connection-level window
+                        // that we have allocated to the stream).
+                        // In this case, we should take that excess allocation away
+                        // and reassign it to other streams.
+                        let window_size = stream.send_flow.window_size();
+                        let available = stream.send_flow.available().as_size();
+                        let reclaimed = if available > window_size {
+                            // Drop down to `window_size`.
+                            let reclaim = available - window_size;
+                            stream
+                                .send_flow
+                                .claim_capacity(reclaim)
+                                .map_err(proto::Error::library_go_away)?;
+                            total_reclaimed += reclaim;
+                            reclaim
+                        } else {
+                            0
+                        };
+
+                        tracing::trace!(
+                            "decremented stream window; id={:?}; decr={}; reclaimed={}; flow={:?}",
+                            stream.id,
+                            dec,
+                            reclaimed,
+                            stream.send_flow
+                        );
+
+                        // TODO: Should this notify the producer when the capacity
+                        // of a stream is reduced? Maybe it should if the capacity
+                        // is reduced to zero, allowing the producer to stop work.
+
+                        Ok::<_, proto::Error>(())
+                    })?;
+
+                    self.prioritize
+                        .assign_connection_capacity(total_reclaimed, store, counts);
+                }
+                Ordering::Greater => {
+                    let inc = val - old_val;
+
+                    store.try_for_each(|mut stream| {
+                        self.recv_stream_window_update(inc, buffer, &mut stream, counts, task)
+                            .map_err(Error::library_go_away)
+                    })?;
+                }
+                Ordering::Equal => (),
+            }
+        }
+
+        if let Some(val) = settings.is_push_enabled() {
+            self.is_push_enabled = val
+        }
+
+        Ok(())
+    }
+                                // connection level capacity
+                                //
+                                // TODO: uncomment
+                                // debug_assert!(stream.is_pending_send_capacity);
+
+                                // The stream has no more capacity, this can
+                                // happen if the remote reduced the stream
+                                // window. In this case, we need to buffer the
+                                // frame and wait for a window update...
+                                stream.pending_send.push_front(buffer, frame.into());
+
+                                continue;
+                            }
+
+                            // Only send up to the max frame length
+                            let len = cmp::min(sz, max_len);
+
+                            // Only send up to the stream's window capacity
+                            let len =
+                                cmp::min(len, stream_capacity.as_size() as usize) as WindowSize;
+
+                            // There *must* be be enough connection level
+                            // capacity at this point.
+                            debug_assert!(len <= self.flow.window_size());
+
+                            // Check if the stream level window the peer knows is available. In some
+                            // scenarios, maybe the window we know is available but the window which
+                            // peer knows is not.
+                            if len > 0 && len > stream.send_flow.window_size() {
+                                stream.pending_send.push_front(buffer, frame.into());
+                                continue;
+                            }
+
+                            tracing::trace!(len, "sending data frame");
+
+                            // Update the flow control
+                            tracing::trace_span!("updating stream flow").in_scope(|| {
+                                stream.send_data(len, self.max_buffer_size);
+
+                                // Assign the capacity back to the connection that
+                                // was just consumed from the stream in the previous
+                                // line.
+                                // TODO: proper error handling
+                                let _res = self.flow.assign_capacity(len);
+                                debug_assert!(_res.is_ok());
+                            });
+
+                            let (eos, len) = tracing::trace_span!("updating connection flow")
+                                .in_scope(|| {
+                                    // TODO: proper error handling
+                                    let _res = self.flow.send_data(len);
+use crate::SendFrame;
+
+use h2::frame::{self, Frame};
+use h2::proto::Error;
+use h2::SendError;
+
+use futures::future::poll_fn;
+use futures::{ready, Stream, StreamExt};
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+use super::assert::assert_frame_eq;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
+use std::{cmp, io, usize};
+
+/// A mock I/O
+#[derive(Debug)]
+pub struct Mock {
+    pipe: Pipe,
+}
+
+#[derive(Debug)]
+pub struct Handle {
+    codec: crate::Codec<Pipe>,
+}
+
+#[derive(Debug)]
+pub struct Pipe {
+    inner: Arc<Mutex<Inner>>,
+}
+
+#[derive(Debug)]
+struct Inner {
+    /// Data written by the test case to the h2 lib.
+    rx: Vec<u8>,
+
+    /// Notify when data is ready to be received.
+    rx_task: Option<Waker>,
+
+    /// Data written by the `h2` library to be read by the test case.
+    tx: Vec<u8>,
+
+    /// Notify when data is written. This notifies the test case waiters.
+    tx_task: Option<Waker>,
+
+    /// Number of bytes that can be written before `write` returns `Poll::Pending`.
+    tx_rem: usize,
+
+    /// Task to notify when write capacity becomes available.
+    tx_rem_task: Option<Waker>,
+
+    /// True when the pipe is closed.
+    closed: bool,
+
+    /// Trigger an `UnexpectedEof` error on read
+    unexpected_eof: bool,
+}
+
+const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Create a new mock and handle
+pub fn new() -> (Mock, Handle) {
+    new_with_write_capacity(usize::MAX)
+}
+
+/// Create a new mock and handle allowing up to `cap` bytes to be written.
+pub fn new_with_write_capacity(cap: usize) -> (Mock, Handle) {
+    let inner = Arc::new(Mutex::new(Inner {
+        rx: vec![],
+        rx_task: None,
+        tx: vec![],
+        tx_task: None,
+        tx_rem: cap,
+        tx_rem_task: None,
+        closed: false,
+        unexpected_eof: false,
+    }));
+
+    let mock = Mock {
+        pipe: Pipe {
+            inner: inner.clone(),
+        },
+    };
+
+    let handle = Handle {
+        codec: h2::Codec::new(Pipe { inner }),
+    };
+
+    (mock, handle)
+}
+
+// ===== impl Handle =====
+
+impl Handle {
+    /// Get a mutable reference to inner Codec.
+    pub fn codec_mut(&mut self) -> &mut crate::Codec<Pipe> {
+        &mut self.codec
+    }
+
+    pub fn close_without_notify(&mut self) {
+        let mut me = self.codec.get_mut().inner.lock().unwrap();
+        me.unexpected_eof = true;
+    }
+
+    /// Send a frame
+    pub async fn send(&mut self, item: SendFrame) -> Result<(), SendError> {
+        // Queue the frame
+        self.codec.buffer(item).unwrap();
+
+        // Flush the frame
+        poll_fn(|cx| {
+            let p = self.codec.flush(cx);
+            assert!(p.is_ready());
+            p
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Writes the client preface
+    pub async fn write_preface(&mut self) {
+        self.codec.get_mut().write_all(PREFACE).await.unwrap();
+    }
+
+    /// Read the client preface
+    pub async fn read_preface(&mut self) -> io::Result<()> {
+        let mut buf = vec![0u8; PREFACE.len()];
+        self.read_exact(&mut buf).await?;
+        assert_eq!(buf, PREFACE);
+        Ok(())
+    }
+
+    pub async fn recv_frame<F: Into<Frame>>(&mut self, expected: F) {
+        let frame = self.next().await.unwrap().unwrap();
+        assert_frame_eq(frame, expected);
+    }
+
+    pub async fn send_frame<F: Into<SendFrame>>(&mut self, frame: F) {
+        self.send(frame.into()).await.unwrap();
+    }
+
+    pub async fn recv_eof(&mut self) {
+        let frame = self.next().await;
+        assert!(frame.is_none());
+    }
+
+    pub async fn send_bytes(&mut self, data: &[u8]) {
+mod error;
+mod framed_read;
+mod framed_write;
+
+pub use self::error::{SendError, UserError};
+
+use self::framed_read::FramedRead;
+use self::framed_write::FramedWrite;
+
+use crate::frame::{self, Data, Frame};
+use crate::proto::Error;
+
+use bytes::Buf;
+use futures_core::Stream;
+use futures_sink::Sink;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::codec::length_delimited;
+
+use std::io;
+
+#[derive(Debug)]
+pub struct Codec<T, B> {
+    inner: FramedRead<FramedWrite<T, B>>,
+}
+
+impl<T, B> Codec<T, B>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+    B: Buf,
+{
+    /// Returns a new `Codec` with the default max frame size
+    #[inline]
+    pub fn new(io: T) -> Self {
+        Self::with_max_recv_frame_size(io, frame::DEFAULT_MAX_FRAME_SIZE as usize)
+    }
+
+    /// Returns a new `Codec` with the given maximum frame size
+    pub fn with_max_recv_frame_size(io: T, max_frame_size: usize) -> Self {
+        // Wrap with writer
+        let framed_write = FramedWrite::new(io);
+
+        // Delimit the frames
+        let delimited = length_delimited::Builder::new()
+            .big_endian()
+            .length_field_length(3)
+            .length_adjustment(9)
+            .num_skip(0) // Don't skip the header
+            .new_read(framed_write);
+
+        let mut inner = FramedRead::new(delimited);
+
+        // Use FramedRead's method since it checks the value is within range.
+        inner.set_max_frame_size(max_frame_size);
+
+        Codec { inner }
+    }
+}
+
+impl<T, B> Codec<T, B> {
+    /// Updates the max received frame size.
+    ///
+    /// The change takes effect the next time a frame is decoded. In other
+    /// words, if a frame is currently in process of being decoded with a frame
+    /// size greater than `val` but less than the max frame size in effect
+    /// before calling this function, then the frame will be allowed.
+    #[inline]
+    pub fn set_max_recv_frame_size(&mut self, val: usize) {
+        self.inner.set_max_frame_size(val)
+    }
+
+    /// Returns the current max received frame size setting.
+    ///
+    /// This is the largest size this codec will accept from the wire. Larger
+    /// frames will be rejected.
+    #[cfg(feature = "unstable")]
+    #[inline]
+    pub fn max_recv_frame_size(&self) -> usize {
+        self.inner.max_frame_size()
+    }
+
+    /// Returns the max frame size that can be sent to the peer.
+    pub fn max_send_frame_size(&self) -> usize {
+        self.inner.get_ref().max_frame_size()
+    }
+
+    /// Set the peer's max frame size.
+    pub fn set_max_send_frame_size(&mut self, val: usize) {
+        self.framed_write().set_max_frame_size(val)
+    }
+
+    /// Set the peer's header table size size.
+    pub fn set_send_header_table_size(&mut self, val: usize) {
+        self.framed_write().set_header_table_size(val)
+    }
+
+    /// Set the decoder header table size size.
+    pub fn set_recv_header_table_size(&mut self, val: usize) {
+        self.inner.set_header_table_size(val)
+    }
+
+    /// Set the max header list size that can be received.
+    pub fn set_max_recv_header_list_size(&mut self, val: usize) {
+        self.inner.set_max_header_list_size(val);
+    }
+
+    /// Get a reference to the inner stream.
+    #[cfg(feature = "unstable")]
+    pub fn get_ref(&self) -> &T {
+        self.inner.get_ref().get_ref()
+    }
+
+    /// Get a mutable reference to the inner stream.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.inner.get_mut().get_mut()
+    }
+
+    /// Takes the data payload value that was fully written to the socket
+    pub(crate) fn take_last_data_frame(&mut self) -> Option<Data<B>> {
+        self.framed_write().take_last_data_frame()
+    }
+
+    fn framed_write(&mut self) -> &mut FramedWrite<T, B> {
+        self.inner.get_mut()
+    }
+}
+
+impl<T, B> Codec<T, B>
+where
+    T: AsyncWrite + Unpin,
+    B: Buf,
+{
+    /// Returns `Ready` when the codec can buffer a frame
+    pub fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.framed_write().poll_ready(cx)
+    }
+
+    /// Buffer a frame.
+    ///
+    /// `poll_ready` must be called first to ensure that a frame may be
+    /// accepted.
+    ///
+    /// TODO: Rename this to avoid conflicts with Sink::buffer
+    pub fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
+        self.framed_write().buffer(item)
+    }
+
+    /// Flush buffered data to the wire
+    pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {

@@ -1,0 +1,575 @@
+impl<K, V, S> Inner<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn do_run_pending_tasks(
+        &self,
+        timeout: Option<Duration>,
+        max_log_sync_repeats: u32,
+        eviction_batch_size: u32,
+    ) -> bool {
+        if self.max_capacity == Some(0) {
+            return false;
+        }
+
+        // Acquire some locks.
+        let mut deqs = self.deques.lock();
+        let mut timer_wheel = self.timer_wheel.lock();
+
+        let started_at = if timeout.is_some() {
+            Some(self.current_time())
+        } else {
+            None
+        };
+        let mut should_process_logs = true;
+        let mut calls = 0u32;
+        let current_ec = self.entry_count.load();
+        let current_ws = self.weighted_size.load();
+        let mut eviction_state =
+            EvictionState::new(current_ec, current_ws, self.removal_notifier.as_ref());
+
+        loop {
+            if should_process_logs {
+                let r_len = self.read_op_ch.len();
+                if r_len > 0 {
+                    self.apply_reads(&mut deqs, &mut timer_wheel, r_len);
+                }
+
+                let w_len = self.write_op_ch.len();
+                if w_len > 0 {
+                    self.apply_writes(&mut deqs, &mut timer_wheel, w_len, &mut eviction_state);
+                }
+
+                if self.eviction_policy == EvictionPolicyConfig::TinyLfu
+                    && self.should_enable_frequency_sketch(&eviction_state.counters)
+                {
+                    self.enable_frequency_sketch(&eviction_state.counters);
+                }
+
+                calls += 1;
+            }
+
+            // Set this flag to `false`. The `evict_*` and `invalidate_*` methods
+            // below may set it to `true` if there are more entries to evict in next
+            // loop.
+            eviction_state.more_entries_to_evict = false;
+            let last_eviction_count = eviction_state.counters.eviction_count;
+
+            // Evict entries if there are any expired entries in the hierarchical
+            // timer wheels.
+            if timer_wheel.is_enabled() {
+                self.evict_expired_entries_using_timers(
+                    &mut timer_wheel,
+                    &mut deqs,
+                    &mut eviction_state,
+                );
+            }
+
+            // Evict entries if there are any expired entries in the write order or
+            // access order deques.
+            if self.has_expiry() || self.has_valid_after() {
+                self.evict_expired_entries_using_deqs(
+                    &mut deqs,
+                    &mut timer_wheel,
+                    eviction_batch_size,
+                    &mut eviction_state,
+                );
+            }
+
+            // Evict entries if there are any invalidation predicates set by the
+            // `invalidate_entries_if` method.
+            if let Some(invalidator) = &self.invalidator {
+                if !invalidator.is_empty() {
+                    self.invalidate_entries(
+                        invalidator,
+                        &mut deqs,
+                        &mut timer_wheel,
+                        eviction_batch_size,
+                        &mut eviction_state,
+                    );
+                }
+            }
+
+            // Evict if this cache has more entries than its capacity.
+            let weights_to_evict = self.weights_to_evict(&eviction_state.counters);
+            if weights_to_evict > 0 {
+                self.evict_lru_entries(
+                    &mut deqs,
+                    &mut timer_wheel,
+                    eviction_batch_size,
+                    weights_to_evict,
+                    &mut eviction_state,
+                );
+            }
+
+            // Check whether to continue this loop or not.
+
+            should_process_logs = calls <= max_log_sync_repeats
+                && (self.read_op_ch.len() >= READ_LOG_FLUSH_POINT
+                    || self.write_op_ch.len() >= WRITE_LOG_FLUSH_POINT);
+
+            let should_evict_more_entries = eviction_state.more_entries_to_evict
+                // Check if there were any entries evicted in this loop.
+                && (eviction_state.counters.eviction_count - last_eviction_count) > 0;
+
+            // Break the loop if there will be nothing to do in next loop.
+            if !should_process_logs && !should_evict_more_entries {
+                break;
+            }
+
+            // Break the loop if the eviction listener is set and timeout has been
+            // reached.
+            if let (Some(to), Some(started)) = (timeout, started_at) {
+                let elapsed = self.current_time().saturating_duration_since(started);
+                if elapsed >= to {
+                    break;
+                }
+            }
+        }
+
+        debug_assert_eq!(self.entry_count.load(), current_ec);
+        debug_assert_eq!(self.weighted_size.load(), current_ws);
+        self.entry_count.store(eviction_state.counters.entry_count);
+        self.weighted_size
+            .store(eviction_state.counters.weighted_size);
+
+        crossbeam_epoch::pin().flush();
+
+        // Ensure the deqs lock is held until here.
+        drop(deqs);
+
+        eviction_state.more_entries_to_evict
+    }
+}
+
+//
+// private methods
+//
+impl<K, V, S> Inner<K, V, S>
+where
+    /// Runs the pending tasks. Returns `true` if there are more entries to evict.
+    pub(crate) async fn do_run_pending_tasks(
+        &self,
+        timeout: Option<Duration>,
+        max_log_sync_repeats: u32,
+        eviction_batch_size: u32,
+    ) -> bool {
+        if self.max_capacity == Some(0) {
+            return false;
+        }
+
+        // Acquire some locks.
+        let mut deqs = self.deques.lock().await;
+        let mut timer_wheel = self.timer_wheel.lock().await;
+
+        let started_at = if timeout.is_some() {
+            Some(self.current_time())
+        } else {
+            None
+        };
+        let mut should_process_logs = true;
+        let mut calls = 0u32;
+        let current_ec = self.entry_count.load();
+        let current_ws = self.weighted_size.load();
+        let mut eviction_state =
+            EvictionState::new(current_ec, current_ws, self.removal_notifier.as_ref());
+
+        loop {
+            if should_process_logs {
+                let r_len = self.read_op_ch.len();
+                if r_len > 0 {
+                    self.apply_reads(&mut deqs, &mut timer_wheel, r_len).await;
+                }
+
+                let w_len = self.write_op_ch.len();
+                if w_len > 0 {
+                    self.apply_writes(&mut deqs, &mut timer_wheel, w_len, &mut eviction_state)
+                        .await;
+                }
+
+                if self.eviction_policy == EvictionPolicyConfig::TinyLfu
+                    && self.should_enable_frequency_sketch(&eviction_state.counters)
+                {
+                    self.enable_frequency_sketch(&eviction_state.counters).await;
+                }
+
+                // If there are any async tasks waiting in `BaseCache::schedule_write_op`
+                // method for the write op channel to have enough room, notify them.
+                let listeners = self.write_op_ch_ready_event.total_listeners();
+                if listeners > 0 {
+                    let n = listeners.min(WRITE_LOG_CH_SIZE - self.write_op_ch.len());
+                    // Notify the `n` listeners. The `notify` method accepts 0, so no
+                    // need to check if `n` is greater than 0.
+                    self.write_op_ch_ready_event.notify(n);
+                }
+
+                calls += 1;
+            }
+
+            // Set this flag to `false`. The `evict_*` and `invalidate_*` methods
+            // below may set it to `true` if there are more entries to evict in next
+            // loop.
+            eviction_state.more_entries_to_evict = false;
+            let last_eviction_count = eviction_state.counters.eviction_count;
+
+            // Evict entries if there are any expired entries in the hierarchical
+            // timer wheels.
+            if timer_wheel.is_enabled() {
+                self.evict_expired_entries_using_timers(
+                    &mut timer_wheel,
+                    &mut deqs,
+                    &mut eviction_state,
+                )
+                .await;
+            }
+
+            // Evict entries if there are any expired entries in the write order or
+            // access order deques.
+            if self.has_expiry() || self.has_valid_after() {
+                self.evict_expired_entries_using_deqs(
+                    &mut deqs,
+                    &mut timer_wheel,
+                    eviction_batch_size,
+                    &mut eviction_state,
+                )
+                .await;
+            }
+
+            // Evict entries if there are any invalidation predicates set by the
+            // `invalidate_entries_if` method.
+            if let Some(invalidator) = &self.invalidator {
+                if !invalidator.is_empty() {
+                    self.invalidate_entries(
+                        invalidator,
+                        &mut deqs,
+                        &mut timer_wheel,
+                        eviction_batch_size,
+                        &mut eviction_state,
+                    )
+                    .await;
+                }
+            }
+
+            // Evict if this cache has more entries than its capacity.
+            let weights_to_evict = self.weights_to_evict(&eviction_state.counters);
+            if weights_to_evict > 0 {
+                self.evict_lru_entries(
+                    &mut deqs,
+                    &mut timer_wheel,
+                    eviction_batch_size,
+                    weights_to_evict,
+                    &mut eviction_state,
+                )
+                .await;
+            }
+
+            // Check whether to continue this loop or not.
+
+            should_process_logs = calls <= max_log_sync_repeats
+                && (self.read_op_ch.len() >= READ_LOG_FLUSH_POINT
+                    || self.write_op_ch.len() >= WRITE_LOG_FLUSH_POINT);
+
+            let should_evict_more_entries = eviction_state.more_entries_to_evict
+                // Check if there were any entries evicted in this loop.
+                && (eviction_state.counters.eviction_count - last_eviction_count) > 0;
+
+            // Break the loop if there will be nothing to do in next loop.
+            if !should_process_logs && !should_evict_more_entries {
+                break;
+            }
+
+            // Break the loop if the eviction listener is set and timeout has been
+            // reached.
+            if let (Some(to), Some(started)) = (timeout, started_at) {
+                let elapsed = self.current_time().saturating_duration_since(started);
+                if elapsed >= to {
+                    break;
+                }
+            }
+        }
+
+        debug_assert_eq!(self.entry_count.load(), current_ec);
+        debug_assert_eq!(self.weighted_size.load(), current_ws);
+        self.entry_count.store(eviction_state.counters.entry_count);
+        self.weighted_size
+            .store(eviction_state.counters.weighted_size);
+
+        crossbeam_epoch::pin().flush();
+
+        // Ensure this lock is held until here.
+        drop(deqs);
+
+        eviction_state.more_entries_to_evict
+    }
+}
+
+//
+// private methods
+//
+impl<K, V, S> Inner<K, V, S>
+where
+    }
+
+    pub(crate) fn key_locks_map_is_empty(&self) -> bool {
+        self.inner.key_locks_map_is_empty()
+    }
+}
+
+struct EvictionState<'a, K, V> {
+    counters: EvictionCounters,
+    notifier: Option<&'a RemovalNotifier<K, V>>,
+    more_entries_to_evict: bool,
+}
+
+impl<'a, K, V> EvictionState<'a, K, V> {
+    fn new(
+        entry_count: u64,
+        weighted_size: u64,
+        notifier: Option<&'a RemovalNotifier<K, V>>,
+    ) -> Self {
+        Self {
+            counters: EvictionCounters::new(entry_count, weighted_size),
+            notifier,
+            more_entries_to_evict: false,
+        }
+    }
+
+    fn is_notifier_enabled(&self) -> bool {
+        self.notifier.is_some()
+    }
+
+    fn notify_entry_removal(
+        &mut self,
+        key: Arc<K>,
+        entry: &MiniArc<ValueEntry<K, V>>,
+        cause: RemovalCause,
+    ) where
+        K: Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+    {
+        if let Some(notifier) = self.notifier {
+            notifier.notify(key, entry.value.clone(), cause);
+        } else {
+            panic!("notify_entry_removal is called when the notification is disabled");
+        }
+    }
+}
+
+struct EvictionCounters {
+    entry_count: u64,
+    weighted_size: u64,
+    eviction_count: u64,
+}
+
+impl EvictionCounters {
+    #[inline]
+    fn new(entry_count: u64, weighted_size: u64) -> Self {
+        Self {
+            entry_count,
+            weighted_size,
+            eviction_count: 0,
+        }
+    }
+
+    #[inline]
+    fn saturating_add(&mut self, entry_count: u64, weight: u32) {
+        self.entry_count += entry_count;
+        let total = &mut self.weighted_size;
+        *total = total.saturating_add(weight as u64);
+    }
+
+    #[inline]
+    fn saturating_sub(&mut self, entry_count: u64, weight: u32) {
+        self.entry_count -= entry_count;
+        let total = &mut self.weighted_size;
+        *total = total.saturating_sub(weight as u64);
+    }
+
+    #[inline]
+    fn incr_eviction_count(&mut self) {
+        let count = &mut self.eviction_count;
+        *count = count.saturating_add(1);
+    }
+}
+
+#[derive(Default)]
+struct EntrySizeAndFrequency {
+    policy_weight: u64,
+    freq: u32,
+}
+
+impl EntrySizeAndFrequency {
+    fn new(policy_weight: u32) -> Self {
+        Self {
+            policy_weight: policy_weight as u64,
+            ..Default::default()
+        }
+    }
+
+    fn add_policy_weight(&mut self, weight: u32) {
+        self.policy_weight += weight as u64;
+    }
+
+    fn add_frequency(&mut self, freq: &FrequencySketch, hash: u64) {
+        self.freq += freq.frequency(hash) as u32;
+    }
+}
+
+// NOTE: Clippy found that the `Admitted` variant contains at least a few hundred
+// bytes of data and the `Rejected` variant contains no data at all. It suggested to
+// box the `SmallVec`.
+//
+// We ignore the suggestion because (1) the `SmallVec` is used to avoid heap
+// allocation as it will be used in a performance hot spot, and (2) this enum has a
+// very short lifetime and there will only one instance at a time.
+#[allow(clippy::large_enum_variant)]
+enum AdmissionResult<K> {
+    Admitted {
+        /// A vec of pairs of `KeyHash` and `last_accessed`.
+        victim_keys: SmallVec<[(KeyHash<K>, Option<Instant>); 8]>,
+    },
+    Rejected,
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+use futures_util::FutureExt;
+
+use crate::notification::{AsyncEvictionListener, RemovalCause};
+
+pub(crate) struct RemovalNotifier<K, V> {
+    listener: AsyncEvictionListener<K, V>,
+    is_enabled: AtomicBool,
+    #[cfg(feature = "logging")]
+    cache_name: Option<String>,
+}
+
+impl<K, V> RemovalNotifier<K, V> {
+    pub(crate) fn new(listener: AsyncEvictionListener<K, V>, _cache_name: Option<String>) -> Self {
+        Self {
+            listener,
+            is_enabled: AtomicBool::new(true),
+            #[cfg(feature = "logging")]
+            cache_name: _cache_name,
+        }
+    }
+
+    pub(crate) async fn notify(&self, key: Arc<K>, value: V, cause: RemovalCause) {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        if !self.is_enabled.load(Ordering::Acquire) {
+            return;
+        }
+
+        // This macro unwraps the result of the catch_unwind call if it is Ok. And
+        // disable the notifier and do early return if the listener panicked.
+        macro_rules! try_or_disable {
+            ($match_expr:expr) => {
+                match $match_expr {
+                    Ok(v) => v,
+                    Err(_payload) => {
+                        self.is_enabled.store(false, Ordering::Release);
+                        #[cfg(feature = "logging")]
+                        log_panic(&*_payload, self.cache_name.as_deref());
+                        return;
+                    }
+                }
+            };
+        }
+
+        let listener_clo = || (self.listener)(key, value, cause);
+
+        // Safety: It is safe to assert unwind safety here because we will not
+        // call the listener again if it has been panicked.
+        let fut = try_or_disable!(catch_unwind(AssertUnwindSafe(listener_clo)));
+        try_or_disable!(AssertUnwindSafe(fut).catch_unwind().await);
+    }
+}
+
+#[cfg(feature = "logging")]
+fn log_panic(payload: &(dyn std::any::Any + Send + 'static), cache_name: Option<&str>) {
+    // Try to downcast the payload into &str or String.
+    //
+    // NOTE: Clippy will complain if we use `if let Some(_)` here.
+    // https://rust-lang.github.io/rust-clippy/master/index.html#manual_map
+    let message: Option<std::borrow::Cow<'_, str>> =
+        (payload.downcast_ref::<&str>().map(|s| (*s).into()))
+            .or_else(|| payload.downcast_ref::<String>().map(Into::into));
+
+    let cn = cache_name
+        .map(|name| format!("[{name}] "))
+        .unwrap_or_default();
+
+    if let Some(m) = message {
+        log::error!("{cn}Disabled the eviction listener because it panicked at '{m}'");
+    } else {
+        log::error!("{cn}Disabled the eviction listener because it panicked");
+    }
+}
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+use crate::notification::{EvictionListener, RemovalCause};
+
+pub(crate) struct RemovalNotifier<K, V> {
+    listener: EvictionListener<K, V>,
+    is_enabled: AtomicBool,
+    #[cfg(feature = "logging")]
+    cache_name: Option<String>,
+}
+
+impl<K, V> RemovalNotifier<K, V> {
+    pub(crate) fn new(listener: EvictionListener<K, V>, _cache_name: Option<String>) -> Self {
+        Self {
+            listener,
+            is_enabled: AtomicBool::new(true),
+            #[cfg(feature = "logging")]
+            cache_name: _cache_name,
+        }
+    }
+
+    pub(crate) fn notify(&self, key: Arc<K>, value: V, cause: RemovalCause) {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        if !self.is_enabled.load(Ordering::Acquire) {
+            return;
+        }
+
+        let listener_clo = || (self.listener)(key, value, cause);
+
+        // Safety: It is safe to assert unwind safety here because we will not
+        // call the listener again if it has been panicked.
+        let result = catch_unwind(AssertUnwindSafe(listener_clo));
+        if let Err(_payload) = result {
+            self.is_enabled.store(false, Ordering::Release);
+            #[cfg(feature = "logging")]
+            log_panic(&*_payload, self.cache_name.as_deref());
+        }
+    }
+}
+
+#[cfg(feature = "logging")]
+fn log_panic(payload: &(dyn std::any::Any + Send + 'static), cache_name: Option<&str>) {
+    // Try to downcast the payload into &str or String.
+    //
+    // NOTE: Clippy will complain if we use `if let Some(_)` here.
+    // https://rust-lang.github.io/rust-clippy/master/index.html#manual_map
+    let message: Option<std::borrow::Cow<'_, str>> =
+        (payload.downcast_ref::<&str>().map(|s| (*s).into()))
+            .or_else(|| payload.downcast_ref::<String>().map(Into::into));
+
+    let cn = cache_name
+        .map(|name| format!("[{name}] "))
+        .unwrap_or_default();
+
+    if let Some(m) = message {
+        log::error!("{cn}Disabled the eviction listener because it panicked at '{m}'");
+    } else {
+        log::error!("{cn}Disabled the eviction listener because it panicked");
+    }
+}

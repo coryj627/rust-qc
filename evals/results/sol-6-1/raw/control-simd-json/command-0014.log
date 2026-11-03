@@ -1,0 +1,251 @@
+     1	use crate::Deserializer;
+     2	use crate::Result;
+     3	use crate::SillyWrapper;
+     4	use crate::error::ErrorType;
+     5	use crate::impls::neon::stage1::bit_mask;
+     6	use crate::safer_unchecked::GetSaferUnchecked;
+     7	use crate::stringparse::{ESCAPE_MAP, handle_unicode_codepoint};
+     8	
+     9	use std::arch::aarch64::{
+    10	    uint8x16_t, vandq_u8, vceqq_u8, vgetq_lane_u32, vld1q_u8, vmovq_n_u8, vpaddq_u8,
+    11	    vreinterpretq_u32_u8,
+    12	};
+    13	
+    14	#[cfg_attr(not(feature = "no-inline"), inline)]
+    15	fn find_bs_bits_and_quote_bits(v0: uint8x16_t, v1: uint8x16_t) -> (u32, u32) {
+    16	    unsafe {
+    17	        let quote_mask = vmovq_n_u8(b'"');
+    18	        let bs_mask = vmovq_n_u8(b'\\');
+    19	        let bit_mask = bit_mask();
+    20	
+    21	        let cmp_bs_0: uint8x16_t = vceqq_u8(v0, bs_mask);
+    22	        let cmp_bs_1: uint8x16_t = vceqq_u8(v1, bs_mask);
+    23	        let cmp_qt_0: uint8x16_t = vceqq_u8(v0, quote_mask);
+    24	        let cmp_qt_1: uint8x16_t = vceqq_u8(v1, quote_mask);
+    25	
+    26	        let cmp_bs_0 = vandq_u8(cmp_bs_0, bit_mask);
+    27	        let cmp_bs_1 = vandq_u8(cmp_bs_1, bit_mask);
+    28	        let cmp_qt_0 = vandq_u8(cmp_qt_0, bit_mask);
+    29	        let cmp_qt_1 = vandq_u8(cmp_qt_1, bit_mask);
+    30	
+    31	        let sum0: uint8x16_t = vpaddq_u8(cmp_bs_0, cmp_bs_1);
+    32	        let sum1: uint8x16_t = vpaddq_u8(cmp_qt_0, cmp_qt_1);
+    33	        let sum0 = vpaddq_u8(sum0, sum1);
+    34	        let sum0 = vpaddq_u8(sum0, sum0);
+    35	
+    36	        (
+    37	            vgetq_lane_u32(vreinterpretq_u32_u8(sum0), 0),
+    38	            vgetq_lane_u32(vreinterpretq_u32_u8(sum0), 1),
+    39	        )
+    40	    }
+    41	}
+    42	
+    43	#[allow(clippy::if_not_else, clippy::too_many_lines)]
+    44	#[cfg_attr(not(feature = "no-inline"), inline)]
+    45	pub(crate) fn parse_str<'invoke, 'de>(
+    46	    input: SillyWrapper<'de>,
+    47	    data: &'invoke [u8],
+    48	    buffer: &'invoke mut [u8],
+    49	    mut idx: usize,
+    50	) -> Result<&'de str> {
+    51	    use ErrorType::{InvalidEscape, InvalidUnicodeCodepoint};
+    52	    let input = input.input;
+    53	
+    54	    // Add 1 to skip the initial "
+    55	    idx += 1;
+    56	    //let mut read: usize = 0;
+    57	
+    58	    // we include the terminal '"' so we know where to end
+    59	    // This is safe since we check sub's length in the range access above and only
+    60	    // create sub sliced form sub to `sub.len()`.
+    61	
+    62	    let src: &[u8] = unsafe { data.get_kinda_unchecked(idx..) };
+    63	    let mut src_i: usize = 0;
+    64	    let mut len = src_i;
+    65	    loop {
+    66	        let (v0, v1) = unsafe {
+    67	            (
+    68	                vld1q_u8(src.get_kinda_unchecked(src_i..src_i + 16).as_ptr()),
+    69	                vld1q_u8(src.get_kinda_unchecked(src_i + 16..src_i + 32).as_ptr()),
+    70	            )
+    71	        };
+    72	
+    73	        let (bs_bits, quote_bits) = find_bs_bits_and_quote_bits(v0, v1);
+    74	
+    75	        if (bs_bits.wrapping_sub(1) & quote_bits) != 0 {
+    76	            // we encountered quotes first. Move dst to point to quotes and exit
+    77	            // find out where the quote is...
+    78	            let quote_dist: u32 = quote_bits.trailing_zeros();
+    79	
+    80	            ///////////////////////
+    81	            // Above, check for overflow in case someone has a crazy string (>=4GB?)
+    82	            // But only add the overflow check when the document itself exceeds 4GB
+    83	            // Currently unneeded because we refuse to parse docs larger or equal to 4GB.
+    84	            ////////////////////////
+    85	
+    86	            // we advance the point, accounting for the fact that we have a NULl termination
+    87	
+    88	            len += quote_dist as usize;
+    89	            unsafe {
+    90	                let v =
+    91	                    std::str::from_utf8_unchecked(std::slice::from_raw_parts(input.add(idx), len));
+    92	                return Ok(v);
+    93	            }
+    94	
+    95	            // we compare the pointers since we care if they are 'at the same spot'
+    96	            // not if they are the same value
+    97	        }
+    98	        if (quote_bits.wrapping_sub(1) & bs_bits) == 0 {
+    99	            // they are the same. Since they can't co-occur, it means we encountered
+   100	            // neither.
+   101	            src_i += 32;
+   102	            len += 32;
+   103	        } else {
+   104	            // Move to the 'bad' character
+   105	            let bs_dist: u32 = bs_bits.trailing_zeros();
+   106	            len += bs_dist as usize;
+   107	            src_i += bs_dist as usize;
+   108	            break;
+   109	        }
+   110	    }
+   111	
+   112	    let mut dst_i: usize = 0;
+   113	
+   114	    // To be more conform with upstream
+   115	    loop {
+   116	        let (v0, v1) = unsafe {
+   117	            (
+   118	                vld1q_u8(src.get_kinda_unchecked(src_i..src_i + 16).as_ptr()),
+   119	                vld1q_u8(src.get_kinda_unchecked(src_i + 16..src_i + 32).as_ptr()),
+   120	            )
+   121	        };
+   122	
+   123	        unsafe {
+   124	            buffer
+   125	                .get_kinda_unchecked_mut(dst_i..dst_i + 32)
+   126	                .copy_from_slice(src.get_kinda_unchecked(src_i..src_i + 32));
+   127	        }
+   128	
+   129	        // store to dest unconditionally - we can overwrite the bits we don't like
+   130	        // later
+   131	        let (bs_bits, quote_bits) = find_bs_bits_and_quote_bits(v0, v1);
+   132	
+   133	        if (bs_bits.wrapping_sub(1) & quote_bits) != 0 {
+   134	            // we encountered quotes first. Move dst to point to quotes and exit
+   135	            // find out where the quote is...
+   136	            let quote_dist: u32 = quote_bits.trailing_zeros();
+   137	
+   138	            ///////////////////////
+   139	            // Above, check for overflow in case someone has a crazy string (>=4GB?)
+   140	            // But only add the overflow check when the document itself exceeds 4GB
+   141	            // Currently unneeded because we refuse to parse docs larger or equal to 4GB.
+   142	            ////////////////////////
+   143	
+   144	            // we advance the point, accounting for the fact that we have a NULl termination
+   145	
+   146	            dst_i += quote_dist as usize;
+   147	            unsafe {
+   148	                input
+   149	                    .add(idx + len)
+   150	                    .copy_from_nonoverlapping(buffer.as_ptr(), dst_i);
+   151	                let v = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+   152	                    input.add(idx),
+   153	                    len + dst_i,
+   154	                ));
+   155	                return Ok(v);
+   156	            }
+   157	
+   158	            // we compare the pointers since we care if they are 'at the same spot'
+   159	            // not if they are the same value
+   160	        }
+   161	        if (quote_bits.wrapping_sub(1) & bs_bits) != 0 {
+   162	            // find out where the backspace is
+   163	            let bs_dist: u32 = bs_bits.trailing_zeros();
+   164	            let escape_char: u8 = unsafe { *src.get_kinda_unchecked(src_i + bs_dist as usize + 1) };
+   165	            // we encountered backslash first. Handle backslash
+   166	            if escape_char == b'u' {
+   167	                // move src/dst up to the start; they will be further adjusted
+   168	                // within the unicode codepoint handling code.
+   169	                src_i += bs_dist as usize;
+   170	                dst_i += bs_dist as usize;
+   171	                let Ok((o, s)) =
+   172	                    handle_unicode_codepoint(unsafe { src.get_kinda_unchecked(src_i..) }, unsafe {
+   173	                        buffer.get_kinda_unchecked_mut(dst_i..)
+   174	                    })
+   175	                else {
+   176	                    return Err(Deserializer::error_c(src_i, 'u', InvalidUnicodeCodepoint));
+   177	                };
+   178	                if o == 0 {
+   179	                    return Err(Deserializer::error_c(src_i, 'u', InvalidUnicodeCodepoint));
+   180	                }
+   255	        whitespace: u64,
+   256	        quote_mask: u64,
+   257	        quote_bits: u64,
+   258	        prev_iter_ends_pseudo_pred: &mut u64,
+   259	    ) -> u64 {
+   260	        // mask off anything inside quotes
+   261	        structurals &= !quote_mask;
+   262	        // add the real quote bits back into our bitmask as well, so we can
+   263	        // quickly traverse the strings we've spent all this trouble gathering
+   264	        structurals |= quote_bits;
+   265	        // Now, establish "pseudo-structural characters". These are non-whitespace
+   266	        // characters that are (a) outside quotes and (b) have a predecessor that's
+   267	        // either whitespace or a structural character. This means that subsequent
+   268	        // passes will get a chance to encounter the first character of every string
+   269	        // of non-whitespace and, if we're parsing an atom like true/false/null or a
+   270	        // number we can stop at the first whitespace or structural character
+   271	        // following it.
+   272	
+   273	        // a qualified predecessor is something that can happen 1 position before an
+   274	        // pseudo-structural character
+   275	        let pseudo_pred: u64 = structurals | whitespace;
+   276	
+   277	        let shifted_pseudo_pred: u64 = (pseudo_pred << 1) | *prev_iter_ends_pseudo_pred;
+   278	        *prev_iter_ends_pseudo_pred = pseudo_pred >> 63;
+   279	        let pseudo_structurals: u64 = shifted_pseudo_pred & (!whitespace) & (!quote_mask);
+   280	        structurals |= pseudo_structurals;
+   281	
+   282	        // now, we've used our close quotes all we need to. So let's switch them off
+   283	        // they will be off in the quote mask and on in quote bits.
+   284	        structurals &= !(quote_bits & !quote_mask);
+   285	        structurals
+   286	    }
+   287	
+   288	    unsafe fn fill_s8(n: i8) -> Self::SimdRepresentation;
+   289	}
+   290	
+   291	/// Deserializer struct to deserialize a JSON
+   292	#[derive(Debug)]
+   293	pub struct Deserializer<'de> {
+   294	    // Note: we use the 2nd part as both index and length since only one is ever
+   295	    // used (array / object use len) everything else uses idx
+   296	    pub(crate) tape: Vec<Node<'de>>,
+   297	    idx: usize,
+   298	}
+   299	
+   300	// architecture dependant parse_str
+   301	
+   302	#[derive(Debug, Clone, Copy)]
+   303	pub(crate) struct SillyWrapper<'de> {
+   304	    input: *mut u8,
+   305	    _marker: std::marker::PhantomData<&'de ()>,
+   306	}
+   307	
+   308	impl From<*mut u8> for SillyWrapper<'_> {
+   309	    #[cfg_attr(not(feature = "no-inline"), inline)]
+   310	    fn from(input: *mut u8) -> Self {
+   311	        Self {
+   312	            input,
+   313	            _marker: std::marker::PhantomData,
+   314	        }
+   315	    }
+   316	}
+   317	
+   318	#[cfg(all(
+   319	    feature = "runtime-detection",
+   320	    any(target_arch = "x86_64", target_arch = "x86"),
+   321	))] // The runtime detection code is inspired from simdutf8's implementation
+   322	type FnRaw = *mut ();
+   323	#[cfg(all(
+   324	    feature = "runtime-detection",
+   325	    any(target_arch = "x86_64", target_arch = "x86"),

@@ -1,0 +1,192 @@
+//! Half-open spans measured in bytes.
+//!
+//! [`ByteSpan`] represents `[start, end)`, with `start <= end`. A span is
+//! independent of any particular string; [`ByteSpan::slice`] checks its bounds
+//! and UTF-8 boundaries against the supplied string.
+//!
+//! ```
+//! use byte_span::{ByteSpan, SpanError};
+//!
+//! let text = "aé🦀";
+//! let span = ByteSpan::new(1, 3)?;
+//! assert_eq!(span.len(), 2); // bytes, not characters
+//! assert_eq!(span.slice(text)?, "é");
+//! assert!(span.contains(1));
+//! assert!(!span.contains(3));
+//!
+//! let other = ByteSpan::new(2, 7)?;
+//! assert_eq!(span.intersection(&other), Some(ByteSpan::new(2, 3)?));
+//! // A byte intersection need not lie on UTF-8 boundaries.
+//! assert!(matches!(other.slice(text),
+//!     Err(SpanError::InvalidCharBoundary { offset: 2 })));
+//! # Ok::<(), SpanError>(())
+//! ```
+
+use std::fmt;
+
+/// A half-open byte interval `[start, end)` with `start <= end`.
+///
+/// Empty spans are valid. Endpoints may be any `usize` values satisfying the
+/// invariant, even if they do not refer to a particular string. The private
+/// fields ensure that construction always validates their order.
+///
+/// ```compile_fail
+/// use byte_span::ByteSpan;
+/// let reversed = ByteSpan { start: 10, end: 1 }; // endpoints are private
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ByteSpan {
+    start: usize,
+    end: usize,
+}
+
+/// A failure to construct a byte span or slice a UTF-8 string.
+///
+/// Variants and their fields let callers inspect failures without parsing text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpanError {
+    /// Construction received `start > end`.
+    Reversed {
+        /// Requested starting byte offset.
+        start: usize,
+        /// Requested exclusive ending byte offset.
+        end: usize,
+    },
+    /// Slicing received an end beyond the string's byte length.
+    ///
+    /// This error takes precedence over invalid UTF-8 boundaries.
+    OutOfBounds {
+        /// Requested starting byte offset.
+        start: usize,
+        /// Requested exclusive ending byte offset.
+        end: usize,
+        /// Length of the input string in bytes.
+        text_len: usize,
+    },
+    /// An in-bounds endpoint falls inside a UTF-8 code point.
+    InvalidCharBoundary {
+        /// Invalid byte offset; the start is reported first if both are invalid.
+        offset: usize,
+    },
+}
+
+impl ByteSpan {
+    /// Creates a span with the given byte offsets.
+    ///
+    /// Equal endpoints create an empty span. No string bounds or UTF-8
+    /// boundaries are checked until [`Self::slice`] is called.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpanError::Reversed`] when `start > end`.
+    pub fn new(start: usize, end: usize) -> Result<Self, SpanError> {
+        if start > end {
+            Err(SpanError::Reversed { start, end })
+        } else {
+            Ok(Self { start, end })
+        }
+    }
+
+    /// Returns the inclusive starting byte offset.
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
+    /// Returns the exclusive ending byte offset.
+    pub fn end(&self) -> usize {
+        self.end
+    }
+
+    /// Returns the length in bytes, which may be zero.
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// Returns whether the span has zero length.
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+
+    /// Returns whether `offset` lies in `[start, end)`.
+    ///
+    /// Empty spans contain no offsets.
+    pub fn contains(&self, offset: usize) -> bool {
+        self.start <= offset && offset < self.end
+    }
+
+    /// Returns the overlapping byte interval only if it has positive length.
+    ///
+    /// Touching spans and intersections involving empty spans return `None`.
+    /// This operation does not check UTF-8 boundaries.
+    pub fn intersection(&self, other: &Self) -> Option<Self> {
+        let start = self.start.max(other.start);
+        let end = self.end.min(other.end);
+        if start < end {
+            Some(Self { start, end })
+        } else {
+            None
+        }
+    }
+
+    /// Borrows the substring at these byte offsets from `text`.
+    ///
+    /// An empty span at a valid UTF-8 boundary, including `text.len()`, returns
+    /// an empty string. Empty spans inside a code point are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpanError::OutOfBounds`] if the end exceeds `text.len()`,
+    /// before checking either UTF-8 boundary. Otherwise returns
+    /// [`SpanError::InvalidCharBoundary`] for an invalid endpoint, checking the
+    /// start before the end.
+    ///
+    /// ```
+    /// use byte_span::{ByteSpan, SpanError};
+    /// assert_eq!(ByteSpan::new(2, 2)?.slice("é")?, "");
+    /// assert_eq!(ByteSpan::new(1, 2)?.slice("é"),
+    ///     Err(SpanError::InvalidCharBoundary { offset: 1 }));
+    /// assert_eq!(ByteSpan::new(1, 3)?.slice("é"),
+    ///     Err(SpanError::OutOfBounds { start: 1, end: 3, text_len: 2 }));
+    /// # Ok::<(), SpanError>(())
+    /// ```
+    pub fn slice<'a>(&self, text: &'a str) -> Result<&'a str, SpanError> {
+        if self.end > text.len() {
+            return Err(SpanError::OutOfBounds {
+                start: self.start,
+                end: self.end,
+                text_len: text.len(),
+            });
+        }
+        text.get(self.start..self.end)
+            .ok_or_else(|| SpanError::InvalidCharBoundary {
+                offset: if !text.is_char_boundary(self.start) {
+                    self.start
+                } else {
+                    self.end
+                },
+            })
+    }
+}
+
+impl fmt::Display for SpanError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Reversed { start, end } => {
+                write!(f, "byte span start {start} exceeds end {end}")
+            }
+            Self::OutOfBounds {
+                start,
+                end,
+                text_len,
+            } => write!(
+                f,
+                "byte span [{start}, {end}) exceeds string byte length {text_len}"
+            ),
+            Self::InvalidCharBoundary { offset } => {
+                write!(f, "byte offset {offset} is not a UTF-8 character boundary")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SpanError {}

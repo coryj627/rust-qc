@@ -1,0 +1,265 @@
+    // https://github.com/moka-rs/moka/issues/345
+    #[test]
+    fn test_race_between_updating_entry_and_processing_its_write_ops() {
+        let (clock, mock) = Clock::mock();
+        let cache = Cache::builder()
+            .max_capacity(2)
+            .time_to_idle(Duration::from_secs(1))
+            .clock(clock)
+            .build();
+
+        cache.insert("a", "alice");
+        cache.insert("b", "bob");
+        cache.insert("c", "cathy"); // c1
+        mock.increment(Duration::from_secs(2));
+
+        // The following `insert` will do the followings:
+        // 1. Replaces current "c" (c1) in the concurrent hash table (cht).
+        // 2. Runs the pending tasks implicitly.
+        //    (1) "a" will be admitted.
+        //    (2) "b" will be admitted.
+        //    (3) c1 will be evicted by size constraint.
+        //    (4) "a" will be evicted due to expiration.
+        //    (5) "b" will be evicted due to expiration.
+        // 3. Send its `WriteOp` log to the channel.
+        cache.insert("c", "cindy"); // c2
+
+        // Remove "c" (c2) from the cht.
+        assert_eq!(cache.remove(&"c"), Some("cindy")); // c-remove
+
+        mock.increment(Duration::from_secs(2));
+
+        // The following `run_pending_tasks` will do the followings:
+        // 1. Admits "c" (c2) to the cache. (Create a node in the LRU deque)
+        // 2. Because of c-remove, removes c2's node from the LRU deque.
+        cache.run_pending_tasks();
+        assert_eq!(cache.entry_count(), 0);
+    }
+
+    #[test]
+    fn test_race_between_recreating_entry_and_processing_its_write_ops() {
+        let cache = Cache::builder().max_capacity(2).build();
+
+        cache.insert('a', "a");
+        cache.insert('b', "b");
+        cache.run_pending_tasks();
+
+        cache.insert('c', "c1"); // (a) `EntryInfo` 1, gen: 1
+        assert!(cache.remove(&'a').is_some()); // (b)
+        assert!(cache.remove(&'b').is_some()); // (c)
+        assert!(cache.remove(&'c').is_some()); // (d) `EntryInfo` 1, gen: 2
+        cache.insert('c', "c2"); // (e) `EntryInfo` 2, gen: 1
+
+        // Now the `write_op_ch` channel contains the following `WriteOp`s:
+        //
+        // - 0: (a) insert "c1" (`EntryInfo` 1, gen: 1)
+        // - 1: (b) remove "a"
+        // - 2: (c) remove "b"
+        // - 3: (d) remove "c1" (`EntryInfo` 1, gen: 2)
+        // - 4: (e) insert "c2" (`EntryInfo` 2, gen: 1)
+        //
+        // 0 for "c1" is going to be rejected because the cache is full. Let's ensure
+        // processing 0 must not remove "c2" from the concurrent hash table. (Their
+        // gen are the same, but `EntryInfo`s are different)
+        cache.run_pending_tasks();
+        assert_eq!(cache.get(&'c'), Some("c2"));
+    }
+
+    #[test]
+    fn test_iter() {
+        const NUM_KEYS: usize = 50;
+
+        fn make_value(key: usize) -> String {
+            format!("val: {key}")
+        }
+
+        let cache = Cache::builder()
+            .max_capacity(100)
+            .time_to_idle(Duration::from_secs(10))
+            .build();
+
+        for key in 0..NUM_KEYS {
+            cache.insert(key, make_value(key));
+        }
+
+        let mut key_set = std::collections::HashSet::new();
+
+        for (key, value) in &cache {
+            assert_eq!(value, make_value(*key));
+
+            key_set.insert(*key);
+        }
+
+        // Ensure there are no missing or duplicate keys in the iteration.
+        assert_eq!(key_set.len(), NUM_KEYS);
+    }
+
+    /// Runs 16 threads at the same time and ensures no deadlock occurs.
+    ///
+    /// - Eight of the threads will update key-values in the cache.
+    /// - Eight others will iterate the cache.
+    ///
+    #[test]
+    fn test_iter_multi_threads() {
+        use std::collections::HashSet;
+
+        const NUM_KEYS: usize = 1024;
+        const NUM_THREADS: usize = 16;
+
+        fn make_value(key: usize) -> String {
+            format!("val: {key}")
+        }
+
+        let cache = Cache::builder()
+            .max_capacity(2048)
+            .time_to_idle(Duration::from_secs(10))
+            .build();
+
+        // Initialize the cache.
+        for key in 0..NUM_KEYS {
+            cache.insert(key, make_value(key));
+        }
+
+        let rw_lock = Arc::new(std::sync::RwLock::<()>::default());
+        let write_lock = rw_lock.write().unwrap();
+
+        // https://rust-lang.github.io/rust-clippy/master/index.html#needless_collect
+        #[allow(clippy::needless_collect)]
+        let handles = (0..NUM_THREADS)
+            .map(|n| {
+                let cache = cache.clone();
+                let rw_lock = Arc::clone(&rw_lock);
+
+                if n % 2 == 0 {
+                    // This thread will update the cache.
+                    std::thread::spawn(move || {
+                        let read_lock = rw_lock.read().unwrap();
+                        for key in 0..NUM_KEYS {
+                            // TODO: Update keys in a random order?
+                            cache.insert(key, make_value(key));
+                        }
+                        std::mem::drop(read_lock);
+                    })
+                } else {
+                    // This thread will iterate the cache.
+                    std::thread::spawn(move || {
+                        let read_lock = rw_lock.read().unwrap();
+                        let mut key_set = HashSet::new();
+                        for (key, value) in &cache {
+                            assert_eq!(value, make_value(*key));
+                            key_set.insert(*key);
+                        }
+                        // Ensure there are no missing or duplicate keys in the iteration.
+                        assert_eq!(key_set.len(), NUM_KEYS);
+                        std::mem::drop(read_lock);
+                    })
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // Let these threads to run by releasing the write lock.
+        std::mem::drop(write_lock);
+    fn handle_remove(
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        entry: MiniArc<ValueEntry<K, V>>,
+        gen: Option<u16>,
+        counters: &mut EvictionCounters,
+    ) {
+        if let Some(timer_node) = entry.take_timer_node() {
+            timer_wheel.deschedule(timer_node);
+        }
+        Self::handle_remove_without_timer_wheel(deqs, entry, gen, counters);
+    }
+
+    fn handle_remove_without_timer_wheel(
+        deqs: &mut Deques<K>,
+        entry: MiniArc<ValueEntry<K, V>>,
+        gen: Option<u16>,
+        counters: &mut EvictionCounters,
+    ) {
+        if entry.is_admitted() {
+            entry.set_admitted(false);
+            counters.saturating_sub(1, entry.policy_weight());
+            // The following two unlink_* functions will unset the deq nodes.
+            deqs.unlink_ao(&entry);
+            Deques::unlink_wo(&mut deqs.write_order, &entry);
+        } else {
+            entry.unset_q_nodes();
+        }
+        if let Some(g) = gen {
+            entry.entry_info().set_policy_gen(g);
+        }
+    }
+
+    fn handle_remove_with_deques(
+        ao_deq_name: &str,
+        ao_deq: &mut Deque<KeyHashDate<K>>,
+        wo_deq: &mut Deque<KeyHashDate<K>>,
+        timer_wheel: &mut TimerWheel<K>,
+        entry: MiniArc<ValueEntry<K, V>>,
+        counters: &mut EvictionCounters,
+    ) {
+        if let Some(timer) = entry.take_timer_node() {
+            timer_wheel.deschedule(timer);
+        }
+        if entry.is_admitted() {
+            entry.set_admitted(false);
+            counters.saturating_sub(1, entry.policy_weight());
+            // The following two unlink_* functions will unset the deq nodes.
+            Deques::unlink_ao_from_deque(ao_deq_name, ao_deq, &entry);
+            Deques::unlink_wo(wo_deq, &entry);
+        } else {
+            entry.unset_q_nodes();
+        }
+    }
+
+    fn evict_expired_entries_using_timers(
+        &self,
+///
+/// - This entry is expired by the time-to-idle config of this cache instance.
+/// - Or, it is invalidated by the `invalidate_all` method.
+#[inline]
+fn is_expired_entry_ao(
+    time_to_idle: &Option<Duration>,
+    valid_after: &Option<Instant>,
+    entry: &impl AccessTime,
+    now: Instant,
+) -> bool {
+    if let Some(ts) = entry.last_accessed() {
+        is_invalid_entry(valid_after, ts) || is_expired_by_tti(time_to_idle, ts, now)
+    } else {
+        false
+    }
+}
+
+/// Returns `true` when one of the following conditions is met:
+///
+/// - This entry is expired by the time-to-live (TTL) config of this cache instance.
+/// - Or, it is invalidated by the `invalidate_all` method.
+#[inline]
+fn is_expired_entry_wo(
+    time_to_live: &Option<Duration>,
+    valid_after: &Option<Instant>,
+    entry: &impl AccessTime,
+    now: Instant,
+) -> bool {
+    if let Some(ts) = entry.last_modified() {
+        is_invalid_entry(valid_after, ts) || is_expired_by_ttl(time_to_live, ts, now)
+    } else {
+        false
+    }
+}
+
+#[inline]
+fn is_entry_expired_ao_or_invalid(
+    time_to_idle: &Option<Duration>,
+    valid_after: &Option<Instant>,
+    entry_last_accessed: Instant,
+    now: Instant,
+) -> (bool, bool) {
+    let ts = entry_last_accessed;
+    let expired = is_expired_by_tti(time_to_idle, ts, now);
+    let invalid = is_invalid_entry(valid_after, ts);
+    (expired, invalid)
+12.0525 minutes used of 45.0

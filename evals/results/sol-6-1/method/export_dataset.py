@@ -159,7 +159,9 @@ def scan(output):
         "personal_name": re.compile(r"\bcoryj?\b", re.IGNORECASE),
     }
     hits = []
-    for folder in [output / name for name in ("raw", "reports", "artifacts", "controls", "stage5")]:
+    for folder in [output / name for name in (
+        "raw", "reports", "artifacts", "controls", "stage5", "grading", "schedules",
+    )]:
         for path in folder.rglob("*"):
             if path.is_file():
                 text = path.read_bytes().decode("utf-8", errors="replace")

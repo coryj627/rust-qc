@@ -1,0 +1,153 @@
+use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::term::test::TermSize;
+use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::vte::ansi;
+
+fn advance(term: &mut Term<VoidListener>, bytes: &[u8]) {
+    let mut processor: ansi::Processor = ansi::Processor::new();
+    for &byte in bytes {
+        processor.advance(term, byte);
+    }
+}
+
+#[test]
+fn origin_mode_homes_cursor() {
+    for initial_origin in [false, true] {
+        for origin in [false, true] {
+            for position in
+                [b"\x1b[1;4H".as_slice(), b"\x1b[4;4H".as_slice(), b"\x1b[7;10HX".as_slice()]
+            {
+                let size = TermSize::new(10, 8);
+                let mut term = Term::new(Config::default(), &size, VoidListener);
+                advance(&mut term, b"\x1b[3;6r\x1b[?1h\x1b[?2004h");
+                if initial_origin {
+                    advance(&mut term, b"\x1b[?6h");
+                }
+                advance(&mut term, position);
+
+                // Cover positions above, inside, and below the margins, including pending wrap.
+                let home = Point::new(Line(if origin { 2 } else { 0 }), Column(0));
+                let mut expected_grid = term.grid().clone();
+                expected_grid[home].c = 'A';
+                let mut expected_mode = *term.mode();
+                expected_mode.set(TermMode::ORIGIN, origin);
+
+                advance(&mut term, if origin { b"\x1b[?6h" } else { b"\x1b[?6l" });
+                assert_eq!(term.grid().cursor.point, home);
+                assert!(!term.grid().cursor.input_needs_wrap);
+                assert_eq!(*term.mode(), expected_mode);
+
+                advance(&mut term, b"A");
+                assert_eq!(term.grid().cursor.point, Point::new(home.line, Column(1)));
+                assert_eq!(*term.grid(), expected_grid);
+
+                // DECOM must retain both scrolling margins.
+                advance(&mut term, b"\x1b[?6h\x1b[99;1H");
+                assert_eq!(term.grid().cursor.point, Point::new(Line(5), Column(0)));
+                advance(&mut term, b"\x1b[H");
+                assert_eq!(term.grid().cursor.point, Point::new(Line(2), Column(0)));
+            }
+        }
+    }
+}
+
+#[test]
+fn save_restore_cursor_origin_mode() {
+    for origin in [false, true] {
+        for pending_wrap in [false, true] {
+            let size = TermSize::new(10, 8);
+            let mut term = Term::new(Config::default(), &size, VoidListener);
+            advance(&mut term, b"\x1b[3;6r");
+            if origin {
+                advance(&mut term, b"\x1b[?6h");
+            }
+
+            // Save rendition, character set, and wrap state together with origin mode.
+            advance(&mut term, b"\x1b[1;31m\x1b(0");
+            advance(&mut term, if pending_wrap { b"\x1b[2;10Hq" } else { b"\x1b[2;5H" });
+            let saved_cursor = term.grid().cursor.clone();
+            advance(&mut term, b"\x1b7");
+
+            advance(&mut term, if origin { b"\x1b[?6l" } else { b"\x1b[?6h" });
+            advance(&mut term, b"\x1b[4;2H\x1b[0m\x1b(B\x1b[?1h");
+            let mut expected_mode = *term.mode();
+            expected_mode.set(TermMode::ORIGIN, origin);
+            advance(&mut term, b"\x1b8");
+
+            assert_eq!(*term.mode(), expected_mode);
+            assert_eq!(term.grid().cursor, saved_cursor);
+            assert_eq!(
+                term.grid().cursor.point,
+                Point::new(
+                    Line(if origin { 3 } else { 1 }),
+                    Column(if pending_wrap { 9 } else { 4 })
+                ),
+            );
+
+            // Printing after restore uses the saved wrap, character set, and rendition.
+            advance(&mut term, b"a");
+            let printed = if pending_wrap {
+                Point::new(saved_cursor.point.line + 1, Column(0))
+            } else {
+                saved_cursor.point
+            };
+            let cell = &term.grid()[printed];
+            assert_eq!(cell.c, '▒');
+            assert_eq!(cell.fg, saved_cursor.template.fg);
+            assert_eq!(cell.flags, saved_cursor.template.flags);
+
+            // Further addressing uses the restored origin, without changing the margins.
+            advance(&mut term, b"\x1b[1;2Hq");
+            let addressed = Point::new(Line(if origin { 2 } else { 0 }), Column(1));
+            assert_eq!(term.grid()[addressed].c, '─');
+            advance(&mut term, b"\x1b[99;1H");
+            assert_eq!(
+                term.grid().cursor.point,
+                Point::new(Line(if origin { 5 } else { 7 }), Column(0)),
+            );
+        }
+    }
+}
+
+#[test]
+fn saved_origin_mode_per_screen() {
+    let size = TermSize::new(10, 8);
+    let mut term = Term::new(Config::default(), &size, VoidListener);
+    advance(&mut term, b"\x1b[3;6r\x1b[?6h\x1b[2;4H\x1b[?1049h");
+
+    // The alternate screen has its own saved cursor with origin mode disabled.
+    advance(&mut term, b"\x1b[?6l\x1b[2;5H\x1b7\x1b[?6h\x1b8");
+    assert!(!term.mode().contains(TermMode::ORIGIN));
+    assert_eq!(term.grid().cursor.point, Point::new(Line(1), Column(4)));
+
+    // Entering the alternate screen saved the primary cursor with origin mode enabled.
+    advance(&mut term, b"\x1b[?1049l\x1b8");
+    assert!(term.mode().contains(TermMode::ORIGIN));
+    assert_eq!(term.grid().cursor.point, Point::new(Line(3), Column(3)));
+
+    advance(&mut term, b"\x1b[?1049h\x1b8");
+    assert!(!term.mode().contains(TermMode::ORIGIN));
+    assert_eq!(term.grid().cursor.point, Point::new(Line(1), Column(4)));
+}
+
+#[test]
+fn reset_clears_saved_origin_mode() {
+    for alternate_screen in [false, true] {
+        let size = TermSize::new(10, 8);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        advance(&mut term, b"\x1b[3;6r\x1b[?6h\x1b7\x1b[?1049h\x1b7");
+        if !alternate_screen {
+            advance(&mut term, b"\x1b[?1049l");
+        }
+
+        // RIS resets the saved state for both screen buffers.
+        advance(&mut term, b"\x1bc\x1b[3;6r\x1b[?6h\x1b8");
+        assert!(!term.mode().contains(TermMode::ORIGIN));
+        assert_eq!(term.grid().cursor.point, Point::new(Line(0), Column(0)));
+
+        advance(&mut term, b"\x1b[?1049h\x1b[?6h\x1b8");
+        assert!(!term.mode().contains(TermMode::ORIGIN));
+        assert_eq!(term.grid().cursor.point, Point::new(Line(0), Column(0)));
+    }
+}
