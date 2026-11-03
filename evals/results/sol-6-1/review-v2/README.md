@@ -61,3 +61,11 @@ cell is excluded from the paired effect. Completed reports can still be graded
 with explicit gaps if the remaining queue completes cleanly. Eligibility, task
 wording, full budgets, model and effort are unchanged by this infrastructure
 departure.
+
+The two active reviews and the next originally scheduled review subsequently
+completed normally. All thirteen completed reports passed provenance and host
+execution checks; all fourteen finished workspaces passed the post-run sole-skill
+and archived-skill byte checks. The [recovery record](capacity-recovery-outcome.json)
+also confirms the original schedule and all 52 prompt hashes were preserved.
+Three workers then resumed the remaining 38 original tasks. The capacity failure
+remains missing, with no replacement; grading has not started.
