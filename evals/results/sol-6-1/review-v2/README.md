@@ -43,3 +43,21 @@ ShellCheck check. Rust candidate code
 was not built or run on the host during those Python tests.
 
 Status: completed in 15.867 measured active minutes with no provider error, 47 sandbox commands, no transcript/provenance flags and no detected host execution. The agent reported 19 candidate findings; those claims have not been independently graded or verified. This is not a bug-count or skill-effect result. See the [report](reports/v2-pilot-pulldown-cmark.md), [checks](pilot-checks.json) and [scrubbed evidence](raw/v2-pilot-pulldown-cmark/).
+
+## Comparison progress
+
+At 20:12 UTC on 2026-11-03, ten primary reviews had completed, two were still
+running, one had failed with `serverOverloaded`, and 39 had not started. No v2
+`cyberPolicy` error or usage/disk stop had been recorded. These are execution
+counts, not verified findings or an effect estimate.
+
+The dispatcher stopped new work after the capacity error. Its missing final
+report remains a gap. The prospective [recovery and missingness
+rule](capacity-deviation-plan.json) preserves the original queued tasks and
+requires clean completion of active reviews before continuing with one
+previously unattempted task. A second capacity failure stops for an availability
+decision. There is no replacement run; the incomplete detailed pulldown-cmark
+cell is excluded from the paired effect. Completed reports can still be graded
+with explicit gaps if the remaining queue completes cleanly. Eligibility, task
+wording, full budgets, model and effort are unchanged by this infrastructure
+departure.
