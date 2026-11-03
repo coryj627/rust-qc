@@ -1,7 +1,8 @@
 # Sol evaluation protocol and execution log
 
-This directory records work on issue #23. Evaluation is in progress. No skill
-effect or recommendation can be inferred from the repository checks or preflight.
+This directory records work on issue #23. Evaluation and grading are complete,
+with the audit coverage gaps stated in the results README. Repository checks and
+preflight alone do not establish a skill effect.
 
 ## Frozen inputs
 
@@ -48,6 +49,8 @@ in that preflight. A subsequent preflight also wrote and read a container canary
 native `apply_patch` failed with `No usable execution environment is available`.
 The turn uses `externalSandbox` with restricted network to describe the actual
 container permissions without incorrectly implying that `/work` is read-only.
+The allowlisted check output and final preflight report are in
+`../preflight/result.json`; account events, reasoning and transport IDs are excluded.
 
 For discovery tasks the harness enumerates the sole extracted skill's exact
 frontmatter description and workspace path in developer context. The task prompt
@@ -137,7 +140,7 @@ Later dispatchers use atomic per-run claims so an additional worker can safely
 take queued work when a slot becomes available. They never reuse an existing
 run directory. A shared resource-stop marker halts new dispatch and interrupts
 new-version runners if a usage/disk limit is observed. No such limit has been
-observed so far. Exit-137 command records are possible timeout **or** memory
+observed. Exit-137 command records are possible timeout **or** memory
 kills; the original sandbox does not distinguish these causes. Do not interpret
 the legacy `command_timeouts` field as proof of a timeout.
 
@@ -150,7 +153,7 @@ all exit paths, and are tested with a 360 KiB escaped result. The failed author
 is excluded and replaced by a fresh author with the full 45-minute budget, the
 same source/prompt, and no prior output. Existing running agents are not restarted.
 
-## Case preparation and remaining gates
+## Case preparation and grading
 
 Six separate clean-profile agents author the Stage 5 cases and rubrics. They
 receive source/specification inputs but no treatment outputs, skill text, arm
@@ -193,7 +196,7 @@ the Stage 5 quality rubrics, which have their own two independent graders.
 
 Recommendations must wait until all grading finishes and come from a new agent
 that has not audited, graded, read Claude's results, or seen Sol's arm mapping
-beforehand. No recommendation has been made during preparation.
+beforehand. No recommendation was made during preparation or grading.
 
 The DECOM assessor could not run the author's full `prepared.sha256` check: that
 manifest was omitted with author preparation logs to keep them out of assessment
@@ -206,6 +209,17 @@ file-integrity evidence; it does not replace, rerun or change behavioral results
 source, tests or rubric. Graders receive the retained assessment limitation and
 the supplemental check. Case-wide assessment context is preserved when filtering
 DECOM's JSON down to a single candidate. A canary test rejects an altered asset.
+
+The parser assessor detected stale artifacts from the frozen runner's shared
+build-directory names. It reran every candidate's six frozen checks with empty,
+isolated build directories, preserving initial and definitive logs. No candidate
+or assertion changed. Its additional category-adapter probes are supplemental
+evidence for the prewritten harm criterion, not new quality requirements; the
+frozen parser contract does not require structured error categories. The original
+24-test suite and quality rubric remain authoritative. Wikilink's scorer completed
+all required checks; exploratory probes mentioned in three submission reports
+were not replayed because the assessment inputs held the submitted crate rather
+than those temporary probe workspaces. Their original artifacts remain published.
 
 ## Analysis rules fixed before grading
 
@@ -269,7 +283,9 @@ that archive were checked against the pinned baseline; an upstream terminal
 recording contains public fixture paths, not host data from this evaluation.
 Hashes and dispositions are in `../export-scans/privacy-review.json` and
 `baseline-archive-review.json`. Scanning covers raw evidence, reports, artifacts,
-control bundles, grading inputs/maps, schedules and all Stage 5 preparation/assessment files.
+control bundles, grading inputs/maps, schedules, preflight output and all Stage 5
+preparation/assessment files. Literal public-source recipe PATH text is also
+retained after hash-bound review; it is not an expanded host environment.
 
 ## Publication and handoff
 
@@ -285,5 +301,13 @@ key scores. Its disagreements must accompany any result based on those scores.
 The recommendations profile is created only after every evaluation agent has
 finished and all quality reconciliation decisions are frozen. It receives the
 archived skill, scrubbed final Sol evidence, full submission sources and the
-earlier Claude results for the first time at that point. Its input hashes and
-fresh-profile provenance are recorded separately. It cannot edit the skill.
+earlier Claude results for the first time at that point. Its input hashes,
+committed data-freeze revision and fresh-profile provenance are recorded
+separately. It cannot edit the skill.
+
+All 24 submissions have two agreeing quality/harm judgments; no fresh adjudicator
+was needed. There are no missing grading sheets or unresolved quality disputes.
+The independent key recheck's one disagreement remains an explicit diagnostic.
+All 72 assessment/grading source copies match the original treatment submissions,
+including literal symlink targets and excluding build caches. The source checks
+also reject symlink roots and path escapes. See `submission-integrity.json`.

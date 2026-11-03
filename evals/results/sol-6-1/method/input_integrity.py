@@ -27,11 +27,16 @@ def verify(scratch, case):
         frozen = subprocess.check_output(["git", "show", f"{CASE_FREEZE}:{committed_path}"],
                                          cwd=repository)
         supplied = prepared / relative
-        if supplied.is_symlink() or supplied.read_bytes() != frozen:
+        if (supplied.is_symlink() or
+                not supplied.resolve().is_relative_to(prepared.parent.resolve()) or
+                supplied.read_bytes() != frozen):
             raise ValueError(f"Assessment input changed from the frozen case: {case}/{relative}")
         hashes[str(relative)] = hashlib.sha256(frozen).hexdigest()
     assessor = prepared.parent
-    gate = (assessor / "gate/check.sh").read_bytes()
+    gate_path = assessor / "gate/check.sh"
+    if gate_path.is_symlink() or not gate_path.resolve().is_relative_to(assessor.resolve()):
+        raise ValueError("Assessor gate escaped its workspace")
+    gate = gate_path.read_bytes()
     if gate != (scratch / "skill-tree/.agents/skills/rust-qc/scripts/check.sh").read_bytes():
         raise ValueError("Assessor gate differs from the archived skill")
     record = {"case": case, "case_freeze_commit": CASE_FREEZE,

@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 from export_dataset import workspace_files
@@ -18,6 +19,14 @@ def main():
     args = parser.parse_args()
     scratch = args.scratch.resolve()
     root = Path(__file__).resolve().parent.parent
+    data_freeze_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+    subprocess.run(["git", "diff", "--quiet", "HEAD", "--", str(root)],
+                   cwd=root, check=True)
+    if subprocess.check_output(
+            ["git", "ls-files", "--others", "--exclude-standard", "--", str(root)],
+            cwd=root, text=True).strip():
+        raise SystemExit("Commit the final evidence before preparing recommendation inputs")
     run = "recommend-sol61"
     plan = scratch / "recommendations-schedule.json"
     if plan.exists() or (scratch / "private" / run).exists():
@@ -25,7 +34,9 @@ def main():
     for path in (scratch / "private").glob("*/metadata.json"):
         if json.loads(path.read_text())["status"] in {"starting", "running"}:
             raise SystemExit("Wait until every evaluation agent has finished")
-    required = ["key_scores.json", "findings.jsonl", "quality_scores.json", "summary.json",
+    required = ["README.md", "method/protocol.md", "stage2/results.json",
+                "method/submission-integrity.json",
+                "key_scores.json", "findings.jsonl", "quality_scores.json", "summary.json",
                 "grading_gaps.json", "quality_disputes.json", "disputes.json",
                 "key_recheck.json", "runs.tsv", "grading/provenance.json"]
     for name in required:
@@ -43,6 +54,9 @@ def main():
     for name in ("grading_gaps.json", "quality_disputes.json", "disputes.json"):
         if json.loads((root / name).read_text()):
             raise SystemExit(f"Unresolved grading evidence: {name}")
+    integrity = json.loads((root / "method/submission-integrity.json").read_text())
+    if integrity["changed_copies"] or integrity["gaps"]:
+        raise SystemExit("Complete the submission source-integrity check before recommendations")
     latest_scan = max((root / "export-scans").glob("refresh-*.json"),
                       key=lambda path: path.stat().st_mtime)
     if json.loads(latest_scan.read_text())["unreviewed_hits"]:
@@ -70,6 +84,7 @@ def main():
     for name in required:
         hashes[name] = hashlib.sha256((root / name).read_bytes()).hexdigest()
     record = {"recommendation_run": run, "model": "gpt-6.1-sol", "effort": "high",
+              "data_freeze_commit": data_freeze_commit,
               "fresh_profile": True, "prior_auditing_or_grading": False,
               "claude_results_and_arm_mapping_first_available": "after final grading freeze",
               "final_evidence_sha256": hashes, "privacy_scan": latest_scan.name}
@@ -89,6 +104,11 @@ control results, recheck results, and method/protocol.md. Inspect original repor
 quotes, actual submission source under /work/submissions/<run>, relevant hidden
 assessment logs and independent/reconciled grades for every proposed change.
 /work/claude has the earlier results for carefully qualified comparisons.
+The document will live in evals/results/sol-6-1/. Use links relative to that
+directory: /work/sol/foo becomes foo, and /work/claude/foo becomes ../foo.
+Submission source links should point to artifacts/<run>/crate/<path> when that
+exported file exists. Check every local evidence link against /work/sol or the
+corresponding /work/claude input. Do not publish /work paths as document links.
 Do not count invalid or missing runs as evidence or zeros; no complete Sol audit
 pair exists. Separate observations, causal uncertainty, and proposals. Current
 quality scores are reconciled judgments, not the original grader average.

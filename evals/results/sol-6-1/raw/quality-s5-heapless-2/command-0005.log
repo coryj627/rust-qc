@@ -1,0 +1,871 @@
+     1	//! A fixed-capacity hash table where the iteration order is independent of the hash of the keys.
+     2	use core::{
+     3	    borrow::Borrow,
+     4	    fmt,
+     5	    hash::{BuildHasher, Hash},
+     6	    mem,
+     7	    num::NonZeroU32,
+     8	    ops, slice,
+     9	};
+    10	
+    11	use hash32::{BuildHasherDefault, FnvHasher};
+    12	
+    13	use crate::Vec;
+    14	
+    15	/// An [`IndexMap`] using the default FNV hasher.
+    16	///
+    17	/// A list of all Methods and Traits available for `FnvIndexMap` can be found in
+    18	/// the [`IndexMap`] documentation.
+    19	///
+    20	/// # Examples
+    21	/// ```
+    22	/// use heapless::index_map::FnvIndexMap;
+    23	///
+    24	/// // A hash map with a capacity of 16 key-value pairs allocated on the stack
+    25	/// let mut book_reviews = FnvIndexMap::<_, _, 16>::new();
+    26	///
+    27	/// // review some books.
+    28	/// book_reviews
+    29	///     .insert("Adventures of Huckleberry Finn", "My favorite book.")
+    30	///     .unwrap();
+    31	/// book_reviews
+    32	///     .insert("Grimms' Fairy Tales", "Masterpiece.")
+    33	///     .unwrap();
+    34	/// book_reviews
+    35	///     .insert("Pride and Prejudice", "Very enjoyable.")
+    36	///     .unwrap();
+    37	/// book_reviews
+    38	///     .insert("The Adventures of Sherlock Holmes", "Eye lyked it alot.")
+    39	///     .unwrap();
+    40	///
+    41	/// // check for a specific one.
+    42	/// if !book_reviews.contains_key("Les Misérables") {
+    43	///     println!(
+    44	///         "We've got {} reviews, but Les Misérables ain't one.",
+    45	///         book_reviews.len()
+    46	///     );
+    47	/// }
+    48	///
+    49	/// // oops, this review has a lot of spelling mistakes, let's delete it.
+    50	/// book_reviews.remove("The Adventures of Sherlock Holmes");
+    51	///
+    52	/// // look up the values associated with some keys.
+    53	/// let to_find = ["Pride and Prejudice", "Alice's Adventure in Wonderland"];
+    54	/// for book in &to_find {
+    55	///     match book_reviews.get(book) {
+    56	///         Some(review) => println!("{}: {}", book, review),
+    57	///         None => println!("{} is unreviewed.", book),
+    58	///     }
+    59	/// }
+    60	///
+    61	/// // iterate over everything.
+    62	/// for (book, review) in &book_reviews {
+    63	///     println!("{}: \"{}\"", book, review);
+    64	/// }
+    65	/// ```
+    66	pub type FnvIndexMap<K, V, const N: usize> = IndexMap<K, V, BuildHasherDefault<FnvHasher>, N>;
+    67	
+    68	#[derive(Clone, Copy, Eq, PartialEq)]
+    69	struct HashValue(u16);
+    70	
+    71	impl HashValue {
+    72	    fn desired_pos(&self, mask: usize) -> usize {
+    73	        usize::from(self.0) & mask
+    74	    }
+    75	
+    76	    fn probe_distance(&self, mask: usize, current: usize) -> usize {
+    77	        current.wrapping_sub(self.desired_pos(mask)) & mask
+    78	    }
+    79	}
+    80	
+    81	#[doc(hidden)]
+    82	#[derive(Clone)]
+    83	pub struct Bucket<K, V> {
+    84	    hash: HashValue,
+    85	    key: K,
+    86	    value: V,
+    87	}
+    88	
+    89	#[doc(hidden)]
+    90	#[derive(Clone, Copy, PartialEq)]
+    91	pub struct Pos {
+    92	    // compact representation of `{ hash_value: u16, index: u16 }`
+    93	    // To get the most from `NonZero` we store the *value minus 1*. This way `None::Option<Pos>`
+    94	    // is equivalent to the very unlikely value of  `{ hash_value: 0xffff, index: 0xffff }` instead
+    95	    // the more likely of `{ hash_value: 0x00, index: 0x00 }`
+    96	    nz: NonZeroU32,
+    97	}
+    98	
+    99	impl Pos {
+   100	    fn new(index: usize, hash: HashValue) -> Self {
+   101	        Self {
+   102	            nz: unsafe {
+   103	                NonZeroU32::new_unchecked(
+   104	                    ((u32::from(hash.0) << 16) + index as u32).wrapping_add(1),
+   105	                )
+   106	            },
+   107	        }
+   108	    }
+   109	
+   110	    fn hash(&self) -> HashValue {
+   111	        HashValue((self.nz.get().wrapping_sub(1) >> 16) as u16)
+   112	    }
+   113	
+   114	    fn index(&self) -> usize {
+   115	        self.nz.get().wrapping_sub(1) as u16 as usize
+   116	    }
+   117	}
+   118	
+   119	enum Insert<K, V> {
+   120	    Success(Inserted<V>),
+   121	    Full((K, V)),
+   122	}
+   123	struct Inserted<V> {
+   124	    index: usize,
+   125	    old_value: Option<V>,
+   126	}
+   127	
+   128	macro_rules! probe_loop {
+   129	    ($probe_var: ident < $len: expr, $body: expr) => {
+   130	        loop {
+   131	            if $probe_var < $len {
+   132	                $body
+   133	                    $probe_var += 1;
+   134	            } else {
+   135	                $probe_var = 0;
+   136	            }
+   137	        }
+   138	    }
+   139	}
+   140	
+   141	struct CoreMap<K, V, const N: usize> {
+   142	    entries: Vec<Bucket<K, V>, N, usize>,
+   143	    indices: [Option<Pos>; N],
+   144	}
+   145	
+   146	impl<K, V, const N: usize> CoreMap<K, V, N> {
+   147	    const fn new() -> Self {
+   148	        const INIT: Option<Pos> = None;
+   149	
+   150	        Self {
+   151	            entries: Vec::new(),
+   152	            indices: [INIT; N],
+   153	        }
+   154	    }
+   155	}
+   156	
+   157	impl<K, V, const N: usize> CoreMap<K, V, N>
+   158	where
+   159	    K: Eq + Hash,
+   160	{
+   161	    fn capacity() -> usize {
+   162	        N
+   163	    }
+   164	
+   165	    fn mask() -> usize {
+   166	        Self::capacity() - 1
+   167	    }
+   168	
+   169	    fn find<Q>(&self, hash: HashValue, query: &Q) -> Option<(usize, usize)>
+   170	    where
+   171	        K: Borrow<Q>,
+   172	        Q: ?Sized + Eq,
+   173	    {
+   174	        let mut probe = hash.desired_pos(Self::mask());
+   175	        let mut dist = 0;
+   176	
+   177	        probe_loop!(probe < self.indices.len(), {
+   178	            if let Some(pos) = self.indices[probe] {
+   179	                let entry_hash = pos.hash();
+   180	                // NOTE(i) we use unchecked indexing below
+   181	                let i = pos.index();
+   182	                debug_assert!(i < self.entries.len());
+   183	
+   184	                if dist > entry_hash.probe_distance(Self::mask(), probe) {
+   185	                    // give up when probe distance is too long
+   186	                    return None;
+   187	                } else if entry_hash == hash
+   188	                    && unsafe { self.entries.get_unchecked(i).key.borrow() == query }
+   189	                {
+   190	                    return Some((probe, i));
+   191	                }
+   192	            } else {
+   193	                return None;
+   194	            }
+   195	
+   196	            dist += 1;
+   197	        });
+   198	    }
+   199	
+   200	    fn insert(&mut self, hash: HashValue, key: K, value: V) -> Insert<K, V> {
+   201	        let mut probe = hash.desired_pos(Self::mask());
+   202	        let mut dist = 0;
+   203	
+   204	        probe_loop!(probe < self.indices.len(), {
+   205	            let pos = &mut self.indices[probe];
+   206	
+   207	            if let Some(pos) = *pos {
+   208	                let entry_hash = pos.hash();
+   209	                // NOTE(i) we use unchecked indexing below
+   210	                let i = pos.index();
+   211	                debug_assert!(i < self.entries.len());
+   212	
+   213	                let their_dist = entry_hash.probe_distance(Self::mask(), probe);
+   214	
+   215	                if their_dist < dist {
+   216	                    if self.entries.is_full() {
+   217	                        return Insert::Full((key, value));
+   218	                    }
+   219	                    // robin hood: steal the spot if it's better for us
+   220	                    let index = self.entries.len();
+   221	                    unsafe { self.entries.push_unchecked(Bucket { hash, key, value }) };
+   222	                    Self::insert_phase_2(&mut self.indices, probe, Pos::new(index, hash));
+   223	                    return Insert::Success(Inserted {
+   224	                        index,
+   225	                        old_value: None,
+   226	                    });
+   227	                } else if entry_hash == hash && unsafe { self.entries.get_unchecked(i).key == key }
+   228	                {
+   229	                    return Insert::Success(Inserted {
+   230	                        index: i,
+   231	                        old_value: Some(mem::replace(
+   232	                            unsafe { &mut self.entries.get_unchecked_mut(i).value },
+   233	                            value,
+   234	                        )),
+   235	                    });
+   236	                }
+   237	            } else {
+   238	                if self.entries.is_full() {
+   239	                    return Insert::Full((key, value));
+   240	                }
+   241	                // empty bucket, insert here
+   242	                let index = self.entries.len();
+   243	                *pos = Some(Pos::new(index, hash));
+   244	                unsafe { self.entries.push_unchecked(Bucket { hash, key, value }) };
+   245	                return Insert::Success(Inserted {
+   246	                    index,
+   247	                    old_value: None,
+   248	                });
+   249	            }
+   250	            dist += 1;
+   251	        });
+   252	    }
+   253	
+   254	    // phase 2 is post-insert where we forward-shift `Pos` in the indices.
+   255	    fn insert_phase_2(indices: &mut [Option<Pos>; N], mut probe: usize, mut old_pos: Pos) -> usize {
+   256	        probe_loop!(probe < indices.len(), {
+   257	            let pos = unsafe { indices.get_unchecked_mut(probe) };
+   258	
+   259	            let mut is_none = true; // work around lack of NLL
+   260	            if let Some(pos) = pos.as_mut() {
+   261	                old_pos = mem::replace(pos, old_pos);
+   262	                is_none = false;
+   263	            }
+   264	
+   265	            if is_none {
+   266	                *pos = Some(old_pos);
+   267	                return probe;
+   268	            }
+   269	        });
+   270	    }
+   271	
+   272	    fn remove_found(&mut self, probe: usize, found: usize) -> (K, V) {
+   273	        // index `probe` and entry `found` is to be removed
+   274	        // use swap_remove, but then we need to update the index that points
+   275	        // to the other entry that has to move
+   276	        self.indices[probe] = None;
+   277	        let entry = unsafe { self.entries.swap_remove_unchecked(found) };
+   278	
+   279	        // correct index that points to the entry that had to swap places
+   280	        if let Some(entry) = self.entries.get(found) {
+   281	            // was not last element
+   282	            // examine new element in `found` and find it in indices
+   283	            let mut probe = entry.hash.desired_pos(Self::mask());
+   284	
+   285	            probe_loop!(probe < self.indices.len(), {
+   286	                if let Some(pos) = self.indices[probe] {
+   287	                    if pos.index() >= self.entries.len() {
+   288	                        // found it
+   289	                        self.indices[probe] = Some(Pos::new(found, entry.hash));
+   290	                        break;
+   291	                    }
+   292	                }
+   293	            });
+   294	        }
+   295	
+   296	        self.backward_shift_after_removal(probe);
+   297	
+   298	        (entry.key, entry.value)
+   299	    }
+   300	
+   301	    fn retain_in_order<F>(&mut self, mut keep: F)
+   302	    where
+   303	        F: FnMut(&mut K, &mut V) -> bool,
+   304	    {
+   305	        self.entries
+   306	            .retain_mut(|entry| keep(&mut entry.key, &mut entry.value));
+   307	
+   308	        if self.entries.len() < self.indices.len() {
+   309	            self.rebuild_indices();
+   310	        }
+   311	    }
+   312	
+   313	    fn rebuild_indices(&mut self) {
+   314	        const INIT: Option<Pos> = None;
+   315	
+   316	        for index in self.indices.iter_mut() {
+   317	            *index = INIT;
+   318	        }
+   319	
+   320	        for (index, entry) in self.entries.iter().enumerate() {
+   321	            let mut probe = entry.hash.desired_pos(Self::mask());
+   322	            let mut dist = 0;
+   323	
+   324	            probe_loop!(probe < self.indices.len(), {
+   325	                let pos = &mut self.indices[probe];
+   326	
+   327	                if let Some(pos) = *pos {
+   328	                    let entry_hash = pos.hash();
+   329	
+   330	                    // robin hood: steal the spot if it's better for us
+   331	                    let their_dist = entry_hash.probe_distance(Self::mask(), probe);
+   332	                    if their_dist < dist {
+   333	                        Self::insert_phase_2(&mut self.indices, probe, Pos::new(index, entry.hash));
+   334	                        break;
+   335	                    }
+   336	                } else {
+   337	                    *pos = Some(Pos::new(index, entry.hash));
+   338	                    break;
+   339	                }
+   340	                dist += 1;
+   341	            });
+   342	        }
+   343	    }
+   344	
+   345	    fn backward_shift_after_removal(&mut self, probe_at_remove: usize) {
+   346	        // backward shift deletion in self.indices
+   347	        // after probe, shift all non-ideally placed indices backward
+   348	        let mut last_probe = probe_at_remove;
+   349	        let mut probe = probe_at_remove + 1;
+   350	
+   351	        probe_loop!(probe < self.indices.len(), {
+   352	            if let Some(pos) = self.indices[probe] {
+   353	                let entry_hash = pos.hash();
+   354	
+   355	                if entry_hash.probe_distance(Self::mask(), probe) > 0 {
+   356	                    unsafe { *self.indices.get_unchecked_mut(last_probe) = self.indices[probe] }
+   357	                    self.indices[probe] = None;
+   358	                } else {
+   359	                    break;
+   360	                }
+   361	            } else {
+   362	                break;
+   363	            }
+   364	            last_probe = probe;
+   365	        });
+   366	    }
+   367	}
+   368	
+   369	impl<K, V, const N: usize> Clone for CoreMap<K, V, N>
+   370	where
+   371	    K: Clone,
+   372	    V: Clone,
+   373	{
+   374	    fn clone(&self) -> Self {
+   375	        Self {
+   376	            entries: self.entries.clone(),
+   377	            indices: self.indices,
+   378	        }
+   379	    }
+   380	}
+   381	
+   382	/// A view into an entry in the map
+   383	pub enum Entry<'a, K, V, const N: usize> {
+   384	    /// The entry corresponding to the key `K` exists in the map
+   385	    Occupied(OccupiedEntry<'a, K, V, N>),
+   386	    /// The entry corresponding to the key `K` does not exist in the map
+   387	    Vacant(VacantEntry<'a, K, V, N>),
+   388	}
+   389	
+   390	impl<'a, K, V, const N: usize> Entry<'a, K, V, N>
+  1190	            Insert::Success(inserted) => Ok(inserted.old_value),
+  1191	            Insert::Full((k, v)) => Err((k, v)),
+  1192	        }
+  1193	    }
+  1194	
+  1195	    /// Same as [`swap_remove`](Self::swap_remove)
+  1196	    ///
+  1197	    /// Computes in *O*(1) time (average).
+  1198	    ///
+  1199	    /// # Examples
+  1200	    ///
+  1201	    /// ```
+  1202	    /// use heapless::index_map::FnvIndexMap;
+  1203	    ///
+  1204	    /// let mut map = FnvIndexMap::<_, _, 8>::new();
+  1205	    /// map.insert(1, "a").unwrap();
+  1206	    /// assert_eq!(map.remove(&1), Some("a"));
+  1207	    /// assert_eq!(map.remove(&1), None);
+  1208	    /// ```
+  1209	    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
+  1210	    where
+  1211	        K: Borrow<Q>,
+  1212	        Q: ?Sized + Hash + Eq,
+  1213	    {
+  1214	        self.swap_remove(key)
+  1215	    }
+  1216	
+  1217	    /// Remove the key-value pair equivalent to `key` and return its value.
+  1218	    ///
+  1219	    /// Like `Vec::swap_remove`, the pair is removed by swapping it with the last element of the map
+  1220	    /// and popping it off. **This perturbs the position of what used to be the last element!**
+  1221	    ///
+  1222	    /// Return `None` if `key` is not in map.
+  1223	    ///
+  1224	    /// Computes in *O*(1) time (average).
+  1225	    pub fn swap_remove<Q>(&mut self, key: &Q) -> Option<V>
+  1226	    where
+  1227	        K: Borrow<Q>,
+  1228	        Q: ?Sized + Hash + Eq,
+  1229	    {
+  1230	        self.find(key)
+  1231	            .map(|(probe, found)| self.core.remove_found(probe, found).1)
+  1232	    }
+  1233	
+  1234	    /// Retains only the elements specified by the predicate.
+  1235	    ///
+  1236	    /// In other words, remove all pairs `(k, v)` for which `f(&k, &mut v)` returns `false`.
+  1237	    pub fn retain<F>(&mut self, mut f: F)
+  1238	    where
+  1239	        F: FnMut(&K, &mut V) -> bool,
+  1240	    {
+  1241	        self.core.retain_in_order(move |k, v| f(k, v));
+  1242	    }
+  1243	
+  1244	    /// Shortens the map, keeping the first `len` elements and dropping the rest.
+  1245	    ///
+  1246	    /// If `len` is greater than the map's current length, this has no effect.
+  1247	    ///
+  1248	    /// Computes in *O*(n) time (average).
+  1249	    ///
+  1250	    /// # Examples
+  1251	    ///
+  1252	    /// ```
+  1253	    /// use heapless::index_map::FnvIndexMap;
+  1254	    ///
+  1255	    /// let mut map = FnvIndexMap::<_, _, 8>::new();
+  1256	    /// map.insert(3, "a").unwrap();
+  1257	    /// map.insert(2, "b").unwrap();
+  1258	    /// map.insert(1, "c").unwrap();
+  1259	    /// map.truncate(2);
+  1260	    /// assert_eq!(map.len(), 2);
+  1261	    /// assert_eq!(map.get(&1), None);
+  1262	    ///
+  1263	    /// let mut iter = map.iter();
+  1264	    /// assert_eq!(iter.next(), Some((&3, &"a")));
+  1265	    /// assert_eq!(iter.next(), Some((&2, &"b")));
+  1266	    /// assert_eq!(iter.next(), None);
+  1267	    /// ```
+  1268	    pub fn truncate(&mut self, len: usize) {
+  1269	        if len >= self.len() {
+  1270	            return;
+  1271	        }
+  1272	
+  1273	        self.core.entries.truncate(len);
+  1274	        // Removing indices can leave holes in probe chains for retained entries.
+  1275	        self.core.rebuild_indices();
+  1276	    }
+  1277	
+  1278	    /* Private API */
+  1279	    /// Return probe (indices) and position (entries)
+  1280	    fn find<Q>(&self, key: &Q) -> Option<(usize, usize)>
+  1281	    where
+  1282	        K: Borrow<Q>,
+  1283	        Q: ?Sized + Hash + Eq,
+  1284	    {
+  1285	        if self.is_empty() {
+  1286	            return None;
+  1287	        }
+  1288	        let h = hash_with(key, &self.build_hasher);
+  1289	        self.core.find(h, key)
+  1290	    }
+  1291	}
+  1292	
+  1293	impl<K, Q, V, S, const N: usize> ops::Index<&Q> for IndexMap<K, V, S, N>
+  1294	where
+  1295	    K: Eq + Hash + Borrow<Q>,
+  1296	    Q: ?Sized + Eq + Hash,
+  1297	    S: BuildHasher,
+  1298	{
+  1299	    type Output = V;
+  1300	
+  1810	        let entry = src.entry(key);
+  1811	        match entry {
+  1812	            Entry::Occupied(o) => {
+  1813	                assert_eq!(value, o.insert(value2));
+  1814	            }
+  1815	            Entry::Vacant(_) => {
+  1816	                panic!("Entry not found");
+  1817	            }
+  1818	        };
+  1819	        assert_eq!(value2, *src.get(&key).unwrap());
+  1820	    }
+  1821	
+  1822	    #[test]
+  1823	    fn entry_remove_entry() {
+  1824	        let key = 0;
+  1825	        let value = 0;
+  1826	        let mut src = almost_filled_map();
+  1827	        src.insert(key, value).unwrap();
+  1828	        assert_eq!(MAP_SLOTS, src.len());
+  1829	        let entry = src.entry(key);
+  1830	        match entry {
+  1831	            Entry::Occupied(o) => {
+  1832	                assert_eq!((key, value), o.remove_entry());
+  1833	            }
+  1834	            Entry::Vacant(_) => {
+  1835	                panic!("Entry not found")
+  1836	            }
+  1837	        };
+  1838	        assert_eq!(MAP_SLOTS - 1, src.len());
+  1839	    }
+  1840	
+  1841	    #[test]
+  1842	    fn entry_remove() {
+  1843	        let key = 0;
+  1844	        let value = 0;
+  1845	        let mut src = almost_filled_map();
+  1846	        src.insert(key, value).unwrap();
+  1847	        assert_eq!(MAP_SLOTS, src.len());
+  1848	        let entry = src.entry(key);
+  1849	        match entry {
+  1850	            Entry::Occupied(o) => {
+  1851	                assert_eq!(value, o.remove());
+  1852	            }
+  1853	            Entry::Vacant(_) => {
+  1854	                panic!("Entry not found");
+  1855	            }
+  1856	        };
+  1857	        assert_eq!(MAP_SLOTS - 1, src.len());
+  1858	    }
+  1859	
+  1860	    #[test]
+  1861	    fn retain() {
+  1862	        let mut none = almost_filled_map();
+  1863	        none.retain(|_, _| false);
+  1864	        assert!(none.is_empty());
+  1865	
+  1866	        let mut all = almost_filled_map();
+  1867	        all.retain(|_, _| true);
+  1868	        assert_eq!(all.len(), MAP_SLOTS - 1);
+  1869	
+  1870	        let mut even = almost_filled_map();
+  1871	        even.retain(|_, &mut v| v.is_multiple_of(2));
+  1872	        assert_eq!(even.len(), (MAP_SLOTS - 1) / 2);
+  1873	        for &v in even.values() {
+  1874	            assert_eq!(v % 2, 0);
+  1875	        }
+  1876	
+  1877	        let mut odd = almost_filled_map();
+  1878	        odd.retain(|_, &mut v| !v.is_multiple_of(2));
+  1879	        assert_eq!(odd.len(), MAP_SLOTS / 2);
+  1880	        for &v in odd.values() {
+  1881	            assert_ne!(v % 2, 0);
+  1882	        }
+  1883	        assert_eq!(odd.insert(2, 2), Ok(None));
+  1884	        assert_eq!(odd.len(), (MAP_SLOTS / 2) + 1);
+  1885	    }
+  1886	
+  1887	    #[test]
+  1888	    fn truncate_with_collisions() {
+  1889	        // Map each u8 key directly to its hash so the probe chains are predictable.
+  1890	        #[derive(Default)]
+  1891	        struct IdentityHasher(u64);
+  1892	
+  1893	        impl core::hash::Hasher for IdentityHasher {
+  1894	            fn finish(&self) -> u64 {
+  1895	                self.0
+  1896	            }
+  1897	
+  1898	            fn write(&mut self, bytes: &[u8]) {
+  1899	                assert_eq!(bytes.len(), 1);
+  1900	                self.0 = u64::from(bytes[0]);
+  1901	            }
+  1902	        }
+  1903	
+  1904	        // The third key displaces the first key in each case. Truncating to two
+  1905	        // entries must close that hole, including when the chain wraps around.
+  1906	        for keys in [[1u8, 0, 8, 16, 2, 10, 3, 11], [0, 7, 15, 23, 1, 9, 6, 14]] {
+  1907	            for initial_len in 0..=keys.len() {
+  1908	                for len in (0..=keys.len() + 1).chain(core::iter::once(usize::MAX)) {
+  1909	                    let mut map = IndexMap::<_, _, BuildHasherDefault<IdentityHasher>, 8>::new();
+  1910	                    for &key in &keys[..initial_len] {
+  1911	                        map.insert(key, u16::from(key) + 100).unwrap();
+  1912	                    }
+  1913	
+  1914	                    map.truncate(len);
+  1915	
+  1916	                    let retained_len = len.min(initial_len);
+  1917	                    assert_eq!(map.len(), retained_len);
+  1918	                    assert_eq!(map.is_empty(), retained_len == 0);
+  1919	                    assert!(map.iter().map(|(&k, &v)| (k, v)).eq(keys[..retained_len]
+  1920	                        .iter()
+  1921	                        .map(|&k| (k, u16::from(k) + 100))));
+  1922	                    for (index, key) in keys.iter().enumerate() {
+  1923	                        let expected = if index < retained_len {
+  1924	                            Some(u16::from(*key) + 100)
+  1925	                        } else {
+  1926	                            None
+  1927	                        };
+  1928	                        assert_eq!(map.get(key).copied(), expected);
+  1929	                        assert_eq!(map.contains_key(key), expected.is_some());
+  1930	                    }
+  1931	                }
+  1932	            }
+  1933	        }
+  1934	    }
+  1935	
+  1936	    #[test]
+  1937	    fn entry_roll_through_all() {
+  1938	        let mut src: FnvIndexMap<usize, usize, MAP_SLOTS> = FnvIndexMap::new();
+  1939	        for i in 0..MAP_SLOTS {
+  1940	            match src.entry(i) {
+  1941	                Entry::Occupied(_) => {
+  1942	                    panic!("Entry found before insert");
+  1943	                }
+  1944	                Entry::Vacant(v) => {
+  1945	                    assert_eq!(i, *v.insert(i).unwrap());
+  1946	                }
+  1947	            }
+  1948	        }
+  1949	        let add_mod = 99;
+  1950	        for i in 0..MAP_SLOTS {
+  1951	            match src.entry(i) {
+  1952	                Entry::Occupied(o) => {
+  1953	                    assert_eq!(i, o.insert(i + add_mod));
+  1954	                }
+  1955	                Entry::Vacant(_) => {
+  1956	                    panic!("Entry not found after insert");
+  1957	                }
+  1958	            }
+  1959	        }
+  1960	        for i in 0..MAP_SLOTS {
+   800	    /// ```no_run
+   801	    /// # #![allow(dead_code)]
+   802	    /// use heapless::Vec;
+   803	    ///
+   804	    /// # // This is just a minimal skeleton for the doc example;
+   805	    /// # // don't use this as a starting point for a real library.
+   806	    /// # pub struct StreamWrapper { strm: *mut core::ffi::c_void }
+   807	    /// # const Z_OK: i32 = 0;
+   808	    /// # extern "C" {
+   809	    /// #     fn deflateGetDictionary(
+   810	    /// #         strm: *mut core::ffi::c_void,
+   811	    /// #         dictionary: *mut u8,
+   812	    /// #         dictLength: *mut usize,
+   813	    /// #     ) -> i32;
+   814	    /// # }
+   815	    /// # impl StreamWrapper {
+   816	    /// pub fn get_dictionary(&self) -> Option<Vec<u8, 32768>> {
+   817	    ///     // Per the FFI method's docs, "32768 bytes is always enough".
+   818	    ///     let mut dict = Vec::new();
+   819	    ///     let mut dict_length = 0;
+   820	    ///     // SAFETY: When `deflateGetDictionary` returns `Z_OK`, it holds that:
+   821	    ///     // 1. `dict_length` elements were initialized.
+   822	    ///     // 2. `dict_length` <= the capacity (32_768)
+   823	    ///     // which makes `set_len` safe to call.
+   824	    ///     unsafe {
+   825	    ///         // Make the FFI call...
+   826	    ///         let r = deflateGetDictionary(self.strm, dict.as_mut_ptr(), &mut dict_length);
+   827	    ///         if r == Z_OK {
+   828	    ///             // ...and update the length to what was initialized.
+   829	    ///             dict.set_len(dict_length);
+   830	    ///             Some(dict)
+   831	    ///         } else {
+   832	    ///             None
+   833	    ///         }
+   834	    ///     }
+   835	    /// }
+   836	    /// # }
+   837	    /// ```
+   838	    ///
+   839	    /// While the following example is sound, there is a memory leak since
+   840	    /// the inner vectors were not freed prior to the `set_len` call:
+   841	    ///
+   842	    /// ```
+   843	    /// use core::iter::FromIterator;
+   844	    /// use heapless::Vec;
+   845	    ///
+   846	    /// let mut vec = Vec::<Vec<u8, 3>, 3>::from_iter(
+   847	    ///     [
+   848	    ///         Vec::from_iter([1, 0, 0].iter().cloned()),
+   849	    ///         Vec::from_iter([0, 1, 0].iter().cloned()),
+   850	    ///         Vec::from_iter([0, 0, 1].iter().cloned()),
+   851	    ///     ]
+   852	    ///     .iter()
+   853	    ///     .cloned(),
+   854	    /// );
+   855	    /// // SAFETY:
+   856	    /// // 1. `old_len..0` is empty so no elements need to be initialized.
+   857	    /// // 2. `0 <= capacity` always holds whatever `capacity` is.
+   858	    /// unsafe {
+   859	    ///     vec.set_len(0);
+   860	    /// }
+   861	    /// ```
+   862	    ///
+   863	    /// Normally, here, one would use [`clear`] instead to correctly drop
+   864	    /// the contents and thus not leak memory.
+   865	    pub unsafe fn set_len(&mut self, new_len: usize) {
+   866	        debug_assert!(new_len <= self.capacity());
+   867	
+   868	        self.len = LenT::from_usize(new_len);
+   869	    }
+   870	
+   871	    /// Removes an element from the vector and returns it.
+   872	    ///
+   873	    /// The removed element is replaced by the last element of the vector.
+   874	    ///
+   875	    /// This does not preserve ordering, but is *O*(1).
+   876	    ///
+   877	    /// # Panics
+   878	    ///
+   879	    /// Panics if `index` is out of bounds.
+   880	    ///
+   881	    /// # Examples
+   882	    ///
+   883	    /// ```
+   884	    /// use heapless::Vec;
+   885	    ///
+   886	    /// let mut v: Vec<_, 8> = Vec::new();
+   887	    /// v.push("foo").unwrap();
+   888	    /// v.push("bar").unwrap();
+   889	    /// v.push("baz").unwrap();
+   890	    /// v.push("qux").unwrap();
+   891	    ///
+   892	    /// assert_eq!(v.swap_remove(1), "bar");
+   893	    /// assert_eq!(&*v, ["foo", "qux", "baz"]);
+   894	    ///
+   895	    /// assert_eq!(v.swap_remove(0), "foo");
+   896	    /// assert_eq!(&*v, ["baz", "qux"]);
+   897	    /// ```
+   898	    pub fn swap_remove(&mut self, index: usize) -> T {
+   899	        assert!(index < self.len());
+   900	        unsafe { self.swap_remove_unchecked(index) }
+   901	    }
+   902	
+   903	    /// Removes an element from the vector and returns it.
+   904	    ///
+   905	    /// The removed element is replaced by the last element of the vector.
+   906	    ///
+   907	    /// This does not preserve ordering, but is *O*(1).
+   908	    ///
+   909	    /// # Safety
+   910	    ///
+   911	    ///  Assumes `index` within bounds.
+   912	    ///
+   913	    /// # Examples
+   914	    ///
+   915	    /// ```
+   916	    /// use heapless::Vec;
+   917	    ///
+   918	    /// let mut v: Vec<_, 8> = Vec::new();
+   919	    /// v.push("foo").unwrap();
+   920	    /// v.push("bar").unwrap();
+   921	    /// v.push("baz").unwrap();
+   922	    /// v.push("qux").unwrap();
+   923	    ///
+   924	    /// assert_eq!(unsafe { v.swap_remove_unchecked(1) }, "bar");
+   925	    /// assert_eq!(&*v, ["foo", "qux", "baz"]);
+   926	    ///
+   927	    /// assert_eq!(unsafe { v.swap_remove_unchecked(0) }, "foo");
+   928	    /// assert_eq!(&*v, ["baz", "qux"]);
+   929	    /// ```
+   930	    pub unsafe fn swap_remove_unchecked(&mut self, index: usize) -> T {
+   931	        let length = self.len();
+   932	        debug_assert!(index < length);
+   933	        let value = ptr::read(self.as_ptr().add(index));
+   934	        let base_ptr = self.as_mut_ptr();
+   935	        ptr::copy(base_ptr.add(length - 1), base_ptr.add(index), 1);
+   936	        self.len -= LenT::one();
+   937	        value
+   938	    }
+   939	
+   940	    /// Returns true if the vec is full
+[package]
+authors = [
+  "Jorge Aparicio <<email>>",
+  "Per Lindgren <<email>>",
+  "Emil Fresk <<email>>",
+]
+categories = ["data-structures", "no-std"]
+description = "`static` friendly data structures that don't require dynamic memory allocation"
+documentation = "https://docs.rs/heapless"
+edition = "2021"
+keywords = ["static", "no-heap"]
+license = "MIT OR Apache-2.0"
+name = "heapless"
+repository = "https://github.com/rust-embedded/heapless"
+version = "0.9.1"
+
+[features]
+bytes = ["dep:bytes"]
+
+# Enable polyfilling of atomics via `portable-atomic`.
+# `portable-atomic` polyfills some functionality by default, but to get full atomics you must
+# enable one of its features to tell it how to do it. See `portable-atomic` documentation for details.
+portable-atomic = ["dep:portable-atomic"]
+
+# Enable polyfilling of atomics via portable-atomic, using critical section for locking
+portable-atomic-critical-section = ["dep:portable-atomic", "portable-atomic", "portable-atomic?/critical-section"]
+
+# Enable polyfilling of atomics via portable-atomic, using disabling interrupts for locking.
+# WARNING: this is only sound for single-core bare-metal privileged-mode targets!
+portable-atomic-unsafe-assume-single-core = ["dep:portable-atomic", "portable-atomic", "portable-atomic?/unsafe-assume-single-core"]
+
+# implement serde traits.
+serde = ["dep:serde"]
+
+# implement ufmt traits.
+ufmt = ["dep:ufmt", "dep:ufmt-write"]
+
+# Implement `defmt::Format`.
+defmt = ["dep:defmt"]
+
+# Enable larger MPMC sizes.
+mpmc_large = []
+
+# Implement some alloc Vec interoperability
+alloc = []
+
+nightly = []
+
+[dependencies]
+bytes = { version = "1", default-features = false, optional = true }
+portable-atomic = { version = "1.0", optional = true }
+hash32 = "0.3.0"
+serde = { version = "1", optional = true, default-features = false }
+ufmt = { version = "0.2", optional = true }
+ufmt-write = { version = "0.1", optional = true }
+defmt = { version = "1.0.1", optional = true }
+
+# for the pool module
+[target.'cfg(any(target_arch = "arm", target_pointer_width = "32", target_pointer_width = "64"))'.dependencies]
+stable_deref_trait = { version = "1", default-features = false }
+
+[dev-dependencies]
+critical-section = { version = "1.1", features = ["std"] }
+static_assertions = "1.1.0"
+
+[package.metadata.docs.rs]
+features = [
+  "bytes",
+  "ufmt",
+  "serde",
+  "defmt",
+  "mpmc_large",
+  "portable-atomic-critical-section",
+  "alloc",
+]
+# for the pool module
+targets = ["i686-unknown-linux-gnu"]
+rustdoc-args = ["--cfg", "docsrs"]

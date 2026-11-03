@@ -1,0 +1,5 @@
+Candidate A: frozen hidden tests 10 passed / 0 failed (5 debug, 5 release); both full suites, no-default check/tests, serde+SIMD suite, formatting and package rustdoc passed. Focused candidate regression passed Miri. Package Clippy exited 101 (28 diagnostics). Archived gate exited 1: format passed, Clippy failed, workspace rustdoc/tests blocked by mozjs_sys needing unavailable llvm-objdump. These gate results are separate from hidden tests.
+
+Complete output and numeric command metadata are under logs/. Frozen concise summaries are under frozen-runner-logs/. Source manifests show submissions and ordinary verification copies unchanged; only frozen hidden tests were added to the review copy. assessment.json contains every check command, exit and outcome. The orchestrator uses fresh scratch/log directories and refuses an overwrite; adapt only paths for a rerun.
+
+Redacted report claims a 19,173,960-input generated delimiter probe, but no reproducer source or exact invocation was submitted. It was not reconstructed or rerun. This does not affect the completed frozen checks.

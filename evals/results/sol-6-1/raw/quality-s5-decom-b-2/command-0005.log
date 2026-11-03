@@ -1,0 +1,974 @@
+        self.full = true;
+
+        self.lines.clear();
+        self.lines.reserve(num_lines);
+        for line in 0..num_lines {
+            self.lines.push(LineDamageBounds::undamaged(line, num_cols));
+        }
+    }
+
+    /// Damage point inside of the viewport.
+    #[inline]
+    fn damage_point(&mut self, point: Point<usize>) {
+        self.damage_line(point.line, point.column.0, point.column.0);
+    }
+
+    /// Expand `line`'s damage to span at least `left` to `right` column.
+    #[inline]
+    fn damage_line(&mut self, line: usize, left: usize, right: usize) {
+        self.lines[line].expand(left, right);
+    }
+
+    /// Reset information about terminal damage.
+    fn reset(&mut self, num_cols: usize) {
+        self.full = false;
+        self.lines.iter_mut().for_each(|line| line.reset(num_cols));
+    }
+}
+
+pub struct Term<T> {
+    /// Terminal focus controlling the cursor shape.
+    pub is_focused: bool,
+
+    /// Cursor for keyboard selection.
+    pub vi_mode_cursor: ViModeCursor,
+
+    pub selection: Option<Selection>,
+
+    /// Currently active grid.
+    ///
+    /// Tracks the screen buffer currently in use. While the alternate screen buffer is active,
+    /// this will be the alternate grid. Otherwise it is the primary screen buffer.
+    grid: Grid<Cell>,
+
+    /// Currently inactive grid.
+    ///
+    /// Opposite of the active grid. While the alternate screen buffer is active, this will be the
+    /// primary grid. Otherwise it is the alternate screen buffer.
+    inactive_grid: Grid<Cell>,
+
+    /// Index into `charsets`, pointing to what ASCII is currently being mapped to.
+    active_charset: CharsetIndex,
+
+    /// Tabstops.
+    tabs: TabStops,
+
+    /// Mode flags.
+    mode: TermMode,
+
+    /// Origin mode associated with the active grid's saved cursor.
+    saved_origin: bool,
+
+    /// Origin mode associated with the inactive grid's saved cursor.
+    inactive_saved_origin: bool,
+
+    /// Scroll region.
+    ///
+    /// Range going from top to bottom of the terminal, indexed from the top of the viewport.
+    scroll_region: Range<Line>,
+
+    /// Modified terminal colors.
+    colors: Colors,
+
+    /// Current style of the cursor.
+    cursor_style: Option<CursorStyle>,
+
+    /// Proxy for sending events to the event loop.
+    event_proxy: T,
+
+    /// Current title of the window.
+    title: Option<String>,
+
+    /// Stack of saved window titles. When a title is popped from this stack, the `title` for the
+    /// term is set.
+    title_stack: Vec<Option<String>>,
+
+    /// The stack for the keyboard modes.
+    keyboard_mode_stack: Vec<KeyboardModes>,
+
+    /// Currently inactive keyboard mode stack.
+    inactive_keyboard_mode_stack: Vec<KeyboardModes>,
+
+    /// Information about damaged cells.
+    damage: TermDamageState,
+
+    /// Config directly for the terminal.
+    config: Config,
+}
+
+/// Configuration options for the [`Term`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    /// The maximum amount of scrolling history.
+    pub scrolling_history: usize,
+
+    /// Default cursor style to reset the cursor to.
+    pub default_cursor_style: CursorStyle,
+
+    /// Cursor style for Vi mode.
+    pub vi_mode_cursor_style: Option<CursorStyle>,
+
+    /// The characters which terminate semantic selection.
+    ///
+    /// The default value is [`SEMANTIC_ESCAPE_CHARS`].
+    pub semantic_escape_chars: String,
+
+    /// Whether to enable kitty keyboard protocol.
+    pub kitty_keyboard: bool,
+
+    /// OSC52 support mode.
+    pub osc52: Osc52,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            scrolling_history: 10000,
+            semantic_escape_chars: SEMANTIC_ESCAPE_CHARS.to_owned(),
+            default_cursor_style: Default::default(),
+            vi_mode_cursor_style: Default::default(),
+            kitty_keyboard: Default::default(),
+            osc52: Default::default(),
+        }
+    }
+}
+
+/// OSC 52 behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all = "lowercase"))]
+pub enum Osc52 {
+    /// The handling of the escape sequence is disabled.
+    Disabled,
+    /// Only copy sequence is accepted.
+    ///
+    /// This option is the default as a compromise between entirely
+    /// disabling it (the most secure) and allowing `paste` (the less secure).
+    #[default]
+    OnlyCopy,
+    /// Only paste sequence is accepted.
+    OnlyPaste,
+    /// Both are accepted.
+    CopyPaste,
+}
+
+impl<T> Term<T> {
+    #[inline]
+    pub fn scroll_display(&mut self, scroll: Scroll)
+    where
+        T: EventListener,
+    {
+        let old_display_offset = self.grid.display_offset();
+        self.grid.scroll_display(scroll);
+        self.event_proxy.send_event(Event::MouseCursorDirty);
+
+        // Clamp vi mode cursor to the viewport.
+        let viewport_start = -(self.grid.display_offset() as i32);
+        let viewport_end = viewport_start + self.bottommost_line().0;
+        let vi_cursor_line = &mut self.vi_mode_cursor.point.line.0;
+        *vi_cursor_line = cmp::min(viewport_end, cmp::max(viewport_start, *vi_cursor_line));
+        self.vi_mode_recompute_selection();
+
+        // Damage everything if display offset changed.
+        if old_display_offset != self.grid().display_offset() {
+            self.mark_fully_damaged();
+        }
+    }
+
+    pub fn new<D: Dimensions>(config: Config, dimensions: &D, event_proxy: T) -> Term<T> {
+        let num_cols = dimensions.columns();
+        let num_lines = dimensions.screen_lines();
+
+        let history_size = config.scrolling_history;
+        let grid = Grid::new(num_lines, num_cols, history_size);
+        let inactive_grid = Grid::new(num_lines, num_cols, 0);
+
+        let tabs = TabStops::new(grid.columns());
+
+        let scroll_region = Line(0)..Line(grid.screen_lines() as i32);
+
+        // Initialize terminal damage, covering the entire terminal upon launch.
+        let damage = TermDamageState::new(num_cols, num_lines);
+
+        Term {
+            inactive_grid,
+            scroll_region,
+            event_proxy,
+            damage,
+            config,
+            grid,
+            tabs,
+            inactive_keyboard_mode_stack: Default::default(),
+            keyboard_mode_stack: Default::default(),
+            active_charset: Default::default(),
+            vi_mode_cursor: Default::default(),
+            cursor_style: Default::default(),
+            colors: color::Colors::default(),
+            title_stack: Default::default(),
+            is_focused: Default::default(),
+            selection: Default::default(),
+            title: Default::default(),
+            mode: Default::default(),
+            saved_origin: Default::default(),
+            inactive_saved_origin: Default::default(),
+        }
+    }
+
+    /// Collect the information about the changes in the lines, which
+    /// could be used to minimize the amount of drawing operations.
+    ///
+    /// The user controlled elements, like `Vi` mode cursor and `Selection` are **not** part of the
+    /// collected damage state. Those could easily be tracked by comparing their old and new
+    /// value between adjacent frames.
+    ///
+    /// After reading damage [`reset_damage`] should be called.
+    ///
+    /// [`reset_damage`]: Self::reset_damage
+    #[must_use]
+    pub fn damage(&mut self) -> TermDamage<'_> {
+        // Ensure the entire terminal is damaged after entering insert mode.
+        // Leaving is handled in the ansi handler.
+        if self.mode.contains(TermMode::INSERT) {
+            self.mark_fully_damaged();
+        let min_delta = cmp::min(0, num_lines as i32 - self.grid.cursor.point.line.0 - 1);
+        delta = cmp::min(cmp::max(delta, min_delta), history_size as i32);
+        self.vi_mode_cursor.point.line += delta;
+
+        let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
+        self.grid.resize(!is_alt, num_lines, num_cols);
+        self.inactive_grid.resize(is_alt, num_lines, num_cols);
+
+        // Invalidate selection and tabs only when necessary.
+        if old_cols != num_cols {
+            self.selection = None;
+
+            // Recreate tabs list.
+            self.tabs.resize(num_cols);
+        } else if let Some(selection) = self.selection.take() {
+            let max_lines = cmp::max(num_lines, old_lines) as i32;
+            let range = Line(0)..Line(max_lines);
+            self.selection = selection.rotate(self, &range, -delta);
+        }
+
+        // Clamp vi cursor to viewport.
+        let vi_point = self.vi_mode_cursor.point;
+        let viewport_top = Line(-(self.grid.display_offset() as i32));
+        let viewport_bottom = viewport_top + self.bottommost_line();
+        self.vi_mode_cursor.point.line =
+            cmp::max(cmp::min(vi_point.line, viewport_bottom), viewport_top);
+        self.vi_mode_cursor.point.column = cmp::min(vi_point.column, self.last_column());
+
+        // Reset scrolling region.
+        self.scroll_region = Line(0)..Line(self.screen_lines() as i32);
+
+        // Resize damage information.
+        self.damage.resize(num_cols, num_lines);
+    }
+
+    /// Active terminal modes.
+    #[inline]
+    pub fn mode(&self) -> &TermMode {
+        &self.mode
+    }
+
+    /// Swap primary and alternate screen buffer.
+    pub fn swap_alt(&mut self) {
+        if !self.mode.contains(TermMode::ALT_SCREEN) {
+            // Set alt screen cursor to the current primary screen cursor.
+            self.inactive_grid.cursor = self.grid.cursor.clone();
+
+            // Drop information about the primary screens saved cursor.
+            self.grid.saved_cursor = self.grid.cursor.clone();
+            self.saved_origin = self.mode.contains(TermMode::ORIGIN);
+
+            // Reset alternate screen contents.
+            self.inactive_grid.reset_region(..);
+        }
+
+        mem::swap(&mut self.keyboard_mode_stack, &mut self.inactive_keyboard_mode_stack);
+        let keyboard_mode =
+            self.keyboard_mode_stack.last().copied().unwrap_or(KeyboardModes::NO_MODE).into();
+        self.set_keyboard_mode(keyboard_mode, KeyboardModesApplyBehavior::Replace);
+
+        mem::swap(&mut self.grid, &mut self.inactive_grid);
+        mem::swap(&mut self.saved_origin, &mut self.inactive_saved_origin);
+        self.mode ^= TermMode::ALT_SCREEN;
+        self.selection = None;
+        self.mark_fully_damaged();
+    }
+
+    /// Scroll screen down.
+    ///
+    /// Text moves down; clear at bottom
+    /// Expects origin to be in scroll range.
+    #[inline]
+    fn scroll_down_relative(&mut self, origin: Line, mut lines: usize) {
+        trace!("Scrolling down relative: origin={}, lines={}", origin, lines);
+
+        lines = cmp::min(lines, (self.scroll_region.end - self.scroll_region.start).0 as usize);
+        lines = cmp::min(lines, (self.scroll_region.end - origin).0 as usize);
+
+        let region = origin..self.scroll_region.end;
+
+        // Scroll selection.
+        self.selection =
+            self.selection.take().and_then(|s| s.rotate(self, &region, -(lines as i32)));
+
+        // Scroll vi mode cursor.
+        let line = &mut self.vi_mode_cursor.point.line;
+            if col == num_cols - 1 {
+                break;
+            }
+
+            for i in col.0 + 1..num_cols {
+                col = index::Column(i);
+                if self.tabs[col] {
+                    break;
+                }
+            }
+
+            self.grid.cursor.point.column = col;
+        }
+
+        let line = self.grid.cursor.point.line.0 as usize;
+        self.damage.damage_line(line, old_col, self.grid.cursor.point.column.0);
+    }
+
+    #[inline]
+    fn save_cursor_position(&mut self) {
+        trace!("Saving cursor position");
+
+        self.grid.saved_cursor = self.grid.cursor.clone();
+        self.saved_origin = self.mode.contains(TermMode::ORIGIN);
+    }
+
+    #[inline]
+    fn restore_cursor_position(&mut self) {
+        trace!("Restoring cursor position");
+
+        self.damage_cursor();
+        self.grid.cursor = self.grid.saved_cursor.clone();
+        self.mode.set(TermMode::ORIGIN, self.saved_origin);
+        self.damage_cursor();
+    }
+
+    #[inline]
+    fn clear_line(&mut self, mode: ansi::LineClearMode) {
+        trace!("Clearing line: {:?}", mode);
+
+        let cursor = &self.grid.cursor;
+        let bg = cursor.template.bg;
+        let point = cursor.point;
+
+        let (left, right) = match mode {
+            ansi::LineClearMode::Right if cursor.input_needs_wrap => return,
+            ansi::LineClearMode::Right => (point.column, Column(self.columns())),
+            ansi::LineClearMode::Left => (Column(0), point.column + 1),
+            ansi::LineClearMode::All => (Column(0), Column(self.columns())),
+        };
+
+        self.damage.damage_line(point.line.0 as usize, left.0, right.0 - 1);
+
+        let row = &mut self.grid[point.line];
+        for cell in &mut row[left..right] {
+            *cell = bg.into();
+        }
+
+        let range = self.grid.cursor.point.line..=self.grid.cursor.point.line;
+        self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
+    }
+            ansi::ClearMode::All => {
+                if self.mode.contains(TermMode::ALT_SCREEN) {
+                    self.grid.reset_region(..);
+                } else {
+                    let old_offset = self.grid.display_offset();
+
+                    self.grid.clear_viewport();
+
+                    // Compute number of lines scrolled by clearing the viewport.
+                    let lines = self.grid.display_offset().saturating_sub(old_offset);
+
+                    self.vi_mode_cursor.point.line =
+                        (self.vi_mode_cursor.point.line - lines).grid_clamp(self, Boundary::Grid);
+                }
+
+                self.selection = None;
+            },
+            ansi::ClearMode::Saved if self.history_size() > 0 => {
+                self.grid.clear_history();
+
+                self.vi_mode_cursor.point.line =
+                    self.vi_mode_cursor.point.line.grid_clamp(self, Boundary::Cursor);
+
+                self.selection = self.selection.take().filter(|s| !s.intersects_range(..Line(0)));
+            },
+            // We have no history to clear.
+            ansi::ClearMode::Saved => (),
+        }
+
+        self.mark_fully_damaged();
+    }
+
+    #[inline]
+    fn clear_tabs(&mut self, mode: ansi::TabulationClearMode) {
+        trace!("Clearing tabs: {:?}", mode);
+        match mode {
+            ansi::TabulationClearMode::Current => {
+                self.tabs[self.grid.cursor.point.column] = false;
+            },
+            ansi::TabulationClearMode::All => {
+                self.tabs.clear_all();
+            },
+        }
+    }
+
+    /// Reset all important fields in the term struct.
+    #[inline]
+    fn reset_state(&mut self) {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            mem::swap(&mut self.grid, &mut self.inactive_grid);
+        }
+        self.active_charset = Default::default();
+        self.cursor_style = None;
+        self.grid.reset();
+        self.inactive_grid.reset();
+        self.saved_origin = Default::default();
+        self.inactive_saved_origin = Default::default();
+        self.scroll_region = Line(0)..Line(self.screen_lines() as i32);
+        self.tabs = TabStops::new(self.columns());
+        self.title_stack = Vec::new();
+        self.title = None;
+        self.selection = None;
+        self.vi_mode_cursor = Default::default();
+        self.keyboard_mode_stack = Default::default();
+        self.inactive_keyboard_mode_stack = Default::default();
+
+        // Preserve vi mode across resets.
+        self.mode &= TermMode::VI;
+        self.mode.insert(TermMode::default());
+
+        self.event_proxy.send_event(Event::CursorBlinkingChange);
+        self.mark_fully_damaged();
+    }
+
+    #[inline]
+    fn reverse_index(&mut self) {
+        trace!("Reversing index");
+        // If cursor is at the top.
+        if self.grid.cursor.point.line == self.scroll_region.start {
+            self.scroll_down(1);
+        } else {
+            self.damage_cursor();
+            self.grid.cursor.point.line = cmp::max(self.grid.cursor.point.line - 1, Line(0));
+            self.damage_cursor();
+        }
+    }
+                cursor.template.flags.insert(Flags::DOTTED_UNDERLINE);
+            },
+            Attr::DashedUnderline => {
+                cursor.template.flags.remove(Flags::ALL_UNDERLINES);
+                cursor.template.flags.insert(Flags::DASHED_UNDERLINE);
+            },
+            Attr::CancelUnderline => cursor.template.flags.remove(Flags::ALL_UNDERLINES),
+            Attr::Hidden => cursor.template.flags.insert(Flags::HIDDEN),
+            Attr::CancelHidden => cursor.template.flags.remove(Flags::HIDDEN),
+            Attr::Strike => cursor.template.flags.insert(Flags::STRIKEOUT),
+            Attr::CancelStrike => cursor.template.flags.remove(Flags::STRIKEOUT),
+            _ => {
+                debug!("Term got unhandled attr: {:?}", attr);
+            },
+        }
+    }
+
+    #[inline]
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        let mode = match mode {
+            PrivateMode::Named(mode) => mode,
+            PrivateMode::Unknown(mode) => {
+                debug!("Ignoring unknown mode {} in set_private_mode", mode);
+                return;
+            },
+        };
+
+        trace!("Setting private mode: {:?}", mode);
+        match mode {
+            NamedPrivateMode::UrgencyHints => self.mode.insert(TermMode::URGENCY_HINTS),
+            NamedPrivateMode::SwapScreenAndSetRestoreCursor => {
+                if !self.mode.contains(TermMode::ALT_SCREEN) {
+                    self.swap_alt();
+                }
+            },
+            NamedPrivateMode::ShowCursor => self.mode.insert(TermMode::SHOW_CURSOR),
+            NamedPrivateMode::CursorKeys => self.mode.insert(TermMode::APP_CURSOR),
+            // Mouse protocols are mutually exclusive.
+            NamedPrivateMode::ReportMouseClicks => {
+                self.mode.remove(TermMode::MOUSE_MODE);
+                self.mode.insert(TermMode::MOUSE_REPORT_CLICK);
+                self.event_proxy.send_event(Event::MouseCursorDirty);
+            },
+            NamedPrivateMode::ReportCellMouseMotion => {
+                self.mode.remove(TermMode::MOUSE_MODE);
+                self.mode.insert(TermMode::MOUSE_DRAG);
+                self.event_proxy.send_event(Event::MouseCursorDirty);
+            },
+            NamedPrivateMode::ReportAllMouseMotion => {
+                self.mode.remove(TermMode::MOUSE_MODE);
+                self.mode.insert(TermMode::MOUSE_MOTION);
+                self.event_proxy.send_event(Event::MouseCursorDirty);
+            },
+            NamedPrivateMode::ReportFocusInOut => self.mode.insert(TermMode::FOCUS_IN_OUT),
+            NamedPrivateMode::BracketedPaste => self.mode.insert(TermMode::BRACKETED_PASTE),
+            // Mouse encodings are mutually exclusive.
+            NamedPrivateMode::SgrMouse => {
+                self.mode.remove(TermMode::UTF8_MOUSE);
+                self.mode.insert(TermMode::SGR_MOUSE);
+            },
+            NamedPrivateMode::Utf8Mouse => {
+                self.mode.remove(TermMode::SGR_MOUSE);
+                self.mode.insert(TermMode::UTF8_MOUSE);
+            },
+            NamedPrivateMode::AlternateScroll => self.mode.insert(TermMode::ALTERNATE_SCROLL),
+            NamedPrivateMode::LineWrap => self.mode.insert(TermMode::LINE_WRAP),
+            NamedPrivateMode::Origin => {
+                self.mode.insert(TermMode::ORIGIN);
+                self.goto(0, 0);
+            },
+            NamedPrivateMode::ColumnMode => self.deccolm(),
+            NamedPrivateMode::BlinkingCursor => {
+                let style = self.cursor_style.get_or_insert(self.config.default_cursor_style);
+                style.blinking = true;
+                self.event_proxy.send_event(Event::CursorBlinkingChange);
+            },
+            NamedPrivateMode::SyncUpdate => (),
+        }
+    }
+
+    #[inline]
+    fn unset_private_mode(&mut self, mode: PrivateMode) {
+        let mode = match mode {
+            PrivateMode::Named(mode) => mode,
+            PrivateMode::Unknown(mode) => {
+                debug!("Ignoring unknown mode {} in unset_private_mode", mode);
+                return;
+            },
+        };
+
+        trace!("Unsetting private mode: {:?}", mode);
+        match mode {
+            NamedPrivateMode::UrgencyHints => self.mode.remove(TermMode::URGENCY_HINTS),
+            NamedPrivateMode::SwapScreenAndSetRestoreCursor => {
+                if self.mode.contains(TermMode::ALT_SCREEN) {
+                    self.swap_alt();
+                }
+            },
+            NamedPrivateMode::ShowCursor => self.mode.remove(TermMode::SHOW_CURSOR),
+            NamedPrivateMode::CursorKeys => self.mode.remove(TermMode::APP_CURSOR),
+            NamedPrivateMode::ReportMouseClicks => {
+                self.mode.remove(TermMode::MOUSE_REPORT_CLICK);
+                self.event_proxy.send_event(Event::MouseCursorDirty);
+            },
+            NamedPrivateMode::ReportCellMouseMotion => {
+                self.mode.remove(TermMode::MOUSE_DRAG);
+                self.event_proxy.send_event(Event::MouseCursorDirty);
+            },
+            NamedPrivateMode::ReportAllMouseMotion => {
+                self.mode.remove(TermMode::MOUSE_MOTION);
+                self.event_proxy.send_event(Event::MouseCursorDirty);
+            },
+            NamedPrivateMode::ReportFocusInOut => self.mode.remove(TermMode::FOCUS_IN_OUT),
+            NamedPrivateMode::BracketedPaste => self.mode.remove(TermMode::BRACKETED_PASTE),
+            NamedPrivateMode::SgrMouse => self.mode.remove(TermMode::SGR_MOUSE),
+            NamedPrivateMode::Utf8Mouse => self.mode.remove(TermMode::UTF8_MOUSE),
+            NamedPrivateMode::AlternateScroll => self.mode.remove(TermMode::ALTERNATE_SCROLL),
+            NamedPrivateMode::LineWrap => self.mode.remove(TermMode::LINE_WRAP),
+            NamedPrivateMode::Origin => {
+                self.mode.remove(TermMode::ORIGIN);
+                self.goto(0, 0);
+            },
+            NamedPrivateMode::ColumnMode => self.deccolm(),
+            NamedPrivateMode::BlinkingCursor => {
+                let style = self.cursor_style.get_or_insert(self.config.default_cursor_style);
+                style.blinking = false;
+                self.event_proxy.send_event(Event::CursorBlinkingChange);
+            },
+            NamedPrivateMode::SyncUpdate => (),
+        }
+    }
+
+    #[inline]
+    fn report_private_mode(&mut self, mode: PrivateMode) {
+        trace!("Reporting private mode {mode:?}");
+        let state = match mode {
+            PrivateMode::Named(mode) => match mode {
+                NamedPrivateMode::CursorKeys => self.mode.contains(TermMode::APP_CURSOR).into(),
+                NamedPrivateMode::Origin => self.mode.contains(TermMode::ORIGIN).into(),
+                NamedPrivateMode::LineWrap => self.mode.contains(TermMode::LINE_WRAP).into(),
+                NamedPrivateMode::BlinkingCursor => {
+                    let style = self.cursor_style.get_or_insert(self.config.default_cursor_style);
+                    style.blinking.into()
+                },
+                NamedPrivateMode::ShowCursor => self.mode.contains(TermMode::SHOW_CURSOR).into(),
+                NamedPrivateMode::ReportMouseClicks => {
+                    self.mode.contains(TermMode::MOUSE_REPORT_CLICK).into()
+                },
+                NamedPrivateMode::ReportCellMouseMotion => {
+                    self.mode.contains(TermMode::MOUSE_DRAG).into()
+                },
+                NamedPrivateMode::ReportAllMouseMotion => {
+                    self.mode.contains(TermMode::MOUSE_MOTION).into()
+                },
+                NamedPrivateMode::ReportFocusInOut => {
+                    self.mode.contains(TermMode::FOCUS_IN_OUT).into()
+                },
+                NamedPrivateMode::Utf8Mouse => self.mode.contains(TermMode::UTF8_MOUSE).into(),
+                NamedPrivateMode::SgrMouse => self.mode.contains(TermMode::SGR_MOUSE).into(),
+                NamedPrivateMode::AlternateScroll => {
+                    self.mode.contains(TermMode::ALTERNATE_SCROLL).into()
+                },
+                NamedPrivateMode::UrgencyHints => {
+                    self.mode.contains(TermMode::URGENCY_HINTS).into()
+                },
+                NamedPrivateMode::SwapScreenAndSetRestoreCursor => {
+                    self.mode.contains(TermMode::ALT_SCREEN).into()
+                },
+                NamedPrivateMode::BracketedPaste => {
+                    self.mode.contains(TermMode::BRACKETED_PASTE).into()
+                },
+/work/candidates/B/alacritty_terminal/src/term/mod.rs:728:            self.grid.saved_cursor = self.grid.cursor.clone();
+/work/candidates/B/alacritty_terminal/src/term/mod.rs:1166:    fn goto(&mut self, line: i32, col: usize) {
+/work/candidates/B/alacritty_terminal/src/term/mod.rs:1185:    fn goto_line(&mut self, line: i32) {
+/work/candidates/B/alacritty_terminal/src/term/mod.rs:1191:    fn goto_col(&mut self, col: usize) {
+/work/candidates/B/alacritty_terminal/src/term/mod.rs:1629:    fn save_cursor_position(&mut self) {
+/work/candidates/B/alacritty_terminal/src/term/mod.rs:1632:        self.grid.saved_cursor = self.grid.cursor.clone();
+/work/candidates/B/alacritty_terminal/src/term/mod.rs:1637:    fn restore_cursor_position(&mut self) {
+/work/candidates/B/alacritty_terminal/src/term/mod.rs:1641:        self.grid.cursor = self.grid.saved_cursor.clone();
+/work/candidates/B/alacritty_terminal/src/term/mod.rs:3156:        term.save_cursor_position();
+/work/candidates/B/alacritty_terminal/src/term/mod.rs:3160:        term.restore_cursor_position();
+/work/candidates/B/alacritty_terminal/src/grid/mod.rs:117:    pub saved_cursor: Cursor<T>,
+/work/candidates/B/alacritty_terminal/src/grid/mod.rs:146:            saved_cursor: Cursor::default(),
+/work/candidates/B/alacritty_terminal/src/grid/mod.rs:343:        self.saved_cursor = Cursor::default();
+/work/candidates/B/alacritty_terminal/src/grid/resize.rs:64:        self.saved_cursor.point.line += from_history;
+/work/candidates/B/alacritty_terminal/src/grid/resize.rs:93:        self.saved_cursor.point.line = min(self.saved_cursor.point.line, Line(target as i32 - 1));
+/work/candidates/B/alacritty_terminal/src/grid/resize.rs:387:        self.saved_cursor.point.column = min(self.saved_cursor.point.column, Column(columns - 1));
+   Compiling alacritty_terminal v0.25.0 (/work/tmp/decom-assess.mts4Yh/source/alacritty_terminal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.98s
+     Running unittests src/lib.rs (/work/tmp/decom-assess.mts4Yh/target/debug/deps/alacritty_terminal-4080e7ed0f27ebc5)
+
+running 128 tests
+test grid::storage::tests::indexing ... ok
+test grid::storage::tests::grow_after_zero ... ok
+test grid::storage::tests::grow_before_zero ... ok
+test grid::storage::tests::indexing_above_inner_len - should panic ... ok
+test grid::storage::tests::rotate ... ok
+test grid::storage::tests::initialize ... ok
+test grid::storage::tests::rotate_wrap_zero ... ok
+test grid::storage::tests::shrink_after_zero ... ok
+test grid::storage::tests::shrink_before_and_after_zero ... ok
+test grid::storage::tests::shrink_before_zero ... ok
+test grid::storage::tests::shrink_then_grow ... ok
+test grid::storage::tests::truncate_invisible_lines ... ok
+test grid::storage::tests::truncate_invisible_lines_beginning ... ok
+test grid::storage::tests::with_capacity ... ok
+test grid::tests::grow_reflow ... ok
+test grid::tests::grow_reflow_disabled ... ok
+test grid::tests::grow_reflow_multiline ... ok
+test grid::tests::scroll_down ... ok
+test grid::tests::scroll_down_with_history ... ok
+test grid::tests::scroll_up ... ok
+test grid::tests::shrink_reflow ... ok
+test grid::tests::shrink_reflow_disabled ... ok
+test grid::tests::shrink_reflow_empty_cell_inside_line ... ok
+test grid::tests::shrink_reflow_twice ... ok
+test grid::tests::test_iter ... ok
+test index::tests::add ... ok
+test index::tests::add_clamp ... ok
+test index::tests::add_grid_clamp ... ok
+test index::tests::add_none_clamp ... ok
+test index::tests::add_wrap ... ok
+test index::tests::location_ordering ... ok
+test index::tests::sub ... ok
+test index::tests::sub_clamp ... ok
+test index::tests::sub_grid_clamp ... ok
+test index::tests::sub_none_clamp ... ok
+test index::tests::sub_wrap ... ok
+test selection::tests::across_adjacent_lines_upward_final_cell_exclusive ... ok
+test selection::tests::between_adjacent_cells_left_to_right ... ok
+test selection::tests::between_adjacent_cells_right_to_left ... ok
+test selection::tests::block_is_empty ... ok
+test selection::tests::block_selection ... ok
+test selection::tests::line_selection ... ok
+test selection::tests::range_intersection ... ok
+test selection::tests::rotate_in_region_down ... ok
+test selection::tests::rotate_in_region_up ... ok
+test selection::tests::rotate_in_region_up_block ... ok
+test selection::tests::selection_bigger_then_smaller ... ok
+test selection::tests::semantic_selection ... ok
+test selection::tests::simple_is_empty ... ok
+test selection::tests::simple_selection ... ok
+test selection::tests::single_cell_left_to_right ... ok
+test selection::tests::single_cell_right_to_left ... ok
+test term::cell::tests::cell_size_is_below_cap ... ok
+test term::cell::tests::line_length_works ... ok
+test term::cell::tests::line_length_works_with_wrapline ... ok
+test term::search::tests::empty_match ... ok
+test term::search::tests::anchored_empty ... ok
+test term::search::tests::empty_match_multibyte ... ok
+test term::search::tests::empty_match_multiline ... ok
+test term::search::tests::fullwidth_semantic ... ok
+test term::search::tests::end_on_fullwidth ... ok
+test term::search::tests::end_on_multibyte_unicode ... ok
+test term::search::tests::include_linebreak_left ... ok
+test term::search::tests::greed_is_good ... ok
+test term::search::tests::fullwidth ... ok
+test term::search::tests::inline_word_search ... ok
+test term::search::tests::include_linebreak_right ... ok
+test term::search::tests::leading_spacer ... ok
+test term::search::tests::newline_breaking_semantic ... ok
+test term::search::tests::multiline ... ok
+test term::search::tests::multibyte_unicode ... ok
+test term::search::tests::no_match_left ... ok
+test term::search::tests::nested_regex ... ok
+test term::search::tests::no_match_right ... ok
+test term::search::tests::reverse_search_dead_recovery ... ok
+test term::search::tests::regex_left ... ok
+test term::search::tests::regex_right ... ok
+test term::search::tests::singlecell_fullwidth ... ok
+test term::search::tests::skip_dead_cell ... ok
+test term::search::tests::wrap_around_to_another_end ... ok
+test term::search::tests::wide_without_spacer ... ok
+test term::search::tests::wrapping ... ok
+test term::tests::block_selection_works ... ok
+test term::search::tests::wrapping_into_fullwidth ... ok
+test term::tests::clearing_scrollback_resets_display_offset ... ok
+test term::tests::clear_saved_lines ... ok
+test term::tests::clearing_scrollback_sets_vi_cursor_into_viewport ... ok
+test term::tests::clearing_viewport_keeps_history_position ... ok
+test term::tests::damage_cursor_movements ... ok
+test term::tests::clearing_viewport_with_vi_mode_keeps_history_position ... ok
+test term::tests::damage_public_usage ... ok
+test term::search::tests::nfa_compile_error ... ok
+test term::tests::full_damage ... ok
+test term::tests::grow_lines_updates_active_cursor_pos ... ok
+test term::tests::input_line_drawing_character ... ok
+test term::tests::line_selection_works ... ok
+test term::tests::parse_cargo_version ... ok
+test term::tests::scroll_display_page_down ... ok
+test term::tests::scroll_display_page_up ... ok
+test term::tests::semantic_selection_works ... ok
+test term::tests::grid_serde ... ok
+test term::tests::grow_lines_updates_inactive_cursor_pos ... ok
+test term::tests::simple_selection_works ... ok
+test term::tests::vi_cursor_keep_pos_on_scrollback_buffer ... ok
+test term::tests::window_title ... ok
+test tty::unix::test_get_pw_entry ... ok
+test vi_mode::tests::motion_bracket ... ok
+test vi_mode::tests::motion_first_occupied ... ok
+test vi_mode::tests::motion_high_middle_low ... ok
+test vi_mode::tests::motion_semantic_left_end ... ok
+test term::tests::shrink_lines_updates_active_cursor_pos ... ok
+test vi_mode::tests::motion_semantic_left_start ... ok
+test vi_mode::tests::motion_semantic_right_end ... ok
+test vi_mode::tests::motion_semantic_right_start ... ok
+test vi_mode::tests::motion_simple ... ok
+test term::tests::shrink_lines_updates_inactive_cursor_pos ... ok
+test vi_mode::tests::motion_start_end ... ok
+test vi_mode::tests::motion_word ... ok
+test vi_mode::tests::scroll_over_bottom ... ok
+test vi_mode::tests::scroll_over_top ... ok
+test vi_mode::tests::scroll_semantic ... ok
+test vi_mode::tests::semantic_wide ... ok
+test vi_mode::tests::scroll_word ... ok
+test vi_mode::tests::scroll_simple ... ok
+test vi_mode::tests::simple_wide ... ok
+test vi_mode::tests::wide_semantic_char ... ok
+test vi_mode::tests::word_wide ... ok
+test term::search::tests::runtime_cache_error ... ok
+
+test result: ok. 128 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+
+   Compiling alacritty_terminal v0.25.0 (/work/tmp/decom-assess.mts4Yh/source/alacritty_terminal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.37s
+     Running unittests src/lib.rs (/work/tmp/decom-assess.mts4Yh/target/debug/deps/alacritty_terminal-4e9f1fac8994a10e)
+
+running 127 tests
+test grid::storage::tests::indexing ... ok
+test grid::storage::tests::grow_before_zero ... ok
+test grid::storage::tests::grow_after_zero ... ok
+test grid::storage::tests::indexing_above_inner_len - should panic ... ok
+test grid::storage::tests::rotate ... ok
+test grid::storage::tests::initialize ... ok
+test grid::storage::tests::rotate_wrap_zero ... ok
+test grid::storage::tests::shrink_after_zero ... ok
+test grid::storage::tests::shrink_before_and_after_zero ... ok
+test grid::storage::tests::shrink_before_zero ... ok
+test grid::storage::tests::shrink_then_grow ... ok
+test grid::storage::tests::truncate_invisible_lines ... ok
+test grid::storage::tests::truncate_invisible_lines_beginning ... ok
+test grid::storage::tests::with_capacity ... ok
+test grid::tests::grow_reflow ... ok
+test grid::tests::grow_reflow_disabled ... ok
+test grid::tests::grow_reflow_multiline ... ok
+test grid::tests::scroll_down ... ok
+test grid::tests::scroll_down_with_history ... ok
+test grid::tests::scroll_up ... ok
+test grid::tests::shrink_reflow ... ok
+test grid::tests::shrink_reflow_disabled ... ok
+test grid::tests::shrink_reflow_empty_cell_inside_line ... ok
+test grid::tests::shrink_reflow_twice ... ok
+test grid::tests::test_iter ... ok
+test index::tests::add ... ok
+test index::tests::add_clamp ... ok
+test index::tests::add_grid_clamp ... ok
+test index::tests::add_none_clamp ... ok
+test index::tests::add_wrap ... ok
+test index::tests::location_ordering ... ok
+test index::tests::sub ... ok
+test index::tests::sub_clamp ... ok
+test index::tests::sub_grid_clamp ... ok
+test index::tests::sub_none_clamp ... ok
+test index::tests::sub_wrap ... ok
+test selection::tests::across_adjacent_lines_upward_final_cell_exclusive ... ok
+test selection::tests::between_adjacent_cells_left_to_right ... ok
+test selection::tests::between_adjacent_cells_right_to_left ... ok
+test selection::tests::block_is_empty ... ok
+test selection::tests::block_selection ... ok
+test selection::tests::line_selection ... ok
+test selection::tests::range_intersection ... ok
+test selection::tests::rotate_in_region_down ... ok
+test selection::tests::rotate_in_region_up ... ok
+test selection::tests::rotate_in_region_up_block ... ok
+test selection::tests::selection_bigger_then_smaller ... ok
+test selection::tests::semantic_selection ... ok
+test selection::tests::simple_is_empty ... ok
+test selection::tests::simple_selection ... ok
+test selection::tests::single_cell_left_to_right ... ok
+test selection::tests::single_cell_right_to_left ... ok
+test term::cell::tests::cell_size_is_below_cap ... ok
+test term::cell::tests::line_length_works ... ok
+test term::cell::tests::line_length_works_with_wrapline ... ok
+test term::search::tests::empty_match ... ok
+test term::search::tests::empty_match_multiline ... ok
+test term::search::tests::empty_match_multibyte ... ok
+test term::search::tests::anchored_empty ... ok
+test term::search::tests::fullwidth_semantic ... ok
+test term::search::tests::end_on_fullwidth ... ok
+test term::search::tests::end_on_multibyte_unicode ... ok
+test term::search::tests::include_linebreak_left ... ok
+test term::search::tests::greed_is_good ... ok
+test term::search::tests::inline_word_search ... ok
+test term::search::tests::fullwidth ... ok
+test term::search::tests::include_linebreak_right ... ok
+test term::search::tests::leading_spacer ... ok
+test term::search::tests::newline_breaking_semantic ... ok
+test term::search::tests::multiline ... ok
+test term::search::tests::nested_regex ... ok
+test term::search::tests::multibyte_unicode ... ok
+test term::search::tests::no_match_left ... ok
+test term::search::tests::no_match_right ... ok
+test term::search::tests::regex_left ... ok
+test term::search::tests::reverse_search_dead_recovery ... ok
+test term::search::tests::regex_right ... ok
+test term::search::tests::singlecell_fullwidth ... ok
+test term::search::tests::skip_dead_cell ... ok
+test term::search::tests::nfa_compile_error ... ok
+test term::search::tests::wrap_around_to_another_end ... ok
+test term::search::tests::wide_without_spacer ... ok
+test term::tests::block_selection_works ... ok
+test term::search::tests::wrapping ... ok
+test term::search::tests::wrapping_into_fullwidth ... ok
+test term::tests::clearing_scrollback_resets_display_offset ... ok
+test term::tests::clear_saved_lines ... ok
+test term::tests::clearing_scrollback_sets_vi_cursor_into_viewport ... ok
+test term::tests::damage_cursor_movements ... ok
+test term::tests::clearing_viewport_keeps_history_position ... ok
+test term::tests::clearing_viewport_with_vi_mode_keeps_history_position ... ok
+test term::tests::damage_public_usage ... ok
+test term::tests::full_damage ... ok
+test term::tests::input_line_drawing_character ... ok
+test term::tests::grow_lines_updates_active_cursor_pos ... ok
+test term::tests::line_selection_works ... ok
+test term::tests::parse_cargo_version ... ok
+test term::tests::scroll_display_page_down ... ok
+test term::tests::scroll_display_page_up ... ok
+test term::tests::semantic_selection_works ... ok
+test term::tests::grow_lines_updates_inactive_cursor_pos ... ok
+test term::tests::simple_selection_works ... ok
+test term::tests::shrink_lines_updates_active_cursor_pos ... ok
+test term::tests::vi_cursor_keep_pos_on_scrollback_buffer ... ok
+test term::tests::shrink_lines_updates_inactive_cursor_pos ... ok
+test term::tests::window_title ... ok
+test tty::unix::test_get_pw_entry ... ok
+test vi_mode::tests::motion_bracket ... ok
+test vi_mode::tests::motion_first_occupied ... ok
+test vi_mode::tests::motion_high_middle_low ... ok
+test vi_mode::tests::motion_semantic_left_end ... ok
+test vi_mode::tests::motion_semantic_left_start ... ok
+test vi_mode::tests::motion_semantic_right_end ... ok
+test vi_mode::tests::motion_semantic_right_start ... ok
+test vi_mode::tests::motion_simple ... ok
+test vi_mode::tests::motion_start_end ... ok
+test vi_mode::tests::motion_word ... ok
+test vi_mode::tests::scroll_over_bottom ... ok
+test vi_mode::tests::scroll_over_top ... ok
+test vi_mode::tests::scroll_semantic ... ok
+test vi_mode::tests::semantic_wide ... ok
+test vi_mode::tests::simple_wide ... ok
+test vi_mode::tests::scroll_simple ... ok
+test vi_mode::tests::wide_semantic_char ... ok
+test vi_mode::tests::word_wide ... ok
+test vi_mode::tests::scroll_word ... ok
+test term::search::tests::runtime_cache_error ... ok
+
+test result: ok. 127 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+
+   Compiling alacritty_terminal v0.25.0 (/work/tmp/decom-assess.mts4Yh/source/alacritty_terminal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.76s
+     Running tests/ref.rs (/work/tmp/decom-assess.mts4Yh/target/debug/deps/ref-7a9371cf40fb76d5)
+
+running 44 tests
+test clear_underline ... ok
+test alt_reset ... ok
+test colored_underline ... ok
+test csi_rep ... ok
+test colored_reset ... ok
+test decaln_reset ... ok
+test deccolm_reset ... ok
+test delete_chars_reset ... ok
+test delete_lines ... ok
+test erase_chars_reset ... ok
+test fish_cc ... ok
+test erase_in_line ... ok
+test indexed_256_colors ... ok
+test hyperlinks ... ok
+test insert_blank_reset ... ok
+test issue_855 ... ok
+test ll ... ok
+test newline_with_cursor_beyond_scroll_region ... ok
+test grid_reset ... ok
+test saved_cursor ... ok
+test region_scroll_down ... ok
+test saved_cursor_alt ... ok
+test scroll_in_region_up_preserves_history ... ok
+test scroll_up_reset ... ok
+test selective_erasure ... ok
+test sgr ... ok
+test tab_rendering ... ok
+test tmux_git_log ... ok
+test tmux_htop ... ok
+test underline ... ok
+test vim_large_window_scroll ... ok
+test vim_simple_edit ... ok
+test vim_24bitcolors_bce ... ok
+test vttest_cursor_movement_1 ... ok
+test vttest_insert ... ok
+test vttest_origin_mode_1 ... ok
+test vttest_origin_mode_2 ... ok
+test vttest_tab_clear_set ... ok
+test vttest_scroll ... ok
+test wrapline_alt_toggle ... ok
+test zerowidth ... ok
+test zsh_tab_completion ... ok
+test history ... ok
+test row_reset ... ok
+
+test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+

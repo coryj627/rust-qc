@@ -1,0 +1,1 @@
+env RUSTUP_AUTO_INSTALL=0 CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/work/tmp/A-candidate-target python3 /work/prepared/hidden/run.py --crate /work/candidates/A --run-dir /work/tmp/A-public-api-0huffgyb

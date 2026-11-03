@@ -1,0 +1,3 @@
+Implemented `small_config` in [src/lib.rs](/work/crate/src/lib.rs) with ordered parsing, quoted escapes, duplicate detection, and public errors exposing line numbers and error kinds. No dependencies added.
+
+Verification passed: rustfmt, Clippy with warnings denied, rustdoc with warnings denied, 12 unit tests, and 2 documentation tests. Tests include Unicode, malformed input, line endings, round trips, and exhaustive short-input checks.

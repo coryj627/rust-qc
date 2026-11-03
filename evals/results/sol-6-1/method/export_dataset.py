@@ -161,16 +161,20 @@ def scan(output):
         "personal_name": re.compile(r"\bcoryj?\b", re.IGNORECASE),
     }
     hits = []
+    paths = [path for path in output.iterdir() if path.is_file()]
+    paths.extend(path for path in (output / "method").rglob("*")
+                 if path.is_file() and path.suffix in {".json", ".jsonl", ".md", ".log"})
     for folder in [output / name for name in (
-        "raw", "reports", "artifacts", "controls", "stage5", "grading", "schedules",
+        "raw", "reports", "artifacts", "controls", "stage5", "grading", "schedules", "preflight",
+        "stage1", "stage2", "invalid-attempts",
     )]:
-        for path in folder.rglob("*"):
-            if path.is_file():
-                text = path.read_bytes().decode("utf-8", errors="replace")
-                for name, pattern in patterns.items():
-                    for match in pattern.finditer(text):
-                        hits.append({"file": str(path.relative_to(output)), "kind": name,
-                                     "line": text.count("\n", 0, match.start()) + 1})
+        paths.extend(path for path in folder.rglob("*") if path.is_file())
+    for path in paths:
+        text = path.read_bytes().decode("utf-8", errors="replace")
+        for name, pattern in patterns.items():
+            for match in pattern.finditer(text):
+                hits.append({"file": str(path.relative_to(output)), "kind": name,
+                             "line": text.count("\n", 0, match.start()) + 1})
     return hits
 
 

@@ -1,0 +1,548 @@
+/usr/local/cargo/bin/cargo
+total 8
+drwxr-xr-x 2 audit audit 4096 Nov  3 07:19 .
+drwxr-xr-x 1 root  root  4096 Nov  3 16:59 ..
+[target.armv5te-unknown-linux-musleabi]
+rustflags = ["--cfg", "armv5te", "--cfg", "rustver"]
+
+[target.mips-unknown-linux-musl]
+rustflags = ["--cfg", "mips", "--cfg", "rustver"]
+
+[target.mipsel-unknown-linux-musl]
+rustflags = ["--cfg", "mips", "--cfg", "rustver"]
+    timer_wheel: &'iter mut TimerWheel<K>,
+    previous_time: Instant,
+    current_time: Instant,
+    is_done: bool,
+    level: usize,
+    index: u8,
+    end_index: u8,
+    index_mask: u64,
+    is_new_level: bool,
+    is_new_index: bool,
+}
+
+impl<'iter, K> TimerEventsIter<'iter, K> {
+    fn new(
+        timer_wheel: &'iter mut TimerWheel<K>,
+        previous_time: Instant,
+        current_time: Instant,
+    ) -> Self {
+        Self {
+            timer_wheel,
+            previous_time,
+            current_time,
+            is_done: false,
+            level: 0,
+            index: 0,
+            end_index: 0,
+            index_mask: 0,
+            is_new_level: true,
+            is_new_index: true,
+        }
+    }
+}
+
+impl<K> Drop for TimerEventsIter<'_, K> {
+    fn drop(&mut self) {
+        if !self.is_done {
+            // This iterator was dropped before consuming all events. Reset the
+            // `current` to the time when the timer wheel was last successfully
+            // advanced.
+            self.timer_wheel.current = self.previous_time;
+        }
+    }
+}
+
+impl<K> Iterator for TimerEventsIter<'_, K> {
+    type Item = TimerEvent<K>;
+
+    /// NOTE: When necessary, this iterator will unset the timer node pointer in the
+    /// `ValueEntry`.
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.is_done {
+            return None;
+        }
+
+        loop {
+            if self.is_new_level {
+                let previous_time_nanos = self.timer_wheel.time_nanos(self.previous_time);
+                let current_time_nanos = self.timer_wheel.time_nanos(self.current_time);
+                let previous_ticks = previous_time_nanos >> SHIFT[self.level];
+                let current_ticks = current_time_nanos >> SHIFT[self.level];
+
+                if current_ticks <= previous_ticks {
+                    self.is_done = true;
+                    return None;
+                }
+
+                self.index_mask = BUCKET_COUNTS[self.level] - 1;
+                self.index = (previous_ticks & self.index_mask) as u8;
+                let steps =
+                    (current_ticks - previous_ticks + 1).min(BUCKET_COUNTS[self.level]) as u8;
+                self.end_index = self.index + steps;
+
+                self.is_new_level = false;
+                self.is_new_index = true;
+
+                // dbg!(self.level, self.index, self.end_index);
+            }
+
+            let i = self.index & self.index_mask as u8;
+
+            if self.is_new_index {
+                // Move the sentinel to the back of the queue.
+                self.timer_wheel
+                    .reset_timer_node_positions(self.level, i as usize);
+
+                self.is_new_index = false;
+            }
+
+            // Pop the next timer event (cache entry) from the queue at the current
+            // level and index.
+            //
+            // We will repeat processing this level until we see the sentinel.
+            // (`pop_timer_node` will return `None` when it sees the sentinel)
+            if let Some(node) = self.timer_wheel.pop_timer_node(self.level, i as usize) {
+                let expiration_time = node.as_ref().element.entry_info().expiration_time();
+                if let Some(t) = expiration_time {
+                    if t <= self.current_time {
+                        // The cache entry has expired. Unset the timer node from
+                        // the ValueEntry and return the node.
+                        node.as_ref().element.unset_timer_node_in_deq_nodes();
+                        return Some(TimerEvent::Expired(node));
+                    }
+
+                    // The cache entry has not expired. Reschedule it.
+                    let node_p = NonNull::new(Box::into_raw(node)).expect("Got a null ptr");
+
+                    #[cfg(test)]
+                    // Get the entry info before rescheduling (mutating) the node to
+                    // avoid Stacked Borrows/Tree Borrows violations on `node_p`.
+                    let entry_info =
+                        MiniArc::clone(unsafe { node_p.as_ref() }.element.entry_info());
+
+                    match self.timer_wheel.schedule_existing_node(node_p) {
+                        ReschedulingResult::Rescheduled => {
+                            #[cfg(test)]
+                            return Some(TimerEvent::Rescheduled(entry_info));
+                            #[cfg(not(test))]
+                            return Some(TimerEvent::Rescheduled(()));
+                        }
+                        ReschedulingResult::Removed(node) => {
+                            // The timer event has been removed from the timer
+                            // wheel. Unset the timer node from the ValueEntry.
+                            node.as_ref().element.unset_timer_node_in_deq_nodes();
+                            return Some(TimerEvent::Descheduled);
+                        }
+                    }
+                }
+            } else {
+                // Done with the current queue. Move to the next index
+                // and/or next level.
+                self.index += 1;
+                self.is_new_index = true;
+
+                if self.index >= self.end_index {
+                    self.level += 1;
+                    // No more levels to process. We are done.
+                    if self.level >= BUCKET_COUNTS.len() {
+                        self.is_done = true;
+                        return None;
+                    }
+                    self.is_new_level = true;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+use std::sync::atomic::{self, AtomicBool, AtomicU16, AtomicU32, Ordering};
+
+use super::{AccessTime, KeyHash};
+use crate::common::time::{AtomicInstant, Instant};
+
+#[derive(Debug)]
+pub(crate) struct EntryInfo<K> {
+    key_hash: KeyHash<K>,
+    /// `is_admitted` indicates that the entry has been admitted to the cache. When
+    /// `false`, it means the entry is _temporary_ admitted to the cache or evicted
+    /// from the cache (so it should not have LRU nodes).
+    is_admitted: AtomicBool,
+    /// `entry_gen` (entry generation) is incremented every time the entry is updated
+    /// in the concurrent hash table.
+    entry_gen: AtomicU16,
+    /// `policy_gen` (policy generation) is incremented every time entry's `WriteOp`
+    /// is applied to the cache policies including the access-order queue (the LRU
+    /// deque).
+    policy_gen: AtomicU16,
+    last_accessed: AtomicInstant,
+    last_modified: AtomicInstant,
+    expiration_time: AtomicInstant,
+    policy_weight: AtomicU32,
+}
+
+impl<K> EntryInfo<K> {
+    #[inline]
+    pub(crate) fn new(key_hash: KeyHash<K>, timestamp: Instant, policy_weight: u32) -> Self {
+        #[cfg(feature = "unstable-debug-counters")]
+        super::debug_counters::InternalGlobalDebugCounters::entry_info_created();
+
+        Self {
+            key_hash,
+            is_admitted: AtomicBool::default(),
+            // `entry_gen` starts at 1 and `policy_gen` start at 0.
+            entry_gen: AtomicU16::new(1),
+            policy_gen: AtomicU16::new(0),
+            last_accessed: AtomicInstant::new(timestamp),
+            last_modified: AtomicInstant::new(timestamp),
+            expiration_time: AtomicInstant::default(),
+            policy_weight: AtomicU32::new(policy_weight),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn key_hash(&self) -> &KeyHash<K> {
+        &self.key_hash
+    }
+
+    #[inline]
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.is_admitted.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(crate) fn set_admitted(&self, value: bool) {
+        self.is_admitted.store(value, Ordering::Release);
+    }
+
+    /// Returns `true` if the `ValueEntry` having this `EntryInfo` is dirty.
+    ///
+    /// Dirty means that the entry has been updated in the concurrent hash table but
+    /// not yet in the cache policies such as access-order queue.
+    #[inline]
+    pub(crate) fn is_dirty(&self) -> bool {
+        let result =
+            self.entry_gen.load(Ordering::Relaxed) != self.policy_gen.load(Ordering::Relaxed);
+        atomic::fence(Ordering::Acquire);
+        result
+    }
+
+    #[inline]
+    pub(crate) fn entry_gen(&self) -> u16 {
+        self.entry_gen.load(Ordering::Acquire)
+    }
+
+    /// Increments the entry generation and returns the new value.
+    #[inline]
+    pub(crate) fn incr_entry_gen(&self) -> u16 {
+        // NOTE: This operation wraps around on overflow.
+        let prev = self.entry_gen.fetch_add(1, Ordering::AcqRel);
+        // Need to add `1` to the previous value to get the current value.
+        prev.wrapping_add(1)
+    }
+
+    /// Sets the policy generation to the given value.
+    #[inline]
+    pub(crate) fn set_policy_gen(&self, value: u16) {
+        let g = &self.policy_gen;
+        loop {
+            let current = g.load(Ordering::Acquire);
+
+            // Do not set the given value if it is smaller than the current value of
+            // `policy_gen`. Note that the current value may have been wrapped
+            // around. If the value is much larger than the current value, it is
+            // likely that the value of `policy_gen` has been wrapped around.
+            if current >= value || value.wrapping_sub(current) > u16::MAX / 2 {
+                break;
+            }
+
+            // Try to set the value.
+            if g.compare_exchange_weak(current, value, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn policy_weight(&self) -> u32 {
+        self.policy_weight.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_policy_weight(&self, size: u32) {
+        self.policy_weight.store(size, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn expiration_time(&self) -> Option<Instant> {
+        self.expiration_time.instant()
+    }
+
+    pub(crate) fn set_expiration_time(&self, time: Option<Instant>) {
+        if let Some(t) = time {
+            self.expiration_time.set_instant(t);
+        } else {
+            self.expiration_time.clear();
+        }
+    }
+}
+
+#[cfg(feature = "unstable-debug-counters")]
+impl<K> Drop for EntryInfo<K> {
+    fn drop(&mut self) {
+        super::debug_counters::InternalGlobalDebugCounters::entry_info_dropped();
+    }
+}
+
+impl<K> AccessTime for EntryInfo<K> {
+    #[inline]
+    fn last_accessed(&self) -> Option<Instant> {
+        self.last_accessed.instant()
+    }
+
+    #[inline]
+    fn set_last_accessed(&self, timestamp: Instant) {
+        self.last_accessed.set_instant(timestamp);
+    }
+
+    #[inline]
+    fn last_modified(&self) -> Option<Instant> {
+        self.last_modified.instant()
+    }
+
+    #[inline]
+    fn set_last_modified(&self, timestamp: Instant) {
+        self.last_modified.set_instant(timestamp);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::EntryInfo;
+
+    // Run with:
+    //   RUSTFLAGS='--cfg rustver' cargo test --lib --features sync -- common::concurrent::entry_info::test --nocapture
+    //   RUSTFLAGS='--cfg rustver' cargo test --lib --no-default-features --features sync -- common::concurrent::entry_info::test --nocapture
+    //
+    // Note: the size of the struct may change in a future version of Rust.
+    #[cfg_attr(
+        not(all(rustver, any(target_os = "linux", target_os = "macos"))),
+        ignore
+    )]
+    #[test]
+    fn check_struct_size() {
+        use std::mem::size_of;
+
+        #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+        enum TargetArch {
+            Linux64,
+            Linux32X86,
+            Linux32Arm,
+            Linux32Mips,
+            MacOS64,
+        }
+
+        use TargetArch::*;
+
+        #[allow(clippy::option_env_unwrap)]
+        // e.g. "1.64"
+        let ver =
+            option_env!("RUSTC_SEMVER").expect("RUSTC_SEMVER env var was not set at compile time");
+        let arch = if cfg!(target_os = "linux") {
+            if cfg!(target_pointer_width = "64") {
+                Linux64
+            } else if cfg!(target_pointer_width = "32") {
+                if cfg!(target_arch = "x86") {
+                    Linux32X86
+                } else if cfg!(target_arch = "arm") {
+                    Linux32Arm
+                } else if cfg!(target_arch = "mips") {
+                    Linux32Mips
+                } else {
+                    unimplemented!();
+                }
+            } else {
+                unimplemented!();
+            }
+        } else if cfg!(target_os = "macos") {
+            MacOS64
+        } else {
+            panic!("Unsupported target architecture");
+        };
+
+        let expected_sizes = match arch {
+            Linux64 | Linux32Arm | Linux32Mips => vec![("1.51", 56)],
+            Linux32X86 => vec![("1.51", 48)],
+            MacOS64 => vec![("1.62", 56)],
+        };
+
+        let mut expected = None;
+        for (ver_str, size) in expected_sizes {
+            expected = Some(size);
+            if ver >= ver_str {
+                break;
+            }
+        }
+
+        if let Some(size) = expected {
+            assert_eq!(size_of::<EntryInfo<()>>(), size);
+        } else {
+            panic!("No expected size for {arch:?} with Rust version {ver}");
+        }
+    }
+}
+use std::{hash::Hash, sync::Arc};
+
+// This trait is implemented by `sync::BaseCache` and `sync::Cache`.
+pub(crate) trait ScanningGet<K, V> {
+    /// Returns the number of segments in the concurrent hash table.
+    fn num_cht_segments(&self) -> usize;
+
+    /// Returns a _clone_ of the value corresponding to the key.
+    ///
+    /// Unlike the `get` method of cache, this method is not considered a cache read
+    /// operation, so it does not update the historic popularity estimator or reset
+    /// the idle timer for the key.
+    fn scanning_get(&self, key: &Arc<K>) -> Option<V>;
+
+    /// Returns a vec of keys in a specified segment of the concurrent hash table.
+    fn keys(&self, cht_segment: usize) -> Option<Vec<Arc<K>>>;
+}
+
+/// Iterator visiting all key-value pairs in a cache in arbitrary order.
+///
+/// Call [`Cache::iter`](./struct.Cache.html#method.iter) method to obtain an `Iter`.
+pub struct Iter<'i, K, V> {
+    keys: Option<Vec<Arc<K>>>,
+    cache_segments: Box<[&'i dyn ScanningGet<K, V>]>,
+    num_cht_segments: usize,
+    cache_seg_index: usize,
+    cht_seg_index: usize,
+    is_done: bool,
+}
+
+impl<'i, K, V> Iter<'i, K, V> {
+    pub(crate) fn with_single_cache_segment(
+        cache: &'i dyn ScanningGet<K, V>,
+        num_cht_segments: usize,
+    ) -> Self {
+        Self {
+            keys: None,
+            cache_segments: Box::new([cache]),
+            num_cht_segments,
+            cache_seg_index: 0,
+            cht_seg_index: 0,
+            is_done: false,
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    pub(crate) fn with_multiple_cache_segments(
+        cache_segments: Box<[&'i dyn ScanningGet<K, V>]>,
+        num_cht_segments: usize,
+    ) -> Self {
+        Self {
+            keys: None,
+            cache_segments,
+            num_cht_segments,
+            cache_seg_index: 0,
+            cht_seg_index: 0,
+            is_done: false,
+        }
+    }
+}
+
+impl<K, V> Iterator for Iter<'_, K, V>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    type Item = (Arc<K>, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.is_done {
+            return None;
+        }
+
+        while let Some(key) = self.next_key() {
+            if let Some(v) = self.cache().scanning_get(&key) {
+                return Some((key, v));
+            }
+        }
+
+        self.is_done = true;
+        None
+    }
+}
+
+impl<'i, K, V> Iter<'i, K, V>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    fn cache(&self) -> &'i dyn ScanningGet<K, V> {
+        self.cache_segments[self.cache_seg_index]
+    }
+
+    fn next_key(&mut self) -> Option<Arc<K>> {
+        while let Some(keys) = self.current_keys() {
+            if let key @ Some(_) = keys.pop() {
+                return key;
+            }
+        }
+        None
+    }
+
+    fn current_keys(&mut self) -> Option<&mut Vec<Arc<K>>> {
+        // If keys is none or some but empty, try to get next keys.
+        while self.keys.as_ref().map_or(true, Vec::is_empty) {
+            // Adjust indices.
+            if self.cht_seg_index >= self.num_cht_segments {
+                self.cache_seg_index += 1;
+                self.cht_seg_index = 0;
+                if self.cache_seg_index >= self.cache_segments.len() {
+                    // No more cache segments left.
+                    return None;
+                }
+            }
+
+            let cache_segment = self.cache_segments[self.cache_seg_index];
+            self.keys = cache_segment.keys(self.cht_seg_index);
+            self.num_cht_segments = cache_segment.num_cht_segments();
+
+            self.cht_seg_index += 1;
+        }
+
+        self.keys.as_mut()
+    }
+}
+
+// Clippy beta 0.1.83 (f41c7ed9889 2024-10-31) warns about unused lifetimes on 'a.
+// This seems a false positive. The lifetimes are used in the Send and Sync impls.
+// Let's suppress the warning.
+// https://rust-lang.github.io/rust-clippy/master/index.html#extra_unused_lifetimes
+#[allow(clippy::extra_unused_lifetimes)]
+unsafe impl<'a, K, V> Send for Iter<'_, K, V>
+where
+    K: 'a + Eq + Hash + Send,
+    V: 'a + Send,
+{
+}
+
+// Clippy beta 0.1.83 (f41c7ed9889 2024-10-31) warns about unused lifetimes on 'a.
+// This seems a false positive. The lifetimes are used in the Send and Sync impls.
+// Let's suppress the warning.
+// https://rust-lang.github.io/rust-clippy/master/index.html#extra_unused_lifetimes
+#[allow(clippy::extra_unused_lifetimes)]
+unsafe impl<'a, K, V> Sync for Iter<'_, K, V>
+where
+    K: 'a + Eq + Hash + Sync,
+    V: 'a + Sync,
+{
+}

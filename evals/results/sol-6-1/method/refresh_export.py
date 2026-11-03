@@ -64,6 +64,7 @@ def main():
             and review.get("file_sha256") == digest
             and review.get("disposition") in {
                 "retained_nonsecret_container_path", "retained_nonsecret_source_archive",
+                "retained_nonsecret_source_recipe",
             }
             for review in reviews
         )

@@ -24,10 +24,14 @@ class ProvenanceExportTests(unittest.TestCase):
                 sorted(str(p.relative_to(output)) for p in output.rglob('*') if p.is_file()),
                 ['grading/provenance.json', 'schedules/stage5-schedule.json'],
             )
-            for folder in ("grading", "schedules"):
-                (output / folder / "canary.txt").write_text('user@example.invalid')
+            folders = ("grading", "schedules", "invalid-attempts", "stage1", "stage2", "method")
+            for folder in folders:
+                (output / folder).mkdir(exist_ok=True)
+                (output / folder / "canary.md").write_text('user@example.invalid')
+            (output / "recommended-skill-fixes.md").write_text('user@example.invalid')
             self.assertEqual({hit['file'] for hit in scan(output)},
-                             {'grading/canary.txt', 'schedules/canary.txt'})
+                             {f'{folder}/canary.md' for folder in folders}
+                             | {'recommended-skill-fixes.md'})
 
 
 if __name__ == "__main__":
