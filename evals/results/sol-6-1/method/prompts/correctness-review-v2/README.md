@@ -1,6 +1,6 @@
 # Correctness-focused review prompts, version 2
 
-These are prospective prompts requested after the first Sol evaluation. They make the ordinary Rust code-review task explicit and exclude dedicated security testing. They have not been sent to a model or used for any reported score.
+These prompts were requested after the first Sol evaluation. They make the ordinary Rust code-review task explicit and exclude dedicated security testing. They are now used in a [separately labeled v2 run](../../../review-v2/README.md); the original evaluation's scores do not use them.
 
 The existing main prompt asks to report "defects"; the short prompt asks for "problems." Neither spells out the review scope. These replacements ask for documented behavior, API/error handling, routine regression coverage, build/documentation results and maintainability, with evidence of the consequence for ordinary callers.
 

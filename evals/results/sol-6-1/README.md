@@ -91,10 +91,11 @@ pristine workspaces after a successful write-canary preflight. The image lacked
 
 ## Stages 3 and 4: audit coverage and findings
 
-An unexecuted [correctness-focused prompt variant](method/prompts/correctness-review-v2/README.md)
-was drafted after this evaluation to make ordinary code-review criteria explicit
-and exclude dedicated security testing. It is a prospective condition; all counts
-and scores below use the original frozen prompts.
+A separate [correctness-focused review run](review-v2/README.md) now uses the
+[revised prompts](method/prompts/correctness-review-v2/README.md) to make ordinary
+code-review criteria explicit and exclude dedicated security testing. Its scope
+and functional key set differ; all counts and scores below remain the original
+evaluation under its original frozen prompts.
 
 | Cell | Planned | Valid completed | Invalid completed | Provider failure | Not dispatched |
 | --- | ---: | ---: | ---: | ---: | ---: |

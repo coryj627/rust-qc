@@ -1,11 +1,13 @@
-# Correctness-review v2: readiness pilot
+# Correctness-review v2
 
-This is one new, narrower code-quality review using the approved v2 prompt. Its
-purpose is to check execution of that task in the isolated runner before preparing
-a scored comparison. It is not a retry of a security investigation and requests
-no dedicated security assessment, threat modeling, exploitability analysis or
-exploit development. The complete [rendered prompt](prompts/v2-pilot-pulldown-cmark.txt)
-is frozen before dispatch, alongside the [pilot plan](pilot-plan.json).
+The readiness pilot completed normally. A separately frozen 52-review comparison
+is now running with the approved, narrower v2 prompts; it has no scored outcome
+yet. The [comparison plan](comparison-plan.json), [analysis protocol](protocol.md)
+and [workspace preparation](comparison-preparation.json) precede its dispatch.
+No dedicated security assessment, threat modeling, exploitability analysis or
+exploit development is requested. The pilot's complete
+[rendered prompt](prompts/v2-pilot-pulldown-cmark.txt) was also frozen before
+dispatch, alongside its [plan](pilot-plan.json).
 
 The pilot reviews pulldown-cmark's documented behavior, ordinary API use, errors,
 regression coverage, build/docs and maintainability. It receives only the pinned
@@ -36,7 +38,8 @@ a block. Usage or disk limits retain the existing global stop behavior.
 
 The new batch-stop behavior was tested first against the old implementation:
 both new tests failed because it continued to an independent project. The updated
-dispatcher passes the full 48-test harness suite and Ruff. Rust candidate code
+dispatch and grading harness passes 55 tests, Ruff and the namespace shim's
+ShellCheck check. Rust candidate code
 was not built or run on the host during those Python tests.
 
-Status: prepared; no outcome recorded yet.
+Status: completed in 15.867 measured active minutes with no provider error, 47 sandbox commands, no transcript/provenance flags and no detected host execution. The agent reported 19 candidate findings; those claims have not been independently graded or verified. This is not a bug-count or skill-effect result. See the [report](reports/v2-pilot-pulldown-cmark.md), [checks](pilot-checks.json) and [scrubbed evidence](raw/v2-pilot-pulldown-cmark/).
