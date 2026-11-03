@@ -21,7 +21,7 @@ case "$*" in
     --version) [ -z "$PINNED_TOOLCHAIN_MISSING" ] || exit 1 ;;
     "fmt --all --check")
         if [ -n "$NIGHTLY_OPTIONS" ]; then
-            echo "Warning: can't set x, unstable features are only available in nightly channel." >&2
+            echo "Warning: unstable features are only available in nightly channel." >&2
             exit "${STABLE_FMT_STATUS:-1}"
         fi
         ;;

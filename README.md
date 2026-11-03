@@ -28,7 +28,7 @@ Invoke it by name, for example "Use rust-qc to audit this crate." In testing, ag
 
 ## Requirements
 
-- cargo, rustfmt and clippy
+- cargo, rustfmt, clippy and bash (3.2 or newer), for the verification gate
 - python3, for the heuristic scan
 - nightly rustfmt, only for projects whose `rustfmt.toml` uses nightly-only options
 - Miri, recommended for crates that contain `unsafe`
@@ -65,6 +65,15 @@ It exits 0 when every step passes, 1 when any step fails, and 2 when a precondit
 `python3 -I audit_scan.py <crate-root>` reports glob re-exports, weasel-word type names, ASCII-art comments, design-history docs, parameter tables, bare TODOs, empty `expect` messages and print macros in library code. It skips benchmark, fuzz and data folders, and treats tests and examples as non-production code. Inside `src/` it skips only test data and treats only `tests` as non-production, because folder names there are module names. A workspace member whose own folder is named like a skipped folder, such as `crates/data`, is still skipped.
 
 Run the tests from the repository root with `python3 -I tests/test_audit_scan.py` and `python3 -I tests/test_check.py`. The second uses stub commands, so it needs no Rust toolchain.
+
+## Continuous integration
+
+CI runs on every push and pull request.
+
+- **On Linux:** ruff on the Python files, shellcheck on `check.sh`, and validation of the skill against the Agent Skills specification.
+- **On Linux and macOS:** both test files, then `check.sh` on the fixture crates, confirming exit codes 0, 1 and 2. These run under `/bin/bash`, so macOS covers bash 3.2.
+
+CI checks the scripts and the skill's format. It does not check whether the rules give good results; that is what the evaluations under "How it was tested" are for.
 
 ## How it was tested
 
