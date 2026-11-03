@@ -74,3 +74,9 @@ regression evidence and unchanged baseline source; see [validation](controls-val
 The [grading-input freeze](grading-input-checks.json) records 26 blind key graders
 and 13 independent verifiers, exact input round trips and zero dropped sections.
 Main and short paired effects can include at most nine and three projects respectively.
+
+A later coverage check, after the first verifier completed and before arm-level
+analysis, found residual totals phrased as “issues” and remaining severity-bucket
+summaries. The preflight did not detect those formulations. All 39 frozen input
+sets remain unchanged; [the recorded limitation](grading-blinding-limitations.json)
+qualifies control blinding and must accompany the verifier/control results.
