@@ -44,7 +44,10 @@ it and therefore could not execute any commands; no evaluation used that setup.
 A separate Sol high preflight observed UID 1000, `/work` as the working directory,
 absent host repository/profile paths and Docker socket, and `Network is
 unreachable` on a socket connection to an external IP. No skills were available
-in that preflight.
+in that preflight. A subsequent preflight also wrote and read a container canary;
+native `apply_patch` failed with `No usable execution environment is available`.
+The turn uses `externalSandbox` with restricted network to describe the actual
+container permissions without incorrectly implying that `/work` is read-only.
 
 For discovery tasks the harness enumerates the sole extracted skill's exact
 frontmatter description and workspace path in developer context. The task prompt
@@ -82,6 +85,13 @@ reproduced locally: Python/stub checks ran on macOS, Rust fixtures on Linux.
 Each uses a fresh workspace containing its fixture and the archived skill at
 `.agents/skills/rust-qc/`. No task prompt names the skill. The per-task ceiling is
 45 minutes; these are not the keyed audit cells.
+
+The first eight attempts (IDs without `-v2`) used the host `read-only` policy in
+model context. Several agents therefore declined container edits or builds,
+although `/work` was writable. All eight are invalidated as harness failures,
+retained separately, and excluded from results. The identical frozen cases are
+rerun from pristine workspaces with `-v2` IDs after the canary preflight. This is
+a disclosed repeat, not a skill failure or a selection of preferred outputs.
 
 ## Remaining gates
 

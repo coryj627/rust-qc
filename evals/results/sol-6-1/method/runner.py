@@ -278,7 +278,9 @@ async def run_agent(args):
                 metadata.update(status="running", started_unix=time.time())
                 send({"id": 4, "method": "turn/start", "params": {
                     "threadId": thread_id, "model": MODEL, "effort": EFFORT,
-                    "environments": [], "input": [{"type": "text", "text": prompt}],
+                    "environments": [],
+                    "sandboxPolicy": {"type": "externalSandbox", "networkAccess": "restricted"},
+                    "input": [{"type": "text", "text": prompt}],
                 }})
             elif message.get("id") == 4 and "result" in message:
                 turn_id = result["turn"]["id"]
