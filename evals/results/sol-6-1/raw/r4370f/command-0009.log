@@ -1,0 +1,1001 @@
+        let ran = Ran::default();
+        for invocation in invocations {
+          Self::run_recipe(
+            &invocation.arguments,
+            config,
+            false,
+            &ran,
+            invocation.recipe,
+            &scopes,
+            search,
+          )?;
+        }
+
+        Ok(())
+      }
+      Subcommand::Command {
+        binary, arguments, ..
+      } => {
+        let mut command = if config.shell_command {
+          let mut command = self.settings.shell_command(config);
+          command.arg(binary);
+          command
+        } else {
+          Command::resolve(binary)
+        };
+
+        command
+          .args(arguments)
+          .current_dir(&search.working_directory);
+
+        self.evaluate_scopes(
+          config,
+          &dotenv_arena,
+          overrides,
+          None,
+          &root,
+          &scope_arena,
+          &mut scopes,
+          search,
+          Some(HashSet::new()).as_ref(),
+        )?;
+
+        let (_module, scope, dotenv) = scopes.get(&self.module_path).unwrap();
+        let scope = scope.child();
+
+        command.export(&self.settings, dotenv, &scope, &self.unexports);
+
+        let (result, caught) = command.status_guard();
+
+        let status = result.map_err(|io_error| Error::CommandInvoke {
+          binary: binary.clone(),
+          arguments: arguments.clone(),
+          io_error,
+        })?;
+
+        if !status.success() {
+          return Err(Error::CommandStatus {
+            binary: binary.clone(),
+            arguments: arguments.clone(),
+            status,
+          });
+        }
+
+        if let Some(signal) = caught {
+          return Err(Error::Interrupted { signal });
+        }
+
+        Ok(())
+      }
+      Subcommand::Evaluate { format, path } => {
+        let (module, variable, variable_references) = self.evaluation_target(path)?;
+
+        self.evaluate_scopes(
+          config,
+          &dotenv_arena,
+          overrides,
+          None,
+          &root,
+          &scope_arena,
+          &mut scopes,
+          search,
+          Some(&variable_references),
+        )?;
+
+        let scope = scopes.get(&module.module_path).unwrap().1;
+
+        if let Some(variable) = variable {
+          print!("{}", scope.value(variable).unwrap());
+        } else {
+          let width = scope.names().fold(0, |max, name| name.len().max(max));
+
+          for binding in scope.bindings() {
+            if !binding.private {
+              match format {
+                EvaluateFormat::Just => {
+                  println!("{0:1$} := \"{2}\"", binding.name, width, binding.value);
+                }
+                EvaluateFormat::Shell => {
+                  if binding.export || module.settings.export {
+                    print!("export ");
+                  }
+                  print!("{}=\"", binding.name.lexeme().replace('-', "_"));
+                  for c in binding.value.chars() {
+                    if matches!(c, '!' | '"' | '$' | '\\' | '`') {
+                      print!("\\");
+                    }
+                    print!("{c}");
+                  }
+                  println!("\"");
+                }
+              }
+            }
+          }
+        }
+
+        Ok(())
+      }
+      _ => unreachable!(),
+    }
+  }
+
+  pub(crate) fn evaluation_target<'a>(
+    &'a self,
+    path: &'a Modulepath,
+  ) -> RunResult<'src, (&'a Justfile<'a>, Option<&'a str>, HashSet<Number>)> {
+    let mut current = self;
+
+    let mut variable = None;
+
+    for (i, component) in path.components.iter().enumerate() {
+      let last = i + 1 == path.components.len();
+
+      if last && current.assignments.contains_key(component) {
+        variable = Some(component.as_ref());
+        break;
+      }
+
+      if let Some(module) = current.modules.get(component) {
+        current = module;
+      } else if last {
+        return Err(Error::EvalUnknownSubmoduleOrVariable {
+          suggestion: current.suggest_variable_or_submodule(component),
+          component: component.into(),
+        });
+      } else {
+        return Err(Error::EvalUnknownSubmodule {
+          suggestion: current.suggest_submodule(component),
+          component: component.into(),
+        });
+      }
+    }
+
+    let variable_references = if let Some(variable) = variable {
+      HashSet::from([current.assignments.get(variable).unwrap().number])
+    } else {
+      current
+        .assignments
+        .values()
+        .filter(|assignment| !assignment.private)
+        .map(|assignment| assignment.number)
+        .collect()
+    };
+
+    Ok((current, variable, variable_references))
+  }
+
+  pub(crate) fn check_unstable(&self, config: &Config) -> RunResult<'src> {
+    if let Some(&unstable_feature) = self.unstable_features.iter().next() {
+      config.require_unstable(self, unstable_feature)?;
+    }
+
+    for module in self.modules.values() {
+      module.check_unstable(config)?;
+    }
+
+    Ok(())
+  }
+
+  pub(crate) fn get_alias(&self, name: &str) -> Option<&Alias<'src>> {
+    self.aliases.get(name)
+  }
+
+  pub(crate) fn get_recipe(&self, name: &str) -> Option<&Recipe<'src>> {
+    self
+      .recipes
+      .get(name)
+      .map(Arc::as_ref)
+      .or_else(|| self.aliases.get(name).map(|alias| alias.target.as_ref()))
+  }
+
+  pub(crate) fn is_submodule(&self) -> bool {
+    self.name.is_some()
+  }
+
+  pub(crate) fn name(&self) -> &'src str {
+    self.name.map(|name| name.lexeme()).unwrap_or_default()
+  }
+
+  fn run_recipe(
+    arguments: &[Vec<String>],
+    config: &Config,
+    is_dependency: bool,
+    ran: &Ran,
+    recipe: &Recipe<'src>,
+    scopes: &Scopes<'src, '_>,
+    search: &Search,
+  ) -> RunResult<'src> {
+    let mutex = ran.mutex(recipe, arguments);
+
+    let mut guard = mutex.lock().unwrap();
+
+    if *guard {
+      return Ok(());
+    }
+
+    let (module, scope, dotenv) = scopes
+      .get(recipe.module_path())
+      .expect("failed to retrieve scope for module");
+
+    let context = ExecutionContext {
+      config,
+      dotenv,
+      module,
+      search,
+    };
+
+    let (outer, positional) = Evaluator::evaluate_parameters(
+      arguments,
+      &context,
+      is_dependency,
+      &recipe.parameters,
+      recipe,
+      scope,
+    )?;
+
+    let scope = outer.child();
+
+    let mut evaluator = Evaluator::new(&context, BTreeMap::new(), true, &scope);
+
+    if !config.yes && !recipe.confirm(&mut evaluator)? {
+      return Err(Error::NotConfirmed {
+        recipe: recipe.name(),
+      });
+    }
+
+    Self::run_dependencies(
+      config,
+      &context,
+      recipe.priors(),
+      &mut evaluator,
+      ran,
+      recipe,
+      scopes,
+      search,
+    )?;
+
+    recipe.run(&context, &scope, &positional, is_dependency)?;
+
+    Self::run_dependencies(
+      config,
+      &context,
+      recipe.subsequents(),
+      &mut evaluator,
+      &Ran::default(),
+      recipe,
+      scopes,
+      search,
+    )?;
+
+    *guard = true;
+
+    Ok(())
+  }
+
+  fn run_dependencies<'run>(
+    config: &Config,
+    context: &ExecutionContext<'src, 'run>,
+    dependencies: &[Dependency<'src>],
+    evaluator: &mut Evaluator<'src, 'run>,
+    ran: &Ran,
+    recipe: &Recipe<'src>,
+    scopes: &Scopes<'src, 'run>,
+    search: &Search,
+  ) -> RunResult<'src> {
+    if context.config.no_dependencies {
+      return Ok(());
+    }
+
+    let mut evaluated = Vec::new();
+    for Dependency { recipe, arguments } in dependencies {
+      let mut grouped = Vec::new();
+      for group in arguments {
+        let evaluated_group = group
+          .iter()
+          .map(|argument| evaluator.evaluate_expression(argument))
+          .collect::<RunResult<Vec<String>>>()?;
+        grouped.push(evaluated_group);
+      }
+      evaluated.push((recipe, grouped));
+    }
+
+    if recipe.is_parallel() {
+      thread::scope::<_, RunResult>(|thread_scope| {
+        let mut handles = Vec::new();
+        for (recipe, arguments) in evaluated {
+          handles.push(thread_scope.spawn(move || {
+            Self::run_recipe(&arguments, config, true, ran, recipe, scopes, search)
+          }));
+        }
+        for handle in handles {
+          handle
+            .join()
+            .map_err(|_| Error::internal("parallel dependency thread panicked"))??;
+        }
+        Ok(())
+      })?;
+    } else {
+      for (recipe, arguments) in evaluated {
+        Self::run_recipe(&arguments, config, true, ran, recipe, scopes, search)?;
+      }
+    }
+
+    Ok(())
+  }
+
+  pub(crate) fn public_modules(&self, config: &Config) -> Vec<&Justfile> {
+    let mut modules = self
+      .modules
+      .values()
+      .filter(|module| !module.private)
+      .collect::<Vec<&Justfile>>();
+
+    if config.unsorted {
+      modules.sort_by_key(|module| {
+        module
+          .name
+          .map(|name| name.token.offset)
+          .unwrap_or_default()
+      });
+    }
+
+    modules
+  }
+
+  pub(crate) fn public_recipes(&self, config: &Config) -> Vec<&Recipe> {
+    let mut recipes = self
+      .recipes
+      .values()
+      .map(AsRef::as_ref)
+      .filter(|recipe| recipe.is_public())
+      .collect::<Vec<&Recipe>>();
+
+    if config.unsorted {
+      recipes.sort_by_key(|recipe| (&recipe.import_offsets, recipe.name.offset));
+    }
+
+    recipes
+  }
+
+  pub(crate) fn public_recipes_recursive(&self, config: &Config) -> Vec<&Recipe> {
+    let mut recipes = Vec::new();
+
+    let mut stack = vec![self];
+    while let Some(current) = stack.pop() {
+      for recipe in current.public_recipes(config) {
+        recipes.push(recipe);
+      }
+
+      for module in current.public_modules(config).into_iter().rev() {
+        stack.push(module);
+      }
+    }
+
+    recipes
+  }
+
+  pub(crate) fn public_aliases_recursive(&self, config: &Config) -> Vec<(&Alias, &Modulepath)> {
+    let mut aliases = Vec::new();
+
+    let mut stack = vec![self];
+    while let Some(current) = stack.pop() {
+      for alias in current.aliases.values() {
+        if alias.is_public() {
+          aliases.push((alias, &current.module_path));
+        }
+      }
+
+      for module in current.public_modules(config).into_iter().rev() {
+        stack.push(module);
+      }
+    }
+
+    aliases
+  }
+
+  pub(crate) fn groups(&self) -> Vec<&str> {
+    self
+      .groups
+      .iter()
+      .map(|group| group.cooked.as_str())
+      .collect()
+  }
+
+  pub(crate) fn public_groups(&self, config: &Config) -> Vec<String> {
+    let mut groups = Vec::new();
+
+    for recipe in self.recipes.values() {
+      if recipe.is_public() {
+        for group in recipe.groups() {
+          groups.push((recipe.import_offsets.as_slice(), recipe.name.offset, group));
+        }
+      }
+    }
+
+    for submodule in self.public_modules(config) {
+      for group in submodule.groups() {
+        groups.push((&[], submodule.name.unwrap().offset, group.to_string()));
+      }
+    }
+
+    if config.unsorted {
+      groups.sort();
+    } else {
+      groups.sort_by(|(_, _, a), (_, _, b)| a.cmp(b));
+    }
+
+    let mut seen = HashSet::new();
+
+    groups.retain(|(_, _, group)| seen.insert(group.clone()));
+
+    groups.into_iter().map(|(_, _, group)| group).collect()
+  }
+}
+
+impl ColorDisplay for Justfile<'_> {
+  fn fmt(&self, f: &mut Formatter, color: Color) -> fmt::Result {
+    let mut items = self.recipes.len() + self.assignments.len() + self.aliases.len();
+    for (name, assignment) in &self.assignments {
+      if assignment.export {
+        write!(f, "export ")?;
+      }
+      write!(f, "{name} := {}", assignment.value)?;
+      items -= 1;
+      if items != 0 {
+        write!(f, "\n\n")?;
+      }
+    }
+    for alias in self.aliases.values() {
+      write!(f, "{alias}")?;
+      items -= 1;
+      if items != 0 {
+        write!(f, "\n\n")?;
+      }
+    }
+    for recipe in self.recipes.values() {
+      write!(f, "{}", recipe.color_display(color))?;
+      items -= 1;
+      if items != 0 {
+        write!(f, "\n\n")?;
+      }
+    }
+    Ok(())
+  }
+}
+
+impl<'src> Keyed<'src> for Justfile<'src> {
+  fn key(&self) -> &'src str {
+    self.name()
+  }
+}
+
+use {super::*, CompileErrorKind::*};
+
+pub(crate) struct RecipeResolver<'src: 'run, 'run> {
+  assignments: &'run Table<'src, Assignment<'src>>,
+  functions: &'run Table<'src, FunctionDefinition<'src>>,
+  modulepath: &'run Modulepath,
+  modules: &'run Table<'src, Justfile<'src>>,
+  resolved_recipes: Table<'src, Arc<Recipe<'src>>>,
+  settings: &'run Settings,
+  unresolved_recipes: Table<'src, UnresolvedRecipe<'src>>,
+}
+
+impl<'src: 'run, 'run> RecipeResolver<'src, 'run> {
+  pub(crate) fn resolve_recipes(
+    assignments: &'run Table<'src, Assignment<'src>>,
+    functions: &'run Table<'src, FunctionDefinition<'src>>,
+    modulepath: &'run Modulepath,
+    modules: &'run Table<'src, Justfile<'src>>,
+    settings: &'run Settings,
+    unresolved_recipes: Table<'src, UnresolvedRecipe<'src>>,
+  ) -> CompileResult<'src, Table<'src, Arc<Recipe<'src>>>> {
+    let mut resolver = Self {
+      assignments,
+      functions,
+      modulepath,
+      modules,
+      resolved_recipes: Table::new(),
+      settings,
+      unresolved_recipes,
+    };
+
+    while let Some(unresolved) = resolver.unresolved_recipes.pop() {
+      resolver.resolve_recipe(&mut Vec::new(), unresolved)?;
+    }
+
+    Ok(resolver.resolved_recipes)
+  }
+
+  fn resolve_recipe(
+    &mut self,
+    stack: &mut Vec<&'src str>,
+    recipe: UnresolvedRecipe<'src>,
+  ) -> CompileResult<'src, Arc<Recipe<'src>>> {
+    if let Some(resolved) = self.resolved_recipes.get(recipe.name()) {
+      return Ok(Arc::clone(resolved));
+    }
+
+    stack.push(recipe.name());
+
+    let dependencies = recipe
+      .dependencies
+      .iter()
+      .map(|dependency| {
+        self
+          .resolve_dependency(dependency, &recipe, stack)?
+          .ok_or_else(|| {
+            dependency.recipe.last().error(UnknownDependency {
+              recipe: recipe.name(),
+              unknown: dependency.recipe.clone(),
+            })
+          })
+      })
+      .collect::<CompileResult<Vec<Arc<Recipe>>>>()?;
+
+    stack.pop();
+
+    let resolved = Arc::new(recipe.resolve(
+      self.assignments,
+      self.functions,
+      self.modulepath,
+      dependencies,
+      self.settings,
+    )?);
+    self.resolved_recipes.insert(Arc::clone(&resolved));
+    Ok(resolved)
+  }
+
+  fn resolve_dependency(
+    &mut self,
+    dependency: &UnresolvedDependency<'src>,
+    recipe: &UnresolvedRecipe<'src>,
+    stack: &mut Vec<&'src str>,
+  ) -> CompileResult<'src, Option<Arc<Recipe<'src>>>> {
+    let name = dependency.recipe.last().lexeme();
+
+    if dependency.recipe.components() > 1 {
+      // recipe is in a submodule and is thus already resolved
+      Ok(Analyzer::resolve_recipe(
+        &dependency.recipe,
+        self.modules,
+        &self.resolved_recipes,
+      ))
+    } else if let Some(resolved) = self.resolved_recipes.get(name) {
+      // recipe is the current module and has already been resolved
+      Ok(Some(Arc::clone(resolved)))
+    } else if stack.contains(&name) {
+      // recipe depends on itself
+      let first = stack[0];
+      stack.push(first);
+      Err(
+        dependency.recipe.last().error(CircularRecipeDependency {
+          recipe: recipe.name(),
+          circle: stack
+            .iter()
+            .skip_while(|name| **name != dependency.recipe.last().lexeme())
+            .copied()
+            .collect(),
+        }),
+      )
+    } else if let Some(unresolved) = self.unresolved_recipes.remove(name) {
+      // recipe is as of yet unresolved
+      Ok(Some(self.resolve_recipe(stack, unresolved)?))
+    } else {
+      // recipe is unknown
+      Ok(None)
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  analysis_error! {
+    name:   circular_recipe_dependency,
+    input:  "a: b\nb: a",
+    offset: 8,
+    line:   1,
+    column: 3,
+    width:  1,
+    kind:   CircularRecipeDependency{recipe: "b", circle: vec!["a", "b", "a"]},
+  }
+
+  analysis_error! {
+    name:   self_recipe_dependency,
+    input:  "a: a",
+    offset: 3,
+    line:   0,
+    column: 3,
+    width:  1,
+    kind:   CircularRecipeDependency{recipe: "a", circle: vec!["a", "a"]},
+  }
+
+  analysis_error! {
+    name:   unknown_dependency,
+    input:  "a: b",
+    offset: 3,
+    line:   0,
+    column: 3,
+    width:  1,
+    kind:   UnknownDependency{
+      recipe: "a",
+      unknown: Namepath::from(Name::from_identifier(
+        Token{
+          column: 3,
+          kind: TokenKind::Identifier,
+          length: 1,
+          line: 0,
+          offset: 3,
+          path: Path::new("justfile"),
+          src: "a: b" }))
+    },
+  }
+
+  analysis_error! {
+    name:   unknown_interpolation_variable,
+    input:  "x:\n {{   hello}}",
+    offset: 9,
+    line:   1,
+    column: 6,
+    width:  5,
+    kind:   UndefinedVariable{variable: "hello"},
+  }
+
+  analysis_error! {
+    name:   unknown_second_interpolation_variable,
+    input:  "wtf:=\"x\"\nx:\n echo\n foo {{wtf}} {{ lol }}",
+    offset: 34,
+    line:   3,
+    column: 16,
+    width:  3,
+    kind:   UndefinedVariable{variable: "lol"},
+  }
+
+  analysis_error! {
+    name:   unknown_variable_in_default,
+    input:  "a f=foo:",
+    offset: 4,
+    line:   0,
+    column: 4,
+    width:  3,
+    kind:   UndefinedVariable{variable: "foo"},
+  }
+
+  analysis_error! {
+    name:   unknown_variable_in_dependency_argument,
+    input:  "bar x:\nfoo: (bar baz)",
+    offset: 17,
+    line:   1,
+    column: 10,
+    width:  3,
+    kind:   UndefinedVariable{variable: "baz"},
+  }
+}
+use super::*;
+
+/// Methods common to all AST nodes. Currently only used in parser unit tests.
+pub(crate) trait Node<'src> {
+  /// Construct an untyped tree of atoms representing this Node. This function,
+  /// and `Tree` type, are only used in parser unit tests.
+  fn tree(&self) -> Tree<'src>;
+}
+
+impl<'src> Node<'src> for Ast<'src> {
+  fn tree(&self) -> Tree<'src> {
+    Tree::atom("justfile")
+      .extend(
+        self
+          .items
+          .iter()
+          .filter(|item| !matches!(item, Item::Newline))
+          .map(Node::tree),
+      )
+      .extend(self.warnings.iter().map(Node::tree))
+  }
+}
+
+impl<'src> Node<'src> for Item<'src> {
+  fn tree(&self) -> Tree<'src> {
+    match self {
+      Self::Alias(alias) => alias.tree(),
+      Self::Assignment(assignment) => assignment.tree(),
+      Self::Comment(comment) => comment.tree(),
+      Self::Import {
+        relative, optional, ..
+      } => {
+        let mut tree = Tree::atom("import");
+
+        if *optional {
+          tree = tree.push("?");
+        }
+
+        tree.push(format!("{relative}"))
+      }
+      Self::Module {
+        name,
+        optional,
+        relative,
+        ..
+      } => {
+        let mut tree = Tree::atom("mod");
+
+        if *optional {
+          tree = tree.push("?");
+        }
+
+        tree = tree.push(name.lexeme());
+
+        if let Some(relative) = relative {
+          tree = tree.push(format!("{relative}"));
+        }
+
+        tree
+      }
+      Self::Newline => unreachable!(),
+      Self::Function(function) => {
+        let mut tree = Tree::atom("function");
+        tree.push_mut(function.name.lexeme());
+        for (name, _number) in &function.parameters {
+          tree.push_mut(name.lexeme());
+        }
+        tree.push_mut(function.body.tree());
+        tree
+      }
+      Self::Recipe(recipe) => recipe.tree(),
+      Self::Set(set) => set.tree(),
+      Self::Unexport { name } => {
+        let mut unexport = Tree::atom(Keyword::Unexport.lexeme());
+        unexport.push_mut(name.lexeme().replace('-', "_"));
+        unexport
+      }
+    }
+  }
+}
+
+impl<'src> Node<'src> for Namepath<'src> {
+  fn tree(&self) -> Tree<'src> {
+    match self.components() {
+      1 => Tree::atom(self.last().lexeme()),
+      _ => Tree::list(
+        self
+          .iter()
+          .map(|name| Tree::atom(Cow::Borrowed(name.lexeme()))),
+      ),
+    }
+  }
+}
+
+impl<'src> Node<'src> for Alias<'src, Namepath<'src>> {
+  fn tree(&self) -> Tree<'src> {
+    let target = self.target.tree();
+
+    Tree::atom(Keyword::Alias.lexeme())
+      .push(self.name.lexeme())
+      .push(target)
+  }
+}
+
+impl<'src> Node<'src> for Assignment<'src> {
+  fn tree(&self) -> Tree<'src> {
+    if self.export {
+      Tree::atom("assignment")
+        .push("#")
+        .push(Keyword::Export.lexeme())
+    } else {
+      Tree::atom("assignment")
+    }
+    .push(self.name.lexeme())
+    .push(self.value.tree())
+  }
+}
+
+impl<'src> Node<'src> for Expression<'src> {
+  fn tree(&self) -> Tree<'src> {
+    match self {
+      Self::And { lhs, rhs } => Tree::atom("&&").push(lhs.tree()).push(rhs.tree()),
+      Self::Assert {
+        condition: Condition { lhs, rhs, operator },
+        error,
+        ..
+      } => Tree::atom(Keyword::Assert.lexeme())
+        .push(lhs.tree())
+        .push(operator.to_string())
+        .push(rhs.tree())
+        .push(error.tree()),
+      Self::Backtick { contents, .. } => Tree::atom("backtick").push(Tree::string(contents)),
+      Self::Call { name, arguments } => {
+        let mut tree = Tree::atom("call");
+        tree.push_mut(name.lexeme());
+        for arg in arguments {
+          tree.push_mut(arg.tree());
+        }
+        tree
+      }
+      Self::Concatenation { lhs, rhs } => Tree::atom("+").push(lhs.tree()).push(rhs.tree()),
+      Self::Conditional {
+        condition: Condition { lhs, rhs, operator },
+        then,
+        otherwise,
+      } => {
+        let mut tree = Tree::atom(Keyword::If.lexeme());
+        tree.push_mut(lhs.tree());
+        tree.push_mut(operator.to_string());
+        tree.push_mut(rhs.tree());
+        tree.push_mut(then.tree());
+        tree.push_mut(otherwise.tree());
+        tree
+      }
+      Self::FormatString { start, expressions } => {
+        let mut tree = Tree::atom("format");
+        tree.push_mut(Tree::string(&start.cooked));
+        for (expression, string) in expressions {
+          tree.push_mut(expression.tree());
+          tree.push_mut(Tree::string(&string.cooked));
+        }
+        tree
+      }
+      Self::Group { contents } => Tree::List(vec![contents.tree()]),
+      Self::Join { lhs: None, rhs } => Tree::atom("/").push(rhs.tree()),
+      Self::Join {
+        lhs: Some(lhs),
+        rhs,
+      } => Tree::atom("/").push(lhs.tree()).push(rhs.tree()),
+      Self::Or { lhs, rhs } => Tree::atom("||").push(lhs.tree()).push(rhs.tree()),
+      Self::StringLiteral {
+        string_literal: StringLiteral { cooked, .. },
+      } => Tree::string(cooked),
+      Self::Variable { name } => Tree::atom(name.lexeme()),
+    }
+  }
+}
+
+impl<'src> Node<'src> for UnresolvedRecipe<'src> {
+  fn tree(&self) -> Tree<'src> {
+    let mut t = Tree::atom("recipe");
+
+    if self.quiet {
+      t.push_mut("#");
+      t.push_mut("quiet");
+    }
+
+    if let Some(doc) = &self.doc {
+      t.push_mut(Tree::string(doc));
+    }
+
+    t.push_mut(self.name.lexeme());
+
+    if !self.parameters.is_empty() {
+      let mut params = Tree::atom("params");
+
+      for parameter in &self.parameters {
+        if let Some(prefix) = parameter.kind.prefix() {
+          params.push_mut(prefix);
+        }
+
+        params.push_mut(parameter.tree());
+      }
+
+      t.push_mut(params);
+    }
+
+    if !self.dependencies.is_empty() {
+      let mut dependencies = Tree::atom("deps");
+      let mut subsequents = Tree::atom("sups");
+
+      for (i, dependency) in self.dependencies.iter().enumerate() {
+        let mut d = dependency.recipe.tree();
+
+        for argument in &dependency.arguments {
+          d.push_mut(argument.tree());
+        }
+
+        if i < self.priors {
+          dependencies.push_mut(d);
+crate/tests/alias.rs
+crate/tests/alias_style.rs
+crate/tests/allow_duplicate_recipes.rs
+crate/tests/allow_duplicate_variables.rs
+crate/tests/allow_missing.rs
+crate/tests/arg_attribute.rs
+crate/tests/assert_stdout.rs
+crate/tests/assert_success.rs
+crate/tests/assertions.rs
+crate/tests/assignment.rs
+crate/tests/attributes.rs
+crate/tests/backticks.rs
+crate/tests/byte_order_mark.rs
+crate/tests/ceiling.rs
+crate/tests/changelog.rs
+crate/tests/choose.rs
+crate/tests/command.rs
+crate/tests/completions.rs
+crate/tests/conditional.rs
+crate/tests/confirm.rs
+crate/tests/constants.rs
+crate/tests/datetime.rs
+crate/tests/default.rs
+crate/tests/delimiters.rs
+crate/tests/dependencies.rs
+crate/tests/directories.rs
+crate/tests/dotenv.rs
+crate/tests/dump.rs
+crate/tests/edit.rs
+crate/tests/equals.rs
+crate/tests/error_messages.rs
+crate/tests/evaluate.rs
+crate/tests/examples.rs
+crate/tests/explain.rs
+crate/tests/export.rs
+crate/tests/fallback.rs
+crate/tests/format.rs
+crate/tests/format_string.rs
+crate/tests/function_definitions.rs
+crate/tests/functions.rs
+crate/tests/global.rs
+crate/tests/groups.rs
+crate/tests/guards.rs
+crate/tests/ignore_comments.rs
+crate/tests/imports.rs
+crate/tests/init.rs
+crate/tests/interpolation.rs
+crate/tests/invocation_directory.rs
+crate/tests/json.rs
+crate/tests/lazy.rs
+crate/tests/lib.rs
+crate/tests/line_prefixes.rs
+crate/tests/list.rs
+crate/tests/logical_operators.rs
+crate/tests/man.rs
+crate/tests/misc.rs
+crate/tests/modules.rs
+crate/tests/multibyte_char.rs
+crate/tests/newline_escape.rs
+crate/tests/no_aliases.rs
+crate/tests/no_cd.rs
+crate/tests/no_dependencies.rs
+crate/tests/no_exit_message.rs
+crate/tests/non_unicode.rs
+crate/tests/options.rs
+crate/tests/os_attributes.rs
+crate/tests/overrides.rs
+crate/tests/parallel.rs
+crate/tests/parameters.rs
+crate/tests/parser.rs
+crate/tests/positional_arguments.rs
+crate/tests/private.rs
+crate/tests/quiet.rs
+crate/tests/quote.rs
+crate/tests/readme.rs
+crate/tests/recursion_limit.rs
+crate/tests/regexes.rs
+crate/tests/request.rs
+crate/tests/resolve.rs
+crate/tests/run.rs
+crate/tests/scope.rs
+crate/tests/script.rs
+crate/tests/search.rs
+crate/tests/search_arguments.rs
+crate/tests/settings.rs
+crate/tests/shadowing_parameters.rs
+crate/tests/shebang.rs
+crate/tests/shell.rs
+crate/tests/shell_expansion.rs
+crate/tests/show.rs
+crate/tests/signals.rs
+crate/tests/slash_operator.rs
+crate/tests/string.rs
+crate/tests/subsequents.rs
+crate/tests/summary.rs
+crate/tests/tempdir.rs
+crate/tests/test.rs
+crate/tests/timestamps.rs
+crate/tests/undefined_variables.rs
+crate/tests/unexport.rs
+crate/tests/unstable.rs
+crate/tests/usage.rs
+crate/tests/which_function.rs
+crate/tests/windows.rs
+crate/tests/windows_shell.rs
+crate/tests/working_directory.rs

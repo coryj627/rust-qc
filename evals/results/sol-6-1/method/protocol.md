@@ -93,12 +93,64 @@ retained separately, and excluded from results. The identical frozen cases are
 rerun from pristine workspaces with `-v2` IDs after the canary preflight. This is
 a disclosed repeat, not a skill failure or a selection of preferred outputs.
 
-## Remaining gates
+## Stages 3 and 4
 
-Before keyed audits: fetch pinned baselines and git2's pinned submodule, run
-`prep_audits.py leaks`, freeze randomized run order, and test transcript checkers
-on a known violation. Before writing/changing runs: commit all six cases, hidden
-tests and independently written rubrics. Grading includes decoy keys, confirmed
-false findings, logged redactions and a separate 10% recheck. Recommendations
-must wait until all grading finishes and come from a new agent that has not
-audited, graded, read Claude's results, or seen Sol's arm mapping beforehand.
+All ten pinned templates were built from fresh archives. The git2 submodule was
+fetched at `338e6fb681369ff0537719095e22ce9dc602dbf0`. The original dependency
+leak checker found zero projects requiring inspection. The 40-run Stage 3 order
+was randomized and frozen privately before dispatch. Baseline and treatment
+workspaces share the same source/cache template; only treatment has the skill.
+
+Stage 4 has its own randomized 12-run schedule and 15-minute budget. Its task is
+exactly `Review this crate for problems.` plus common workspace, build, sandbox
+and timing instructions. Skill selection uses the sole available-skills catalog,
+without the detailed report instructions in Stage 3. Do not pool these cells.
+
+Provider `cyberPolicy` errors have stopped some audits without final reports.
+These are missing observations, not zero scores. The scheduler never retries an
+existing run directory and stops further audits for the blocked project in that
+schedule. Other projects continue. Other failure kinds stop new dispatch; a
+usage or disk limit requires stopping the evaluation as the issue specifies.
+
+The runner was tightened after the initial audit dispatch to check its deadline
+even while response events stream continuously, and to record its own source
+hash. Earlier runs retain the earlier runner provenance in git. Budgets and
+task wording were not changed.
+
+## Case preparation and remaining gates
+
+Six separate clean-profile agents author the Stage 5 cases and rubrics. They
+receive source/specification inputs but no treatment outputs, skill text, arm
+mapping or other author's rubric. The chosen upstream bugs are heapless-6,
+pulldown-cmark-3 and just-6; selection preceded audit output inspection. DECOM,
+the parser and the public-API library complete the six cases. All case bundles,
+including hidden tests, must be committed before any treatment starts.
+`prepare_stage5.py` checks committed bytes and author manifests before provisioning
+24 independent workspaces. Stage 5 uses a frozen 45-minute budget per treatment.
+Captured author code is evidence and is excluded from repository Python linting;
+maintained orchestration code remains linted.
+
+Independent control authors receive source and real defect summaries only, never
+audit reports or mappings. They must confirm two false key entries and five false
+findings per project. Graders see anonymized key IDs with decoys mixed in.
+Verifiers receive the redacted reports as ordered, lossless text passages, with
+five false passages inserted among them. Private maps identify controls for
+exclusion from totals. Every redacted line replacement/drop is recorded; text
+inside code fences and trailing blank lines are preserved. Two independent key
+graders and one verifier are provisioned per audit cell. Missing reports remain
+absent. A separate random 10% recheck must use unredacted reports.
+
+Recommendations must wait until all grading finishes and come from a new agent
+that has not audited, graded, read Claude's results, or seen Sol's arm mapping
+beforehand. No recommendation has been made during preparation.
+
+## Export
+
+The exporter uses an allowlist of completed user/agent/tool events and command
+logs, excluding reasoning, sessions, profiles and transport metadata. Agent-created
+symlinks cannot be followed into host files. Changed sources and probe artifacts
+are retained; build caches, compiled binaries/core dumps and files above 10 MB
+are excluded with a per-export record. Deleted source paths are also recorded.
+The current privacy review retains three nonsecret PATH matches: a container-local
+fake-fzf probe and the container's standard tool PATH. Their file hashes and
+dispositions are recorded in `../export-scans/privacy-review.json`.

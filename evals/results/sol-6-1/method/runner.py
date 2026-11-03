@@ -10,6 +10,7 @@ tool dispatched through the original sb wrapper. See protocol.md for limitations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -156,6 +157,7 @@ async def run_agent(args):
         "skill_version": "v1.0.0" if args.skill else None,
         "skill_location": args.skill, "command_timeouts": [], "unexpected_requests": [],
         "tool_transport": "dynamic sandbox_exec -> sb run", "host_environment": False,
+        "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
     }
     waits = private / "waits.txt"
     command_index = 0
@@ -232,6 +234,13 @@ async def run_agent(args):
             "capabilities": {"experimentalApi": True},
         }})
         while True:
+            if started is not None and used() >= args.minutes * 60:
+                metadata["status"] = "budget_exhausted"
+                if thread_id and turn_id:
+                    send({"id": 99, "method": "turn/interrupt", "params": {
+                        "threadId": thread_id, "turnId": turn_id,
+                    }})
+                break
             remaining = max(1, args.minutes * 60 - used()) if started else 120
             try:
                 raw = await asyncio.wait_for(process.stdout.readline(), remaining)

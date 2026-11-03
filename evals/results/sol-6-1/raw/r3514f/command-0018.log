@@ -1,0 +1,1066 @@
+4.09795 minutes used of 45.0
+use std::io::{Read, Seek, SeekFrom};
+
+use memchr::memmem::{Finder, FinderRev};
+
+use crate::result::ZipResult;
+
+pub trait FinderDirection<'a> {
+    fn new(needle: &'a [u8]) -> Self;
+    fn reset_cursor(bounds: (u64, u64), window_size: usize) -> u64;
+    fn scope_window(window: &[u8], mid_window_offset: usize) -> (&[u8], usize);
+
+    fn needle(&self) -> &[u8];
+    fn find(&self, haystack: &[u8]) -> Option<usize>;
+    fn move_cursor(&self, cursor: u64, bounds: (u64, u64), window_size: usize) -> Option<u64>;
+    fn move_scope(&self, offset: usize) -> usize;
+}
+
+pub struct Forward<'a>(Finder<'a>);
+impl<'a> FinderDirection<'a> for Forward<'a> {
+    fn new(needle: &'a [u8]) -> Self {
+        Self(Finder::new(needle))
+    }
+
+    fn reset_cursor((start_inclusive, _): (u64, u64), _: usize) -> u64 {
+        start_inclusive
+    }
+
+    fn scope_window(window: &[u8], mid_window_offset: usize) -> (&[u8], usize) {
+        (&window[mid_window_offset..], mid_window_offset)
+    }
+
+    fn find(&self, haystack: &[u8]) -> Option<usize> {
+        self.0.find(haystack)
+    }
+
+    fn needle(&self) -> &[u8] {
+        self.0.needle()
+    }
+
+    fn move_cursor(&self, cursor: u64, bounds: (u64, u64), window_size: usize) -> Option<u64> {
+        let magic_overlap = self.needle().len().saturating_sub(1) as u64;
+        let next = cursor.saturating_add(window_size as u64 - magic_overlap);
+
+        if next >= bounds.1 {
+            None
+        } else {
+            Some(next)
+        }
+    }
+
+    fn move_scope(&self, offset: usize) -> usize {
+        offset + self.needle().len()
+    }
+}
+
+pub struct Backwards<'a>(FinderRev<'a>);
+impl<'a> FinderDirection<'a> for Backwards<'a> {
+    fn new(needle: &'a [u8]) -> Self {
+        Self(FinderRev::new(needle))
+    }
+
+    fn reset_cursor(bounds: (u64, u64), window_size: usize) -> u64 {
+        bounds
+            .1
+            .saturating_sub(window_size as u64)
+            .clamp(bounds.0, bounds.1)
+    }
+
+    fn scope_window(window: &[u8], mid_window_offset: usize) -> (&[u8], usize) {
+        (&window[..mid_window_offset], 0)
+    }
+
+    fn find(&self, haystack: &[u8]) -> Option<usize> {
+        self.0.rfind(haystack)
+    }
+
+    fn needle(&self) -> &[u8] {
+        self.0.needle()
+    }
+
+    fn move_cursor(&self, cursor: u64, bounds: (u64, u64), window_size: usize) -> Option<u64> {
+        let magic_overlap = self.needle().len().saturating_sub(1) as u64;
+
+        if cursor <= bounds.0 {
+            None
+        } else {
+            Some(
+                cursor
+                    .saturating_add(magic_overlap)
+                    .saturating_sub(window_size as u64)
+                    .clamp(bounds.0, bounds.1),
+            )
+        }
+    }
+
+    fn move_scope(&self, offset: usize) -> usize {
+        offset
+    }
+}
+
+/// A utility for finding magic symbols from the end of a seekable reader.
+///
+/// Can be repurposed to recycle the internal buffer.
+pub struct MagicFinder<Direction> {
+    buffer: Box<[u8]>,
+    pub(self) finder: Direction,
+    cursor: u64,
+    mid_buffer_offset: Option<usize>,
+    bounds: (u64, u64),
+}
+
+impl<'a, T: FinderDirection<'a>> MagicFinder<T> {
+    /// Create a new magic bytes finder to look within specific bounds.
+    pub fn new(magic_bytes: &'a [u8], start_inclusive: u64, end_exclusive: u64) -> Self {
+        const BUFFER_SIZE: usize = 2048;
+
+        // Smaller buffer size would be unable to locate bytes.
+        // Equal buffer size would stall (the window could not be moved).
+        debug_assert!(BUFFER_SIZE >= magic_bytes.len());
+
+        Self {
+            buffer: vec![0; BUFFER_SIZE].into_boxed_slice(),
+            finder: T::new(magic_bytes),
+            cursor: T::reset_cursor((start_inclusive, end_exclusive), BUFFER_SIZE),
+            mid_buffer_offset: None,
+            bounds: (start_inclusive, end_exclusive),
+        }
+    }
+
+    /// Repurpose the finder for different bytes or bounds.
+    pub fn repurpose(&mut self, magic_bytes: &'a [u8], bounds: (u64, u64)) -> &mut Self {
+        debug_assert!(self.buffer.len() >= magic_bytes.len());
+
+        self.finder = T::new(magic_bytes);
+        self.cursor = T::reset_cursor(bounds, self.buffer.len());
+        self.bounds = bounds;
+
+        // Reset the mid-buffer offset, to invalidate buffer content.
+        self.mid_buffer_offset = None;
+
+        self
+    }
+
+    /// Find the next magic bytes in the direction specified in the type.
+    pub fn next<R: Read + Seek>(&mut self, reader: &mut R) -> ZipResult<Option<u64>> {
+        loop {
+            if self.cursor < self.bounds.0 || self.cursor >= self.bounds.1 {
+                // The finder is consumed
+                break;
+            }
+
+            /* Position the window and ensure correct length */
+            let window_start = self.cursor;
+            let window_end = self
+                .cursor
+                .saturating_add(self.buffer.len() as u64)
+                .min(self.bounds.1);
+
+            if window_end <= window_start {
+                // Short-circuit on zero-sized windows to prevent loop
+                break;
+            }
+
+            let window = &mut self.buffer[..(window_end - window_start) as usize];
+
+            if self.mid_buffer_offset.is_none() {
+                reader.seek(SeekFrom::Start(window_start))?;
+                reader.read_exact(window)?;
+            }
+
+            let (window, window_start_offset) = match self.mid_buffer_offset {
+                Some(mid_buffer_offset) => T::scope_window(window, mid_buffer_offset),
+                None => (&*window, 0usize),
+            };
+
+            if let Some(offset) = self.finder.find(window) {
+                let magic_pos = window_start + window_start_offset as u64 + offset as u64;
+                reader.seek(SeekFrom::Start(magic_pos))?;
+
+                self.mid_buffer_offset = Some(self.finder.move_scope(window_start_offset + offset));
+
+                return Ok(Some(magic_pos));
+            }
+
+            self.mid_buffer_offset = None;
+
+            match self
+                .finder
+                .move_cursor(self.cursor, self.bounds, self.buffer.len())
+            {
+                Some(new_cursor) => {
+                    self.cursor = new_cursor;
+                }
+                None => {
+                    // Destroy the finder when we've reached the end of the bounds.
+                    self.bounds.0 = self.bounds.1;
+                    break;
+                }
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+/// A magic bytes finder with an optimistic guess that is tried before
+/// the inner finder begins searching from end. This enables much faster
+/// lookup in files without appended junk, because the magic bytes will be
+/// found directly.
+///
+/// The guess can be marked as mandatory to produce an error. This is useful
+/// if the ArchiveOffset is known and auto-detection is not desired.
+pub struct OptimisticMagicFinder<Direction> {
+    inner: MagicFinder<Direction>,
+    initial_guess: Option<(u64, bool)>,
+}
+
+/// This is a temporary restriction, to avoid heap allocation in [`Self::next_back`].
+///
+/// We only use magic bytes of size 4 at the moment.
+const STACK_BUFFER_SIZE: usize = 8;
+
+impl<'a, Direction: FinderDirection<'a>> OptimisticMagicFinder<Direction> {
+    /// Create a new empty optimistic magic bytes finder.
+    pub fn new_empty() -> Self {
+        Self {
+            inner: MagicFinder::new(&[], 0, 0),
+            initial_guess: None,
+        }
+    }
+
+    /// Repurpose the finder for different bytes, bounds and initial guesses.
+    pub fn repurpose(
+        &mut self,
+        magic_bytes: &'a [u8],
+        bounds: (u64, u64),
+        initial_guess: Option<(u64, bool)>,
+    ) -> &mut Self {
+        debug_assert!(magic_bytes.len() <= STACK_BUFFER_SIZE);
+
+        self.inner.repurpose(magic_bytes, bounds);
+        self.initial_guess = initial_guess;
+
+        self
+    }
+
+    /// Equivalent to `next_back`, with an optional initial guess attempted before
+    /// proceeding with reading from the back of the reader.
+    pub fn next<R: Read + Seek>(&mut self, reader: &mut R) -> ZipResult<Option<u64>> {
+        if let Some((v, mandatory)) = self.initial_guess {
+            reader.seek(SeekFrom::Start(v))?;
+
+            let mut buffer = [0; STACK_BUFFER_SIZE];
+            let buffer = &mut buffer[..self.inner.finder.needle().len()];
+
+            // Attempt to match only if there's enough space for the needle
+            if v.saturating_add(buffer.len() as u64) <= self.inner.bounds.1 {
+                reader.read_exact(buffer)?;
+
+                // If a match is found, yield it.
+                if self.inner.finder.needle() == buffer {
+                    self.initial_guess.take();
+                    reader.seek(SeekFrom::Start(v))?;
+                    return Ok(Some(v));
+                }
+            }
+
+            // If a match is not found, but the initial guess was mandatory, return an error.
+            if mandatory {
+                return Ok(None);
+            }
+
+            // If the initial guess was not mandatory, remove it, as it was not found.
+            self.initial_guess.take();
+        }
+
+        self.inner.next(reader)
+    }
+}
+//! A counter mode (CTR) for AES to work with the encryption used in zip files.
+//!
+//! This was implemented since the zip specification requires the mode to not use a nonce and uses a
+//! different byte order (little endian) than NIST (big endian).
+//! See [AesCtrZipKeyStream] for more information.
+
+use crate::unstable::LittleEndianWriteExt;
+use aes::cipher::generic_array::GenericArray;
+use aes::cipher::{BlockEncrypt, KeyInit};
+use std::{any, fmt};
+
+/// Internal block size of an AES cipher.
+const AES_BLOCK_SIZE: usize = 16;
+
+/// AES-128.
+#[derive(Debug)]
+pub struct Aes128;
+/// AES-192
+#[derive(Debug)]
+pub struct Aes192;
+/// AES-256.
+#[derive(Debug)]
+pub struct Aes256;
+
+/// An AES cipher kind.
+pub trait AesKind {
+    /// Key type.
+    type Key: AsRef<[u8]>;
+    /// Cipher used to decrypt.
+    type Cipher: KeyInit;
+}
+
+impl AesKind for Aes128 {
+    type Key = [u8; 16];
+    type Cipher = aes::Aes128;
+}
+
+impl AesKind for Aes192 {
+    type Key = [u8; 24];
+    type Cipher = aes::Aes192;
+}
+
+impl AesKind for Aes256 {
+    type Key = [u8; 32];
+    type Cipher = aes::Aes256;
+}
+
+/// An AES-CTR key stream generator.
+///
+/// Implements the slightly non-standard AES-CTR variant used by WinZip AES encryption.
+///
+/// Typical AES-CTR implementations combine a nonce with a 64 bit counter. WinZIP AES instead uses
+/// no nonce and also uses a different byte order (little endian) than NIST (big endian).
+///
+/// The stream implements the `Read` trait; encryption or decryption is performed by XOR-ing the
+/// bytes from the key stream with the ciphertext/plaintext.
+pub struct AesCtrZipKeyStream<C: AesKind> {
+    /// Current AES counter.
+    counter: u128,
+    /// AES cipher instance.
+    cipher: C::Cipher,
+    /// Stores the currently available keystream bytes.
+    buffer: [u8; AES_BLOCK_SIZE],
+    /// Number of bytes already used up from `buffer`.
+    pos: usize,
+}
+
+impl<C> fmt::Debug for AesCtrZipKeyStream<C>
+where
+    C: AesKind,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "AesCtrZipKeyStream<{}>(counter: {})",
+            any::type_name::<C>(),
+            self.counter
+        )
+    }
+}
+
+impl<C> AesCtrZipKeyStream<C>
+where
+    C: AesKind,
+    C::Cipher: KeyInit,
+{
+    /// Creates a new zip variant AES-CTR key stream.
+    ///
+    /// # Panics
+    ///
+    /// This panics if `key` doesn't have the correct size for cipher `C`.
+    pub fn new(key: &[u8]) -> AesCtrZipKeyStream<C> {
+        AesCtrZipKeyStream {
+            counter: 1,
+            cipher: C::Cipher::new(GenericArray::from_slice(key)),
+            buffer: [0u8; AES_BLOCK_SIZE],
+            pos: AES_BLOCK_SIZE,
+        }
+    }
+}
+
+impl<C> AesCipher for AesCtrZipKeyStream<C>
+where
+    C: AesKind,
+    C::Cipher: BlockEncrypt,
+{
+    /// Decrypt or encrypt `target`.
+    #[inline]
+    fn crypt_in_place(&mut self, mut target: &mut [u8]) {
+        while !target.is_empty() {
+            if self.pos == AES_BLOCK_SIZE {
+                // Note: AES block size is always 16 bytes, same as u128.
+                self.buffer
+                    .as_mut()
+                    .write_u128_le(self.counter)
+                    .expect("did not expect u128 le conversion to fail");
+                self.cipher
+                    .encrypt_block(GenericArray::from_mut_slice(&mut self.buffer));
+                self.counter += 1;
+                self.pos = 0;
+            }
+
+            let target_len = target.len().min(AES_BLOCK_SIZE - self.pos);
+
+            xor(
+                &mut target[0..target_len],
+                &self.buffer[self.pos..(self.pos + target_len)],
+            );
+            target = &mut target[target_len..];
+            self.pos += target_len;
+        }
+    }
+}
+
+/// This trait allows using generic AES ciphers with different key sizes.
+pub trait AesCipher {
+    fn crypt_in_place(&mut self, target: &mut [u8]);
+}
+
+/// XORs a slice in place with another slice.
+#[inline]
+fn xor(dest: &mut [u8], src: &[u8]) {
+    assert_eq!(dest.len(), src.len());
+
+    for (lhs, rhs) in dest.iter_mut().zip(src.iter()) {
+        *lhs ^= *rhs;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Aes128, Aes192, Aes256, AesCipher, AesCtrZipKeyStream, AesKind};
+    use aes::cipher::{BlockEncrypt, KeyInit};
+
+    /// Checks whether `crypt_in_place` produces the correct plaintext after one use and yields the
+    /// cipertext again after applying it again.
+    fn roundtrip<Aes>(key: &[u8], ciphertext: &[u8], expected_plaintext: &[u8])
+    where
+        Aes: AesKind,
+        Aes::Cipher: KeyInit + BlockEncrypt,
+    {
+        let mut key_stream = AesCtrZipKeyStream::<Aes>::new(key);
+
+        let mut plaintext = ciphertext.to_vec().into_boxed_slice();
+        key_stream.crypt_in_place(&mut plaintext);
+        assert_eq!(*plaintext, *expected_plaintext);
+
+        // Round-tripping should yield the ciphertext again.
+        let mut key_stream = AesCtrZipKeyStream::<Aes>::new(key);
+        key_stream.crypt_in_place(&mut plaintext);
+        assert_eq!(*plaintext, *ciphertext);
+    }
+
+    #[test]
+    #[should_panic]
+    fn new_with_wrong_key_size() {
+        AesCtrZipKeyStream::<Aes128>::new(&[1, 2, 3, 4, 5]);
+    }
+
+    // The data used in these tests was generated with p7zip without any compression.
+    // It's not possible to recreate the exact same data, since a random salt is used for encryption.
+    // `7z a -phelloworld -mem=AES256 -mx=0 aes256_40byte.zip 40byte_data.txt`
+    #[test]
+    fn crypt_aes_256_0_byte() {
+        let ciphertext = [];
+        let expected_plaintext = &[];
+        let key = [
+            0x0b, 0xec, 0x2e, 0xf2, 0x46, 0xf0, 0x7e, 0x35, 0x16, 0x54, 0xe0, 0x98, 0x10, 0xb3,
+            0x18, 0x55, 0x24, 0xa3, 0x9e, 0x0e, 0x40, 0xe7, 0x92, 0xad, 0xb2, 0x8a, 0x48, 0xf4,
+            0x5c, 0xd0, 0xc0, 0x54,
+        ];
+
+        roundtrip::<Aes256>(&key, &ciphertext, expected_plaintext);
+    }
+
+    #[test]
+    fn crypt_aes_128_5_byte() {
+        let ciphertext = [0x98, 0xa9, 0x8c, 0x26, 0x0e];
+        let expected_plaintext = b"asdf\n";
+        let key = [
+            0xe0, 0x25, 0x7b, 0x57, 0x97, 0x6a, 0xa4, 0x23, 0xab, 0x94, 0xaa, 0x44, 0xfd, 0x47,
+            0x4f, 0xa5,
+        ];
+
+        roundtrip::<Aes128>(&key, &ciphertext, expected_plaintext);
+    }
+
+    #[test]
+    fn crypt_aes_192_5_byte() {
+        let ciphertext = [0x36, 0x55, 0x5c, 0x61, 0x3c];
+        let expected_plaintext = b"asdf\n";
+        let key = [
+            0xe4, 0x4a, 0x88, 0x52, 0x8f, 0xf7, 0x0b, 0x81, 0x7b, 0x75, 0xf1, 0x74, 0x21, 0x37,
+            0x8c, 0x90, 0xad, 0xbe, 0x4a, 0x65, 0xa8, 0x96, 0x0e, 0xcc,
+        ];
+
+        roundtrip::<Aes192>(&key, &ciphertext, expected_plaintext);
+    }
+
+    #[test]
+    fn crypt_aes_256_5_byte() {
+        let ciphertext = [0xc2, 0x47, 0xc0, 0xdc, 0x56];
+        let expected_plaintext = b"asdf\n";
+        let key = [
+            0x79, 0x5e, 0x17, 0xf2, 0xc6, 0x3d, 0x28, 0x9b, 0x4b, 0x4b, 0xbb, 0xa9, 0xba, 0xc9,
+            0xa5, 0xee, 0x3a, 0x4f, 0x0f, 0x4b, 0x29, 0xbd, 0xe9, 0xb8, 0x41, 0x9c, 0x41, 0xa5,
+            0x15, 0xb2, 0x86, 0xab,
+        ];
+
+        roundtrip::<Aes256>(&key, &ciphertext, expected_plaintext);
+    }
+
+    #[test]
+    fn crypt_aes_128_40_byte() {
+        let ciphertext = [
+            0xcf, 0x72, 0x6b, 0xa1, 0xb2, 0x0f, 0xdf, 0xaa, 0x10, 0xad, 0x9c, 0x7f, 0x6d, 0x1c,
+            0x8d, 0xb5, 0x16, 0x7e, 0xbb, 0x11, 0x69, 0x52, 0x8c, 0x89, 0x80, 0x32, 0xaa, 0x76,
+            0xa6, 0x18, 0x31, 0x98, 0xee, 0xdd, 0x22, 0x68, 0xb7, 0xe6, 0x77, 0xd2,
+        ];
+        let expected_plaintext = b"Lorem ipsum dolor sit amet, consectetur\n";
+        let key = [
+            0x43, 0x2b, 0x6d, 0xbe, 0x05, 0x76, 0x6c, 0x9e, 0xde, 0xca, 0x3b, 0xf8, 0xaf, 0x5d,
+            0x81, 0xb6,
+        ];
+
+        roundtrip::<Aes128>(&key, &ciphertext, expected_plaintext);
+    }
+
+    #[test]
+    fn crypt_aes_192_40_byte() {
+        let ciphertext = [
+            0xa6, 0xfc, 0x52, 0x79, 0x2c, 0x6c, 0xfe, 0x68, 0xb1, 0xa8, 0xb3, 0x07, 0x52, 0x8b,
+            0x82, 0xa6, 0x87, 0x9c, 0x72, 0x42, 0x3a, 0xf8, 0xc6, 0xa9, 0xc9, 0xfb, 0x61, 0x19,
+            0x37, 0xb9, 0x56, 0x62, 0xf4, 0xfc, 0x5e, 0x7a, 0xdd, 0x55, 0x0a, 0x48,
+        ];
+        let expected_plaintext = b"Lorem ipsum dolor sit amet, consectetur\n";
+        let key = [
+            0xac, 0x92, 0x41, 0xba, 0xde, 0xd9, 0x02, 0xfe, 0x40, 0x92, 0x20, 0xf6, 0x56, 0x03,
+            0xfe, 0xae, 0x1b, 0xba, 0x01, 0x97, 0x97, 0x79, 0xbb, 0xa6,
+        ];
+
+        roundtrip::<Aes192>(&key, &ciphertext, expected_plaintext);
+    }
+
+    #[test]
+    fn crypt_aes_256_40_byte() {
+        let ciphertext = [
+            0xa9, 0x99, 0xbd, 0xea, 0x82, 0x9b, 0x8f, 0x2f, 0xb7, 0x52, 0x2f, 0x6b, 0xd8, 0xf6,
+            0xab, 0x0e, 0x24, 0x51, 0x9e, 0x18, 0x0f, 0xc0, 0x8f, 0x54, 0x15, 0x80, 0xae, 0xbc,
+            0xa0, 0x5c, 0x8a, 0x11, 0x8d, 0x14, 0x7e, 0xc5, 0xb4, 0xae, 0xd3, 0x37,
+        ];
+        let expected_plaintext = b"Lorem ipsum dolor sit amet, consectetur\n";
+        let key = [
+            0x64, 0x7c, 0x7a, 0xde, 0xf0, 0xf2, 0x61, 0x49, 0x1c, 0xf1, 0xf1, 0xe3, 0x37, 0xfc,
+            0xe1, 0x4d, 0x4a, 0x77, 0xd4, 0xeb, 0x9e, 0x3d, 0x75, 0xce, 0x9a, 0x3e, 0x10, 0x50,
+            0xc2, 0x07, 0x36, 0xb6,
+        ];
+
+        roundtrip::<Aes256>(&key, &ciphertext, expected_plaintext);
+    }
+}
+//! Implementation of the ZipCrypto algorithm
+//!
+//! The following paper was used to implement the ZipCrypto algorithm:
+//! [https://courses.cs.ut.ee/MTAT.07.022/2015_fall/uploads/Main/dmitri-report-f15-16.pdf](https://courses.cs.ut.ee/MTAT.07.022/2015_fall/uploads/Main/dmitri-report-f15-16.pdf)
+
+use std::fmt::{Debug, Formatter};
+use std::hash::Hash;
+use std::num::Wrapping;
+
+use crate::result::ZipError;
+
+/// A container to hold the current key state
+#[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
+#[derive(Clone, Copy, Hash, Ord, PartialOrd, Eq, PartialEq)]
+pub(crate) struct ZipCryptoKeys {
+    key_0: Wrapping<u32>,
+    key_1: Wrapping<u32>,
+    key_2: Wrapping<u32>,
+}
+
+impl Debug for ZipCryptoKeys {
+    #[allow(unreachable_code)]
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        #[cfg(not(any(test, fuzzing)))]
+        {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::Hasher;
+            let mut t = DefaultHasher::new();
+            self.hash(&mut t);
+            f.write_fmt(format_args!("ZipCryptoKeys(hash {})", t.finish()))
+        }
+        #[cfg(any(test, fuzzing))]
+        f.write_fmt(format_args!(
+            "ZipCryptoKeys::of({:#10x},{:#10x},{:#10x})",
+            self.key_0, self.key_1, self.key_2
+        ))
+    }
+}
+
+impl ZipCryptoKeys {
+    const fn new() -> ZipCryptoKeys {
+        ZipCryptoKeys {
+            key_0: Wrapping(0x12345678),
+            key_1: Wrapping(0x23456789),
+            key_2: Wrapping(0x34567890),
+        }
+    }
+
+    #[allow(unused)]
+    pub const fn of(key_0: u32, key_1: u32, key_2: u32) -> ZipCryptoKeys {
+        ZipCryptoKeys {
+            key_0: Wrapping(key_0),
+            key_1: Wrapping(key_1),
+            key_2: Wrapping(key_2),
+        }
+    }
+
+    fn update(&mut self, input: u8) {
+        self.key_0 = ZipCryptoKeys::crc32(self.key_0, input);
+        self.key_1 =
+            (self.key_1 + (self.key_0 & Wrapping(0xff))) * Wrapping(0x08088405) + Wrapping(1);
+        self.key_2 = ZipCryptoKeys::crc32(self.key_2, (self.key_1 >> 24).0 as u8);
+    }
+
+    fn stream_byte(&mut self) -> u8 {
+        let temp: Wrapping<u16> = Wrapping(self.key_2.0 as u16) | Wrapping(3);
+        ((temp * (temp ^ Wrapping(1))) >> 8).0 as u8
+    }
+
+    fn decrypt_byte(&mut self, cipher_byte: u8) -> u8 {
+        let plain_byte: u8 = self.stream_byte() ^ cipher_byte;
+        self.update(plain_byte);
+        plain_byte
+    }
+
+    #[allow(dead_code)]
+    fn encrypt_byte(&mut self, plain_byte: u8) -> u8 {
+        let cipher_byte: u8 = self.stream_byte() ^ plain_byte;
+        self.update(plain_byte);
+        cipher_byte
+    }
+
+    fn crc32(crc: Wrapping<u32>, input: u8) -> Wrapping<u32> {
+        (crc >> 8) ^ Wrapping(CRCTABLE[((crc & Wrapping(0xff)).0 as u8 ^ input) as usize])
+    }
+    pub(crate) fn derive(password: &[u8]) -> ZipCryptoKeys {
+        let mut keys = ZipCryptoKeys::new();
+        for byte in password.iter() {
+            keys.update(*byte);
+        }
+        keys
+    }
+}
+
+/// A ZipCrypto reader with unverified password
+pub struct ZipCryptoReader<R> {
+    file: R,
+    keys: ZipCryptoKeys,
+}
+
+pub enum ZipCryptoValidator {
+    PkzipCrc32(u32),
+    InfoZipMsdosTime(u16),
+}
+
+impl<R: std::io::Read> ZipCryptoReader<R> {
+    /// Note: The password is `&[u8]` and not `&str` because the
+    /// [zip specification](https://pkware.cachefly.net/webdocs/APPNOTE/APPNOTE-6.3.3.TXT)
+    /// does not specify password encoding (see function `update_keys` in the specification).
+    /// Therefore, if `&str` was used, the password would be UTF-8 and it
+    /// would be impossible to decrypt files that were encrypted with a
+    /// password byte sequence that is unrepresentable in UTF-8.
+    pub fn new(file: R, password: &[u8]) -> ZipCryptoReader<R> {
+        ZipCryptoReader {
+            file,
+            keys: ZipCryptoKeys::derive(password),
+        }
+    }
+
+    /// Read the ZipCrypto header bytes and validate the password.
+    pub fn validate(
+        mut self,
+        validator: ZipCryptoValidator,
+    ) -> Result<ZipCryptoReaderValid<R>, ZipError> {
+        // ZipCrypto prefixes a file with a 12 byte header
+        let mut header_buf = [0u8; 12];
+        self.file.read_exact(&mut header_buf)?;
+        for byte in header_buf.iter_mut() {
+            *byte = self.keys.decrypt_byte(*byte);
+        }
+
+        match validator {
+            ZipCryptoValidator::PkzipCrc32(crc32_plaintext) => {
+                // PKZIP before 2.0 used 2 byte CRC check.
+                // PKZIP 2.0+ used 1 byte CRC check. It's more secure.
+                // We also use 1 byte CRC.
+
+                if (crc32_plaintext >> 24) as u8 != header_buf[11] {
+                    return Err(ZipError::InvalidPassword);
+                }
+            }
+            ZipCryptoValidator::InfoZipMsdosTime(last_mod_time) => {
+                // Info-ZIP modification to ZipCrypto format:
+                // If bit 3 of the general purpose bit flag is set
+                // (indicates that the file uses a data-descriptor section),
+                // it uses high byte of 16-bit File Time.
+                // Info-ZIP code probably writes 2 bytes of File Time.
+                // We check only 1 byte.
+
+                if (last_mod_time >> 8) as u8 != header_buf[11] {
+                    return Err(ZipError::InvalidPassword);
+                }
+            }
+        }
+
+        Ok(ZipCryptoReaderValid { reader: self })
+    }
+}
+#[allow(unused)]
+pub(crate) struct ZipCryptoWriter<W> {
+    pub(crate) writer: W,
+    pub(crate) buffer: Vec<u8>,
+    pub(crate) keys: ZipCryptoKeys,
+}
+impl<W: std::io::Write> ZipCryptoWriter<W> {
+    #[allow(unused)]
+    pub(crate) fn finish(mut self, crc32: u32) -> std::io::Result<W> {
+        self.buffer[11] = (crc32 >> 24) as u8;
+        for byte in self.buffer.iter_mut() {
+            *byte = self.keys.encrypt_byte(*byte);
+        }
+        self.writer.write_all(&self.buffer)?;
+        self.writer.flush()?;
+        Ok(self.writer)
+    }
+}
+impl<W: std::io::Write> std::io::Write for ZipCryptoWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A ZipCrypto reader with verified password
+pub struct ZipCryptoReaderValid<R> {
+    reader: ZipCryptoReader<R>,
+}
+
+impl<R: std::io::Read> std::io::Read for ZipCryptoReaderValid<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // Note: There might be potential for optimization. Inspiration can be found at:
+        // https://github.com/kornelski/7z/blob/master/CPP/7zip/Crypto/ZipCrypto.cpp
+
+        let n = self.reader.file.read(buf)?;
+        for byte in buf.iter_mut().take(n) {
+            *byte = self.reader.keys.decrypt_byte(*byte);
+        }
+        Ok(n)
+    }
+}
+
+impl<R: std::io::Read> ZipCryptoReaderValid<R> {
+    /// Consumes this decoder, returning the underlying reader.
+    pub fn into_inner(self) -> R {
+        self.reader.file
+    }
+}
+
+static CRCTABLE: [u32; 256] = [
+    0x00000000, 0x77073096, 0xee0e612c, 0x990951ba, 0x076dc419, 0x706af48f, 0xe963a535, 0x9e6495a3,
+    0x0edb8832, 0x79dcb8a4, 0xe0d5e91e, 0x97d2d988, 0x09b64c2b, 0x7eb17cbd, 0xe7b82d07, 0x90bf1d91,
+    0x1db71064, 0x6ab020f2, 0xf3b97148, 0x84be41de, 0x1adad47d, 0x6ddde4eb, 0xf4d4b551, 0x83d385c7,
+    0x136c9856, 0x646ba8c0, 0xfd62f97a, 0x8a65c9ec, 0x14015c4f, 0x63066cd9, 0xfa0f3d63, 0x8d080df5,
+    0x3b6e20c8, 0x4c69105e, 0xd56041e4, 0xa2677172, 0x3c03e4d1, 0x4b04d447, 0xd20d85fd, 0xa50ab56b,
+    0x35b5a8fa, 0x42b2986c, 0xdbbbc9d6, 0xacbcf940, 0x32d86ce3, 0x45df5c75, 0xdcd60dcf, 0xabd13d59,
+    0x26d930ac, 0x51de003a, 0xc8d75180, 0xbfd06116, 0x21b4f4b5, 0x56b3c423, 0xcfba9599, 0xb8bda50f,
+    0x2802b89e, 0x5f058808, 0xc60cd9b2, 0xb10be924, 0x2f6f7c87, 0x58684c11, 0xc1611dab, 0xb6662d3d,
+    0x76dc4190, 0x01db7106, 0x98d220bc, 0xefd5102a, 0x71b18589, 0x06b6b51f, 0x9fbfe4a5, 0xe8b8d433,
+    0x7807c9a2, 0x0f00f934, 0x9609a88e, 0xe10e9818, 0x7f6a0dbb, 0x086d3d2d, 0x91646c97, 0xe6635c01,
+    0x6b6b51f4, 0x1c6c6162, 0x856530d8, 0xf262004e, 0x6c0695ed, 0x1b01a57b, 0x8208f4c1, 0xf50fc457,
+    0x65b0d9c6, 0x12b7e950, 0x8bbeb8ea, 0xfcb9887c, 0x62dd1ddf, 0x15da2d49, 0x8cd37cf3, 0xfbd44c65,
+    0x4db26158, 0x3ab551ce, 0xa3bc0074, 0xd4bb30e2, 0x4adfa541, 0x3dd895d7, 0xa4d1c46d, 0xd3d6f4fb,
+    0x4369e96a, 0x346ed9fc, 0xad678846, 0xda60b8d0, 0x44042d73, 0x33031de5, 0xaa0a4c5f, 0xdd0d7cc9,
+    0x5005713c, 0x270241aa, 0xbe0b1010, 0xc90c2086, 0x5768b525, 0x206f85b3, 0xb966d409, 0xce61e49f,
+    0x5edef90e, 0x29d9c998, 0xb0d09822, 0xc7d7a8b4, 0x59b33d17, 0x2eb40d81, 0xb7bd5c3b, 0xc0ba6cad,
+    0xedb88320, 0x9abfb3b6, 0x03b6e20c, 0x74b1d29a, 0xead54739, 0x9dd277af, 0x04db2615, 0x73dc1683,
+    0xe3630b12, 0x94643b84, 0x0d6d6a3e, 0x7a6a5aa8, 0xe40ecf0b, 0x9309ff9d, 0x0a00ae27, 0x7d079eb1,
+    0xf00f9344, 0x8708a3d2, 0x1e01f268, 0x6906c2fe, 0xf762575d, 0x806567cb, 0x196c3671, 0x6e6b06e7,
+    0xfed41b76, 0x89d32be0, 0x10da7a5a, 0x67dd4acc, 0xf9b9df6f, 0x8ebeeff9, 0x17b7be43, 0x60b08ed5,
+    0xd6d6a3e8, 0xa1d1937e, 0x38d8c2c4, 0x4fdff252, 0xd1bb67f1, 0xa6bc5767, 0x3fb506dd, 0x48b2364b,
+    0xd80d2bda, 0xaf0a1b4c, 0x36034af6, 0x41047a60, 0xdf60efc3, 0xa867df55, 0x316e8eef, 0x4669be79,
+    0xcb61b38c, 0xbc66831a, 0x256fd2a0, 0x5268e236, 0xcc0c7795, 0xbb0b4703, 0x220216b9, 0x5505262f,
+    0xc5ba3bbe, 0xb2bd0b28, 0x2bb45a92, 0x5cb36a04, 0xc2d7ffa7, 0xb5d0cf31, 0x2cd99e8b, 0x5bdeae1d,
+    0x9b64c2b0, 0xec63f226, 0x756aa39c, 0x026d930a, 0x9c0906a9, 0xeb0e363f, 0x72076785, 0x05005713,
+    0x95bf4a82, 0xe2b87a14, 0x7bb12bae, 0x0cb61b38, 0x92d28e9b, 0xe5d5be0d, 0x7cdcefb7, 0x0bdbdf21,
+    0x86d3d2d4, 0xf1d4e242, 0x68ddb3f8, 0x1fda836e, 0x81be16cd, 0xf6b9265b, 0x6fb077e1, 0x18b74777,
+    0x88085ae6, 0xff0f6a70, 0x66063bca, 0x11010b5c, 0x8f659eff, 0xf862ae69, 0x616bffd3, 0x166ccf45,
+    0xa00ae278, 0xd70dd2ee, 0x4e048354, 0x3903b3c2, 0xa7672661, 0xd06016f7, 0x4969474d, 0x3e6e77db,
+    0xaed16a4a, 0xd9d65adc, 0x40df0b66, 0x37d83bf0, 0xa9bcae53, 0xdebb9ec5, 0x47b2cf7f, 0x30b5ffe9,
+    0xbdbdf21c, 0xcabac28a, 0x53b39330, 0x24b4a3a6, 0xbad03605, 0xcdd70693, 0x54de5729, 0x23d967bf,
+    0xb3667a2e, 0xc4614ab8, 0x5d681b02, 0x2a6f2b94, 0xb40bbe37, 0xc30c8ea1, 0x5a05df1b, 0x2d02ef8d,
+];
+use std::io::{self, Error, Seek};
+
+use bitstream_io::{BitRead, BitReader, Endianness};
+
+#[derive(Default, Clone, Copy)]
+pub struct TableEntry {
+    /// Wide enough to fit the max symbol nbr.
+    pub sym: u16,
+    /// 0 means no symbol.
+    pub len: u8,
+}
+
+/// Deflate uses max 288 symbols.
+const MAX_HUFFMAN_SYMBOLS: usize = 288;
+/// Implode uses max 16-bit codewords.
+const MAX_HUFFMAN_BITS: usize = 16;
+/// Seems a good trade-off.
+const HUFFMAN_LOOKUP_TABLE_BITS: u8 = 8;
+
+pub struct HuffmanDecoder {
+    /// Lookup table for fast decoding of short codewords.
+    pub table: [TableEntry; 1 << HUFFMAN_LOOKUP_TABLE_BITS],
+    /// "Sentinel bits" value for each codeword length.
+    pub sentinel_bits: [u32; MAX_HUFFMAN_BITS + 1],
+    /// First symbol index minus first codeword mod 2**16 for each length.
+    pub offset_first_sym_idx: [u16; MAX_HUFFMAN_BITS + 1],
+    /// Map from symbol index to symbol.
+    pub syms: [u16; MAX_HUFFMAN_SYMBOLS],
+    // num_syms:usize
+}
+
+impl Default for HuffmanDecoder {
+    fn default() -> Self {
+        Self {
+            table: [TableEntry::default(); 1 << HUFFMAN_LOOKUP_TABLE_BITS],
+            sentinel_bits: [0; MAX_HUFFMAN_BITS + 1],
+            offset_first_sym_idx: [0; MAX_HUFFMAN_BITS + 1],
+            syms: [0; MAX_HUFFMAN_SYMBOLS],
+        }
+    }
+}
+
+/// Reverse the n least significant bits of x.
+/// The (16 - n) most significant bits of the result will be zero.
+pub fn reverse_lsb(x: u16, n: usize) -> u16 {
+    debug_assert!(n > 0);
+    debug_assert!(n <= 16);
+    x.reverse_bits() >> (16 - n)
+}
+
+/// Initialize huffman decoder d for a code defined by the n codeword lengths.
+/// Returns `Err` if the codeword lengths do not correspond to a valid prefix
+/// code.
+impl HuffmanDecoder {
+    pub fn init(&mut self, lengths: &[u8], n: usize) -> std::io::Result<()> {
+        let mut count = [0; MAX_HUFFMAN_BITS + 1];
+        let mut code = [0; MAX_HUFFMAN_BITS + 1];
+        let mut sym_idx = [0u16; MAX_HUFFMAN_BITS + 1];
+
+        // Count the number of codewords of each length.
+        for i in 0..n {
+            debug_assert!(lengths[i] as usize <= MAX_HUFFMAN_BITS);
+            count[lengths[i] as usize] += 1;
+        }
+        count[0] = 0; // Ignore zero-length codewords.
+                      // Compute sentinel_bits and offset_first_sym_idx for each length.
+        code[0] = 0;
+        sym_idx[0] = 0;
+        for l in 1..=MAX_HUFFMAN_BITS {
+            // First canonical codeword of this length.
+            code[l] = (code[l - 1] + count[l - 1]) << 1;
+
+            if count[l] != 0 && code[l] as u32 + count[l] as u32 - 1 > (1u32 << l) - 1 {
+                // The last codeword is longer than l bits.
+                return Err(Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the last codeword is longer than len bits",
+                ));
+            }
+
+            let s = (code[l] as u32 + count[l] as u32) << (MAX_HUFFMAN_BITS - l);
+            self.sentinel_bits[l] = s;
+            debug_assert!(self.sentinel_bits[l] >= code[l] as u32, "No overflow!");
+
+            sym_idx[l] = sym_idx[l - 1] + count[l - 1];
+            self.offset_first_sym_idx[l] = sym_idx[l].wrapping_sub(code[l]);
+        }
+
+        // Zero-initialize the lookup table.
+        self.table.fill(TableEntry::default());
+
+        // Build mapping from index to symbol and populate the lookup table.
+        lengths
+            .iter()
+            .enumerate()
+            .take(n)
+            .for_each(|(i, code_len)| {
+                let l = *code_len as usize;
+                if l == 0 {
+                    return;
+                }
+
+                self.syms[sym_idx[l] as usize] = i as u16;
+                sym_idx[l] += 1;
+
+                if l <= HUFFMAN_LOOKUP_TABLE_BITS as usize {
+                    self.table_insert(i, l, code[l]);
+                    code[l] += 1;
+                }
+            });
+
+        Ok(())
+    }
+
+    pub fn table_insert(&mut self, sym: usize, len: usize, codeword: u16) {
+        debug_assert!(len <= HUFFMAN_LOOKUP_TABLE_BITS as usize);
+
+        let codeword = reverse_lsb(codeword, len); // Make it LSB-first.
+        let pad_len = HUFFMAN_LOOKUP_TABLE_BITS as usize - len;
+
+        // Pad the pad_len upper bits with all bit combinations.
+        for padding in 0..(1 << pad_len) {
+            let index = (codeword | (padding << len)) as usize;
+            debug_assert!(sym <= u16::MAX as usize);
+            self.table[index].sym = sym as u16;
+            debug_assert!(len <= u8::MAX as usize);
+            self.table[index].len = len as u8;
+        }
+    }
+
+    /// Use the decoder d to decode a symbol from the LSB-first zero-padded bits.
+    /// Returns the decoded symbol number or an error if no symbol could be decoded.
+    /// *num_used_bits will be set to the number of bits used to decode the symbol,
+    /// or zero if no symbol could be decoded.
+    pub fn huffman_decode<T: std::io::Read + Seek, E: Endianness>(
+        &mut self,
+        length: u64,
+        is: &mut BitReader<T, E>,
+    ) -> std::io::Result<u16> {
+        // First try the lookup table.
+        let read_bits1 = (HUFFMAN_LOOKUP_TABLE_BITS as u64).min(length - is.position_in_bits()?);
+        let lookup_bits = !is.read_var::<u8>(read_bits1 as u32)? as usize;
+        debug_assert!(lookup_bits < self.table.len());
+        if self.table[lookup_bits].len != 0 {
+            debug_assert!(self.table[lookup_bits].len <= HUFFMAN_LOOKUP_TABLE_BITS);
+            is.seek_bits(io::SeekFrom::Current(
+                -(read_bits1 as i64) + self.table[lookup_bits].len as i64,
+            ))?;
+            return Ok(self.table[lookup_bits].sym);
+        }
+
+        // Then do canonical decoding with the bits in MSB-first order.
+        let read_bits2 = (HUFFMAN_LOOKUP_TABLE_BITS as u64).min(length - is.position_in_bits()?);
+        let mut bits = reverse_lsb(
+            (lookup_bits | ((!is.read_var::<u8>(read_bits2 as u32)? as usize) << read_bits1))
+                as u16,
+            MAX_HUFFMAN_BITS,
+        );
+
+        for l in (HUFFMAN_LOOKUP_TABLE_BITS as usize + 1)..=MAX_HUFFMAN_BITS {
+            if (bits as u32) < self.sentinel_bits[l] {
+                bits >>= MAX_HUFFMAN_BITS - l;
+                let sym_idx = (self.offset_first_sym_idx[l] as usize + bits as usize) & 0xFFFF;
+                //assert(sym_idx < self.num_syms);
+                is.seek_bits(io::SeekFrom::Current(
+                    -(read_bits1 as i64 + read_bits2 as i64) + l as i64,
+                ))?;
+                return Ok(self.syms[sym_idx]);
+            }
+        }
+        Err(Error::new(
+            io::ErrorKind::InvalidData,
+            "huffman decode failed",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use bitstream_io::{BitReader, LittleEndian};
+
+    use super::HuffmanDecoder;
+    #[test]
+    fn test_huffman_decode_basic() {
+        let lens = [
+            3, // sym 0:  000
+            3, // sym 1:  001
+            3, // sym 2:  010
+            3, // sym 3:  011
+            3, // sym 4:  100
+            3, // sym 5:  101
+            4, // sym 6:  1100
+            4, // sym 7:  1101
+            0, // sym 8:
+            0, // sym 9:
+            0, // sym 10:
+            0, // sym 11:
+            0, // sym 12:
+            0, // sym 13:
+            0, // sym 14:
+            0, // sym 15:
+            6, // sym 16: 111110
+            5, // sym 17: 11110
+            4, // sym 18: 1110
+        ];
+
+        let mut d = HuffmanDecoder::default();
+        d.init(&lens, lens.len()).unwrap();
+
+        // 000 (msb-first) -> 000 (lsb-first)
+        assert_eq!(
+            d.huffman_decode(
+                8,
+                &mut BitReader::endian(&mut Cursor::new(vec![!0x0]), LittleEndian)
+            )
+            .unwrap(),
+            0
+        );
+
+        /* 011 (msb-first) -> 110 (lsb-first)*/
+        assert_eq!(
+            d.huffman_decode(
+                8,
+                &mut BitReader::endian(&mut Cursor::new(vec![!0b110]), LittleEndian)
+            )
+            .unwrap(),
+            0b011
+        );
+
+        /* 11110 (msb-first) -> 01111 (lsb-first)*/
+        assert_eq!(
+            d.huffman_decode(
+                8,
+                &mut BitReader::endian(&mut Cursor::new(vec![!0b1111]), LittleEndian)
+            )
+            .unwrap(),
+            0b10001
+        );
+
+        /* 111110 (msb-first) -> 011111 (lsb-first)*/
+        assert_eq!(
+            d.huffman_decode(
+                8,
+                &mut BitReader::endian(&mut Cursor::new(vec![!0b11111]), LittleEndian)
+            )
+            .unwrap(),
+            0b10000
+        );
+
+        /* 1111111 (msb-first) -> 1111111 (lsb-first)*/
+        assert!(d
+            .huffman_decode(
+                8,
+                &mut BitReader::endian(&mut Cursor::new(vec![!0x7f]), LittleEndian)
+            )
+            .is_err());
+    }
+}

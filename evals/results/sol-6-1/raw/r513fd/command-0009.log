@@ -1,0 +1,1390 @@
+// Copyright 2015 Google Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+
+//! Pull parser for [CommonMark](https://commonmark.org). This crate provides a [Parser](struct.Parser.html) struct
+//! which is an iterator over [Event](enum.Event.html)s. This iterator can be used
+//! directly, or to output HTML using the [HTML module](html/index.html).
+//!
+//! By default, only CommonMark features are enabled. To use extensions like tables,
+//! footnotes or task lists, enable them by setting the corresponding flags in the
+//! [Options](struct.Options.html) struct.
+//!
+//! # Example
+//! ```rust
+//! use pulldown_cmark::{Parser, Options};
+//!
+//! let markdown_input = "Hello world, this is a ~~complicated~~ *very simple* example.";
+//!
+//! // Set up options and parser. Strikethroughs are not part of the CommonMark standard
+//! // and we therefore must enable it explicitly.
+//! let mut options = Options::empty();
+//! options.insert(Options::ENABLE_STRIKETHROUGH);
+//! let parser = Parser::new_ext(markdown_input, options);
+//!
+//! # #[cfg(feature = "html")] {
+//! // Write to String buffer.
+//! let mut html_output = String::new();
+//! pulldown_cmark::html::push_html(&mut html_output, parser);
+//!
+//! // Check that the output is what we expected.
+//! let expected_html = "<p>Hello world, this is a <del>complicated</del> <em>very simple</em> example.</p>\n";
+//! assert_eq!(expected_html, &html_output);
+//! # }
+//! ```
+//!
+//! Note that consecutive text events can happen due to the manner in which the
+//! parser evaluates the source. A utility `TextMergeStream` exists to improve
+//! the comfort of iterating the events:
+//!
+//! ```rust
+//! use pulldown_cmark::{Event, Parser, TextMergeStream};
+//!
+//! let markdown_input = "Hello world, this is a ~~complicated~~ *very simple* example.";
+//!
+//! let iterator = TextMergeStream::new(Parser::new(markdown_input));
+//!
+//! for event in iterator {
+//!     match event {
+//!         Event::Text(text) => println!("{}", text),
+//!         _ => {}
+//!     }
+//! }
+//! ```
+//!
+
+// When compiled for the rustc compiler itself we want to make sure that this is
+// an unstable crate.
+#![cfg_attr(rustbuild, feature(staged_api, rustc_private))]
+#![cfg_attr(rustbuild, unstable(feature = "rustc_private", issue = "27812"))]
+// Forbid unsafe code unless the SIMD feature is enabled.
+#![cfg_attr(not(feature = "simd"), forbid(unsafe_code))]
+#![warn(missing_debug_implementations)]
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "html")]
+pub mod html;
+
+pub mod utils;
+
+mod entities;
+mod firstpass;
+mod linklabel;
+mod parse;
+mod puncttable;
+mod scanners;
+mod strings;
+mod tree;
+
+use std::fmt::Display;
+
+pub use crate::parse::{
+    BrokenLink, BrokenLinkCallback, DefaultBrokenLinkCallback, OffsetIter, Parser, RefDefs,
+};
+pub use crate::strings::{CowStr, InlineStr};
+pub use crate::utils::*;
+
+/// Codeblock kind.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum CodeBlockKind<'a> {
+    Indented,
+    /// The value contained in the tag describes the language of the code, which may be empty.
+    #[cfg_attr(feature = "serde", serde(borrow))]
+    Fenced(CowStr<'a>),
+}
+
+impl<'a> CodeBlockKind<'a> {
+    pub fn is_indented(&self) -> bool {
+        matches!(*self, CodeBlockKind::Indented)
+    }
+
+    pub fn is_fenced(&self) -> bool {
+        matches!(*self, CodeBlockKind::Fenced(_))
+    }
+
+    pub fn into_static(self) -> CodeBlockKind<'static> {
+        match self {
+            CodeBlockKind::Indented => CodeBlockKind::Indented,
+            CodeBlockKind::Fenced(s) => CodeBlockKind::Fenced(s.into_static()),
+        }
+    }
+}
+
+/// BlockQuote kind (Note, Tip, Important, Warning, Caution).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum BlockQuoteKind {
+    Note,
+    Tip,
+    Important,
+    Warning,
+    Caution,
+}
+
+/// Metadata block kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum MetadataBlockKind {
+    YamlStyle,
+    PlusesStyle,
+}
+
+/// Tags for elements that can contain other elements.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum Tag<'a> {
+    /// A paragraph of text and other inline elements.
+    Paragraph,
+
+    /// A heading, with optional identifier, classes and custom attributes.
+    /// The identifier is prefixed with `#` and the last one in the attributes
+    /// list is chosen, classes are prefixed with `.` and custom attributes
+    /// have no prefix and can optionally have a value (`myattr` or `myattr=myvalue`).
+    ///
+    /// `id`, `classes` and `attrs` are only parsed and populated with [`Options::ENABLE_HEADING_ATTRIBUTES`], `None` or empty otherwise.
+    Heading {
+        level: HeadingLevel,
+        id: Option<CowStr<'a>>,
+        classes: Vec<CowStr<'a>>,
+        /// The first item of the tuple is the attr and second one the value.
+        attrs: Vec<(CowStr<'a>, Option<CowStr<'a>>)>,
+    },
+
+    /// A block quote.
+    ///
+    /// The `BlockQuoteKind` is only parsed & populated with [`Options::ENABLE_GFM`], `None` otherwise.
+    ///
+    /// ```markdown
+    /// > regular quote
+    ///
+    /// > [!NOTE]
+    /// > note quote
+    /// ```
+    BlockQuote(Option<BlockQuoteKind>),
+    /// A code block.
+    CodeBlock(CodeBlockKind<'a>),
+
+    /// An HTML block.
+    ///
+    /// A line that begins with some predefined tags (HTML block tags) (see [CommonMark Spec](https://spec.commonmark.org/0.31.2/#html-blocks) for more details) or any tag that is followed only by whitespace.
+    ///
+    /// Most HTML blocks end on an empty line, though some e.g. `<pre>` like `<script>` or `<!-- Comments -->` don't.
+    /// ```markdown
+    /// <body> Is HTML block even though here is non-whitespace.
+    /// Block ends on an empty line.
+    ///
+    /// <some-random-tag>
+    /// This is HTML block.
+    ///
+    /// <pre> Doesn't end on empty lines.
+    ///
+    /// This is still the same block.</pre>
+    /// ```
+    HtmlBlock,
+
+    /// A list. If the list is ordered the field indicates the number of the first item.
+    /// Contains only list items.
+    List(Option<u64>), // TODO: add delim and tight for ast (not needed for html)
+    /// A list item.
+    Item,
+    /// A footnote definition. The value contained is the footnote's label by which it can
+    /// be referred to.
+    ///
+    /// Only parsed and emitted with [`Options::ENABLE_FOOTNOTES`] or [`Options::ENABLE_OLD_FOOTNOTES`].
+    #[cfg_attr(feature = "serde", serde(borrow))]
+    FootnoteDefinition(CowStr<'a>),
+
+    /// Only parsed and emitted with [`Options::ENABLE_DEFINITION_LIST`].
+    DefinitionList,
+    /// Only parsed and emitted with [`Options::ENABLE_DEFINITION_LIST`].
+    DefinitionListTitle,
+    /// Only parsed and emitted with [`Options::ENABLE_DEFINITION_LIST`].
+    DefinitionListDefinition,
+
+    /// A table. Contains a vector describing the text-alignment for each of its columns.
+    /// Only parsed and emitted with [`Options::ENABLE_TABLES`].
+    Table(Vec<Alignment>),
+    /// A table header. Contains only `TableCell`s. Note that the table body starts immediately
+    /// after the closure of the `TableHead` tag. There is no `TableBody` tag.
+    /// Only parsed and emitted with [`Options::ENABLE_TABLES`].
+    TableHead,
+    /// A table row. Is used both for header rows as body rows. Contains only `TableCell`s.
+    /// Only parsed and emitted with [`Options::ENABLE_TABLES`].
+    TableRow,
+    /// Only parsed and emitted with [`Options::ENABLE_TABLES`].
+    TableCell,
+
+    // span-level tags
+    /// [Emphasis](https://spec.commonmark.org/0.31.2/#emphasis-and-strong-emphasis).
+    /// ```markdown
+    /// half*emph* _strong_ _multi _level__
+    /// ```
+    Emphasis,
+    /// [Strong emphasis](https://spec.commonmark.org/0.31.2/#emphasis-and-strong-emphasis).
+    /// ```markdown
+    /// half**strong** __strong__ __multi __level____
+    /// ```
+    Strong,
+    /// Only parsed and emitted with [`Options::ENABLE_STRIKETHROUGH`].
+    ///
+    /// ```markdown
+    /// ~strike through~
+    /// ```
+    Strikethrough,
+    /// Only parsed and emitted with [`Options::ENABLE_SUPERSCRIPT`].
+    ///
+    /// ```markdown
+    /// ^superscript^
+    /// ```
+    Superscript,
+    /// Only parsed and emitted with [`Options::ENABLE_SUBSCRIPT`], if disabled `~something~` is parsed as [`Strikethrough`](Self::Strikethrough).
+    /// ```markdown
+    Shortcut,
+    /// Shortcut without destination in the document, but resolved by the broken_link_callback
+    ShortcutUnknown,
+    /// Autolink like `<http://foo.bar/baz>`
+    Autolink,
+    /// Email address in autolink like `<<email>>`
+    Email,
+    /// Wikilink link like `[[foo]]` or `[[foo|bar]]`
+    WikiLink {
+        /// `true` if the wikilink was piped.
+        ///
+        /// * `true` - `[[foo|bar]]`
+        /// * `false` - `[[foo]]`
+        has_pothole: bool,
+    },
+}
+
+impl LinkType {
+    /// Map the link type to an equivalent _Unknown link type.
+    fn to_unknown(self) -> Self {
+        match self {
+            LinkType::Reference => LinkType::ReferenceUnknown,
+            LinkType::Collapsed => LinkType::CollapsedUnknown,
+            LinkType::Shortcut => LinkType::ShortcutUnknown,
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// Markdown events that are generated in a preorder traversal of the document
+/// tree, with additional `End` events whenever all of an inner node's children
+/// have been visited.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum Event<'a> {
+    /// Start of a tagged element. Events that are yielded after this event
+    /// and before its corresponding `End` event are inside this element.
+    /// Start and end events are guaranteed to be balanced.
+    #[cfg_attr(feature = "serde", serde(borrow))]
+    Start(Tag<'a>),
+    /// End of a tagged element.
+    End(TagEnd),
+    /// A text node.
+    ///
+    /// All text, outside and inside [`Tag`]s.
+    #[cfg_attr(feature = "serde", serde(borrow))]
+    Text(CowStr<'a>),
+    /// An [inline code node](https://spec.commonmark.org/0.31.2/#code-spans).
+    ///
+    /// ```markdown
+    /// `code`
+    /// ```
+    #[cfg_attr(feature = "serde", serde(borrow))]
+    Code(CowStr<'a>),
+    /// An inline math environment node.
+    /// Requires [`Options::ENABLE_MATH`].
+    ///
+    /// ```markdown
+    /// $math$
+    /// ```
+    #[cfg_attr(feature = "serde", serde(borrow))]
+    InlineMath(CowStr<'a>),
+    /// A display math environment node.
+    /// Requires [`Options::ENABLE_MATH`].
+    ///
+    /// ```markdown
+    /// $$math$$
+    /// ```
+    #[cfg_attr(feature = "serde", serde(borrow))]
+    DisplayMath(CowStr<'a>),
+    /// An HTML node.
+    ///
+    /// A line of HTML inside [`Tag::HtmlBlock`] includes the line break.
+    #[cfg_attr(feature = "serde", serde(borrow))]
+    Html(CowStr<'a>),
+    /// An [inline HTML node](https://spec.commonmark.org/0.31.2/#raw-html).
+    ///
+    /// Contains only the tag itself, e.g. `<open-tag>`, `</close-tag>` or `<!-- comment -->`.
+    ///
+    /// **Note**: Under some conditions HTML can also be parsed as an HTML Block, see [`Tag::HtmlBlock`] for details.
+    #[cfg_attr(feature = "serde", serde(borrow))]
+    InlineHtml(CowStr<'a>),
+    /// A reference to a footnote with given label, which may or may not be defined
+    /// by an event with a [`Tag::FootnoteDefinition`] tag. Definitions and references to them may
+    /// occur in any order. Only parsed and emitted with [`Options::ENABLE_FOOTNOTES`] or [`Options::ENABLE_OLD_FOOTNOTES`].
+    ///
+    /// ```markdown
+    /// [^1]
+    /// ```
+    #[cfg_attr(feature = "serde", serde(borrow))]
+    FootnoteReference(CowStr<'a>),
+    /// A [soft line break](https://spec.commonmark.org/0.31.2/#soft-line-breaks).
+    ///
+    /// Any line break that isn't a [`HardBreak`](Self::HardBreak), or the end of e.g. a paragraph.
+    SoftBreak,
+    /// A [hard line break](https://spec.commonmark.org/0.31.2/#hard-line-breaks).
+    ///
+    /// A line ending that is either preceded by at least two spaces or `\`.
+    ///
+    /// ```markdown
+    /// hard··
+    /// line\
+    /// breaks
+    /// ```
+    /// *`·` is a space*
+    HardBreak,
+    /// A horizontal ruler.
+    ///
+    /// ```markdown
+    /// ***
+    /// ···---
+    /// _·_··_····_··
+    /// ```
+    /// *`·` is any whitespace*
+    Rule,
+    /// A task list marker, rendered as a checkbox in HTML. Contains a true when it is checked.
+    /// Only parsed and emitted with [`Options::ENABLE_TASKLISTS`].
+    /// ```markdown
+    /// - [ ] unchecked
+    /// - [x] checked
+    /// ```
+    TaskListMarker(bool),
+}
+
+impl<'a> Event<'a> {
+    pub fn into_static(self) -> Event<'static> {
+        match self {
+            Event::Start(t) => Event::Start(t.into_static()),
+            Event::End(e) => Event::End(e),
+            Event::Text(s) => Event::Text(s.into_static()),
+            Event::Code(s) => Event::Code(s.into_static()),
+            Event::InlineMath(s) => Event::InlineMath(s.into_static()),
+            Event::DisplayMath(s) => Event::DisplayMath(s.into_static()),
+            Event::Html(s) => Event::Html(s.into_static()),
+            Event::InlineHtml(s) => Event::InlineHtml(s.into_static()),
+            Event::FootnoteReference(s) => Event::FootnoteReference(s.into_static()),
+            Event::SoftBreak => Event::SoftBreak,
+            Event::HardBreak => Event::HardBreak,
+            Event::Rule => Event::Rule,
+            Event::TaskListMarker(b) => Event::TaskListMarker(b),
+        }
+    }
+}
+
+/// Table column text alignment.
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+
+pub enum Alignment {
+    /// Default text alignment.
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+bitflags::bitflags! {
+    /// Option struct containing flags for enabling extra features
+    /// that are not part of the CommonMark spec.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Options: u32 {
+        const ENABLE_TABLES = 1 << 1;
+        /// GitHub-compatible footnote syntax.
+        ///
+        /// Footnotes are referenced with the syntax `[^IDENT]`,
+        /// and defined with an identifier followed by a colon at top level.
+        ///
+        /// ---
+        ///
+        /// ```markdown
+        /// Footnote referenced [^1].
+        ///
+        /// [^1]: footnote defined
+        /// ```
+        ///
+        /// Footnote referenced [^1].
+        ///
+        /// [^1]: footnote defined
+        const ENABLE_FOOTNOTES = 1 << 2;
+        const ENABLE_STRIKETHROUGH = 1 << 3;
+        const ENABLE_TASKLISTS = 1 << 4;
+        /// Enables replacement of ASCII punctuation characters with
+        /// Unicode ligatures and smart quotes.
+        ///
+        /// This includes replacing `--` with `—`, `---` with `—`, `...` with `…`,
+        /// `"quote"` with `“quote”`, and `'quote'` with `‘quote’`.
+        ///
+        /// The replacement takes place during the parsing of the document.
+        const ENABLE_SMART_PUNCTUATION = 1 << 5;
+        /// Extension to allow headings to have ID and classes.
+        ///
+        /// `# text { #id .class1 .class2 myattr other_attr=myvalue }`
+        /// is interpreted as a level 1 heading
+        /// with the content `text`, ID `id`, classes `class1` and `class2` and
+        /// custom attributes `myattr` (without value) and
+        /// `other_attr` with value `myvalue`.
+        /// Note that ID, classes, and custom attributes should be space-separated.
+        const ENABLE_HEADING_ATTRIBUTES = 1 << 6;
+        /// Metadata blocks in YAML style, i.e.:
+        /// - starting with a `---` line
+        /// - ending with a `---` or `...` line
+        const ENABLE_YAML_STYLE_METADATA_BLOCKS = 1 << 7;
+        /// Metadata blocks delimited by:
+        /// - `+++` line at start
+        /// - `+++` line at end
+        const ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS = 1 << 8;
+        /// Older footnote syntax. This flag implies `ENABLE_FOOTNOTES`, changing it to use an
+        /// older syntax instead of the new, default, GitHub-compatible syntax.
+        ///
+        /// New syntax is different from the old syntax regarding
+        /// indentation, nesting, and footnote references with no definition:
+        ///
+        /// ```markdown
+        /// [^1]: In new syntax, this is two footnote definitions.
+        /// [^2]: In old syntax, this is a single footnote definition with two lines.
+        ///
+        /// [^3]:
+        ///
+        ///     In new syntax, this is a footnote with two paragraphs.
+        ///
+        ///     In old syntax, this is a footnote followed by a code block.
+        ///
+        /// In new syntax, this undefined footnote definition renders as
+        /// literal text [^4]. In old syntax, it creates a dangling link.
+        /// ```
+        const ENABLE_OLD_FOOTNOTES = (1 << 9) | (1 << 2);
+        /// With this feature enabled, two events `Event::InlineMath` and `Event::DisplayMath`
+        /// are emitted that conventionally contain TeX formulas.
+        const ENABLE_MATH = 1 << 10;
+        /// Misc GitHub Flavored Markdown features not supported in CommonMark.
+        /// The following features are currently behind this tag:
+        /// - Blockquote tags ([!NOTE], [!TIP], [!IMPORTANT], [!WARNING], [!CAUTION]).
+        const ENABLE_GFM = 1 << 11;
+        /// Commonmark-HS-Extensions compatible definition lists.
+        ///
+        /// ```markdown
+        /// title 1
+        ///   : definition 1
+        /// title 2
+        ///   : definition 2
+        /// ```
+        const ENABLE_DEFINITION_LIST = 1 << 12;
+        const ENABLE_SUPERSCRIPT = 1 << 13;
+        const ENABLE_SUBSCRIPT = 1 << 14;
+        /// Obsidian-style Wikilinks.
+        const ENABLE_WIKILINKS = 1 << 15;
+    }
+}
+
+impl Options {
+    pub(crate) fn has_gfm_footnotes(&self) -> bool {
+        self.contains(Options::ENABLE_FOOTNOTES) && !self.contains(Options::ENABLE_OLD_FOOTNOTES)
+    }
+}
+//! Miscellaneous utilities to increase comfort.
+//! Special thanks to:
+//!
+//! - <https://github.com/BenjaminRi/Redwood-Wiki/blob/master/src/markdown_utils.rs>.
+//! Its author authorized the use of this GPL code in this project in
+//! <https://github.com/raphlinus/pulldown-cmark/issues/507>.
+//!
+//! - <https://gist.github.com/rambip/a507c312ed61c99c24b2a54f98325721>.
+//! Its author proposed the solution in
+//! <https://github.com/raphlinus/pulldown-cmark/issues/708>.
+
+use crate::{CowStr, Event};
+use std::ops::Range;
+
+/// Merge consecutive `Event::Text` events into only one.
+#[derive(Debug)]
+pub struct TextMergeStream<'a, I> {
+    inner: TextMergeWithOffset<'a, DummyOffsets<I>>,
+}
+
+impl<'a, I> TextMergeStream<'a, I>
+where
+    I: Iterator<Item = Event<'a>>,
+{
+    pub fn new(iter: I) -> Self {
+        Self {
+            inner: TextMergeWithOffset::new(DummyOffsets(iter)),
+        }
+    }
+}
+
+impl<'a, I> Iterator for TextMergeStream<'a, I>
+where
+    I: Iterator<Item = Event<'a>>,
+{
+    type Item = Event<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(event, _)| event)
+    }
+}
+
+#[derive(Debug)]
+struct DummyOffsets<I>(I);
+
+impl<'a, I> Iterator for DummyOffsets<I>
+where
+    I: Iterator<Item = Event<'a>>,
+{
+    type Item = (Event<'a>, Range<usize>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|event| (event, 0..0))
+    }
+}
+
+/// Merge consecutive `Event::Text` events into only one, with offsets.
+///
+/// Compatible with with [`OffsetIter`](crate::OffsetIter).
+#[derive(Debug)]
+pub struct TextMergeWithOffset<'a, I> {
+    iter: I,
+    last_event: Option<(Event<'a>, Range<usize>)>,
+}
+
+impl<'a, I> TextMergeWithOffset<'a, I>
+where
+    I: Iterator<Item = (Event<'a>, Range<usize>)>,
+{
+    pub fn new(iter: I) -> Self {
+        Self {
+            iter,
+            last_event: None,
+        }
+    }
+}
+
+impl<'a, I> Iterator for TextMergeWithOffset<'a, I>
+where
+    I: Iterator<Item = (Event<'a>, Range<usize>)>,
+{
+    type Item = (Event<'a>, Range<usize>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match (self.last_event.take(), self.iter.next()) {
+            (
+                Some((Event::Text(last_text), last_offset)),
+                Some((Event::Text(next_text), next_offset)),
+            ) => {
+                // We need to start merging consecutive text events together into one
+                let mut string_buf: String = last_text.into_string();
+                string_buf.push_str(&next_text);
+                let mut offset = last_offset;
+                offset.end = next_offset.end;
+                loop {
+                    // Avoid recursion to avoid stack overflow and to optimize concatenation
+                    match self.iter.next() {
+                        Some((Event::Text(next_text), next_offset)) => {
+                            string_buf.push_str(&next_text);
+                            offset.end = next_offset.end;
+                        }
+                        next_event => {
+                            self.last_event = next_event;
+                            if string_buf.is_empty() {
+                                // Discard text event(s) altogether if there is no text
+                                break self.next();
+                            } else {
+                                break Some((
+                                    Event::Text(CowStr::Boxed(string_buf.into_boxed_str())),
+                                    offset,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            (None, Some(next_event)) => {
+                // This only happens once during the first iteration and if there are items
+                self.last_event = Some(next_event);
+                self.next()
+            }
+            (None, None) => {
+                // This happens when the iterator is depleted
+                None
+            }
+            (last_event, next_event) => {
+                // The ordinary case, emit one event after the other without modification
+                self.last_event = next_event;
+                last_event
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::Parser;
+
+    #[test]
+    fn text_merge_stream_indent() {
+        let source = r#"
+    first line
+    second line
+"#;
+        let parser = TextMergeStream::new(Parser::new(source));
+        let text_events: Vec<_> = parser.filter(|e| matches!(e, Event::Text(_))).collect();
+        assert_eq!(
+            text_events,
+            [Event::Text("first line\nsecond line\n".into())]
+        );
+    }
+
+    #[test]
+    fn text_merge_with_offset_indent() {
+        let source = r#"
+    first line
+    second line
+"#;
+        let parser = TextMergeWithOffset::new(Parser::new(source).into_offset_iter());
+        let text_events: Vec<_> = parser
+            .filter(|e| matches!(e, (Event::Text(_), _)))
+            .collect();
+        assert_eq!(
+            text_events,
+            [(Event::Text("first line\nsecond line\n".into()), 5..32)]
+        );
+    }
+
+    #[test]
+    fn text_merge_empty_is_discarded() {
+        let events = [
+            Event::Rule,
+            Event::Text("".into()),
+            Event::Text("".into()),
+            Event::Rule,
+        ];
+        let result: Vec<_> = TextMergeStream::new(events.into_iter()).collect();
+        assert_eq!(result, [Event::Rule, Event::Rule]);
+    }
+}
+// Copyright 2018 Google LLC
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+
+//! Link label parsing and matching.
+
+use unicase::UniCase;
+
+use crate::scanners::{is_ascii_punctuation, is_ascii_whitespace, scan_eol};
+use crate::strings::CowStr;
+
+#[derive(Debug)]
+pub(crate) enum ReferenceLabel<'a> {
+    Link(CowStr<'a>),
+    Footnote(CowStr<'a>),
+}
+
+pub(crate) type LinkLabel<'a> = UniCase<CowStr<'a>>;
+
+pub(crate) type FootnoteLabel<'a> = UniCase<CowStr<'a>>;
+
+/// Assumes the opening bracket has already been scanned.
+/// The line break handler determines what happens when a linebreak
+/// is found. It is passed the bytes following the line break and
+/// either returns `Some(k)`, where `k` is the number of bytes to skip,
+/// or `None` to abort parsing the label.
+/// Returns the number of bytes read (including closing bracket) and label on success.
+pub(crate) fn scan_link_label_rest<'t>(
+    text: &'t str,
+    linebreak_handler: &dyn Fn(&[u8]) -> Option<usize>,
+    is_in_table: bool,
+) -> Option<(usize, CowStr<'t>)> {
+    let bytes = text.as_bytes();
+    let mut ix = 0;
+    let mut only_white_space = true;
+    let mut codepoints = 0;
+    // no worries, doesn't allocate until we push things onto it
+    let mut label = String::new();
+    let mut mark = 0;
+
+    loop {
+        if codepoints >= 1000 {
+            return None;
+        }
+        match *bytes.get(ix)? {
+            b'[' => return None,
+            b']' => break,
+            // Backslash escapes in link references are normally untouched, but
+            // tables are an exception, because they're parsed as-if the tables
+            // were parsed in a discrete pass, changing `\|` to `|`, and then
+            // passing the changed string to the inline parser.
+            b'|' if is_in_table && ix != 0 && bytes.get(ix - 1) == Some(&b'\\') => {
+                // only way to reach this spot is to have `\\|` (even number of `\` before `|`)
+                label.push_str(&text[mark..ix - 1]);
+                label.push('|');
+                ix += 1;
+                only_white_space = false;
+                mark = ix;
+            }
+            b'\\' if is_in_table && bytes.get(ix + 1) == Some(&b'|') => {
+                // only way to reach this spot is to have `\|` (odd number of `\` before `|`)
+                label.push_str(&text[mark..ix]);
+                label.push('|');
+                ix += 2;
+                codepoints += 1;
+                only_white_space = false;
+                mark = ix;
+            }
+            b'\\' if is_ascii_punctuation(*bytes.get(ix + 1)?) => {
+                ix += 2;
+                codepoints += 2;
+                only_white_space = false;
+            }
+            b if is_ascii_whitespace(b) => {
+                // normalize labels by collapsing whitespaces, including linebreaks
+                let mut whitespaces = 0;
+                let mut linebreaks = 0;
+                let whitespace_start = ix;
+
+                while ix < bytes.len() && is_ascii_whitespace(bytes[ix]) {
+                    if let Some(eol_bytes) = scan_eol(&bytes[ix..]) {
+                        linebreaks += 1;
+                        if linebreaks > 1 {
+                            return None;
+                        }
+                        ix += eol_bytes;
+                        ix += linebreak_handler(&bytes[ix..])?;
+                        whitespaces += 2; // indicate that we need to replace
+                    } else {
+                        whitespaces += if bytes[ix] == b' ' { 1 } else { 2 };
+                        ix += 1;
+                    }
+                }
+                if whitespaces > 1 {
+                    label.push_str(&text[mark..whitespace_start]);
+                    label.push(' ');
+                    mark = ix;
+                    codepoints += ix - whitespace_start;
+                } else {
+                    codepoints += 1;
+                }
+            }
+            b => {
+                only_white_space = false;
+                ix += 1;
+                if b & 0b1000_0000 != 0 {
+                    codepoints += 1;
+                }
+            }
+        }
+    }
+
+    if only_white_space {
+        None
+    } else {
+        let cow = if mark == 0 {
+            let asciiws = &[' ', '\r', '\n', '\t'][..];
+            text[..ix].trim_matches(asciiws).into()
+        } else {
+            label.push_str(&text[mark..ix]);
+            while matches!(
+                label.as_bytes().last(),
+                Some(&b' ' | &b'\r' | &b'\n' | &b'\t')
+            ) {
+                label.pop();
+            }
+            while matches!(
+                label.as_bytes().first(),
+                Some(&b' ' | &b'\r' | &b'\n' | &b'\t')
+            ) {
+                label.remove(0);
+            }
+            label.into()
+        };
+        Some((ix + 1, cow))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::scan_link_label_rest;
+
+    #[test]
+    fn whitespace_normalization() {
+        let input = "«\t\tBlurry Eyes\t\t»][blurry_eyes]";
+        let expected_output = "« Blurry Eyes »"; // regular spaces!
+
+        let (_bytes, normalized_label) = scan_link_label_rest(input, &|_| None, false).unwrap();
+        assert_eq!(expected_output, normalized_label.as_ref());
+    }
+
+    #[test]
+    fn return_carriage_linefeed_ok() {
+        let input = "hello\r\nworld\r\n]";
+        assert!(scan_link_label_rest(input, &|_| Some(0), false).is_some());
+    }
+}
+   Compiling proc-macro2 v1.0.93
+   Compiling pulldown-cmark v0.13.0 (/work/crate/pulldown-cmark)
+    Checking aho-corasick v1.1.3
+    Checking regex-syntax v0.8.5
+error: the borrowed expression implements the required traits
+  --> pulldown-cmark/build.rs:54:20
+   |
+54 |         File::open(&file_path)
+   |                    ^^^^^^^^^^ help: change this to: `file_path`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#needless_borrows_for_generic_args
+   = note: `-D clippy::needless-borrows-for-generic-args` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::needless_borrows_for_generic_args)]`
+
+error: function call inside of `expect`
+  --> pulldown-cmark/build.rs:63:41
+   |
+63 |             File::create(&rs_test_file).expect(&format!("Could not create {:?}", rs_test_file));
+   |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `unwrap_or_else(|_| panic!("Could not create {:?}", rs_test_file))`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#expect_fun_call
+   = note: `-D clippy::expect-fun-call` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::expect_fun_call)]`
+
+error: function call inside of `expect`
+   --> pulldown-cmark/build.rs:117:39
+    |
+117 |         File::create(&suite_mod_file).expect(&format!("Could not create {:?}", &suite_mod_file));
+    |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `unwrap_or_else(|_| panic!("Could not create {:?}", &suite_mod_file))`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#expect_fun_call
+
+error: redundant reference in `format!` argument
+   --> pulldown-cmark/build.rs:117:80
+    |
+117 |         File::create(&suite_mod_file).expect(&format!("Could not create {:?}", &suite_mod_file));
+    |                                                                                ^^^^^^^^^^^^^^^ help: remove the redundant `&`: `suite_mod_file`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#useless_borrows_in_formatting
+    = note: `-D clippy::useless-borrows-in-formatting` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::useless_borrows_in_formatting)]`
+
+error: could not compile `pulldown-cmark` (build script) due to 4 previous errors
+warning: build failed, waiting for other jobs to finish...
+   Compiling quote v1.0.38
+   Compiling pulldown-cmark v0.13.0 (/work/crate/pulldown-cmark)
+   Compiling syn v2.0.98
+warning: pulldown-cmark@0.13.0: Generated 18 tests in "./tests/suite/blockquotes_tags.rs"
+warning: pulldown-cmark@0.13.0: Generated 30 tests in "./tests/suite/definition_lists.rs"
+warning: pulldown-cmark@0.13.0: Generated 26 tests in "./tests/suite/footnotes.rs"
+warning: pulldown-cmark@0.13.0: Generated 3 tests in "./tests/suite/gfm_strikethrough.rs"
+warning: pulldown-cmark@0.13.0: Generated 9 tests in "./tests/suite/gfm_table.rs"
+warning: pulldown-cmark@0.13.0: Generated 2 tests in "./tests/suite/gfm_tasklist.rs"
+warning: pulldown-cmark@0.13.0: Generated 42 tests in "./tests/suite/heading_attrs.rs"
+warning: pulldown-cmark@0.13.0: Generated 47 tests in "./tests/suite/math.rs"
+warning: pulldown-cmark@0.13.0: Generated 12 tests in "./tests/suite/metadata_blocks.rs"
+warning: pulldown-cmark@0.13.0: Generated 11 tests in "./tests/suite/old_footnotes.rs"
+warning: pulldown-cmark@0.13.0: Generated 210 tests in "./tests/suite/regression.rs"
+warning: pulldown-cmark@0.13.0: Generated 16 tests in "./tests/suite/smart_punct.rs"
+warning: pulldown-cmark@0.13.0: Generated 652 tests in "./tests/suite/spec.rs"
+warning: pulldown-cmark@0.13.0: Generated 15 tests in "./tests/suite/strikethrough.rs"
+warning: pulldown-cmark@0.13.0: Generated 6 tests in "./tests/suite/super_sub.rs"
+warning: pulldown-cmark@0.13.0: Generated 28 tests in "./tests/suite/table.rs"
+warning: pulldown-cmark@0.13.0: Generated 21 tests in "./tests/suite/wikilinks.rs"
+   Compiling serde_derive v1.0.217
+    Checking serde v1.0.217
+ Documenting pulldown-cmark v0.13.0 (/work/crate/pulldown-cmark)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.16s
+   Generated /target/doc/pulldown_cmark/index.html
+test suite::wikilinks::wikilinks_test_2 ... ok
+test suite::wikilinks::wikilinks_test_20 ... ok
+test suite::wikilinks::wikilinks_test_21 ... ok
+test suite::wikilinks::wikilinks_test_3 ... ok
+test suite::wikilinks::wikilinks_test_4 ... ok
+test suite::wikilinks::wikilinks_test_5 ... ok
+test suite::wikilinks::wikilinks_test_6 ... ok
+test suite::wikilinks::wikilinks_test_7 ... ok
+test suite::wikilinks::wikilinks_test_8 ... ok
+test suite::wikilinks::wikilinks_test_9 ... ok
+
+test result: ok. 1148 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/serde.rs (/target/debug/deps/serde-a166927bacaac479)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests pulldown_cmark
+
+running 5 tests
+test pulldown-cmark/src/html.rs - html::push_html (line 528) ... ok
+test pulldown-cmark/src/html.rs - html::write_html_fmt (line 603) ... ok
+test pulldown-cmark/src/html.rs - html::write_html_io (line 567) ... ok
+test pulldown-cmark/src/lib.rs - (line 30) ... ok
+test pulldown-cmark/src/lib.rs - (line 56) ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+
+3:warning: docs for function returning `Result` missing `# Errors` section
+4:  --> pulldown-cmark-escape/src/lib.rs:56:5
+12:warning: docs for function returning `Result` missing `# Errors` section
+13:  --> pulldown-cmark-escape/src/lib.rs:57:5
+20:warning: docs for function which may panic missing `# Panics` section
+21:   --> pulldown-cmark-escape/src/lib.rs:134:1
+29:   --> pulldown-cmark-escape/src/lib.rs:161:35
+36:warning: docs for function returning `Result` missing `# Errors` section
+37:   --> pulldown-cmark-escape/src/lib.rs:134:1
+46:warning: used `unwrap()` on a `Result` value
+47:   --> pulldown-cmark-escape/src/lib.rs:161:35
+57:warning: docs for function returning `Result` missing `# Errors` section
+58:   --> pulldown-cmark-escape/src/lib.rs:204:1
+65:warning: docs for function returning `Result` missing `# Errors` section
+66:   --> pulldown-cmark-escape/src/lib.rs:233:1
+73:warning: missing documentation for an associated type
+74:  --> pulldown-cmark-escape/src/lib.rs:54:5
+81:warning: missing documentation for a method
+82:  --> pulldown-cmark-escape/src/lib.rs:56:5
+87:warning: missing documentation for a method
+88:  --> pulldown-cmark-escape/src/lib.rs:57:5
+93:warning: `pulldown-cmark-escape` (lib) generated 10 warnings
+94:warning: the borrowed expression implements the required traits
+95:  --> pulldown-cmark/build.rs:54:20
+103:warning: function call inside of `expect`
+104:  --> pulldown-cmark/build.rs:63:41
+112:warning: used `unwrap()` on an `Option` value
+113:  --> pulldown-cmark/build.rs:65:25
+123:warning: used `unwrap()` on an `Option` value
+124:  --> pulldown-cmark/build.rs:65:25
+133:warning: used `unwrap()` on a `Result` value
+134:  --> pulldown-cmark/build.rs:70:9
+145:warning: used `unwrap()` on a `Result` value
+146:  --> pulldown-cmark/build.rs:73:9
+157:warning: used `unwrap()` on a `Result` value
+158:  --> pulldown-cmark/build.rs:76:9
+169:warning: used `unwrap()` on a `Result` value
+170:   --> pulldown-cmark/build.rs:81:13
+185:warning: function call inside of `expect`
+186:   --> pulldown-cmark/build.rs:117:39
+193:warning: redundant reference in `format!` argument
+194:   --> pulldown-cmark/build.rs:117:80
+202:warning: used `unwrap()` on a `Result` value
+203:   --> pulldown-cmark/build.rs:119:5
+214:warning: used `unwrap()` on a `Result` value
+215:   --> pulldown-cmark/build.rs:122:5
+226:warning: used `unwrap()` on a `Result` value
+227:   --> pulldown-cmark/build.rs:125:5
+238:warning: used `unwrap()` on an `Option` value
+239:   --> pulldown-cmark/build.rs:130:24
+248:warning: used `unwrap()` on an `Option` value
+249:   --> pulldown-cmark/build.rs:130:24
+258:warning: used `unwrap()` on a `Result` value
+259:   --> pulldown-cmark/build.rs:131:9
+268:warning: used `unwrap()` on a `Result` value
+269:   --> pulldown-cmark/build.rs:132:9
+278:warning: used `unwrap()` on a `Result` value
+279:   --> pulldown-cmark/build.rs:133:9
+288:warning: missing documentation for the crate
+289:   --> pulldown-cmark/build.rs:1:1
+299:warning: type does not implement `std::fmt::Debug`; consider adding `#[derive(Debug)]` or a manual implementation
+300:   --> pulldown-cmark/build.rs:138:1
+309:warning: missing documentation for a struct
+310:   --> pulldown-cmark/build.rs:138:1
+315:warning: missing documentation for an associated function
+316:   --> pulldown-cmark/build.rs:144:5
+321:warning: type does not implement `std::fmt::Debug`; consider adding `#[derive(Debug)]` or a manual implementation
+322:   --> pulldown-cmark/build.rs:150:1
+333:warning: missing documentation for a struct
+334:   --> pulldown-cmark/build.rs:150:1
+339:warning: missing documentation for a struct field
+340:   --> pulldown-cmark/build.rs:151:5
+345:warning: missing documentation for a struct field
+346:   --> pulldown-cmark/build.rs:152:5
+351:warning: missing documentation for a struct field
+352:   --> pulldown-cmark/build.rs:153:5
+357:warning: missing documentation for a struct field
+358:   --> pulldown-cmark/build.rs:154:5
+363:warning: missing documentation for a struct field
+364:   --> pulldown-cmark/build.rs:155:5
+369:warning: missing documentation for a struct field
+370:   --> pulldown-cmark/build.rs:156:5
+375:warning: missing documentation for a struct field
+376:   --> pulldown-cmark/build.rs:157:5
+381:warning: `pulldown-cmark` (build script) generated 31 warnings
+382:warning: pulldown-cmark@0.13.0: Generated 18 tests in "./tests/suite/blockquotes_tags.rs"
+383:warning: pulldown-cmark@0.13.0: Generated 30 tests in "./tests/suite/definition_lists.rs"
+384:warning: pulldown-cmark@0.13.0: Generated 26 tests in "./tests/suite/footnotes.rs"
+385:warning: pulldown-cmark@0.13.0: Generated 3 tests in "./tests/suite/gfm_strikethrough.rs"
+386:warning: pulldown-cmark@0.13.0: Generated 9 tests in "./tests/suite/gfm_table.rs"
+387:warning: pulldown-cmark@0.13.0: Generated 2 tests in "./tests/suite/gfm_tasklist.rs"
+388:warning: pulldown-cmark@0.13.0: Generated 42 tests in "./tests/suite/heading_attrs.rs"
+389:warning: pulldown-cmark@0.13.0: Generated 47 tests in "./tests/suite/math.rs"
+390:warning: pulldown-cmark@0.13.0: Generated 12 tests in "./tests/suite/metadata_blocks.rs"
+391:warning: pulldown-cmark@0.13.0: Generated 11 tests in "./tests/suite/old_footnotes.rs"
+392:warning: pulldown-cmark@0.13.0: Generated 210 tests in "./tests/suite/regression.rs"
+393:warning: pulldown-cmark@0.13.0: Generated 16 tests in "./tests/suite/smart_punct.rs"
+394:warning: pulldown-cmark@0.13.0: Generated 652 tests in "./tests/suite/spec.rs"
+395:warning: pulldown-cmark@0.13.0: Generated 15 tests in "./tests/suite/strikethrough.rs"
+396:warning: pulldown-cmark@0.13.0: Generated 6 tests in "./tests/suite/super_sub.rs"
+397:warning: pulldown-cmark@0.13.0: Generated 28 tests in "./tests/suite/table.rs"
+398:warning: pulldown-cmark@0.13.0: Generated 21 tests in "./tests/suite/wikilinks.rs"
+399:warning: empty line after outer attribute
+400:   --> pulldown-cmark/src/lib.rs:636:1
+412:warning: used `unwrap()` on an `Option` value
+413:   --> pulldown-cmark/src/html.rs:261:36
+423:warning: docs for function which may panic missing `# Panics` section
+424:   --> pulldown-cmark/src/html.rs:550:1
+432:   --> pulldown-cmark/src/html.rs:554:5
+439:warning: used `unwrap()` on a `Result` value
+440:   --> pulldown-cmark/src/html.rs:554:5
+449:warning: docs for function returning `Result` missing `# Errors` section
+450:   --> pulldown-cmark/src/html.rs:590:1
+461:warning: docs for function returning `Result` missing `# Errors` section
+462:   --> pulldown-cmark/src/html.rs:625:1
+472:warning: doc list item without indentation
+473: --> pulldown-cmark/src/utils.rs:5:5
+486:warning: doc list item without indentation
+487: --> pulldown-cmark/src/utils.rs:6:5
+499:warning: doc list item without indentation
+500: --> pulldown-cmark/src/utils.rs:9:5
+512:warning: doc list item without indentation
+513:  --> pulldown-cmark/src/utils.rs:10:5
+525:warning: large array defined as const
+526:    --> pulldown-cmark/src/entities.rs:25:1
+544:warning: used `unwrap()` on an `Option` value
+545:   --> pulldown-cmark/src/firstpass.rs:195:40
+554:warning: used `unwrap()` on an `Option` value
+555:   --> pulldown-cmark/src/firstpass.rs:711:29
+564:warning: used `unwrap()` on an `Option` value
+565:   --> pulldown-cmark/src/firstpass.rs:797:37
+574:warning: used `unwrap()` on an `Option` value
+575:    --> pulldown-cmark/src/firstpass.rs:1505:22
+584:warning: accessing first element with `bytes.get(0)`
+585:    --> pulldown-cmark/src/firstpass.rs:1768:12
+593:warning: used `unwrap()` on an `Option` value
+594:    --> pulldown-cmark/src/firstpass.rs:1846:25
+603:warning: used `unwrap()` on an `Option` value
+604:    --> pulldown-cmark/src/firstpass.rs:2012:40
+613:warning: this `map_or` can be simplified
+614:    --> pulldown-cmark/src/firstpass.rs:2134:12
+633:warning: this `map_or` can be simplified
+634:    --> pulldown-cmark/src/firstpass.rs:2146:20
+652:warning: this `map_or` can be simplified
+653:    --> pulldown-cmark/src/firstpass.rs:2154:20
+668:warning: this `map_or` can be simplified
+669:    --> pulldown-cmark/src/firstpass.rs:2160:16
+687:warning: used `unwrap()` on a `Result` value
+688:    --> pulldown-cmark/src/firstpass.rs:2161:17
+697:warning: used `unwrap()` on an `Option` value
+698:    --> pulldown-cmark/src/firstpass.rs:2280:17
+707:warning: used `unwrap()` on an `Option` value
+708:    --> pulldown-cmark/src/firstpass.rs:2288:21
+717:warning: used `unwrap()` on an `Option` value
+718:    --> pulldown-cmark/src/firstpass.rs:2310:21
+727:warning: used `unwrap()` on an `Option` value
+728:    --> pulldown-cmark/src/firstpass.rs:2327:17
+737:warning: can be more succinctly written as a byte str
+738:    --> pulldown-cmark/src/firstpass.rs:2355:26
+749:warning: can be more succinctly written as a byte str
+750:    --> pulldown-cmark/src/firstpass.rs:2379:22
+757:warning: used `unwrap()` on an `Option` value
+758:   --> pulldown-cmark/src/parse.rs:391:35
+767:warning: this `map_or` can be simplified
+768:   --> pulldown-cmark/src/parse.rs:468:38
+786:warning: used `unwrap()` on an `Option` value
+787:   --> pulldown-cmark/src/parse.rs:486:46
+796:warning: this `map_or` can be simplified
+797:   --> pulldown-cmark/src/parse.rs:494:37
+814:warning: used `unwrap()` on an `Option` value
+815:   --> pulldown-cmark/src/parse.rs:652:43
+824:warning: used `unwrap()` on an `Option` value
+825:   --> pulldown-cmark/src/parse.rs:875:23
+834:warning: used `unwrap()` on an `Option` value
+835:    --> pulldown-cmark/src/parse.rs:1051:42
+844:warning: used `unwrap()` on an `Option` value
+845:    --> pulldown-cmark/src/parse.rs:1269:21
+854:warning: used `unwrap()` on an `Option` value
+855:    --> pulldown-cmark/src/parse.rs:1752:28
+864:warning: assert without any message
+865:    --> pulldown-cmark/src/parse.rs:2191:17
+874:warning: used `unwrap()` on an `Option` value
+875:    --> pulldown-cmark/src/parse.rs:2199:25
+884:warning: assert without any message
+885:    --> pulldown-cmark/src/parse.rs:2215:17
+893:warning: used `unwrap()` on an `Option` value
+894:    --> pulldown-cmark/src/parse.rs:2367:21
+903:warning: you don't need to add `&` to all patterns
+904:   --> pulldown-cmark/src/scanners.rs:494:5
+926:warning: using `contains()` instead of `iter().any()` is more efficient
+927:   --> pulldown-cmark/src/scanners.rs:734:16
+935:warning: very complex type used. Consider factoring parts into `type` definitions
+936:    --> pulldown-cmark/src/scanners.rs:1028:22
+944:warning: very complex type used. Consider factoring parts into `type` definitions
+945:    --> pulldown-cmark/src/scanners.rs:1059:22
+952:warning: very complex type used. Consider factoring parts into `type` definitions
+953:    --> pulldown-cmark/src/scanners.rs:1096:22
+960:warning: very complex type used. Consider factoring parts into `type` definitions
+961:    --> pulldown-cmark/src/scanners.rs:1119:22
+968:warning: very complex type used. Consider factoring parts into `type` definitions
+969:    --> pulldown-cmark/src/scanners.rs:1267:22
+976:warning: used `unwrap()` on a `Result` value
+977:  --> pulldown-cmark/src/strings.rs:70:9
+986:warning: used `unwrap()` on an `Option` value
+987:  --> pulldown-cmark/src/tree.rs:19:19
+996:warning: used `unwrap()` on an `Option` value
+997:  --> pulldown-cmark/src/tree.rs:40:21
+1006:warning: used `unwrap()` on an `Option` value
+1007:   --> pulldown-cmark/src/tree.rs:111:22
+1016:warning: used `unwrap()` on an `Option` value
+1017:   --> pulldown-cmark/src/tree.rs:197:25
+1026:warning: assert without any message
+1027:   --> pulldown-cmark/src/tree.rs:237:17
+1035:warning: assert without any message
+1036:   --> pulldown-cmark/src/tree.rs:238:17
+1044:warning: redundant reference in `writeln!` argument
+1045:   --> pulldown-cmark/src/tree.rs:267:33
+1053:warning: used `unwrap()` on an `Option` value
+1054:   --> pulldown-cmark/src/tree.rs:278:33
+1063:warning: missing documentation for a variant
+1064:   --> pulldown-cmark/src/lib.rs:109:5
+1071:warning: missing documentation for a method
+1072:   --> pulldown-cmark/src/lib.rs:116:5
+1077:warning: missing documentation for a method
+1078:   --> pulldown-cmark/src/lib.rs:120:5
+1083:warning: missing documentation for a method
+1084:   --> pulldown-cmark/src/lib.rs:124:5
+1089:warning: missing documentation for a variant
+1090:   --> pulldown-cmark/src/lib.rs:136:5
+1095:warning: missing documentation for a variant
+1096:   --> pulldown-cmark/src/lib.rs:137:5
+1101:warning: missing documentation for a variant
+1102:   --> pulldown-cmark/src/lib.rs:138:5
+1107:warning: missing documentation for a variant
+1108:   --> pulldown-cmark/src/lib.rs:139:5
+1113:warning: missing documentation for a variant
+1114:   --> pulldown-cmark/src/lib.rs:140:5
+1119:warning: missing documentation for a variant
+1120:   --> pulldown-cmark/src/lib.rs:147:5
+1125:warning: missing documentation for a variant
+1126:   --> pulldown-cmark/src/lib.rs:148:5
+1131:warning: missing documentation for a struct field
+1132:   --> pulldown-cmark/src/lib.rs:165:9
+1137:warning: missing documentation for a struct field
+1138:   --> pulldown-cmark/src/lib.rs:166:9
+1143:warning: missing documentation for a struct field
+1144:   --> pulldown-cmark/src/lib.rs:167:9
+1149:warning: missing documentation for a struct field
+1150:   --> pulldown-cmark/src/lib.rs:267:9
+1155:warning: missing documentation for a struct field
+1156:   --> pulldown-cmark/src/lib.rs:268:9
+1161:warning: missing documentation for a struct field
+1162:   --> pulldown-cmark/src/lib.rs:269:9
+1167:warning: missing documentation for a struct field
+1168:   --> pulldown-cmark/src/lib.rs:277:9
+1173:warning: missing documentation for a struct field
+1174:   --> pulldown-cmark/src/lib.rs:278:9
+1179:warning: missing documentation for a struct field
+1180:   --> pulldown-cmark/src/lib.rs:279:9
+1185:warning: missing documentation for a method
+1186:   --> pulldown-cmark/src/lib.rs:291:5
+1191:warning: missing documentation for a method
+1192:   --> pulldown-cmark/src/lib.rs:319:5
+1197:warning: missing documentation for a variant
+1198:   --> pulldown-cmark/src/lib.rs:385:5
+1203:warning: missing documentation for a variant
+1204:   --> pulldown-cmark/src/lib.rs:386:5
+1209:warning: missing documentation for a variant
+1210:   --> pulldown-cmark/src/lib.rs:388:5
+1215:warning: missing documentation for a variant
+1216:   --> pulldown-cmark/src/lib.rs:389:5
+1221:warning: missing documentation for a variant
+1222:   --> pulldown-cmark/src/lib.rs:391:5
+1227:warning: missing documentation for a variant
+1228:   --> pulldown-cmark/src/lib.rs:395:5
+1233:warning: missing documentation for a variant
+1234:   --> pulldown-cmark/src/lib.rs:396:5
+1239:warning: missing documentation for a variant
+1240:   --> pulldown-cmark/src/lib.rs:398:5
+1245:warning: missing documentation for a variant
+1246:   --> pulldown-cmark/src/lib.rs:399:5
+1251:warning: missing documentation for a variant
+1252:   --> pulldown-cmark/src/lib.rs:400:5
+1257:warning: missing documentation for a variant
+1258:   --> pulldown-cmark/src/lib.rs:402:5
+1263:warning: missing documentation for a variant
+1264:   --> pulldown-cmark/src/lib.rs:403:5
+1269:warning: missing documentation for a variant
+1270:   --> pulldown-cmark/src/lib.rs:404:5
+1275:warning: missing documentation for a variant
+1276:   --> pulldown-cmark/src/lib.rs:405:5
+1281:warning: missing documentation for a variant
+1282:   --> pulldown-cmark/src/lib.rs:407:5
+1287:warning: missing documentation for a variant
+1288:   --> pulldown-cmark/src/lib.rs:408:5
+1293:warning: missing documentation for a variant
+1294:   --> pulldown-cmark/src/lib.rs:409:5
+1299:warning: missing documentation for a variant
+1300:   --> pulldown-cmark/src/lib.rs:410:5
+1305:warning: missing documentation for a variant
+1306:   --> pulldown-cmark/src/lib.rs:411:5
+1311:warning: missing documentation for a variant
+1312:   --> pulldown-cmark/src/lib.rs:413:5
+1317:warning: missing documentation for a variant
+1318:   --> pulldown-cmark/src/lib.rs:414:5
+1323:warning: missing documentation for a variant
+1324:   --> pulldown-cmark/src/lib.rs:416:5
+1329:warning: missing documentation for an enum
+1330:   --> pulldown-cmark/src/lib.rs:432:1
+1335:warning: missing documentation for a variant
+1336:   --> pulldown-cmark/src/lib.rs:433:5
+1341:warning: missing documentation for a variant
+1342:   --> pulldown-cmark/src/lib.rs:434:5
+1347:warning: missing documentation for a variant
+1348:   --> pulldown-cmark/src/lib.rs:435:5
+1353:warning: missing documentation for a variant
+1354:   --> pulldown-cmark/src/lib.rs:436:5
+1359:warning: missing documentation for a variant
+1360:   --> pulldown-cmark/src/lib.rs:437:5
+1365:warning: missing documentation for a variant
+1366:   --> pulldown-cmark/src/lib.rs:438:5
+1371:warning: missing documentation for a method
+1372:   --> pulldown-cmark/src/lib.rs:615:5
+1377:warning: missing documentation for a variant
+1378:   --> pulldown-cmark/src/lib.rs:641:5
+1383:warning: missing documentation for a variant
+1384:   --> pulldown-cmark/src/lib.rs:642:5
+1389:warning: missing documentation for a variant
+1390:   --> pulldown-cmark/src/lib.rs:643:5
+1395:warning: missing documentation for an associated constant
+1396:   --> pulldown-cmark/src/lib.rs:646:1
+1408:warning: missing documentation for an associated function
+1409:  --> pulldown-cmark/src/utils.rs:25:5
+1414:warning: missing documentation for an associated function
+1415:  --> pulldown-cmark/src/utils.rs:70:5
+1420:warning: missing documentation for a struct
+1421:   --> pulldown-cmark/src/parse.rs:180:1
+1426:warning: missing documentation for a struct field
+1427:   --> pulldown-cmark/src/parse.rs:181:5
+1432:warning: missing documentation for a struct field
+1433:   --> pulldown-cmark/src/parse.rs:182:5
+1438:warning: missing documentation for a struct field
+1439:   --> pulldown-cmark/src/parse.rs:183:5
+1444:warning: missing documentation for a method
+1445:    --> pulldown-cmark/src/parse.rs:2115:5
+1453:warning: missing documentation for a method
+1454:   --> pulldown-cmark/src/strings.rs:256:5
+1459:warning: missing documentation for a method
+1460:   --> pulldown-cmark/src/strings.rs:264:5
+1465:warning: `pulldown-cmark` (lib) generated 127 warnings (4 duplicates) (run `cargo clippy --fix --lib -p pulldown-cmark -- -W missing_docs -W missing_debug_implementations -W clippy::missing_errors_doc -W clippy::missing_panics_doc -W clippy::undocumented_unsafe_blocks -W clippy::unwrap_used -W clippy::allow_attributes_without_reason -W clippy::missing_assert_message` to apply 13 suggestions)
+1466:warning: missing documentation for a function
+1467:  --> pulldown-cmark/src/main.rs:68:1
+1474:warning: missing documentation for a function
+1475:   --> pulldown-cmark/src/main.rs:208:1
+1480:warning: `pulldown-cmark` (bin "pulldown-cmark") generated 2 warnings
+crate/pulldown-cmark/src/firstpass.rs:2644:    unsafe fn compute_mask(lut: &[u8; 16], bytes: &[u8], ix: usize) -> i32 {
+crate/pulldown-cmark/src/firstpass.rs:2693:            unsafe { simd_iterate_special_bytes(&lut.simd, bytes, ix, callback) }
+crate/pulldown-cmark/src/firstpass.rs:2703:    unsafe fn process_mask<F, T>(
+crate/pulldown-cmark/src/firstpass.rs:2733:    unsafe fn simd_iterate_special_bytes<F, T>(
+crate/pulldown-cmark/src/html.rs:550:pub fn push_html<'a, I>(s: &mut String, iter: I)
+crate/pulldown-cmark/src/html.rs:590:pub fn write_html_io<'a, I, W>(writer: W, iter: I) -> std::io::Result<()>
+crate/pulldown-cmark/src/html.rs:625:pub fn write_html_fmt<'a, I, W>(writer: W, iter: I) -> std::fmt::Result
+crate/pulldown-cmark/src/lib.rs:76:// Forbid unsafe code unless the SIMD feature is enabled.
+crate/pulldown-cmark/src/lib.rs:77:#![cfg_attr(not(feature = "simd"), forbid(unsafe_code))]
+crate/pulldown-cmark/src/lib.rs:108:pub enum CodeBlockKind<'a> {
+crate/pulldown-cmark/src/lib.rs:116:    pub fn is_indented(&self) -> bool {
+crate/pulldown-cmark/src/lib.rs:120:    pub fn is_fenced(&self) -> bool {
+crate/pulldown-cmark/src/lib.rs:124:    pub fn into_static(self) -> CodeBlockKind<'static> {
+crate/pulldown-cmark/src/lib.rs:135:pub enum BlockQuoteKind {
+crate/pulldown-cmark/src/lib.rs:146:pub enum MetadataBlockKind {
+crate/pulldown-cmark/src/lib.rs:154:pub enum Tag<'a> {
+crate/pulldown-cmark/src/lib.rs:291:    pub fn to_end(&self) -> TagEnd {
+crate/pulldown-cmark/src/lib.rs:319:    pub fn into_static(self) -> Tag<'static> {
+crate/pulldown-cmark/src/lib.rs:384:pub enum TagEnd {
+crate/pulldown-cmark/src/lib.rs:432:pub enum HeadingLevel {
+crate/pulldown-cmark/src/lib.rs:457:pub struct InvalidHeadingLevel(usize);
+crate/pulldown-cmark/src/lib.rs:478:pub enum LinkType {
+crate/pulldown-cmark/src/lib.rs:524:pub enum Event<'a> {
+crate/pulldown-cmark/src/lib.rs:615:    pub fn into_static(self) -> Event<'static> {
+crate/pulldown-cmark/src/lib.rs:638:pub enum Alignment {
+crate/pulldown-cmark/src/lib.rs:650:    pub struct Options: u32 {
+crate/pulldown-cmark/src/main.rs:23:#![forbid(unsafe_code)]
+crate/pulldown-cmark/src/main.rs:68:pub fn main() -> std::io::Result<()> {
+crate/pulldown-cmark/src/main.rs:208:pub fn pulldown_cmark(input: &str, opts: Options, broken_links: &mut Vec<BrokenLink<'static>>) {
+crate/pulldown-cmark/src/parse.rs:180:pub struct BrokenLink<'a> {
+crate/pulldown-cmark/src/parse.rs:187:pub struct Parser<'input, F = DefaultBrokenLinkCallback> {
+crate/pulldown-cmark/src/parse.rs:239:    pub fn into_static(self) -> BrokenLink<'static> {
+crate/pulldown-cmark/src/parse.rs:250:    pub fn new(text: &'input str) -> Self {
+crate/pulldown-cmark/src/parse.rs:255:    pub fn new_ext(text: &'input str, options: Options) -> Self {
+crate/pulldown-cmark/src/parse.rs:266:    pub fn new_with_broken_link_callback(
+crate/pulldown-cmark/src/parse.rs:296:    pub fn reference_definitions(&self) -> &RefDefs<'_> {
+crate/pulldown-cmark/src/parse.rs:1434:    pub fn into_offset_iter(self) -> OffsetIter<'input, F> {
+crate/pulldown-cmark/src/parse.rs:1811:pub struct LinkDef<'a> {
+crate/pulldown-cmark/src/parse.rs:1818:    pub fn into_static(self) -> LinkDef<'static> {
+crate/pulldown-cmark/src/parse.rs:1829:pub struct FootnoteDef {
+crate/pulldown-cmark/src/parse.rs:1971:pub struct RefDefs<'input>(pub(crate) HashMap<LinkLabel<'input>, LinkDef<'input>>);
+crate/pulldown-cmark/src/parse.rs:1975:pub struct FootnoteDefs<'input>(pub(crate) HashMap<FootnoteLabel<'input>, FootnoteDef>);
+crate/pulldown-cmark/src/parse.rs:1982:    pub fn get(&'s self, key: &'b str) -> Option<&'b LinkDef<'input>> {
+crate/pulldown-cmark/src/parse.rs:1987:    pub fn iter(&'s self) -> impl Iterator<Item = (&'s str, &'s LinkDef<'input>)> {
+crate/pulldown-cmark/src/parse.rs:1997:    pub fn contains(&'s self, key: &'b str) -> bool {
+crate/pulldown-cmark/src/parse.rs:2001:    pub fn get_mut(&'s mut self, key: CowStr<'input>) -> Option<&'s mut FootnoteDef> {
+crate/pulldown-cmark/src/parse.rs:2007:    pub fn new() -> Self {
+crate/pulldown-cmark/src/parse.rs:2018:    pub fn allocate_cow(&mut self, cow: CowStr<'a>) -> CowIndex {
+crate/pulldown-cmark/src/parse.rs:2024:    pub fn allocate_link(
+crate/pulldown-cmark/src/parse.rs:2036:    pub fn allocate_alignment(&mut self, alignment: Vec<Alignment>) -> AlignmentIndex {
+crate/pulldown-cmark/src/parse.rs:2042:    pub fn allocate_heading(&mut self, attrs: HeadingAttributes<'a>) -> HeadingIndex {
+crate/pulldown-cmark/src/parse.rs:2051:    pub fn take_cow(&mut self, ix: CowIndex) -> CowStr<'a> {
+crate/pulldown-cmark/src/parse.rs:2055:    pub fn take_link(&mut self, ix: LinkIndex) -> (LinkType, CowStr<'a>, CowStr<'a>, CowStr<'a>) {
+crate/pulldown-cmark/src/parse.rs:2060:    pub fn take_alignment(&mut self, ix: AlignmentIndex) -> Vec<Alignment> {
+crate/pulldown-cmark/src/parse.rs:2114:pub trait BrokenLinkCallback<'input> {
+crate/pulldown-cmark/src/parse.rs:2144:pub struct DefaultBrokenLinkCallback;
+crate/pulldown-cmark/src/parse.rs:2163:pub struct OffsetIter<'a, F = DefaultBrokenLinkCallback> {
+crate/pulldown-cmark/src/parse.rs:2169:    pub fn reference_definitions(&self) -> &RefDefs<'_> {
+crate/pulldown-cmark/src/strings.rs:12:pub struct StringTooLongError;
+crate/pulldown-cmark/src/strings.rs:17:pub struct InlineStr {
+crate/pulldown-cmark/src/strings.rs:85:pub enum CowStr<'a> {
+crate/pulldown-cmark/src/strings.rs:256:    pub fn into_string(self) -> String {
+crate/pulldown-cmark/src/strings.rs:264:    pub fn into_static(self) -> CowStr<'static> {
+crate/pulldown-cmark/src/tree.rs:22:    pub fn get(self) -> usize {
+crate/pulldown-cmark/src/utils.rs:17:pub struct TextMergeStream<'a, I> {
+crate/pulldown-cmark/src/utils.rs:25:    pub fn new(iter: I) -> Self {
+crate/pulldown-cmark/src/utils.rs:61:pub struct TextMergeWithOffset<'a, I> {
+crate/pulldown-cmark/src/utils.rs:70:    pub fn new(iter: I) -> Self {

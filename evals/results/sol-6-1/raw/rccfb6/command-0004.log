@@ -1,0 +1,600 @@
+#![deny(warnings)]
+#![cfg_attr(feature = "hints", feature(core_intrinsics))]
+#![cfg_attr(feature = "portable", feature(portable_simd))]
+#![warn(unused_extern_crates)]
+#![deny(
+    clippy::all,
+    clippy::unwrap_used,
+    clippy::unnecessary_unwrap,
+    clippy::pedantic,
+    missing_docs
+)]
+#![allow(
+    clippy::module_name_repetitions,
+    unused_unsafe, // for nightly
+)]
+#![doc = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))]
+
+#[cfg(feature = "serde_impl")]
+extern crate serde as serde_ext;
+
+#[cfg(feature = "serde_impl")]
+/// serde related helper functions
+pub mod serde;
+
+#[cfg(test)]
+/// serde related helper functions
+pub mod tests;
+
+use crate::error::InternalError;
+#[cfg(feature = "serde_impl")]
+pub use crate::serde::{
+    from_reader, from_slice, from_str, to_string, to_string_pretty, to_vec, to_vec_pretty,
+    to_writer, to_writer_pretty,
+};
+
+/// Default trait imports;
+pub mod prelude;
+
+mod charutils;
+#[macro_use]
+mod macros;
+mod error;
+mod numberparse;
+mod safer_unchecked;
+mod stringparse;
+
+use macros::static_cast_u64;
+use safer_unchecked::GetSaferUnchecked;
+use stage2::StackState;
+use tape::Value;
+
+mod impls;
+
+/// Re-export of Cow
+pub mod cow;
+
+/// The maximum padding size required by any SIMD implementation
+pub(crate) const SIMDJSON_PADDING: usize = 32; // take upper limit mem::size_of::<__m256i>()
+/// It's 64 for all (Is this correct?)
+pub(crate) const SIMDINPUT_LENGTH: usize = 64;
+
+mod stage2;
+/// simd-json JSON-DOM value
+pub mod value;
+
+use std::{alloc::dealloc, mem};
+pub use value_trait::StaticNode;
+
+pub use crate::error::{Error, ErrorType};
+#[doc(inline)]
+pub use crate::value::*;
+pub use value_trait::ValueType;
+
+/// simd-json Result type
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(feature = "known-key")]
+mod known_key;
+#[cfg(feature = "known-key")]
+pub use known_key::{Error as KnownKeyError, KnownKey};
+
+pub use crate::tape::{Node, Tape};
+use std::alloc::{Layout, alloc, handle_alloc_error};
+use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
+
+use simdutf8::basic::imp::ChunkedUtf8Validator;
+
+/// A struct to hold the buffers for the parser.
+pub struct Buffers {
+    string_buffer: Vec<u8>,
+    structural_indexes: Vec<u32>,
+    input_buffer: AlignedBuf,
+    stage2_stack: Vec<StackState>,
+}
+
+impl Default for Buffers {
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn default() -> Self {
+        Self::new(128)
+    }
+}
+
+impl Buffers {
+    /// Create new buffer for input length.
+    /// If this is too small a new buffer will be allocated, if needed during parsing.
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[must_use]
+    pub fn new(input_len: usize) -> Self {
+        // this is a heuristic, it will likely be higher but it will avoid some reallocations hopefully
+        let heuristic_index_cout = input_len / 128;
+        Self {
+            string_buffer: Vec::with_capacity(input_len + SIMDJSON_PADDING),
+            structural_indexes: Vec::with_capacity(heuristic_index_cout),
+            input_buffer: AlignedBuf::with_capacity(input_len + SIMDJSON_PADDING * 2),
+            stage2_stack: Vec::with_capacity(heuristic_index_cout),
+        }
+    }
+}
+
+/// Creates a tape from the input for later consumption
+/// # Errors
+///
+/// Will return `Err` if `s` is invalid JSON.
+#[cfg_attr(not(feature = "no-inline"), inline)]
+pub fn to_tape(s: &mut [u8]) -> Result<Tape<'_>> {
+    Deserializer::from_slice(s).map(Deserializer::into_tape)
+}
+
+/// Creates a tape from the input for later consumption
+/// # Errors
+///
+/// Will return `Err` if `s` is invalid JSON.
+#[cfg_attr(not(feature = "no-inline"), inline)]
+pub fn to_tape_with_buffers<'de>(s: &'de mut [u8], buffers: &mut Buffers) -> Result<Tape<'de>> {
+    Deserializer::from_slice_with_buffers(s, buffers).map(Deserializer::into_tape)
+}
+
+/// Fills a already existing tape from the input for later consumption
+/// # Errors
+///
+/// Will return `Err` if `s` is invalid JSON.
+#[cfg_attr(not(feature = "no-inline"), inline)]
+pub fn fill_tape<'de>(s: &'de mut [u8], buffers: &mut Buffers, tape: &mut Tape<'de>) -> Result<()> {
+    tape.0.clear();
+    Deserializer::fill_tape(s, buffers, &mut tape.0)
+}
+
+pub(crate) trait Stage1Parse {
+    type Utf8Validator: ChunkedUtf8Validator;
+    type SimdRepresentation;
+
+    unsafe fn new(ptr: &[u8]) -> Self;
+
+    unsafe fn compute_quote_mask(quote_bits: u64) -> u64;
+
+    unsafe fn cmp_mask_against_input(&self, m: u8) -> u64;
+
+    unsafe fn unsigned_lteq_against_input(&self, maxval: Self::SimdRepresentation) -> u64;
+
+    unsafe fn find_whitespace_and_structurals(&self, whitespace: &mut u64, structurals: &mut u64);
+
+    unsafe fn flatten_bits(base: &mut Vec<u32>, idx: u32, bits: u64);
+
+    // return both the quote mask (which is a half-open mask that covers the first
+    // quote in an unescaped quote pair and everything in the quote pair) and the
+    // quote bits, which are the simple unescaped quoted bits.
+    //
+    // We also update the prev_iter_inside_quote value to tell the next iteration
+    // whether we finished the final iteration inside a quote pair; if so, this
+    // inverts our behavior of whether we're inside quotes for the next iteration.
+    //
+    // Note that we don't do any error checking to see if we have backslash
+    // sequences outside quotes; these
+    // backslash sequences (of any length) will be detected elsewhere.
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn find_quote_mask_and_bits(
+        &self,
+        odd_ends: u64,
+        prev_iter_inside_quote: &mut u64,
+        quote_bits: &mut u64,
+        error_mask: &mut u64,
+    ) -> u64 {
+        unsafe {
+            *quote_bits = self.cmp_mask_against_input(b'"');
+            *quote_bits &= !odd_ends;
+            // remove from the valid quoted region the unescaped characters.
+            let mut quote_mask: u64 = Self::compute_quote_mask(*quote_bits);
+            quote_mask ^= *prev_iter_inside_quote;
+            // All Unicode characters may be placed within the
+            // quotation marks, except for the characters that MUST be escaped:
+            // quotation mark, reverse solidus, and the control characters (U+0000
+            //through U+001F).
+            // https://tools.ietf.org/html/rfc8259
+            let unescaped: u64 = self.unsigned_lteq_against_input(Self::fill_s8(0x1F));
+            *error_mask |= quote_mask & unescaped;
+            // right shift of a signed value expected to be well-defined and standard
+            // compliant as of C++20,
+            // John Regher from Utah U. says this is fine code
+            *prev_iter_inside_quote = static_cast_u64!(static_cast_i64!(quote_mask) >> 63);
+            quote_mask
+        }
+    }
+
+    // return a bitvector indicating where we have characters that end an odd-length
+    // sequence of backslashes (and thus change the behavior of the next character
+    // to follow). A even-length sequence of backslashes, and, for that matter, the
+    // largest even-length prefix of our odd-length sequence of backslashes, simply
+    // modify the behavior of the backslashes themselves.
+    // We also update the prev_iter_ends_odd_backslash reference parameter to
+    // indicate whether we end an iteration on an odd-length sequence of
+    // backslashes, which modifies our subsequent search for odd-length
+    // sequences of backslashes in an obvious way.
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn find_odd_backslash_sequences(&self, prev_iter_ends_odd_backslash: &mut u64) -> u64 {
+        const EVEN_BITS: u64 = 0x5555_5555_5555_5555;
+        const ODD_BITS: u64 = !EVEN_BITS;
+
+        let bs_bits: u64 = unsafe { self.cmp_mask_against_input(b'\\') };
+        let start_edges: u64 = bs_bits & !(bs_bits << 1);
+        // flip lowest if we have an odd-length run at the end of the prior
+        // iteration
+        let even_start_mask: u64 = EVEN_BITS ^ *prev_iter_ends_odd_backslash;
+        let even_starts: u64 = start_edges & even_start_mask;
+        let odd_starts: u64 = start_edges & !even_start_mask;
+        let even_carries: u64 = bs_bits.wrapping_add(even_starts);
+
+        // must record the carry-out of our odd-carries out of bit 63; this
+        // indicates whether the sense of any edge going to the next iteration
+        // should be flipped
+        let (mut odd_carries, iter_ends_odd_backslash) = bs_bits.overflowing_add(odd_starts);
+
+        odd_carries |= *prev_iter_ends_odd_backslash;
+        // push in bit zero as a potential end
+        // if we had an odd-numbered run at the
+        // end of the previous iteration
+        *prev_iter_ends_odd_backslash = u64::from(iter_ends_odd_backslash);
+        let even_carry_ends: u64 = even_carries & !bs_bits;
+        let odd_carry_ends: u64 = odd_carries & !bs_bits;
+        let even_start_odd_end: u64 = even_carry_ends & ODD_BITS;
+        let odd_start_even_end: u64 = odd_carry_ends & EVEN_BITS;
+        let odd_ends: u64 = even_start_odd_end | odd_start_even_end;
+        odd_ends
+    }
+
+    // return a updated structural bit vector with quoted contents cleared out and
+    // pseudo-structural characters added to the mask
+    // updates prev_iter_ends_pseudo_pred which tells us whether the previous
+    // iteration ended on a whitespace or a structural character (which means that
+    // the next iteration
+    // will have a pseudo-structural character at its start)
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn finalize_structurals(
+        mut structurals: u64,
+        whitespace: u64,
+        quote_mask: u64,
+        quote_bits: u64,
+        prev_iter_ends_pseudo_pred: &mut u64,
+    ) -> u64 {
+        // mask off anything inside quotes
+use core::slice::SliceIndex;
+
+pub trait GetSaferUnchecked<T> {
+    unsafe fn get_kinda_unchecked<I>(&self, index: I) -> &<I as SliceIndex<[T]>>::Output
+    where
+        I: SliceIndex<[T]>;
+
+    unsafe fn get_kinda_unchecked_mut<I>(
+        &mut self,
+        index: I,
+    ) -> &mut <I as SliceIndex<[T]>>::Output
+    where
+        I: SliceIndex<[T]>;
+}
+
+impl<T> GetSaferUnchecked<T> for [T] {
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    unsafe fn get_kinda_unchecked<I>(&self, index: I) -> &<I as SliceIndex<[T]>>::Output
+    where
+        I: SliceIndex<[T]>,
+    {
+        #[cfg(debug_assertions)]
+        let r = &self[index];
+        #[cfg(not(debug_assertions))]
+        let r = unsafe { self.get_unchecked(index) };
+        r
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    unsafe fn get_kinda_unchecked_mut<I>(&mut self, index: I) -> &mut <I as SliceIndex<[T]>>::Output
+    where
+        I: SliceIndex<[T]>,
+    {
+        #[cfg(debug_assertions)]
+        let r = &mut self[index];
+        #[cfg(not(debug_assertions))]
+        let r = unsafe { self.get_unchecked_mut(index) };
+        r
+    }
+}
+use crate::BorrowedValue as Value;
+use crate::cow::Cow;
+use crate::prelude::*;
+use halfbrown::RawEntryMut;
+use std::fmt;
+use std::hash::BuildHasher;
+
+use ahash::{AHasher, RandomState};
+use once_cell::sync::OnceCell;
+static NOT_RANDOM: OnceCell<RandomState> = OnceCell::new();
+
+/// `AHash` `BuildHasher` that uses a startup initialized random state for known keys
+#[derive(Clone)]
+pub struct NotSoRandomState(RandomState);
+
+impl Default for NotSoRandomState {
+    fn default() -> Self {
+        Self(NOT_RANDOM.get_or_init(RandomState::new).clone())
+    }
+}
+
+impl BuildHasher for NotSoRandomState {
+    type Hasher = AHasher;
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn build_hasher(&self) -> AHasher {
+        self.0.build_hasher()
+    }
+}
+
+/// Well known key that can be looked up in a `Value` faster.
+/// It achieves this by memorizing the hash.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KnownKey<'key> {
+    key: Cow<'key, str>,
+    hash: u64,
+}
+
+/// Error for known keys
+#[derive(Debug, PartialEq, Clone)]
+pub enum Error {
+    /// The target passed wasn't an object
+    NotAnObject(ValueType),
+}
+
+#[cfg(not(tarpaulin_include))]
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::NotAnObject(t) => write!(f, "Expected object but got {t:?}"),
+        }
+    }
+}
+impl std::error::Error for Error {}
+
+impl<'key, S> From<S> for KnownKey<'key>
+where
+    Cow<'key, str>: From<S>,
+{
+    fn from(key: S) -> Self {
+        let key = Cow::from(key);
+        let hash_builder = NotSoRandomState::default();
+        Self {
+            hash: hash_builder.hash_one(&key),
+            key,
+        }
+    }
+}
+
+impl<'key> KnownKey<'key> {
+    /// The known key
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[must_use]
+    pub fn key(&self) -> &Cow<'key, str> {
+        &self.key
+    }
+
+    /// Looks up this key in a `Value`, returns None if the
+    /// key wasn't present or `target` isn't an object
+    ///
+    /// # Errors
+    ///  * If target is not an object
+    ///
+    /// ```rust
+    /// use simd_json::prelude::*;
+    /// use simd_json::*;
+    /// let object = json!({
+    ///   "answer": 42,
+    ///   "key": 7
+    /// }).into();
+    /// let known_key = KnownKey::from("answer");
+    /// assert_eq!(known_key.lookup(&object).unwrap(), &42);
+    /// ```
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[must_use]
+    pub fn lookup<'target, 'value>(
+        &self,
+        target: &'target Value<'value>,
+    ) -> Option<&'target Value<'value>>
+    where
+        'key: 'value,
+        'value: 'target,
+    {
+        target.as_object().and_then(|m| self.map_lookup(m))
+    }
+
+    /// Looks up this key in a `Object<Cow<'value>` the inner representation of an object `Value`, returns None if the
+    /// key wasn't present.
+    ///
+    /// ```rust
+    /// use simd_json::prelude::*;
+    /// use simd_json::*;
+    /// let object: BorrowedValue = json!({
+    ///   "answer": 42,
+    ///   "key": 7
+    /// }).into();
+    /// let known_key = KnownKey::from("answer");
+    /// if let Some(inner) = object.as_object() {
+    ///   assert_eq!(known_key.map_lookup(inner).unwrap(), &42);
+    /// }
+    /// ```
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[must_use]
+    pub fn map_lookup<'target, 'value>(
+        &self,
+        map: &'target super::borrowed::Object<'value>,
+    ) -> Option<&'target Value<'value>>
+    where
+        'key: 'value,
+        'value: 'target,
+    {
+        map.raw_entry()
+            .from_key_hashed_nocheck(self.hash, &self.key)
+            .map(|kv| kv.1)
+    }
+
+    /// Looks up this key in a `Value`, returns None if the
+    /// key wasn't present or `target` isn't an object
+    ///
+    /// ```rust
+    /// use simd_json::prelude::*;
+    /// use simd_json::*;
+    /// let mut object: BorrowedValue = json!({
+    ///   "answer": 23,
+    ///   "key": 7
+    /// }).into();
+    /// let known_key = KnownKey::from("answer");
+    ///
+    /// assert_eq!(object["answer"], 23);
+    ///
+    /// if let Some(answer) = known_key.lookup_mut(&mut object) {
+    ///   *answer = BorrowedValue::from(42);
+    /// }
+    ///
+    /// assert_eq!(object["answer"], 42);
+    /// ```
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    pub fn lookup_mut<'target, 'value>(
+        &self,
+        target: &'target mut Value<'value>,
+    ) -> Option<&'target mut Value<'value>>
+    where
+        'key: 'value,
+        'value: 'target,
+    {
+        target.as_object_mut().and_then(|m| self.map_lookup_mut(m))
+    }
+
+    /// Looks up this key in a `Object<'value>`, the inner representation of an object value.
+    /// returns None if the key wasn't present.
+    ///
+    /// ```rust
+    /// use simd_json::prelude::*;
+    /// use simd_json::*;
+    /// let mut object: BorrowedValue = json!({
+    ///   "answer": 23,
+    ///   "key": 7
+    /// }).into();
+    ///
+    /// assert_eq!(object["answer"], 23);
+    ///
+    /// let known_key = KnownKey::from("answer");
+    /// if let Some(inner) = object.as_object_mut() {
+    ///   if let Some(answer) = known_key.map_lookup_mut(inner) {
+    ///     *answer = BorrowedValue::from(42);
+    ///   }
+    /// }
+    /// assert_eq!(object["answer"], 42);
+    ///
+    /// ```
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    pub fn map_lookup_mut<'target, 'value>(
+        &self,
+        map: &'target mut super::borrowed::Object<'value>,
+    ) -> Option<&'target mut Value<'value>>
+    where
+        'key: 'value,
+        'value: 'target,
+    {
+        match map
+            .raw_entry_mut()
+            .from_key_hashed_nocheck(self.hash, &self.key)
+        {
+            RawEntryMut::Occupied(e) => Some(e.into_mut()),
+            RawEntryMut::Vacant(_e) => None,
+        }
+    }
+
+    /// Looks up this key in a `Value`, inserts `with` when the key
+    ///  when wasn't present returns None if the `target` isn't an object
+    /// # Errors
+    /// * if target is not a record
+    ///
+    /// ```rust
+    /// use simd_json::prelude::*;
+    /// use simd_json::*;
+    /// let mut object: BorrowedValue = json!({
+    ///   "answer": 23,
+    ///   "key": 7
+    /// }).into();
+    /// let known_key = KnownKey::from("answer");
+    ///
+    /// assert_eq!(object["answer"], 23);
+    ///
+    /// if let Ok(answer) = known_key.lookup_or_insert_mut(&mut object, || 17.into()) {
+    ///   assert_eq!(*answer, 23);
+    ///   *answer = BorrowedValue::from(42);
+    /// }
+    ///
+    /// assert_eq!(object["answer"], 42);
+    ///
+    /// let known_key2 = KnownKey::from("also the answer");
+    /// if let Ok(answer) = known_key2.lookup_or_insert_mut(&mut object, || 8.into()) {
+    ///   assert_eq!(*answer, 8);
+    ///   *answer = BorrowedValue::from(42);
+    /// }
+    ///
+    /// assert_eq!(object["also the answer"], 42);
+    /// ```
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    pub fn lookup_or_insert_mut<'target, 'value, F>(
+        &self,
+        target: &'target mut Value<'value>,
+        with: F,
+    ) -> Result<&'target mut Value<'value>, Error>
+    where
+        'key: 'value,
+        'value: 'target,
+        F: FnOnce() -> Value<'value>,
+    {
+        match target {
+            Value::Object(inner) => Ok(self.map_lookup_or_insert_mut(inner, with)),
+            other => Err(Error::NotAnObject(other.value_type())),
+        }
+    }
+
+    /// Looks up this key in a `Object<'value>`, the inner representation of an object `Value`.
+    /// Inserts `with` when the key when wasn't present.
+    ///
+    /// ```rust
+    /// use simd_json::prelude::*;
+    /// use simd_json::*;
+    /// let mut object: BorrowedValue = json!({
+    ///   "answer": 23,
+    ///   "key": 7
+    /// }).into();
+    /// let known_key = KnownKey::from("answer");
+    ///
+    /// assert_eq!(object["answer"], 23);
+    ///
+    /// if let Some(inner) = object.as_object_mut() {
+    ///   let answer = known_key.map_lookup_or_insert_mut(inner, || 17.into());
+    ///   assert_eq!(*answer, 23);
+    ///   *answer = BorrowedValue::from(42);
+    /// }
+    ///
+    /// assert_eq!(object["answer"], 42);
+    ///
+    /// let known_key2 = KnownKey::from("also the answer");
+    /// if let Some(inner) = object.as_object_mut() {
+    ///   let answer = known_key2.map_lookup_or_insert_mut(inner, || 8.into());
+    ///   assert_eq!(*answer, 8);
+    ///   *answer = BorrowedValue::from(42);
+    /// }
+    ///
+    /// assert_eq!(object["also the answer"], 42);
+    /// ```
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    pub fn map_lookup_or_insert_mut<'target, 'value, F>(
+        &self,
+        map: &'target mut super::borrowed::Object<'value>,
+        with: F,
+    ) -> &'target mut Value<'value>
+    where
+        'key: 'value,
+        'value: 'target,
+        F: FnOnce() -> Value<'value>,
+    {
+        map.raw_entry_mut()
+            .from_key_hashed_nocheck(self.hash, &self.key)
+            .or_insert_with(|| (self.key.clone(), with()))
