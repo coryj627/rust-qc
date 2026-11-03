@@ -137,32 +137,40 @@ def scan_file(root: Path, path: Path, is_library: bool):
 
         if stripped.startswith("//") or is_block_line:
             if RE_BOX_DRAWING.search(line):
-                add("Minor", "CMT-5", i, "ASCII-art or box-drawing characters in a comment; describe the structure in sentences.")
+                add("Minor", "CMT-5", i,
+                    "ASCII-art or box-drawing characters in a comment; "
+                    "describe the structure in sentences.")
             if RE_JOURNAL.search(line):
-                add("Minor", "DOC-11", i, "reads like design history; document current behavior instead.")
+                add("Minor", "DOC-11", i,
+                    "reads like design history; document current behavior instead.")
             if RE_PARAM_TABLE.match(line):
                 add("Minor", "DOC-4", i, "parameter table in docs; describe parameters in prose.")
             if RE_BARE_TODO.search(line):
-                add("Note", "CMT-3", i, "TODO/FIXME without an owner or issue reference, e.g. TODO(#123).")
+                add("Note", "CMT-3", i,
+                    "TODO/FIXME without an owner or issue reference, e.g. TODO(#123).")
             continue
 
         code = line.split("//", 1)[0]
 
         if RE_GLOB_PUB_USE.match(code):
-            add("Major", "ORG-12", i, "glob re-export makes the public surface implicit; re-export items by name.")
+            add("Major", "ORG-12", i,
+                "glob re-export makes the public surface implicit; re-export items by name.")
 
         m = RE_TYPE_DECL.match(code)
         if m:
             name = m.group(2)
             word = next((w for w in WEASEL_WORDS if name.endswith(w) and name != w), None)
             if word:
-                add("Minor", "NAME-5", i, f"type `{name}` ends in weasel word `{word}`; name what it does or holds (an established ecosystem trait such as tower's `Service` is an exception).")
+                add("Minor", "NAME-5", i,
+                    f"type `{name}` ends in weasel word `{word}`; name what it does or holds "
+                    "(an established ecosystem trait such as tower's `Service` is an exception).")
 
         if mask[i] or not production:
             continue
 
         if RE_EMPTY_EXPECT.search(code):
-            add("Major", "PANIC-2", i, "expect with an empty message; state the invariant that makes failure impossible.")
+            add("Major", "PANIC-2", i,
+                "expect with an empty message; state the invariant that makes failure impossible.")
         if library_source and RE_PRINT.search(code):
             add("Minor", "PANIC-6", i, "print macro in library code; return data or use logging.")
 

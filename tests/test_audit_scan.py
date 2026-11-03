@@ -1,4 +1,7 @@
-"""Fixture tests for audit_scan.py. Run from the repository root: python3 -I tests/test_audit_scan.py"""
+"""Fixture tests for audit_scan.py.
+
+Run from the repository root: python3 -I tests/test_audit_scan.py
+"""
 import re
 import subprocess
 import sys
@@ -14,7 +17,7 @@ def scan(fixture):
     if out.returncode != 0:
         sys.exit(f"{fixture}: scan exited {out.returncode}\n{out.stderr}")
     return {(m.group(1), m.group(2), int(m.group(3)))
-            for m in re.finditer(r"^(\S+) (\S+):(\d+)$", out.stdout, re.M)}
+            for m in re.finditer(r"^(\S+) (\S+):(\d+)$", out.stdout, re.MULTILINE)}
 
 
 def expected(fixture):

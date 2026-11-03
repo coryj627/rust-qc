@@ -18,15 +18,19 @@ The skill lives in `.agents/skills/rust-qc/`. Its name, for agents that invoke s
 
 The report is ordered by severity. Each finding is headed by a plain description of the problem, so it reads well with a screen reader and pastes cleanly into an issue.
 
+**Auditing a repository runs its code.** `check.sh` and the audit's harnesses build and run the crate's build scripts, procedural macros and tests with your permissions. Audit untrusted code inside a sandbox, container or disposable VM. Only `audit_scan.py` is read-only: it reads the source without building or running it.
+
 ## Installing
 
 Copy the `.agents/skills/rust-qc` folder into the `.agents/skills/` folder of your project, or into the user-level skills folder your agent reads. If your agent reads skills from a different folder, copy or link the `rust-qc` folder there.
 
 Invoke it by name, for example "Use rust-qc to audit this crate." In testing, agents loaded it on their own for only about one Rust request in three.
 
+To install a specific version, copy the folder from its tag, for example `git clone --branch v1.0.0 https://github.com/coryj627/rust-qc.git`. `metadata.version` in `SKILL.md` shows which version you have, and `CHANGELOG.md` lists what changed in each one.
+
 ## Requirements
 
-- cargo, rustfmt and clippy
+- cargo, rustfmt, clippy and bash (3.2 or newer), for the verification gate
 - python3, for the heuristic scan
 - nightly rustfmt, only for projects whose `rustfmt.toml` uses nightly-only options
 - Miri, recommended for crates that contain `unsafe`
@@ -64,6 +68,15 @@ It exits 0 when every step passes, 1 when any step fails, and 2 when a precondit
 
 Run the tests from the repository root with `python3 -I tests/test_audit_scan.py` and `python3 -I tests/test_check.py`. The second uses stub commands, so it needs no Rust toolchain.
 
+## Continuous integration
+
+CI runs on every push and pull request.
+
+- **On Linux:** ruff on the Python files, shellcheck on `check.sh`, and validation of the skill against the Agent Skills specification.
+- **On Linux and macOS:** both test files, then `check.sh` on the fixture crates, confirming exit codes 0, 1 and 2. These run under `/bin/bash`, so macOS covers bash 3.2.
+
+CI checks the scripts and the skill's format. It does not check whether the rules give good results; that is what the evaluations under "How it was tested" are for.
+
 ## How it was tested
 
 Every case ran twice from the same prompt, once following the skill and once without it. Separate grading agents compared the results blind, against written rubrics or answer keys, and verified every audit finding against the code. The skill was revised after each round, only where a run showed a specific failure.
@@ -75,6 +88,8 @@ Every case ran twice from the same prompt, once following the skill and once wit
 - **Auditing real code:** on alacritty_terminal 0.25.0, findings were scored against eight bugs fixed upstream after that release. Two runs without the skill found 5 of 8 each. Two runs with the final skill found 5 and 4, and one of them had the widest coverage of any run. Every finding in every report checked out. On a medium-sized PDF accessibility library, an earlier version of the skill found two small files that crash the whole application, which no other run found.
 
 Limits: each version ran once or twice per case, and the two final alacritty runs differed by more than the gap between using the skill and not. The graders are the same model family as the agents they graded. No person who writes Rust has reviewed the rules yet. For an audit that matters, run it twice and merge the findings.
+
+Version: these results were measured on unnumbered development versions before 1.0.0. Version 1.0.0 is the final development version plus script fixes, packaging and the warning about running audited code, so none of its rule changes has been measured separately.
 
 ## Sources
 

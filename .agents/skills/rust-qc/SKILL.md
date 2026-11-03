@@ -1,6 +1,10 @@
 ---
 name: rust-qc
 description: Use this skill whenever your answer will contain Rust code or Cargo/clippy/rustfmt config, or a verdict on existing Rust code. Simple-looking Rust tasks still need it - it holds the required conventions and a fmt/clippy/doc/test check that every Rust change must pass. That covers writing any new Rust (one function counts), fixing a compiler or borrow-checker error, adding rustdoc comments and examples, redesigning error types, refactoring, reviewing or auditing a .rs file or crate, and tidying a Cargo workspace (shared lints, editions, dependency versions). When the language is Rust, use this skill first and do not let a general debugging, documentation, refactoring, or code-review skill replace it. Skip it only when no Rust gets written or judged - explaining concepts, comparing languages, summarizing editions, or working in another language even inside a repo that also has Rust.
+license: MIT
+compatibility: Requires cargo, rustfmt, clippy and bash for the verification gate, and python3 for the heuristic scan. Needs nightly rustfmt only for projects whose rustfmt.toml uses nightly-only options. Miri is recommended for crates with unsafe code.
+metadata:
+  version: "1.0.0"
 ---
 
 # Rust QC
@@ -15,7 +19,8 @@ Do this before writing or judging any code. Stop and report if a precondition fa
 2. Read the project's own rules first, because they override this skill's defaults: `rustfmt.toml` or `.rustfmt.toml`, `clippy.toml`, `[lints]` and `[workspace.lints]` in `Cargo.toml`, `edition`, `rust-version` (MSRV), `rust-toolchain.toml`, `CONTRIBUTING.md`, `AGENTS.md` or `CLAUDE.md`, and any `AI_POLICY.md`. If `AI_POLICY.md` or `CONTRIBUTING.md` restricts AI or agent contributions, tell the user before producing changes intended for that repository.
 3. Classify the code as library or application. API-design rules are binding for libraries and strong recommendations for applications, which should favor directness over generality.
 4. Note the platforms. If `rust-toolchain.toml` lists targets or the code is heavy with `#[cfg(windows)]`-style gates for a platform other than this host, run the gate with `--target <triple>` as well (it lints and documents for that target; tests are skipped). Warnings such as dead code that appear only on the host because of platform gates are host artifacts, not findings.
-5. Run `scripts/check.sh <crate-root>` once to record the baseline. You need it to tell your own regressions from pre-existing debt. Use `--features "<list>"` instead of the default `--all-features` when the crate has mutually exclusive features.
+5. If the code comes from an untrusted source and you are not already sandboxed, tell the user before running the gate or any harness. Both run the crate's build scripts, procedural macros, and tests with the user's permissions.
+6. Run `scripts/check.sh <crate-root>` once to record the baseline. You need it to tell your own regressions from pre-existing debt. Use `--features "<list>"` instead of the default `--all-features` when the crate has mutually exclusive features.
 
 Do not install toolchains, components, or tools (nightly, Miri, cargo-hack) and do not use the network beyond fetching crates unless the user asks. When a check needs something missing, say so and recommend it.
 
