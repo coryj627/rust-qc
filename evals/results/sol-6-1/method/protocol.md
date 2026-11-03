@@ -283,8 +283,8 @@ that archive were checked against the pinned baseline; an upstream terminal
 recording contains public fixture paths, not host data from this evaluation.
 Hashes and dispositions are in `../export-scans/privacy-review.json` and
 `baseline-archive-review.json`. Scanning covers raw evidence, reports, artifacts,
-control bundles, grading inputs/maps, schedules, preflight output and all Stage 5
-preparation/assessment files. Literal public-source recipe PATH text is also
+control bundles, grading inputs/maps, schedules, preflight output, all stages,
+invalid attempts, root documents and method data records. Literal public-source recipe PATH text is also
 retained after hash-bound review; it is not an expanded host environment.
 
 ## Publication and handoff

@@ -18,9 +18,11 @@ limits prevent concluding that the skill improves bug finding.
 Repository checks passed. In discovery, the skill loaded for all five intended
 Rust tasks and stayed out of all three excluded tasks. Every evaluation agent
 used **`gpt-6.1-sol`, reasoning effort `high`**, with a fresh profile and container
-access only. The skill itself is unchanged. Recommendations are a separate,
-post-grading deliverable from a fresh agent; accepted changes require a later
-skill version and Claude review.
+access only. The skill itself is unchanged. A fresh post-grading agent's
+[recommendations](recommended-skill-fixes.md) propose separating audit hygiene
+from defect counts and making coding verification summaries reproducible.
+Both proposals are untested; accepted changes require a later skill version and
+Claude review.
 
 ## Inputs and isolation
 
@@ -43,7 +45,7 @@ tool names remained advertised but supplied no host execution environment;
 nested agents were disabled. See the [preflight](preflight/result.json) and
 [protocol](method/protocol.md) for the tested boundary and adaptations.
 
-Rust execution used the existing `rqc-eval:2` image: aarch64 Linux, Rust `1.99.1`
+Rust execution used the existing [`rqc-eval:2` image](method/runtime-image.json): aarch64 Linux, Rust `1.99.1`
 and installed `nightly-2026-10-01`/Miri. No Rust toolchain or component was
 installed, `RUSTUP_AUTO_INSTALL=0` was retained, and no privileged container was
 used. Maximum concurrency was three sandbox workers. No usage or disk limit
@@ -275,8 +277,11 @@ public-source recipe text, and random compressed public-baseline bytes. See
 claim that pattern scanning proves the absence of every possible private string.
 
 All coding grading and reconciliation decisions are complete. The recommendations
-agent is provisioned only after this evidence is committed and receives Claude's
-results and the Sol arm mapping for the first time then. Its input hashes and
-data-freeze revision are recorded separately. Claude's planned cross-family
+agent was provisioned after data-freeze commit `2fb8577` and received Claude's
+results and the Sol arm mapping for the first time then. Its
+[input hashes](method/recommendation-inputs.json) and
+[document validation](method/recommendation-validation.json) record that boundary.
+All 75 local evidence links resolve and both proposed diffs pass `git apply --check`
+against the archived skill; neither diff was applied. Claude's planned cross-family
 sample regrading, evidence checks and sandbox probe reruns remain review work;
 they have not been performed in this Sol evaluation.

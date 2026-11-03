@@ -1,0 +1,377 @@
+The audit found 13 defects: 2 Blocker, 8 Major, and 3 Minor. Nine runtime defects were reproduced through public APIs, including a use-after-free confirmed by Miri. All probes are under `tmp/probe/`; I did not edit `crate/`.
+
+## Blocker
+
+### 1. Clearing expiration leaves a dangling timer pointer
+
+Location: `crate/src/common/timer_wheel.rs:493`
+
+When a queued timer’s expiration becomes `None`, the iterator drops its node without clearing the cache entry’s pointer to it. Later maintenance dereferences freed memory. Both cache implementations use this timer wheel.
+
+Evidence: `timer_clear` creates a two-second expiration, waits 1.2 seconds, and reads with an expiry callback returning `None`. Subsequent maintenance panicked natively. Miri with Tree Borrows reported a dangling reference/use-after-free in `TimerWheel::unlink_timer`.
+
+Fix: clear the entry’s timer pointer before dropping a node whose expiration is unset, and return a descheduling event.
+
+### 2. Fallible initialization can panic an unrelated infallible caller
+
+Locations: `crate/src/sync/value_initializer.rs:348`, `crate/src/future/value_initializer.rs:592`
+
+`get_with` identifies its waiters using `TypeId::of::<()>()`. This collides with `try_get_with` when its error type is `()`. A waiting `get_with` can receive the other operation’s error and execute `unreachable!()`.
+
+Evidence: `unit_error_collision` and `future_collision` start `try_get_with` first, then a concurrent `get_with` for the same key. Returning `Err(())` from the first initializer caused the second caller to panic in both implementations.
+
+Fix: use a private marker type to distinguish infallible initialization from every caller-supplied error type.
+
+## Major
+
+### 3. Concurrent invalidation can resurrect invalidated entries
+
+Locations: `crate/src/sync/base_cache.rs:971`, `crate/src/future/base_cache.rs:1115`
+
+Concurrent `invalidate_all` calls can store their timestamps out of order. An older timestamp overwrites a newer one, making entries valid again despite a completed invalidation.
+
+Evidence: `invalidate_all_race` runs concurrent invalidators while another thread repeatedly inserts, invalidates, and reads one key. Invalidated values reappeared in all four runs, within 212 iterations.
+
+Fix: advance the invalidation timestamp monotonically with a compare-and-exchange loop, handling the unset sentinel separately.
+
+### 4. Asynchronous computations release their lock before writing
+
+Locations: `crate/src/future/value_initializer.rs:350`, `crate/src/future/value_initializer.rs:488`
+
+Calling `set_waiter_value` consumes the guard, removes the waiter, and releases its lock before applying the computed operation. Another computation can therefore read the same old value and overwrite an update, violating the documented serialization guarantee.
+
+Evidence: the main probe pauses one `and_upsert_with` write inside the weigher. A second increment completes while it is paused. Starting from zero, the final counter is one instead of two.
+
+Fix: retain the waiter guard until the computed insert or removal has completed.
+
+### 5. Reordered operation logs leave permanently occupied capacity
+
+Locations: `crate/src/sync/base_cache.rs:1469`, `crate/src/future/base_cache.rs:1620`
+
+An insertion can publish its map entry before queuing its operation log. If removal and its maintenance finish first, processing the delayed insertion log admits an entry already removed from the map.
+
+Evidence: `reordered_remove` pauses insertion in `expire_after_create`, removes the entry, processes maintenance, then resumes insertion. The empty cache subsequently reports one entry. Further maintenance and `invalidate_all` do not repair it; a capacity-one cache rejects a new key.
+
+Fix: reject an upsert superseded by an already-applied removal generation instead of admitting its obsolete metadata.
+
+### 6. Failed replacement attempts corrupt weight accounting
+
+Locations: `crate/src/sync/base_cache.rs:525`, `crate/src/sync/base_cache.rs:650`; corresponding code at `crate/src/future/base_cache.rs:525` and `:780`
+
+Optimistic replacement attempts mutate shared `EntryInfo` before their map compare-and-exchange succeeds. After an unsuccessful attempt, the retry can read its own speculative weight as the previous weight, producing an incorrect accounting delta.
+
+Evidence: `weight_race` controls two replacements by pausing a valid `Clone` implementation. After maintenance, entries weighing 13 collectively report weight 12. Removing the updated entry leaves a weight-ten entry while reporting nine.
+
+Fix: derive accounting from immutable, committed versions, or serialize same-key metadata changes with their map updates.
+
+### 7. Generation wraparound prevents automatic eviction
+
+Location: `crate/src/common/concurrent/entry_info.rs:97`
+
+The ordinary comparison `current >= value` rejects every wrapped generation after `policy_gen` reaches 65,535. Entries then remain dirty and are skipped by expiration and capacity eviction.
+
+Evidence: `generation` performs maintenance after each write. With an initial insertion plus 65,535 replacements, expiration makes `get` return `None`, but repeated maintenance retains entry count and weight at one. The neighboring case with 65,534 replacements removes the entry correctly.
+
+Fix: compare generations using wrapping-distance ordering rather than ordinary integer ordering.
+
+### 8. Returning `None` fails to clear an elapsed expiration
+
+Locations: `crate/src/sync/base_cache.rs:689`, `crate/src/future/base_cache.rs:819`
+
+An elapsed deadline becomes `current_duration = None`. If `expire_after_update` returns `None` to clear expiration, the equality check skips the update, preserving the expired deadline.
+
+Evidence: `refresh_expired` uses a 20-millisecond expiration, waits 40 milliseconds, then refreshes through `get_with`. The update callback explicitly returns `None`. `get_with` returns the new value, but an immediate `get` returns `None`.
+
+Fix: distinguish an elapsed deadline from an absent deadline, and clear the stored expiration when requested.
+
+### 9. Removal notifications ignore per-entry expiration
+
+Locations: `crate/src/sync/base_cache.rs:2316`, `crate/src/sync/base_cache.rs:2340`; corresponding functions at `crate/src/future/base_cache.rs:2513` and `:2554`
+
+Notification classification checks global TTL and idle expiration but omits per-entry deadlines. Consequently, already-expired entries receive `Explicit` or `Replaced` notifications instead of `Expired`.
+
+Evidence: `notification_cause` inserts entries with 20-millisecond per-entry expiration, waits 40 milliseconds, then removes one and replaces another. The listener receives `Explicit` and `Replaced`.
+
+Fix: preserve and check the old per-entry deadline alongside the timestamps used to classify removal.
+
+### 10. Rustdoc fails with warnings denied
+
+Locations: `crate/src/sync/entry_selector.rs:201`, `crate/src/sync/entry_selector.rs:743`, `crate/src/common/concurrent/arc.rs:83`, `crate/src/common/concurrent/arc.rs:99`
+
+Two example links refer to an undefined link label, `ptr::eq` is unresolved, and a bare URL triggers a warning.
+
+Evidence: both verification gates failed the rustdoc step with these four diagnostics.
+
+Fix: correct the example references, fully qualify `std::ptr::eq`, and format the URL as a hyperlink.
+
+## Minor
+
+### 11. Unsafe operations lack local safety justifications
+
+Examples: `crate/src/cht/map/bucket.rs:37`, `crate/src/common/concurrent/arc.rs:115`, `crate/src/common/concurrent/arc.rs:145`
+
+The advisory pass reports 77 unsafe-block and 13 unsafe-implementation safety-comment diagnostics. Confirmed examples omit the allocation, lifetime, and ownership arguments needed to review raw initialization and destruction.
+
+Fix: document the relevant invariants at each unsafe operation and implementation.
+
+### 12. Public documentation is incomplete
+
+Examples: `crate/src/future/entry_selector.rs:242`, `crate/src/sync/segment.rs:279`, `crate/src/notification.rs:44`
+
+The advisory pass identifies 23 undocumented public items and 20 APIs without canonical `# Errors` sections. Fourteen undocumented items belong to the optional debug-counter API.
+
+Fix: document the exposed behavior and error conditions.
+
+### 13. Eight public types lack `Debug`
+
+Examples: `crate/src/future/builder.rs:58`, `crate/src/sync/entry_selector.rs:22`, `crate/src/common/iter.rs:22`
+
+The advisory pass confirms eight public types without `Debug`, preventing their use in ordinary diagnostic formatting.
+
+Fix: provide implementations that omit callback internals where necessary.
+
+## Verification
+
+All execution used `./run`.
+
+- PASS: `cargo fmt --all --check`
+- PASS: `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- FAIL: `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items --all-features`
+- PASS: `cargo test --workspace --all-features`
+- The gate with `--features sync,future` produced the same pass/fail results.
+- PASS: focused Miri bucket and timer-advance tests.
+- CONFIRMED DEFECT: `MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-permissive-provenance" cargo +nightly-2026-10-01 miri run --offline --manifest-path tmp/probe/Cargo.toml --bin timer_clear`
+- PASS: 100,000 collision-heavy operations against a reference map.
+- INCOMPLETE: broader common-module Miri testing exited 137 under the container limit; this was not treated as a defect.
+- MSRV and cargo-hack checks were unavailable with installed tooling.
+
+13 findings. Last `./clock` reading: 21.625600000000002 minutes used of 45.0.{"item":"Clearing expiration leaves a dangling timer pointer","loc":"src/common/timer_wheel.rs:493","sources":["P0003","P0004","P0005","P0006","P0007"],"reports":"A","status":"ran","severity":"high","noise_class":null,"note":"Independent public-API probe panicked natively. Miri with Tree Borrows confirmed use-after-free in unlink_timer after the None branch drops a node without clearing its entry pointer."}
+{"item":"Unit error type collides with infallible initialization","loc":"src/sync/value_initializer.rs:348; src/future/value_initializer.rs:592","sources":["P0008","P0009","P0010","P0011","P0012"],"reports":"A","status":"ran","severity":"high","noise_class":null,"note":"Reproduced in both implementations: try_get_with returning Err(()) makes a concurrent same-key get_with panic at unreachable!(). Both use the unit TypeId."}
+{"item":"Concurrent invalidation timestamps can move backward","loc":"src/sync/base_cache.rs:404; src/sync/base_cache.rs:971; src/future/base_cache.rs:398; src/future/base_cache.rs:1114","sources":["P0014","P0015","P0016","P0017","P0018"],"reports":"A","status":"read","severity":"medium","noise_class":null,"note":"Both implementations capture time before an unconditional atomic store. A delayed older invalidator can overwrite a newer cutoff and expose entries inserted between those timestamps. The 100,000-iteration stress probe did not reproduce it."}
+{"item":"Asynchronous computations unlock before applying their operation","loc":"src/future/value_initializer.rs:350; src/future/value_initializer.rs:488","sources":["P0019","P0020","P0021","P0023","P0024"],"reports":"A","status":"ran","severity":"high","noise_class":null,"note":"Paused the first and_upsert_with inside its weigher; a second same-key computation completed before release. Two increments from zero produced one, confirming lost updates despite documented serialization."}
+{"item":"Cancelling get_with permanently strands followers","loc":"src/future/value_initializer.rs:99","sources":["P0022"],"reports":"A","status":"refuted","severity":null,"noise_class":null,"note":"Dropped a pending initializer after polling a follower into waiting; the follower completed its own initializer. WaiterGuard::drop marks EnclosingFutureAborted and removes the waiter."}
+{"item":"Reordered operation logs leave phantom occupied capacity","loc":"src/sync/base_cache.rs:1469; src/future/base_cache.rs:1620","sources":["P0025","P0026","P0027","P0028","P0029"],"reports":"A","status":"ran","severity":"medium","noise_class":null,"note":"Paused insertion in expire_after_create, removed the published entry, ran maintenance, then resumed. The empty map reported count/weight one; repeated maintenance and invalidate_all preserved it, and a capacity-one cache rejected another key."}
+{"item":"Failed optimistic replacements corrupt weight accounting","loc":"src/sync/base_cache.rs:525; src/sync/base_cache.rs:650; src/future/base_cache.rs:525; src/future/base_cache.rs:780","sources":["P0030","P0031","P0032","P0033","P0034"],"reports":"A","status":"ran","severity":"medium","noise_class":null,"note":"Controlled two replacements using a valid blocking Clone. Actual weight 13 was accounted as 12; removing the updated entry left actual weight 10 accounted as nine. Shared metadata changes precede successful map replacement."}
+{"item":"Generation wraparound prevents eviction","loc":"src/common/concurrent/entry_info.rs:97","sources":["P0035","P0036","P0037","P0038","P0039"],"reports":"A","status":"ran","severity":"medium","noise_class":null,"note":"With maintenance after every write, 65,534 replacements expired cleanly to count/weight zero. At 65,535 replacements, get rejected the expired entry but repeated maintenance retained count/weight one. Ordinary comparison prevents policy generation wrapping."}
+{"item":"Returning None fails to clear an elapsed expiration","loc":"src/sync/base_cache.rs:689; src/future/base_cache.rs:819","sources":["P0040","P0041","P0042","P0043","P0044"],"reports":"A","status":"ran","severity":"medium","noise_class":null,"note":"After a 20ms deadline elapsed, get_with returned the replacement but immediate get returned None despite expire_after_update returning None. The elapsed duration and absent expiration both compare as None, skipping deadline clearing."}
+{"item":"Removal causes omit per-entry expiration","loc":"src/sync/base_cache.rs:2316; src/sync/base_cache.rs:2340; src/future/base_cache.rs:2513; src/future/base_cache.rs:2554","sources":["P0045","P0046","P0047","P0048","P0050"],"reports":"A","status":"ran","severity":"medium","noise_class":null,"note":"Expired entries with per-entry deadlines produced Explicit on invalidation and Replaced on replacement. Classification checks global TTL/TTI but omits the per-entry deadline."}
+{"item":"Deferred invalidate_all removes subsequent writes","loc":"src/future/base_cache.rs:398","sources":["P0049"],"reports":"A","status":"refuted","severity":null,"noise_class":null,"note":"Both a replacement and a new key inserted after invalidate_all survived maintenance. Invalidation stores a timestamp; retrieval and eviction compare entry timestamps against that cutoff."}
+{"item":"Rustdoc fails with warnings denied","loc":"src/sync/entry_selector.rs:201; src/sync/entry_selector.rs:743; src/common/concurrent/arc.rs:83; src/common/concurrent/arc.rs:99","sources":["P0051","P0052","P0053","P0054","P0055"],"reports":"A","status":"not-defect","severity":null,"noise_class":"skill-requested-hygiene","note":"Reproduced all four diagnostics using cargo doc with private items and RUSTDOCFLAGS='-D warnings'. These are documentation-link and build-cleanliness issues."}
+{"item":"contains_key refreshes time-to-idle","loc":"src/sync/base_cache.rs:198","sources":["P0056"],"reports":"A","status":"refuted","severity":null,"noise_class":null,"note":"A membership check before the idle deadline did not prevent expiration. contains_key only checks validity; it does not update access timestamps or record a read."}
+{"item":"Unsafe operations lack local safety comments","loc":"src/cht/map/bucket.rs:37; src/common/concurrent/arc.rs:115; src/common/concurrent/arc.rs:145","sources":["P0058","P0059","P0060","P0062"],"reports":"A","status":"not-defect","severity":null,"noise_class":"skill-requested-hygiene","note":"Clippy independently reported 77 unsafe-block and 13 unsafe-implementation comment warnings. Missing justifications are review/documentation hygiene and do not themselves establish unsoundness."}
+{"item":"Iteration exposes entries expired before consumption","loc":"src/common/iter.rs:74; src/future/base_cache.rs:425","sources":["P0061"],"reports":"A","status":"refuted","severity":null,"noise_class":null,"note":"Created an iterator while entries were live, waited past TTL without maintenance, and observed no yielded entries. Each next calls scanning_get, which checks current expiration and invalidation."}
+{"item":"Public documentation is incomplete","loc":"src/future/entry_selector.rs:242; src/sync/segment.rs:279; src/notification.rs:44","sources":["P0063","P0064","P0065","P0067"],"reports":"A","status":"not-defect","severity":null,"noise_class":"skill-requested-hygiene","note":"Independent checks confirmed 23 undocumented public items under src, including 14 debug-counter items, and 20 missing Errors-section warnings. These are documentation hygiene."}
+{"item":"Ordinary replacement accumulates the previous policy weight","loc":"src/sync/base_cache.rs:1458","sources":["P0066"],"reports":"A","status":"refuted","severity":null,"noise_class":null,"note":"Replacing admitted weight 60 with 30 produced accounted weight 30. Adding another weight-60 key retained both entries at weight 90. The admitted-update branch subtracts old_weight before adding new_weight."}
+{"item":"Eight public types lack Debug","loc":"src/future/builder.rs:58; src/sync/entry_selector.rs:22; src/common/iter.rs:22","sources":["P0068","P0069","P0070","P0071"],"reports":"A","status":"not-defect","severity":null,"noise_class":"skill-requested-hygiene","note":"The missing_debug_implementations lint independently confirmed eight public types. This is public-API diagnostic-formatting hygiene."}
+5.435533333333334 minutes used of 45.0{"bug":"K001","A":{"v":"found","ref":"#5"}}
+{"bug":"K002","A":{"v":"found","ref":"#1"}}
+{"bug":"K003","A":{"v":"missed"}}
+{"bug":"K004","A":{"v":"missed"}}
+{"bug":"K005","A":{"v":"missed"}}
+{"bug":"K006","A":{"v":"found","ref":"#8"}}
+{"bug":"K007","A":{"v":"found","ref":"#4"}}{"bug":"K001","A":{"v":"found","ref":"#5"}}
+{"bug":"K002","A":{"v":"found","ref":"#1"}}
+{"bug":"K003","A":{"v":"missed"}}
+{"bug":"K004","A":{"v":"missed"}}
+{"bug":"K005","A":{"v":"missed"}}
+{"bug":"K006","A":{"v":"found","ref":"#8"}}
+{"bug":"K007","A":{"v":"found","ref":"#4"}}{"bug":"K001","report":"A","v":"partial","ref":"5. Reordered operation logs leave permanently occupied capacity","evidence":"“processing the delayed insertion log admits an entry already removed from the map” identifies stale admission, and “a capacity-one cache rejects a new key” establishes leaked capacity. However, the report does not identify the required unreachable deque node."}
+{"bug":"K007","report":"A","v":"found","ref":"4. Asynchronous computations release their lock before writing","evidence":"“removes the waiter, and releases its lock before applying the computed operation” explicitly identifies premature waiter release in the future cache. “Another computation can therefore read the same old value and overwrite an update” supplies the required stale-read and lost-update consequence."}/work/sol/controls/moka/controls.json
+/work/sol/controls/moka/evidence/README.md
+/work/sol/controls/moka/evidence/baseline-sha256.json
+/work/sol/controls/moka/evidence/build-and-probes.log
+/work/sol/controls/moka/evidence/future_controls.rs
+/work/sol/controls/moka/evidence/probes.log
+/work/sol/controls/moka/evidence/source-excerpts.txt
+/work/sol/controls/moka/evidence/sync_controls.rs
+/work/sol/controls/moka/evidence/validate.py
+/work/sol/controls/moka/evidence/validation.log
+/work/sol/controls/moka/evidence/write_controls.py
+/work/sol/controls/moka/preparation.json
+/work/sol/grading/s3-moka/key.json
+/work/sol/grading/s3-moka/map.json
+/work/sol/grading/s3-moka/redactions.json
+/work/sol/grading/s3-moka/report-A.md
+/work/sol/grading/s3-moka/report-passages.json
+/work/sol/grading/s3-moka/verifier-normalization.json
+/work/sol/grading/s5-decom/map.json
+/work/sol/grading/s5-decom/operator-input-integrity.json
+/work/sol/grading/s5-decom/redactions.json
+/work/sol/grading/s5-decom/reports/A.md
+/work/sol/grading/s5-decom/reports/B.md
+/work/sol/grading/s5-decom/reports/C.md
+/work/sol/grading/s5-decom/reports/D.md
+/work/sol/stage5/assessments/decom/A/README.md
+/work/sol/stage5/assessments/decom/A/checks.json
+/work/sol/stage5/assessments/decom/A/gate-after-Cargo.lock
+/work/sol/stage5/assessments/decom/A/gate-original-Cargo.lock
+/work/sol/stage5/assessments/decom/A/gate.log
+/work/sol/stage5/assessments/decom/A/hidden-command.json
+/work/sol/stage5/assessments/decom/A/hidden-result.json
+/work/sol/stage5/assessments/decom/A/hidden-runner.log
+/work/sol/stage5/assessments/decom/A/hidden/candidate-integration-1.log
+/work/sol/stage5/assessments/decom/A/hidden/candidate-integration-targets.txt
+/work/sol/stage5/assessments/decom/A/hidden/candidate-target-inventory.log
+/work/sol/stage5/assessments/decom/A/hidden/candidate.diff
+/work/sol/stage5/assessments/decom/A/hidden/docs-default.log
+/work/sol/stage5/assessments/decom/A/hidden/environment.txt
+/work/sol/stage5/assessments/decom/A/hidden/existing-lib-default.log
+/work/sol/stage5/assessments/decom/A/hidden/existing-lib-no-default.log
+/work/sol/stage5/assessments/decom/A/hidden/existing-ref-default.log
+/work/sol/stage5/assessments/decom/A/hidden/hidden-compile-default.log
+/work/sol/stage5/assessments/decom/A/hidden/hidden-compile-no-default.log
+/work/sol/stage5/assessments/decom/A/hidden/hidden-default.log
+/work/sol/stage5/assessments/decom/A/hidden/hidden-no-default.log
+/work/sol/stage5/assessments/decom/A/hidden/metadata.json
+/work/sol/stage5/assessments/decom/A/hidden/status.tsv
+/work/sol/stage5/assessments/decom/A/own-changed-stable-format.log
+/work/sol/stage5/assessments/decom/A/own-checks.json
+/work/sol/stage5/assessments/decom/A/own-default-suite.log
+/work/sol/stage5/assessments/decom/A/own-terminal-format.log
+/work/sol/stage5/assessments/decom/A/scratch-layout.json
+/work/sol/stage5/assessments/decom/A/scripts/assemble_assessment.py
+/work/sol/stage5/assessments/decom/A/scripts/run_candidate_checks.py
+/work/sol/stage5/assessments/decom/A/scripts/run_hidden.py
+/work/sol/stage5/assessments/decom/A/scripts/verify_evidence.py
+/work/sol/stage5/assessments/decom/A/submission-after-hidden.sha256.json
+/work/sol/stage5/assessments/decom/A/submission-before.sha256.json
+/work/sol/stage5/assessments/decom/A/submission-final.sha256.json
+/work/sol/stage5/assessments/decom/A/submitted-report.md
+/work/sol/stage5/assessments/decom/A/verification-file-changes.json
+/work/sol/stage5/assessments/decom/B/README.md
+/work/sol/stage5/assessments/decom/B/checks.json
+/work/sol/stage5/assessments/decom/B/gate-after-Cargo.lock
+/work/sol/stage5/assessments/decom/B/gate-original-Cargo.lock
+/work/sol/stage5/assessments/decom/B/gate.log
+/work/sol/stage5/assessments/decom/B/hidden-command.json
+/work/sol/stage5/assessments/decom/B/hidden-result.json
+/work/sol/stage5/assessments/decom/B/hidden-runner.log
+/work/sol/stage5/assessments/decom/B/hidden/candidate-integration-1.log
+/work/sol/stage5/assessments/decom/B/hidden/candidate-integration-targets.txt
+/work/sol/stage5/assessments/decom/B/hidden/candidate-target-inventory.log
+/work/sol/stage5/assessments/decom/B/hidden/candidate.diff
+/work/sol/stage5/assessments/decom/B/hidden/docs-default.log
+/work/sol/stage5/assessments/decom/B/hidden/environment.txt
+/work/sol/stage5/assessments/decom/B/hidden/existing-lib-default.log
+/work/sol/stage5/assessments/decom/B/hidden/existing-lib-no-default.log
+/work/sol/stage5/assessments/decom/B/hidden/existing-ref-default.log
+/work/sol/stage5/assessments/decom/B/hidden/hidden-compile-default.log
+/work/sol/stage5/assessments/decom/B/hidden/hidden-compile-no-default.log
+/work/sol/stage5/assessments/decom/B/hidden/hidden-default.log
+/work/sol/stage5/assessments/decom/B/hidden/hidden-no-default.log
+/work/sol/stage5/assessments/decom/B/hidden/metadata.json
+/work/sol/stage5/assessments/decom/B/hidden/status.tsv
+/work/sol/stage5/assessments/decom/B/own-all-features-suite.log
+/work/sol/stage5/assessments/decom/B/own-changed-stable-format.log
+/work/sol/stage5/assessments/decom/B/own-checks.json
+/work/sol/stage5/assessments/decom/B/own-default-suite.log
+/work/sol/stage5/assessments/decom/B/own-miri-regressions.log
+/work/sol/stage5/assessments/decom/B/own-no-default-suite.log
+/work/sol/stage5/assessments/decom/B/own-terminal-format.log
+/work/sol/stage5/assessments/decom/B/scratch-layout.json
+/work/sol/stage5/assessments/decom/B/scripts/assemble_assessment.py
+/work/sol/stage5/assessments/decom/B/scripts/run_candidate_checks.py
+/work/sol/stage5/assessments/decom/B/scripts/run_hidden.py
+/work/sol/stage5/assessments/decom/B/scripts/verify_evidence.py
+/work/sol/stage5/assessments/decom/B/submission-after-hidden.sha256.json
+/work/sol/stage5/assessments/decom/B/submission-before.sha256.json
+/work/sol/stage5/assessments/decom/B/submission-final.sha256.json
+/work/sol/stage5/assessments/decom/B/submitted-report.md
+/work/sol/stage5/assessments/decom/B/verification-file-changes.json
+/work/sol/stage5/assessments/decom/C/README.md
+/work/sol/stage5/assessments/decom/C/checks.json
+/work/sol/stage5/assessments/decom/C/gate-after-Cargo.lock
+/work/sol/stage5/assessments/decom/C/gate-original-Cargo.lock
+/work/sol/stage5/assessments/decom/C/gate.log
+/work/sol/stage5/assessments/decom/C/hidden-command.json
+/work/sol/stage5/assessments/decom/C/hidden-result.json
+/work/sol/stage5/assessments/decom/C/hidden-runner.log
+/work/sol/stage5/assessments/decom/C/hidden/candidate-integration-1.log
+/work/sol/stage5/assessments/decom/C/hidden/candidate-integration-targets.txt
+/work/sol/stage5/assessments/decom/C/hidden/candidate-target-inventory.log
+/work/sol/stage5/assessments/decom/C/hidden/candidate.diff
+/work/sol/stage5/assessments/decom/C/hidden/docs-default.log
+/work/sol/stage5/assessments/decom/C/hidden/environment.txt
+/work/sol/stage5/assessments/decom/C/hidden/existing-lib-default.log
+/work/sol/stage5/assessments/decom/C/hidden/existing-lib-no-default.log
+/work/sol/stage5/assessments/decom/C/hidden/existing-ref-default.log
+/work/sol/stage5/assessments/decom/C/hidden/hidden-compile-default.log
+/work/sol/stage5/assessments/decom/C/hidden/hidden-compile-no-default.log
+/work/sol/stage5/assessments/decom/C/hidden/hidden-default.log
+/work/sol/stage5/assessments/decom/C/hidden/hidden-no-default.log
+/work/sol/stage5/assessments/decom/C/hidden/metadata.json
+/work/sol/stage5/assessments/decom/C/hidden/status.tsv
+/work/sol/stage5/assessments/decom/C/own-changed-stable-format.log
+/work/sol/stage5/assessments/decom/C/own-checks.json
+/work/sol/stage5/assessments/decom/C/own-default-suite.log
+/work/sol/stage5/assessments/decom/C/own-miri-regressions.log
+/work/sol/stage5/assessments/decom/C/own-no-default-suite.log
+/work/sol/stage5/assessments/decom/C/own-terminal-format.log
+/work/sol/stage5/assessments/decom/C/scratch-layout.json
+/work/sol/stage5/assessments/decom/C/scripts/assemble_assessment.py
+/work/sol/stage5/assessments/decom/C/scripts/run_candidate_checks.py
+/work/sol/stage5/assessments/decom/C/scripts/run_hidden.py
+/work/sol/stage5/assessments/decom/C/scripts/verify_evidence.py
+/work/sol/stage5/assessments/decom/C/submission-after-hidden.sha256.json
+/work/sol/stage5/assessments/decom/C/submission-before.sha256.json
+/work/sol/stage5/assessments/decom/C/submission-final.sha256.json
+/work/sol/stage5/assessments/decom/C/submitted-report.md
+/work/sol/stage5/assessments/decom/C/verification-file-changes.json
+/work/sol/stage5/assessments/decom/D/README.md
+/work/sol/stage5/assessments/decom/D/checks.json
+/work/sol/stage5/assessments/decom/D/gate-after-Cargo.lock
+/work/sol/stage5/assessments/decom/D/gate-original-Cargo.lock
+/work/sol/stage5/assessments/decom/D/gate.log
+/work/sol/stage5/assessments/decom/D/hidden-command.json
+/work/sol/stage5/assessments/decom/D/hidden-result.json
+/work/sol/stage5/assessments/decom/D/hidden-runner.log
+/work/sol/stage5/assessments/decom/D/hidden/candidate-integration-targets.txt
+/work/sol/stage5/assessments/decom/D/hidden/candidate-target-inventory.log
+/work/sol/stage5/assessments/decom/D/hidden/candidate.diff
+/work/sol/stage5/assessments/decom/D/hidden/docs-default.log
+/work/sol/stage5/assessments/decom/D/hidden/environment.txt
+/work/sol/stage5/assessments/decom/D/hidden/existing-lib-default.log
+/work/sol/stage5/assessments/decom/D/hidden/existing-lib-no-default.log
+/work/sol/stage5/assessments/decom/D/hidden/existing-ref-default.log
+/work/sol/stage5/assessments/decom/D/hidden/hidden-compile-default.log
+/work/sol/stage5/assessments/decom/D/hidden/hidden-compile-no-default.log
+/work/sol/stage5/assessments/decom/D/hidden/hidden-default.log
+/work/sol/stage5/assessments/decom/D/hidden/hidden-no-default.log
+/work/sol/stage5/assessments/decom/D/hidden/metadata.json
+/work/sol/stage5/assessments/decom/D/hidden/status.tsv
+/work/sol/stage5/assessments/decom/D/own-changed-stable-format.log
+/work/sol/stage5/assessments/decom/D/own-checks.json
+/work/sol/stage5/assessments/decom/D/own-default-suite.log
+/work/sol/stage5/assessments/decom/D/own-terminal-format.log
+/work/sol/stage5/assessments/decom/D/scratch-layout.json
+/work/sol/stage5/assessments/decom/D/scripts/assemble_assessment.py
+/work/sol/stage5/assessments/decom/D/scripts/run_candidate_checks.py
+/work/sol/stage5/assessments/decom/D/scripts/run_hidden.py
+/work/sol/stage5/assessments/decom/D/scripts/verify_evidence.py
+/work/sol/stage5/assessments/decom/D/submission-after-hidden.sha256.json
+/work/sol/stage5/assessments/decom/D/submission-before.sha256.json
+/work/sol/stage5/assessments/decom/D/submission-final.sha256.json
+/work/sol/stage5/assessments/decom/D/submitted-report.md
+/work/sol/stage5/assessments/decom/D/verification-file-changes.json
+/work/sol/stage5/assessments/decom/assemble_assessment.py
+/work/sol/stage5/assessments/decom/assessment.json
+/work/sol/stage5/assessments/decom/evidence-verification.log
+/work/sol/stage5/assessments/decom/integrity.json
+/work/sol/stage5/assessments/decom/integrity.log
+/work/sol/stage5/assessments/decom/provenance.json
+/work/sol/stage5/assessments/decom/run_candidate_checks.py
+/work/sol/stage5/assessments/decom/run_hidden.py
+/work/sol/stage5/assessments/decom/verify_evidence.py
+/work/sol/artifacts/r894fc/tmp/1251ffed-f9db-4508-875a-3f8eb1e047b0/user1
+/work/sol/artifacts/r894fc/tmp/miri_timer_clear_tree.log
+/work/sol/artifacts/r894fc/tmp/scan.log
+/work/sol/artifacts/r894fc/tmp/1f794609-4b0a-43ea-b621-a37a25060368/user1
+/work/sol/artifacts/r894fc/tmp/miri_timer_clear.log
+/work/sol/artifacts/r894fc/tmp/index.txt
+/work/sol/artifacts/r894fc/tmp/miri_advance.log
+/work/sol/artifacts/r894fc/tmp/miri_common.log
+/work/sol/artifacts/r894fc/tmp/gate_all.log
+/work/sol/artifacts/r894fc/tmp/miri.log
+/work/sol/artifacts/r894fc/tmp/probe/Cargo.toml
+/work/sol/artifacts/r894fc/tmp/probe/Cargo.lock
+/work/sol/artifacts/r894fc/tmp/gate.log
