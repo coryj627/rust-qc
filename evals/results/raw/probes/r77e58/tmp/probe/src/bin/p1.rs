@@ -1,0 +1,75 @@
+use pulldown_cmark::{html, Options, Parser};
+fn h(s: &str, o: Options) -> String { let mut b=String::new(); html::push_html(&mut b, Parser::new_ext(s,o)); b }
+fn t(name:&str, s:&str, o:Options){
+  let r = std::panic::catch_unwind(||h(s,o));
+  println!("--- {name}\nIN : {:?}", s);
+  match r { Ok(x)=>println!("OUT: {:?}", x), Err(_)=>println!("OUT: PANIC") }
+}
+fn main(){
+ let e=Options::empty();
+ let ste=Options::ENABLE_STRIKETHROUGH; 
+ let su=Options::ENABLE_STRIKETHROUGH|Options::ENABLE_SUPERSCRIPT;
+ let w=Options::ENABLE_WIKILINKS; let f=Options::ENABLE_FOOTNOTES;
+ let tb=Options::ENABLE_TABLES;
+ t("crlf code span","`a\r\nb`\r\n",e);
+ t("crlf code span bq","> `a\r\n> b`\r\n",e);
+ t("crlf math",r"$a"  ,Options::ENABLE_MATH);
+ t("crlf math2","$a\r\nb$\r\n",Options::ENABLE_MATH);
+ t("cr only fence","```\rcode\r```\r\rpara\r",e);
+ t("cr only indented","    a\r    b\r\rpara\r",e);
+ t("cr only html","<div>\r\r*p*\r",e);
+ t("cr last html","<div>\rx",e);
+ t("cr only para","a\rb\r\rc\r",e);
+ t("cr fence one char","```\n\rx",e);
+ t("closing fence tab","```\ncode\n```\t\nafter\n",e);
+ t("uppercase pre","<PRE>\n\ntext</PRE>\n\n*x*\n",e);
+ t("uppercase script","<SCRIPT>\nvar a;\n</SCRIPT>\n\n*x*\n",e);
+ t("mixed style","<style>\na{}\n</STYLE>\n\n*x*\n",e);
+ t("atx trailing tab","# foo\t\nb\n",e);
+ t("atx closer tab","# foo\t##\nb\n",e);
+ t("atx closer tab2","# foo ##\t\nb\n",e);
+ t("cdata inner bracket","foo <![CDATA[ a] b ]]> bar\n",e);
+ t("cdata single","foo <![CDATA[a]> bar\n",e);
+ t("cdata ok","foo <![CDATA[a]]> bar\n",e);
+ t("comment in bq","> x <!-- a\n> b --> y\n",e);
+ t("cdata in bq","> x <![CDATA[ a\n> b ]]> y\n",e);
+ t("pi in bq","> x <? a\n> b ?> y\n",e);
+ t("decl in list","- x <!D a\n  b> y\n",e);
+ t("close tag newline","foo </a\n> bar\n",e);
+ t("info tab","``` rust\tfoo\ncode\n```\n",e);
+ t("tilde mismatch","~~a~ b~~\n",ste);
+ t("caret blocks tilde","~a^ b~\n",su);
+ t("tilde blocks caret","^a~ b^\n",su);
+ t("star ok","*a** b*\n",e);
+ t("sup intraword","x^2^ y\n",su);
+ t("sub intraword","H~2~O\n",Options::ENABLE_SUBSCRIPT);
+ t("wiki empty pothole","[[a|]] tail\n",w);
+ t("wiki empty pothole2","x [[a|]]\n",w);
+ t("wiki newline bq","> [[a\n> b]] t\n",w);
+ t("wiki newline","[[a\nb]] t\n",w);
+ t("wiki table","| a |\n|---|\n| [[x\\|y]] |\n",w|tb);
+ t("wiki image","![x [[a]]](b) t\n",w);
+ t("wiki in link","[x [[a]] y](b) t\n",w);
+ t("wiki pothole fmt","[[a|*b*]] t\n",w);
+ t("wiki entity","[[a&amp;b]] t\n",w);
+ t("wiki escape","[[a\\*b]] t\n",w);
+ t("footnote in link","[a [^1] b](c)\n\n[^1]: d\n",f);
+ t("footnote in image","![a [^1] b](c)\n\n[^1]: d\n",f);
+ t("footnote then outer","*[a [^1] b][r]*\n\n[^1]: d\n[r]: /u\n",f);
+ t("footnote case","x[^A] y\n\n[^a]: d\n",f);
+ t("metadata bq","> ---\n> a: 1\n> ---\n> text\n\nafter\n",Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+ t("metadata list","- ---\n  a: 1\n  ---\n  text\n\nafter\n",Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+ t("metadata closing tab","---\na: 1\n---\t\nb\n",Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+ t("attr single","# h {a}\n",Options::ENABLE_HEADING_ATTRIBUTES);
+ t("attr eq","# h {=v}\n",Options::ENABLE_HEADING_ATTRIBUTES);
+ t("attr link","# [a](b{c)}\n",Options::ENABLE_HEADING_ATTRIBUTES);
+ t("table tab delim","| a |\n|\t---\t|\n| b |\n",tb);
+ t("table inner space","| a |\n| - - |\n| b |\n",tb);
+ t("table colon mid","| a |\n| -:- |\n| b |\n",tb);
+ t("label long ascii",&format!("[{0}]\n\n[{0}]: /u\n","a".repeat(1200)),e);
+ t("label 600 nonascii",&format!("[{0}]\n\n[{0}]: /u\n","é".repeat(600)).chars().take(40).collect::<String>(),e);
+ t("title crlf","[a](b \"c\r\nd\")\r\n",e);
+ t("title crlf bq","> [a](b \"c\r\n> d\")\r\n",e);
+ t("ff blank","a\n\x0c\nb\n",e);
+ t("ff heading","#\x0cfoo\n",e);
+}

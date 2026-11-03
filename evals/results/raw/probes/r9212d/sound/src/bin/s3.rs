@@ -1,0 +1,1 @@
+fn main(){ let t=simd_json::Tape(vec![simd_json::Node::Array{len:3,count:3}]); let v=simd_json::value::lazy::Value::from_tape(simd_json::tape::Value::null()); let _=v; let bad=t.as_value(); let l=simd_json::value::lazy::Value::from_tape(bad); println!("{:?}",l.into_value()); }

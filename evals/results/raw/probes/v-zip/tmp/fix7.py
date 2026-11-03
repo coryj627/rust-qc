@@ -1,0 +1,7 @@
+p='probe/src/main.rs'; s=open(p).read()
+new='''
+fn t_huff4(){ use std::collections::BTreeMap; use std::sync::Mutex; static LOCS:Mutex<BTreeMap<String,u64>>=Mutex::new(BTreeMap::new()); std::panic::set_hook(Box::new(|i|{ let l=i.location().map(|l|format!("{}:{}",l.file(),l.line())).unwrap_or_default(); *LOCS.lock().unwrap().entry(l).or_insert(0)+=1; })); let b=fx("legacy/implode.zip"); let mut a=open(&b).unwrap(); let (ds,cs)={let f=a.by_index_raw(0).unwrap(); (f.data_start() as usize,f.compressed_size() as usize)}; let raw=b[ds..ds+cs].to_vec(); let mut errs:BTreeMap<String,u64>=BTreeMap::new(); let mut example:Option<(usize,u8)>=None; for cut in (60..cs).step_by(1) { for last in [0u8,1,3,7,15,31,63,127,255,85,170] { let mut d=raw[..cut].to_vec(); *d.last_mut().unwrap()=last; let mut x=e("i",&d); x.method=6; x.flags=6; x.us=1092; let z=build(&[x]); let mut a=open(&z).unwrap(); let before=LOCS.lock().unwrap().len(); let r=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||{ let mut f=a.by_index(0).unwrap(); let mut v=vec![]; f.read_to_end(&mut v).map_err(|e|e.to_string()).map(|_|()) })); match r {Ok(Err(e))=>{*errs.entry(e).or_insert(0)+=1;},Ok(Ok(()))=>{*errs.entry("ok".into()).or_insert(0)+=1;},Err(_)=>{ if example.is_none(){example=Some((cut,last));} }} } } println!("{:?}\\n{:?}\\nexample {:?}",LOCS.lock().unwrap(),errs,example); }
+fn main(){'''
+s=s.replace('\nfn main(){',new,1)
+s=s.replace('"ppmd_skip"=>t_ppmd_skip(),','"ppmd_skip"=>t_ppmd_skip(),"huff4"=>t_huff4(),')
+open(p,'w').write(s)

@@ -1,0 +1,15 @@
+use simd_json::prelude::*;
+use std::collections::HashMap;
+fn own(s:&str)->String{ let mut b=s.as_bytes().to_vec(); match simd_json::to_owned_value(&mut b){Ok(v)=>format!("OK {v:?}"),Err(e)=>format!("ERR {e}")}}
+fn main(){
+ for s in ["18446744073709551616.5","18446744073709551617e2","1844674407370955161600.5","-170141183460469231731687303715884105728","-170141183460469231731687303715884105729","18446744073709551616","-9223372036854775809","-18446744073709551616","123456789012345678901234567890","-123456789012345678901234567890","99999999999999999999xyz","-99999999999999999999xyz","18446744073709551616xyz","1234567890123456789abc","1.2345678901234567890123abc","12345678901234567890123.5","99999999999999999999.5","18446744073709551615.5","184467440737095516150.5","1e400","-1e400","1e-400","1e308","1.7976931348623157e308","2.2250738585072014e-308","5e-324","4.9e-324","1e-323","1e-324","0.1","0.3","1.1","123.456","1e22","1e23","9007199254740993.0","1e4294967296","0.00000000000000000000000000001","1.00000000000000000000000001","00.5","-","-.5","1.5\0","[99999999999999999999]","1E+2","1e+","1e-","1e0","0e0","-0e0","0.0e-400","1e999","1e1000","1e-999"] { println!("{s:?} -> {}", own(s)); }
+ let mut b=b"340282366920938463463374607431768211455".to_vec(); let t=simd_json::to_tape(&mut b).unwrap(); let v=t.as_value(); println!("tape as_u128={:?} as_i128={:?} cast_f64={:?} is_u128={} type={:?} encode={}", v.as_u128(), v.as_i128(), v.cast_f64(), v.is_u128(), v.value_type(), v.encode());
+ let mut b=b"340282366920938463463374607431768211455".to_vec(); let t=simd_json::to_owned_value(&mut b).unwrap(); println!("owned as_u128={:?} as_i128={:?} cast_f64={:?}", t.as_u128(), t.as_i128(), t.cast_f64());
+ let mut b=b"-170141183460469231731687303715884105728".to_vec(); let t=simd_json::to_tape(&mut b).unwrap(); let v=t.as_value(); println!("tape neg as_i128={:?} cast_f64={:?}", v.as_i128(), v.cast_f64());
+ let mut b=b"18446744073709551615".to_vec(); println!("i128 from u64max {:?}", simd_json::from_slice::<i128>(&mut b).map_err(|e|e.to_string()));
+ let mut b=b"9223372036854775807".to_vec(); println!("i128 from i64max {:?}", simd_json::from_slice::<i128>(&mut b).map_err(|e|e.to_string()));
+ let mut b=b"-1".to_vec(); println!("u128 from -1 {:?} i128 {:?}", simd_json::from_slice::<u128>(&mut b.clone()).map_err(|e|e.to_string()), simd_json::from_slice::<i128>(&mut b).map_err(|e|e.to_string()));
+ let mut b=b"340282366920938463463374607431768211455".to_vec(); println!("f64 from u128 {:?} u128 {:?}", simd_json::from_slice::<f64>(&mut b.clone()).map_err(|e|e.to_string()), simd_json::from_slice::<u128>(&mut b).map_err(|e|e.to_string()));
+ let mut m=HashMap::new(); m.insert(5u128,1u8); println!("to_value u128key {:?} to_string {:?} v {:?}", simd_json::serde::to_owned_value(&m).map_err(|e|e.to_string()), simd_json::to_string(&m).map_err(|e|e.to_string()), simd_json::serde::to_owned_value(&u128::MAX).map_err(|e|e.to_string()));
+ let s=simd_json::to_string(&m).unwrap(); let mut b=s.into_bytes(); println!("u128 key back {:?}", simd_json::from_slice::<HashMap<u128,u8>>(&mut b).map_err(|e|e.to_string()));
+}

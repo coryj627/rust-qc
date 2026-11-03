@@ -1,0 +1,64 @@
+use pulldown_cmark::*;
+use std::time::Instant;
+fn run(name:&str,o:Options,g:&dyn Fn(usize)->String){
+  let mut n=2000usize; let mut prev=0f64; print!("{:<22}",name);
+  loop{ let s=g(n); let t=Instant::now(); let mut c=0usize; for e in Parser::new_ext(&s,o){ if let Event::Text(_)=e {c+=1} } let d=t.elapsed().as_secs_f64();
+    print!(" {}KB:{:.3}s",s.len()/1024,d); let _=c;
+    if d>4.0 || n>=2_000_000 { break } prev=d; n*=2; }
+  let _=prev; println!();
+}
+fn main(){
+  let e=Options::empty();
+  let all=Options::all()-Options::ENABLE_OLD_FOOTNOTES;
+  let y=Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
+  run("meta-bq",y,&|n|"> ---\n> a\n".repeat(n/10));
+  run("meta-list",y,&|n|"- ---\n".repeat(n/6));
+  run("meta-plus",Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS,&|n|"> +++\n> a\n".repeat(n/10));
+  run("title-lines",e,&|n|format!("[a](/u \"{}\")","x\n".repeat(n/2)));
+  run("title-lines-unterm",e,&|n|format!("[a](/u \"{}","x\n".repeat(n/2)));
+  run("wiki-img-nest",Options::ENABLE_WIKILINKS,&|n|format!("{}a{}","![[".repeat(n/3),"]]".repeat(n/3)));
+  run("wiki-nest",Options::ENABLE_WIKILINKS,&|n|format!("{}a{}","[[".repeat(n/2),"]]".repeat(n/2)));
+  run("wiki-pipe-unclosed",Options::ENABLE_WIKILINKS,&|n|"[[a]".repeat(n/4));
+  run("img-nest",e,&|n|format!("{}a{}","![".repeat(n/2),"](u)".repeat(n/2)));
+  run("emph-tilde",all,&|n|"~a ~~a ".repeat(n/7)+&"a~ a~~ ".repeat(n/7));
+  run("emph-caret",all,&|n|"^a ".repeat(n/3)+&"a^ ".repeat(n/3));
+  run("math",all,&|n|"$a {".repeat(n/4));
+  run("math2",all,&|n|"$$a}$ ".repeat(n/6));
+  run("code-mix",e,&|n|{let mut s=String::new(); let mut i=1; while s.len()<n {s.push_str(&"`".repeat(i)); s.push('a'); i=i%50+1;} s});
+  run("bq-nest",e,&|n|">".repeat(n));
+  run("list-nest",e,&|n|"- ".repeat(n/2));
+  run("star-list",e,&|n|"* ".repeat(n/2)+"x");
+  run("ol-nest",e,&|n|"1. ".repeat(n/3));
+  run("dl-chain",all,&|n|"a\n: b\n".repeat(n/6));
+  run("dl-nest",all,&|n|"a\n".to_string()+&": ".repeat(n/2));
+  run("table-wide",all,&|n|format!("{}\n{}\n","|a".repeat(n/2),"|-".repeat(n/2)));
+  run("table-rows",all,&|n|format!("|a|b|\n|-|-|\n{}","|c\n".repeat(n/3)));
+  run("para-pipes",all,&|n|"|a\n".repeat(n/3));
+  run("footnote-defs",all,&|n|"[^a]: b\n".repeat(n/7));
+  run("footnote-nest",all,&|n|"[^a]: ".repeat(n/6));
+  run("refdefs",e,&|n|"[a]: b\n".repeat(n/6));
+  run("refdef-title",e,&|n|format!("[a]: b \"{}","x\n".repeat(n/2)));
+  run("link-open",e,&|n|"[".repeat(n));
+  run("link-close",e,&|n|format!("{}{}","[".repeat(n/2),"]".repeat(n/2)));
+  run("link-ref",e,&|n|"[a][".repeat(n/4));
+  run("link-paren",e,&|n|"[a](".repeat(n/4));
+  run("link-angle",e,&|n|"[a](<".repeat(n/5));
+  run("link-angle2",e,&|n|format!("{}x","[a](<b ".repeat(1)) + &"[a](b ".repeat(n/6));
+  run("html-attr",e,&|n|"<a b=\"".repeat(n/6));
+  run("html-open",e,&|n|"<a ".repeat(n/3));
+  run("html-comment",e,&|n|"<!-- ".repeat(n/5));
+  run("html-cdata",e,&|n|"<![CDATA[]".repeat(n/10));
+  run("html-decl",e,&|n|"<!a".repeat(n/3));
+  run("html-pi",e,&|n|"<?".repeat(n/2));
+  run("html-nl",e,&|n|format!("<a{}","\n b".repeat(n/3)));
+  run("autolink",e,&|n|"<a:".repeat(n/3));
+  run("email",e,&|n|"<a@a.".repeat(n/5));
+  run("setext-attr",Options::ENABLE_HEADING_ATTRIBUTES,&|n|format!("{}{{#a}}\n===\n","a\n".repeat(n/2)));
+  run("atx-attr",Options::ENABLE_HEADING_ATTRIBUTES,&|n|"# a {#b}\n".repeat(n/9));
+  run("hr-try",e,&|n|"- ".repeat(n/2)+"x\n");
+  run("blank-items",e,&|n|"-\n\n".repeat(n/3));
+  run("backslash",e,&|n|"\\".repeat(n));
+  run("entities",e,&|n|"&".repeat(n));
+  run("smart",all,&|n|"'\"".repeat(n/2));
+  run("task",all,&|n|"- [ ] a\n".repeat(n/8));
+}

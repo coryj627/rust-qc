@@ -1,0 +1,95 @@
+use super::*;
+
+/// A single top-level item
+#[derive(Debug, Clone)]
+pub(crate) enum Item<'src> {
+  Alias(Alias<'src, Namepath<'src>>),
+  Assignment(Assignment<'src>),
+  Comment(&'src str),
+  Function(FunctionDefinition<'src>),
+  Import {
+    absolute: Option<PathBuf>,
+    optional: bool,
+    relative: StringLiteral<'src>,
+  },
+  Module {
+    absolute: Option<PathBuf>,
+    doc: Option<String>,
+    groups: Vec<StringLiteral<'src>>,
+    name: Name<'src>,
+    optional: bool,
+    private: bool,
+    relative: Option<StringLiteral<'src>>,
+  },
+  Newline,
+  Recipe(UnresolvedRecipe<'src>),
+  Set(Set<'src>),
+  Unexport {
+    name: Name<'src>,
+  },
+}
+
+impl ColorDisplay for Item<'_> {
+  fn fmt(&self, f: &mut Formatter, color: Color) -> fmt::Result {
+    match self {
+      Self::Alias(alias) => write!(f, "{alias}"),
+      Self::Assignment(assignment) => write!(f, "{assignment}"),
+      Self::Comment(comment) => write!(f, "{comment}"),
+      Self::Function(function) => {
+        write!(f, "{}(", function.name)?;
+        for (i, (parameter, _number)) in function.parameters.iter().enumerate() {
+          if i > 0 {
+            write!(f, ", ")?;
+          }
+          write!(f, "{parameter}")?;
+        }
+        write!(f, ") := {}", function.body)
+      }
+      Self::Import {
+        relative, optional, ..
+      } => {
+        write!(f, "import")?;
+
+        if *optional {
+          write!(f, "?")?;
+        }
+
+        write!(f, " {relative}")
+      }
+      Self::Module {
+        doc,
+        groups,
+        name,
+        optional,
+        relative,
+        ..
+      } => {
+        if let Some(doc) = doc {
+          writeln!(f, "# {doc}")?;
+        }
+
+        for group in groups {
+          writeln!(f, "[group: {group}]")?;
+        }
+
+        write!(f, "mod")?;
+
+        if *optional {
+          write!(f, "?")?;
+        }
+
+        write!(f, " {name}")?;
+
+        if let Some(path) = relative {
+          write!(f, " {path}")?;
+        }
+
+        Ok(())
+      }
+      Self::Newline => Ok(()),
+      Self::Recipe(recipe) => write!(f, "{}", recipe.color_display(color)),
+      Self::Set(set) => write!(f, "{set}"),
+      Self::Unexport { name } => write!(f, "unexport {name}"),
+    }
+  }
+}
