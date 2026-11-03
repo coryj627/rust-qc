@@ -26,6 +26,8 @@ Copy the `.agents/skills/rust-qc` folder into the `.agents/skills/` folder of yo
 
 Invoke it by name, for example "Use rust-qc to audit this crate." In testing, agents loaded it on their own for only about one Rust request in three.
 
+To install a specific version, copy the folder from its tag, for example `git clone --branch v1.0.0 https://github.com/coryj627/rust-qc.git`. `metadata.version` in `SKILL.md` shows which version you have, and `CHANGELOG.md` lists what changed in each one.
+
 ## Requirements
 
 - cargo, rustfmt, clippy and bash (3.2 or newer), for the verification gate
@@ -86,6 +88,8 @@ Every case ran twice from the same prompt, once following the skill and once wit
 - **Auditing real code:** on alacritty_terminal 0.25.0, findings were scored against eight bugs fixed upstream after that release. Two runs without the skill found 5 of 8 each. Two runs with the final skill found 5 and 4, and one of them had the widest coverage of any run. Every finding in every report checked out. On a medium-sized PDF accessibility library, an earlier version of the skill found two small files that crash the whole application, which no other run found.
 
 Limits: each version ran once or twice per case, and the two final alacritty runs differed by more than the gap between using the skill and not. The graders are the same model family as the agents they graded. No person who writes Rust has reviewed the rules yet. For an audit that matters, run it twice and merge the findings.
+
+Version: these results were measured on unnumbered development versions before 1.0.0. Version 1.0.0 is the final development version plus script fixes, packaging and the warning about running audited code, so none of its rule changes has been measured separately.
 
 ## Sources
 
