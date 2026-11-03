@@ -57,6 +57,24 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 2
 fi
 
+# rustup before 1.28 ignores RUSTUP_AUTO_INSTALL, so it could download a missing
+# toolchain. Even its `--version` looks up the active toolchain, so this names a
+# custom toolchain that does not exist, which fails that lookup without a download.
+if command -v rustup >/dev/null 2>&1; then
+    rustup_version="$(RUSTUP_TOOLCHAIN=rust-qc-no-such-toolchain rustup --version 2>/dev/null)"
+    version_pattern='^rustup ([0-9]+)\.([0-9]+)'
+    rustup_major=0
+    rustup_minor=0
+    if [[ "$rustup_version" =~ $version_pattern ]]; then
+        rustup_major="${BASH_REMATCH[1]}"
+        rustup_minor="${BASH_REMATCH[2]}"
+    fi
+    if (( rustup_major < 1 || (rustup_major == 1 && rustup_minor < 28) )); then
+        echo "error: rustup 1.28 or newer is required; older versions can download toolchains with no way to turn that off" >&2
+        exit 2
+    fi
+fi
+
 # The checks below run from the crate root so they see its pinned toolchain.
 cd "$root" || exit 2
 
@@ -86,8 +104,8 @@ if [[ -n "$target" ]]; then
     build_args+=(--target "$target")
 fi
 
-# Asks rustup first, because versions without RUSTUP_AUTO_INSTALL would download
-# nightly for `cargo +nightly`. A dated nightly does not answer to `+nightly`.
+# Asks rustup first, so `+nightly` is only used when nightly is already there. A
+# dated nightly does not answer to `+nightly`.
 nightly_rustfmt_installed() {
     rustup toolchain list 2>/dev/null | grep -E '^nightly-[^0-9]' >/dev/null &&
         cargo +nightly fmt --version >/dev/null 2>&1

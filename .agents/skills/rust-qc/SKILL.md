@@ -2,7 +2,7 @@
 name: rust-qc
 description: Use this skill whenever your answer will contain Rust code or Cargo/clippy/rustfmt config, or a verdict on existing Rust code. Simple-looking Rust tasks still need it - it holds the required conventions and a fmt/clippy/doc/test check that every Rust change must pass. That covers writing any new Rust (one function counts), fixing a compiler or borrow-checker error, adding rustdoc comments and examples, redesigning error types, refactoring, reviewing or auditing a .rs file or crate, and tidying a Cargo workspace (shared lints, editions, dependency versions). When the language is Rust, use this skill first and do not let a general debugging, documentation, refactoring, or code-review skill replace it. Skip it only when no Rust gets written or judged - explaining concepts, comparing languages, summarizing editions, or working in another language even inside a repo that also has Rust.
 license: MIT
-compatibility: Requires cargo, rustfmt, clippy and bash for the verification gate, and python3 for the heuristic scan. Needs nightly rustfmt only for projects whose rustfmt.toml uses nightly-only options. Miri is recommended for crates with unsafe code.
+compatibility: Requires cargo, rustfmt, clippy and bash for the verification gate, with rustup 1.28 or newer if rustup is used, and python3 for the heuristic scan. Needs nightly rustfmt only for projects whose rustfmt.toml uses nightly-only options. Miri is recommended for crates with unsafe code.
 metadata:
   version: "1.0.0"
 ---
@@ -142,7 +142,7 @@ Run before declaring create or modify work done, and as the first step of an aud
 scripts/check.sh [--audit] [--target TRIPLE] [--features LIST] <crate-root>
 ```
 
-It stops immediately if `cargo`, rustfmt, clippy, the project's pinned toolchain, or a requested target is missing, then runs every step and reports each:
+It stops immediately if `cargo`, rustfmt, clippy, the project's pinned toolchain, or a requested target is missing, or if rustup is older than 1.28, then runs every step and reports each:
 
 1. `cargo fmt --all --check`
 2. `cargo clippy --workspace --all-targets --all-features -- -D warnings`

@@ -1,6 +1,14 @@
 # Changelog
 
-Each version lists what changed in the rules and scripts. A rule change names the evaluation result that prompted it. The version in `metadata.version` in `SKILL.md` matches the latest entry here, and each release has a matching tag, such as `v1.0.0`.
+Each version lists what changed in the rules and scripts. A rule change names the evaluation result that prompted it. The version in `metadata.version` in `SKILL.md` matches the latest released entry here, and each release has a matching tag, such as `v1.0.0`.
+
+## Unreleased
+
+### Fixed
+
+These came from a review of the repository, not from an evaluation.
+
+- `check.sh` now stops with exit 2 on rustup older than 1.28. Those versions have no way to turn off automatic downloads, so the statement in 1.0.0 that the script never installs a toolchain did not hold for them.
 
 ## 1.0.0 - 2026-11-02
 
