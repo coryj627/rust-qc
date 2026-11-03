@@ -44,10 +44,19 @@ def main():
         review = metadata_path.with_name("input_review.json")
         if review.exists():
             rows[run]["input_review"] = json.loads(review.read_text())
+    blocks = {
+        (str(row["stage"]), row.get("project")) for row in rows.values()
+        if (row.get("metadata", {}).get("error") or {}).get("codexErrorInfo") == "cyberPolicy"
+    }
+    dispatch_reasons = {}
+    for ledger in sorted(scratch.glob("dispatch-*.json"), key=lambda p: p.stat().st_mtime):
+        for decision in json.loads(ledger.read_text()):
+            if decision.get("reason"):
+                dispatch_reasons[decision["run_id"]] = decision["reason"]
     fields = ["run", "stage", "role", "project", "arm", "letter", "skill_version",
               "requested_model", "requested_effort", "model", "effort", "budget_minutes", "minutes",
               "slot_wait_seconds", "status", "failure_kind", "killed_commands",
-              "report", "validity"]
+              "report", "validity", "absence_reason"]
     with (output / "runs.tsv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields, delimiter="\t", lineterminator="\n")
         writer.writeheader()
@@ -60,6 +69,15 @@ def main():
             )
             if row.get("input_review", {}).get("valid") is False:
                 validity = "invalid-other-source-skill"
+            reason = ""
+            if validity.startswith("invalid-"):
+                reason = validity
+            elif status == "not_started":
+                reason = "project_provider_policy_block" if \
+                    (str(row["stage"]), row.get("project")) in blocks else \
+                    dispatch_reasons.get(run, "not_yet_dispatched")
+            elif status != "completed":
+                reason = (meta.get("error") or {}).get("codexErrorInfo") or status
             minutes = round(meta["active_seconds"] / 60, 3) if "active_seconds" in meta else ""
             report = ""
             if meta.get("report_collected"):
@@ -79,6 +97,7 @@ def main():
                 "killed_commands": json.dumps(meta.get("command_timeouts", [])) if meta else "",
                 "report": report,
                 "validity": validity,
+                "absence_reason": reason,
             })
     print(f"Recorded {len(rows)} planned/attempted runs; missing observations retain empty values")
 

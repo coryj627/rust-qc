@@ -1,0 +1,1202 @@
+impl<K, V, S> InnerSync for Inner<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn run_pending_tasks(
+        &self,
+        timeout: Option<Duration>,
+        max_log_sync_repeats: u32,
+        eviction_batch_size: u32,
+    ) -> bool {
+        self.do_run_pending_tasks(timeout, max_log_sync_repeats, eviction_batch_size)
+    }
+
+    fn now(&self) -> Instant {
+        self.current_time()
+    }
+}
+
+impl<K, V, S> Inner<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn do_run_pending_tasks(
+        &self,
+        timeout: Option<Duration>,
+        max_log_sync_repeats: u32,
+        eviction_batch_size: u32,
+    ) -> bool {
+        if self.max_capacity == Some(0) {
+            return false;
+        }
+
+        // Acquire some locks.
+        let mut deqs = self.deques.lock();
+        let mut timer_wheel = self.timer_wheel.lock();
+
+        let started_at = if timeout.is_some() {
+            Some(self.current_time())
+        } else {
+            None
+        };
+        let mut should_process_logs = true;
+        let mut calls = 0u32;
+        let current_ec = self.entry_count.load();
+        let current_ws = self.weighted_size.load();
+        let mut eviction_state =
+            EvictionState::new(current_ec, current_ws, self.removal_notifier.as_ref());
+
+        loop {
+            if should_process_logs {
+                let r_len = self.read_op_ch.len();
+                if r_len > 0 {
+                    self.apply_reads(&mut deqs, &mut timer_wheel, r_len);
+                }
+
+                let w_len = self.write_op_ch.len();
+                if w_len > 0 {
+                    self.apply_writes(&mut deqs, &mut timer_wheel, w_len, &mut eviction_state);
+                }
+
+                if self.eviction_policy == EvictionPolicyConfig::TinyLfu
+                    && self.should_enable_frequency_sketch(&eviction_state.counters)
+                {
+                    self.enable_frequency_sketch(&eviction_state.counters);
+                }
+
+                calls += 1;
+            }
+
+            // Set this flag to `false`. The `evict_*` and `invalidate_*` methods
+            // below may set it to `true` if there are more entries to evict in next
+            // loop.
+            eviction_state.more_entries_to_evict = false;
+            let last_eviction_count = eviction_state.counters.eviction_count;
+
+            // Evict entries if there are any expired entries in the hierarchical
+            // timer wheels.
+            if timer_wheel.is_enabled() {
+                self.evict_expired_entries_using_timers(
+                    &mut timer_wheel,
+                    &mut deqs,
+                    &mut eviction_state,
+                );
+            }
+
+            // Evict entries if there are any expired entries in the write order or
+            // access order deques.
+            if self.has_expiry() || self.has_valid_after() {
+                self.evict_expired_entries_using_deqs(
+                    &mut deqs,
+                    &mut timer_wheel,
+                    eviction_batch_size,
+                    &mut eviction_state,
+                );
+            }
+
+            // Evict entries if there are any invalidation predicates set by the
+            // `invalidate_entries_if` method.
+            if let Some(invalidator) = &self.invalidator {
+                if !invalidator.is_empty() {
+                    self.invalidate_entries(
+                        invalidator,
+                        &mut deqs,
+                        &mut timer_wheel,
+                        eviction_batch_size,
+                        &mut eviction_state,
+                    );
+                }
+            }
+
+            // Evict if this cache has more entries than its capacity.
+            let weights_to_evict = self.weights_to_evict(&eviction_state.counters);
+            if weights_to_evict > 0 {
+                self.evict_lru_entries(
+                    &mut deqs,
+                    &mut timer_wheel,
+                    eviction_batch_size,
+                    weights_to_evict,
+                    &mut eviction_state,
+                );
+            }
+
+            // Check whether to continue this loop or not.
+
+            should_process_logs = calls <= max_log_sync_repeats
+                && (self.read_op_ch.len() >= READ_LOG_FLUSH_POINT
+                    || self.write_op_ch.len() >= WRITE_LOG_FLUSH_POINT);
+
+            let should_evict_more_entries = eviction_state.more_entries_to_evict
+                // Check if there were any entries evicted in this loop.
+                && (eviction_state.counters.eviction_count - last_eviction_count) > 0;
+
+            // Break the loop if there will be nothing to do in next loop.
+            if !should_process_logs && !should_evict_more_entries {
+                break;
+            }
+
+            // Break the loop if the eviction listener is set and timeout has been
+            // reached.
+            if let (Some(to), Some(started)) = (timeout, started_at) {
+                let elapsed = self.current_time().saturating_duration_since(started);
+                if elapsed >= to {
+                    break;
+                }
+            }
+        }
+
+        debug_assert_eq!(self.entry_count.load(), current_ec);
+        debug_assert_eq!(self.weighted_size.load(), current_ws);
+        self.entry_count.store(eviction_state.counters.entry_count);
+        self.weighted_size
+            .store(eviction_state.counters.weighted_size);
+
+        crossbeam_epoch::pin().flush();
+
+        // Ensure the deqs lock is held until here.
+        drop(deqs);
+
+        eviction_state.more_entries_to_evict
+    }
+}
+
+//
+// private methods
+//
+impl<K, V, S> Inner<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn has_enough_capacity(&self, candidate_weight: u32, counters: &EvictionCounters) -> bool {
+        self.max_capacity.map_or(true, |limit| {
+            counters.weighted_size + candidate_weight as u64 <= limit
+        })
+    }
+
+    fn weights_to_evict(&self, counters: &EvictionCounters) -> u64 {
+        self.max_capacity
+            .map(|limit| counters.weighted_size.saturating_sub(limit))
+            .unwrap_or_default()
+    }
+
+    #[inline]
+    fn should_enable_frequency_sketch(&self, counters: &EvictionCounters) -> bool {
+        match self.max_capacity {
+            None | Some(0) => false,
+            Some(max_cap) => {
+                if self.frequency_sketch_enabled.load(Ordering::Acquire) {
+                    false // The frequency sketch is already enabled.
+                } else {
+                    counters.weighted_size >= max_cap / 2
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn enable_frequency_sketch(&self, counters: &EvictionCounters) {
+        if let Some(max_cap) = self.max_capacity {
+            let c = counters;
+            let cap = if self.weigher.is_none() {
+                max_cap
+            } else {
+                (c.entry_count as f64 * (c.weighted_size as f64 / max_cap as f64)) as u64
+            };
+            self.do_enable_frequency_sketch(cap);
+        }
+    }
+
+    #[cfg(test)]
+    fn enable_frequency_sketch_for_testing(&self) {
+        if let Some(max_cap) = self.max_capacity {
+            self.do_enable_frequency_sketch(max_cap);
+        }
+    }
+
+    #[inline]
+    fn do_enable_frequency_sketch(&self, cache_capacity: u64) {
+        let skt_capacity = common::sketch_capacity(cache_capacity);
+        self.frequency_sketch.write().ensure_capacity(skt_capacity);
+        self.frequency_sketch_enabled.store(true, Ordering::Release);
+    }
+
+    fn apply_reads(&self, deqs: &mut Deques<K>, timer_wheel: &mut TimerWheel<K>, count: usize) {
+        use ReadOp::{Hit, Miss};
+        let mut freq = self.frequency_sketch.write();
+        let ch = &self.read_op_ch;
+        for _ in 0..count {
+            match ch.try_recv() {
+                Ok(Hit {
+                    value_entry,
+                    is_expiry_modified,
+                }) => {
+                    let kh = value_entry.entry_info().key_hash();
+                    freq.increment(kh.hash);
+                    if is_expiry_modified {
+                        self.update_timer_wheel(&value_entry, timer_wheel);
+                    }
+                    deqs.move_to_back_ao(&value_entry);
+                }
+                Ok(Miss(hash)) => freq.increment(hash),
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn apply_writes(
+        &self,
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        count: usize,
+        eviction_state: &mut EvictionState<'_, K, V>,
+    ) where
+        V: Clone,
+    {
+        use WriteOp::{Remove, Upsert};
+        let freq = self.frequency_sketch.read();
+        let ch = &self.write_op_ch;
+
+        for _ in 0..count {
+            match ch.try_recv() {
+                Ok(Upsert {
+                    key_hash: kh,
+                    value_entry: entry,
+                    entry_gen: gen,
+                    old_weight,
+                    new_weight,
+                }) => self.handle_upsert(
+                    kh,
+                    entry,
+                    gen,
+                    old_weight,
+                    new_weight,
+                    deqs,
+                    timer_wheel,
+                    &freq,
+                    eviction_state,
+                ),
+                Ok(Remove {
+                    kv_entry: KvEntry { key: _key, entry },
+                    entry_gen: gen,
+                }) => {
+                    Self::handle_remove(
+                        deqs,
+                        timer_wheel,
+                        entry,
+                        Some(gen),
+                        &mut eviction_state.counters,
+                    );
+                }
+                Err(_) => break,
+            };
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_upsert(
+        &self,
+        kh: KeyHash<K>,
+        entry: MiniArc<ValueEntry<K, V>>,
+        gen: u16,
+        old_weight: u32,
+        new_weight: u32,
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        freq: &FrequencySketch,
+        eviction_state: &mut EvictionState<'_, K, V>,
+    ) where
+        V: Clone,
+    {
+        {
+            let counters = &mut eviction_state.counters;
+
+            if entry.is_admitted() {
+                // The entry has been already admitted, so treat this as an update.
+                counters.saturating_sub(0, old_weight);
+                counters.saturating_add(0, new_weight);
+                self.update_timer_wheel(&entry, timer_wheel);
+                deqs.move_to_back_ao(&entry);
+                deqs.move_to_back_wo(&entry);
+                entry.entry_info().set_policy_gen(gen);
+                return;
+            }
+
+            if self.has_enough_capacity(new_weight, counters) {
+                // There are enough room in the cache (or the cache is unbounded).
+                // Add the candidate to the deques.
+                self.handle_admit(&entry, new_weight, deqs, timer_wheel, counters);
+                entry.entry_info().set_policy_gen(gen);
+                return;
+            }
+        }
+
+        if let Some(max) = self.max_capacity {
+            if new_weight as u64 > max {
+                // The candidate is too big to fit in the cache. Reject it.
+
+                // Lock the key for removal if blocking removal notification is enabled.
+                let kl = self.maybe_key_lock(&kh.key);
+                let _klg = &kl.as_ref().map(|kl| kl.lock());
+
+                let removed = self.cache.remove_if(
+                    kh.hash,
+                    |k| k == &kh.key,
+                    |_, current_entry| {
+                        MiniArc::ptr_eq(entry.entry_info(), current_entry.entry_info())
+                            && current_entry.entry_info().entry_gen() == gen
+                    },
+                );
+                if let Some(entry) = removed {
+                    if eviction_state.is_notifier_enabled() {
+                        let key = Arc::clone(&kh.key);
+                        eviction_state.notify_entry_removal(key, &entry, RemovalCause::Size);
+                    }
+                    eviction_state.counters.incr_eviction_count();
+                }
+                entry.entry_info().set_policy_gen(gen);
+                return;
+            }
+        }
+
+        // TODO: Refactoring the policy implementations.
+        // https://github.com/moka-rs/moka/issues/389
+
+        // Try to admit the candidate.
+        let admission_result = match &self.eviction_policy {
+            EvictionPolicyConfig::TinyLfu => {
+                let mut candidate = EntrySizeAndFrequency::new(new_weight);
+                candidate.add_frequency(freq, kh.hash);
+                Self::admit(&candidate, &self.cache, deqs, freq)
+            }
+            EvictionPolicyConfig::Lru => AdmissionResult::Admitted {
+                victim_keys: SmallVec::default(),
+            },
+        };
+
+        match admission_result {
+            AdmissionResult::Admitted { victim_keys } => {
+                // Try to remove the victims from the hash map.
+                for (vic_kh, vic_la) in victim_keys {
+                    let vic_key = vic_kh.key;
+                    let vic_hash = vic_kh.hash;
+
+                    // Lock the key for removal if blocking removal notification is enabled.
+                    let kl = self.maybe_key_lock(&vic_key);
+                    let _klg = &kl.as_ref().map(|kl| kl.lock());
+
+                    if let Some((vic_key, vic_entry)) = self.cache.remove_entry_if_and(
+                        vic_hash,
+                        |k| k == &vic_key,
+                        |_, entry| entry.entry_info().last_accessed() == vic_la,
+                        |k, v| (k.clone(), v.clone()),
+                    ) {
+                        if eviction_state.is_notifier_enabled() {
+                            eviction_state.notify_entry_removal(
+                                vic_key,
+                                &vic_entry,
+                                RemovalCause::Size,
+                            );
+                        }
+                        eviction_state.counters.incr_eviction_count();
+                        // And then remove the victim from the deques.
+                        Self::handle_remove(
+                            deqs,
+                            timer_wheel,
+                            vic_entry,
+                            None,
+                            &mut eviction_state.counters,
+                        );
+                    } else {
+                        // Could not remove the victim from the cache. Skip it as its
+                        // ValueEntry might have been invalidated.
+                        if let Some(node) = deqs.probation.peek_front() {
+                            if node.element.key() == &vic_key && node.element.hash() == vic_hash {
+                                deqs.probation.move_front_to_back();
+                            }
+                        }
+                    }
+                }
+
+                // Add the candidate to the deques.
+                self.handle_admit(
+                    &entry,
+                    new_weight,
+                    deqs,
+                    timer_wheel,
+                    &mut eviction_state.counters,
+                );
+                entry.entry_info().set_policy_gen(gen);
+            }
+            AdmissionResult::Rejected => {
+                // Lock the key for removal if blocking removal notification is enabled.
+                let kl = self.maybe_key_lock(&kh.key);
+                let _klg = &kl.as_ref().map(|kl| kl.lock());
+
+                // Remove the candidate from the cache (hash map) if the entry
+                // generation matches.
+                let key = Arc::clone(&kh.key);
+                let removed = self.cache.remove_if(
+                    kh.hash,
+                    |k| k == &key,
+                    |_, current_entry| {
+                        MiniArc::ptr_eq(entry.entry_info(), current_entry.entry_info())
+                            && current_entry.entry_info().entry_gen() == gen
+                    },
+                );
+
+                if let Some(entry) = removed {
+                    entry.entry_info().set_policy_gen(gen);
+                    if eviction_state.is_notifier_enabled() {
+                        eviction_state.notify_entry_removal(key, &entry, RemovalCause::Size);
+                    }
+                    eviction_state.counters.incr_eviction_count();
+                }
+            }
+        };
+    }
+
+    /// Performs size-aware admission explained in the paper:
+    /// [Lightweight Robust Size Aware Cache Management][size-aware-cache-paper]
+    /// by Gil Einziger, Ohad Eytan, Roy Friedman, Ben Manes.
+    ///
+    /// [size-aware-cache-paper]: https://arxiv.org/abs/2105.08770
+    ///
+    /// There are some modifications in this implementation:
+    /// - To admit to the main space, candidate's frequency must be higher than
+    ///   the aggregated frequencies of the potential victims. (In the paper,
+    ///   `>=` operator is used rather than `>`)  The `>` operator will do a better
+    ///   job to prevent the main space from polluting.
+    /// - When a candidate is rejected, the potential victims will stay at the LRU
+    ///   position of the probation access-order queue. (In the paper, they will be
+    ///   promoted (to the MRU position?) to force the eviction policy to select a
+    ///   different set of victims for the next candidate). We may implement the
+    ///   paper's behavior later?
+    ///
+    #[inline]
+    fn admit(
+        candidate: &EntrySizeAndFrequency,
+        cache: &CacheStore<K, V, S>,
+        deqs: &mut Deques<K>,
+        freq: &FrequencySketch,
+    ) -> AdmissionResult<K> {
+        const MAX_CONSECUTIVE_RETRIES: usize = 5;
+        let mut retries = 0;
+
+        let mut victims = EntrySizeAndFrequency::default();
+        let mut victim_keys = SmallVec::default();
+
+        let deq = &mut deqs.probation;
+
+        // Get first potential victim at the LRU position.
+        let mut next_victim = deq.peek_front_ptr();
+
+        // Aggregate potential victims.
+        while victims.policy_weight < candidate.policy_weight
+            && victims.freq <= candidate.freq
+            && retries <= MAX_CONSECUTIVE_RETRIES
+        {
+            let Some(victim) = next_victim.take() else {
+                // No more potential victims.
+                break;
+            };
+            next_victim = DeqNode::next_node_ptr(victim);
+
+            let vic_elem = &unsafe { victim.as_ref() }.element;
+            if vic_elem.is_dirty() {
+                // Skip this node as its ValueEntry have been updated or invalidated.
+                unsafe { deq.move_to_back(victim) };
+                retries += 1;
+                continue;
+            }
+
+            let key = vic_elem.key();
+            let hash = vic_elem.hash();
+            let last_accessed = vic_elem.entry_info().last_accessed();
+
+            if let Some(vic_entry) = cache.get(hash, |k| k == key) {
+                victims.add_policy_weight(vic_entry.policy_weight());
+                victims.add_frequency(freq, hash);
+                victim_keys.push((KeyHash::new(Arc::clone(key), hash), last_accessed));
+                retries = 0;
+            } else {
+                // Could not get the victim from the cache (hash map). Skip this node
+                // as its ValueEntry might have been invalidated (after we checked
+                // `is_dirty` above`).
+                unsafe { deq.move_to_back(victim) };
+                retries += 1;
+            }
+        }
+
+        // Admit or reject the candidate.
+
+        // TODO: Implement some randomness to mitigate hash DoS attack.
+        // See Caffeine's implementation.
+
+        if victims.policy_weight >= candidate.policy_weight && candidate.freq > victims.freq {
+            AdmissionResult::Admitted { victim_keys }
+        } else {
+            AdmissionResult::Rejected
+        }
+    }
+
+    fn handle_admit(
+        &self,
+        entry: &MiniArc<ValueEntry<K, V>>,
+        policy_weight: u32,
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        counters: &mut EvictionCounters,
+    ) {
+        counters.saturating_add(1, policy_weight);
+
+        self.update_timer_wheel(entry, timer_wheel);
+
+        // Update the deques.
+        deqs.push_back_ao(
+            CacheRegion::MainProbation,
+            KeyHashDate::new(entry.entry_info()),
+            entry,
+        );
+        if self.is_write_order_queue_enabled() {
+            deqs.push_back_wo(KeyHashDate::new(entry.entry_info()), entry);
+        }
+        entry.set_admitted(true);
+    }
+
+    /// NOTE: This method may enable the timer wheel.
+    fn update_timer_wheel(
+        &self,
+        entry: &MiniArc<ValueEntry<K, V>>,
+        timer_wheel: &mut TimerWheel<K>,
+    ) {
+        // Enable the timer wheel if needed.
+        if entry.entry_info().expiration_time().is_some() && !timer_wheel.is_enabled() {
+            timer_wheel.enable();
+        }
+
+        // Update the timer wheel.
+        match (
+            entry.entry_info().expiration_time().is_some(),
+            entry.timer_node(),
+        ) {
+            // Do nothing; the cache entry has no expiration time and not registered
+            // to the timer wheel.
+            (false, None) => (),
+            // Register the cache entry to the timer wheel; the cache entry has an
+            // expiration time and not registered to the timer wheel.
+            (true, None) => {
+                let timer = timer_wheel.schedule(
+                    MiniArc::clone(entry.entry_info()),
+                    MiniArc::clone(entry.deq_nodes()),
+                );
+                entry.set_timer_node(timer);
+            }
+            // Reschedule the cache entry in the timer wheel; the cache entry has an
+            // expiration time and already registered to the timer wheel.
+            (true, Some(tn)) => {
+                let result = timer_wheel.reschedule(tn);
+                if let ReschedulingResult::Removed(removed_tn) = result {
+                    // The timer node was removed from the timer wheel because the
+                    // expiration time has been unset by other thread after we
+                    // checked.
+                    entry.set_timer_node(None);
+                    drop(removed_tn);
+                }
+            }
+            // Unregister the cache entry from the timer wheel; the cache entry has
+            // no expiration time but registered to the timer wheel.
+            (false, Some(tn)) => {
+                entry.set_timer_node(None);
+                timer_wheel.deschedule(tn);
+            }
+        }
+    }
+
+    fn handle_remove(
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        entry: MiniArc<ValueEntry<K, V>>,
+        gen: Option<u16>,
+        counters: &mut EvictionCounters,
+use std::sync::atomic::{self, AtomicBool, AtomicU16, AtomicU32, Ordering};
+
+use super::{AccessTime, KeyHash};
+use crate::common::time::{AtomicInstant, Instant};
+
+#[derive(Debug)]
+pub(crate) struct EntryInfo<K> {
+    key_hash: KeyHash<K>,
+    /// `is_admitted` indicates that the entry has been admitted to the cache. When
+    /// `false`, it means the entry is _temporary_ admitted to the cache or evicted
+    /// from the cache (so it should not have LRU nodes).
+    is_admitted: AtomicBool,
+    /// `entry_gen` (entry generation) is incremented every time the entry is updated
+    /// in the concurrent hash table.
+    entry_gen: AtomicU16,
+    /// `policy_gen` (policy generation) is incremented every time entry's `WriteOp`
+    /// is applied to the cache policies including the access-order queue (the LRU
+    /// deque).
+    policy_gen: AtomicU16,
+    last_accessed: AtomicInstant,
+    last_modified: AtomicInstant,
+    expiration_time: AtomicInstant,
+    policy_weight: AtomicU32,
+}
+
+impl<K> EntryInfo<K> {
+    #[inline]
+    pub(crate) fn new(key_hash: KeyHash<K>, timestamp: Instant, policy_weight: u32) -> Self {
+        #[cfg(feature = "unstable-debug-counters")]
+        super::debug_counters::InternalGlobalDebugCounters::entry_info_created();
+
+        Self {
+            key_hash,
+            is_admitted: AtomicBool::default(),
+            // `entry_gen` starts at 1 and `policy_gen` start at 0.
+            entry_gen: AtomicU16::new(1),
+            policy_gen: AtomicU16::new(0),
+            last_accessed: AtomicInstant::new(timestamp),
+            last_modified: AtomicInstant::new(timestamp),
+            expiration_time: AtomicInstant::default(),
+            policy_weight: AtomicU32::new(policy_weight),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn key_hash(&self) -> &KeyHash<K> {
+        &self.key_hash
+    }
+
+    #[inline]
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.is_admitted.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(crate) fn set_admitted(&self, value: bool) {
+        self.is_admitted.store(value, Ordering::Release);
+    }
+
+    /// Returns `true` if the `ValueEntry` having this `EntryInfo` is dirty.
+    ///
+    /// Dirty means that the entry has been updated in the concurrent hash table but
+    /// not yet in the cache policies such as access-order queue.
+    #[inline]
+    pub(crate) fn is_dirty(&self) -> bool {
+        let result =
+            self.entry_gen.load(Ordering::Relaxed) != self.policy_gen.load(Ordering::Relaxed);
+        atomic::fence(Ordering::Acquire);
+        result
+    }
+
+    #[inline]
+    pub(crate) fn entry_gen(&self) -> u16 {
+        self.entry_gen.load(Ordering::Acquire)
+    }
+
+    /// Increments the entry generation and returns the new value.
+    #[inline]
+    pub(crate) fn incr_entry_gen(&self) -> u16 {
+        // NOTE: This operation wraps around on overflow.
+        let prev = self.entry_gen.fetch_add(1, Ordering::AcqRel);
+        // Need to add `1` to the previous value to get the current value.
+        prev.wrapping_add(1)
+    }
+
+    /// Sets the policy generation to the given value.
+    #[inline]
+    pub(crate) fn set_policy_gen(&self, value: u16) {
+        let g = &self.policy_gen;
+        loop {
+            let current = g.load(Ordering::Acquire);
+
+            // Do not set the given value if it is smaller than the current value of
+            // `policy_gen`. Note that the current value may have been wrapped
+            // around. If the value is much larger than the current value, it is
+            // likely that the value of `policy_gen` has been wrapped around.
+            if current >= value || value.wrapping_sub(current) > u16::MAX / 2 {
+                break;
+            }
+
+            // Try to set the value.
+            if g.compare_exchange_weak(current, value, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn policy_weight(&self) -> u32 {
+        self.policy_weight.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_policy_weight(&self, size: u32) {
+        self.policy_weight.store(size, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn expiration_time(&self) -> Option<Instant> {
+        self.expiration_time.instant()
+    }
+
+    pub(crate) fn set_expiration_time(&self, time: Option<Instant>) {
+        if let Some(t) = time {
+            self.expiration_time.set_instant(t);
+        } else {
+            self.expiration_time.clear();
+        }
+    }
+}
+
+#[cfg(feature = "unstable-debug-counters")]
+impl<K> Drop for EntryInfo<K> {
+    fn drop(&mut self) {
+        super::debug_counters::InternalGlobalDebugCounters::entry_info_dropped();
+    }
+}
+
+impl<K> AccessTime for EntryInfo<K> {
+    #[inline]
+    fn last_accessed(&self) -> Option<Instant> {
+        self.last_accessed.instant()
+    }
+
+    #[inline]
+    fn set_last_accessed(&self, timestamp: Instant) {
+        self.last_accessed.set_instant(timestamp);
+    }
+
+    #[inline]
+    fn last_modified(&self) -> Option<Instant> {
+        self.last_modified.instant()
+    }
+
+    #[inline]
+    fn set_last_modified(&self, timestamp: Instant) {
+        self.last_modified.set_instant(timestamp);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::EntryInfo;
+
+    // Run with:
+    //   RUSTFLAGS='--cfg rustver' cargo test --lib --features sync -- common::concurrent::entry_info::test --nocapture
+    //   RUSTFLAGS='--cfg rustver' cargo test --lib --no-default-features --features sync -- common::concurrent::entry_info::test --nocapture
+    //
+    // Note: the size of the struct may change in a future version of Rust.
+    #[cfg_attr(
+        not(all(rustver, any(target_os = "linux", target_os = "macos"))),
+        ignore
+    )]
+    #[test]
+    fn check_struct_size() {
+        use std::mem::size_of;
+
+        #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+        enum TargetArch {
+            Linux64,
+            Linux32X86,
+            Linux32Arm,
+            Linux32Mips,
+            MacOS64,
+        }
+
+        use TargetArch::*;
+
+        #[allow(clippy::option_env_unwrap)]
+        // e.g. "1.64"
+        let ver =
+            option_env!("RUSTC_SEMVER").expect("RUSTC_SEMVER env var was not set at compile time");
+        let arch = if cfg!(target_os = "linux") {
+            if cfg!(target_pointer_width = "64") {
+                Linux64
+            } else if cfg!(target_pointer_width = "32") {
+                if cfg!(target_arch = "x86") {
+                    Linux32X86
+                } else if cfg!(target_arch = "arm") {
+                    Linux32Arm
+                } else if cfg!(target_arch = "mips") {
+                    Linux32Mips
+                } else {
+                    unimplemented!();
+                }
+            } else {
+                unimplemented!();
+            }
+        } else if cfg!(target_os = "macos") {
+            MacOS64
+        } else {
+            panic!("Unsupported target architecture");
+        };
+
+        let expected_sizes = match arch {
+            Linux64 | Linux32Arm | Linux32Mips => vec![("1.51", 56)],
+            Linux32X86 => vec![("1.51", 48)],
+            MacOS64 => vec![("1.62", 56)],
+        };
+
+        let mut expected = None;
+        for (ver_str, size) in expected_sizes {
+            expected = Some(size);
+            if ver >= ver_str {
+                break;
+            }
+        }
+
+        if let Some(size) = expected {
+            assert_eq!(size_of::<EntryInfo<()>>(), size);
+        } else {
+            panic!("No expected size for {arch:?} with Rust version {ver}");
+        }
+    }
+}
+// License and Copyright Notice:
+//
+// Some of the code and doc comments in this module were copied from
+// `std::collections::LinkedList` in the Rust standard library.
+// https://github.com/rust-lang/rust/blob/master/src/liballoc/collections/linked_list.rs
+//
+// The original code/comments from LinkedList are dual-licensed under
+// the Apache License, Version 2.0 <https://github.com/rust-lang/rust/blob/master/LICENSE-APACHE>
+// or the MIT license <https://github.com/rust-lang/rust/blob/master/LICENSE-MIT>
+//
+// Copyrights of the original code/comments are retained by their contributors.
+// For full authorship information, see the version control history of
+// https://github.com/rust-lang/rust/ or https://thanks.rust-lang.org
+
+use std::{marker::PhantomData, ptr::NonNull};
+
+use super::CacheRegion;
+
+#[cfg(feature = "unstable-debug-counters")]
+use crate::common::concurrent::debug_counters;
+
+// `crate::{sync,unsync}::DeqNodes` uses a `tagptr::TagNonNull<DeqNode<T>, 2>`
+// pointer. To reserve the space for the 2-bit tag, use 4 bytes as the *minimum*
+// alignment.
+// https://doc.rust-lang.org/reference/type-layout.html#the-alignment-modifiers
+#[repr(align(4))]
+#[derive(PartialEq, Eq)]
+pub(crate) struct DeqNode<T> {
+    next: Option<NonNull<DeqNode<T>>>,
+    prev: Option<NonNull<DeqNode<T>>>,
+    pub(crate) element: T,
+}
+
+impl<T> std::fmt::Debug for DeqNode<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeqNode")
+            .field("next", &self.next)
+            .field("prev", &self.prev)
+            .finish()
+    }
+}
+
+impl<T> DeqNode<T> {
+    pub(crate) fn new(element: T) -> Self {
+        #[cfg(feature = "unstable-debug-counters")]
+        debug_counters::InternalGlobalDebugCounters::deq_node_created();
+
+        Self {
+            next: None,
+            prev: None,
+            element,
+        }
+    }
+
+    pub(crate) fn next_node_ptr(this: NonNull<Self>) -> Option<NonNull<DeqNode<T>>> {
+        unsafe { this.as_ref() }.next
+    }
+}
+
+#[cfg(feature = "unstable-debug-counters")]
+impl<T> Drop for DeqNode<T> {
+    fn drop(&mut self) {
+        debug_counters::InternalGlobalDebugCounters::deq_node_dropped();
+    }
+}
+
+/// Cursor is used to remember the current iterating position.
+enum DeqCursor<T> {
+    Node(NonNull<DeqNode<T>>),
+    Done,
+}
+
+pub(crate) struct Deque<T> {
+    region: CacheRegion,
+    len: usize,
+    head: Option<NonNull<DeqNode<T>>>,
+    tail: Option<NonNull<DeqNode<T>>>,
+    cursor: Option<DeqCursor<T>>,
+    marker: PhantomData<Box<DeqNode<T>>>,
+}
+
+impl<T> Drop for Deque<T> {
+    fn drop(&mut self) {
+        struct DropGuard<'a, T>(&'a mut Deque<T>);
+
+        impl<T> Drop for DropGuard<'_, T> {
+            fn drop(&mut self) {
+                // Continue the same loop we do below. This only runs when a destructor has
+                // panicked. If another one panics this will abort.
+                while self.0.pop_front().is_some() {}
+            }
+        }
+
+        while let Some(node) = self.pop_front() {
+            let guard = DropGuard(self);
+            drop(node);
+            std::mem::forget(guard);
+        }
+    }
+}
+
+// Inner crate public function/methods
+impl<T> Deque<T> {
+    pub(crate) fn new(region: CacheRegion) -> Self {
+        Self {
+            region,
+            len: 0,
+            head: None,
+            tail: None,
+            cursor: None,
+            marker: PhantomData,
+        }
+    }
+
+    pub(crate) fn region(&self) -> CacheRegion {
+        self.region
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn contains(&self, node: &DeqNode<T>) -> bool {
+        node.prev.is_some() || self.is_head(node)
+    }
+
+    pub(crate) fn peek_front(&self) -> Option<&DeqNode<T>> {
+        self.head.as_ref().map(|node| unsafe { node.as_ref() })
+    }
+
+    pub(crate) fn peek_front_ptr(&self) -> Option<NonNull<DeqNode<T>>> {
+        self.head.as_ref().copied()
+    }
+
+    /// Removes and returns the node at the front of the list.
+    pub(crate) fn pop_front(&mut self) -> Option<Box<DeqNode<T>>> {
+        // This method takes care not to create mutable references to whole nodes,
+        // to maintain validity of aliasing pointers into `element`.
+        self.head.map(|node| unsafe {
+            if self.is_at_cursor(node.as_ref()) {
+                self.advance_cursor();
+            }
+
+            let mut node = Box::from_raw(node.as_ptr());
+            self.head = node.next;
+
+            match self.head {
+                None => self.tail = None,
+                // Not creating new mutable (unique!) references overlapping `element`.
+                Some(head) => (*head.as_ptr()).prev = None,
+            }
+
+            self.len -= 1;
+
+            node.prev = None;
+            node.next = None;
+            node
+        })
+    }
+
+    pub(crate) fn peek_back(&self) -> Option<&DeqNode<T>> {
+        self.tail.as_ref().map(|node| unsafe { node.as_ref() })
+    }
+
+    /// Adds the given node to the back of the list.
+    pub(crate) fn push_back(&mut self, mut node: Box<DeqNode<T>>) -> NonNull<DeqNode<T>> {
+        // This method takes care not to create mutable references to whole nodes,
+        // to maintain validity of aliasing pointers into `element`.
+        unsafe {
+            node.next = None;
+            node.prev = self.tail;
+            let node = NonNull::new(Box::into_raw(node)).expect("Got a null ptr");
+
+            match self.tail {
+                None => self.head = Some(node),
+                // Not creating new mutable (unique!) references overlapping `element`.
+                Some(tail) => (*tail.as_ptr()).next = Some(node),
+            }
+
+            self.tail = Some(node);
+            self.len += 1;
+            node
+        }
+    }
+
+    pub(crate) unsafe fn move_to_back(&mut self, mut node: NonNull<DeqNode<T>>) {
+        if self.is_tail(node.as_ref()) {
+            // Already at the tail. Nothing to do.
+            return;
+        }
+
+        if self.is_at_cursor(node.as_ref()) {
+            self.advance_cursor();
+        }
+
+        let node = node.as_mut(); // this one is ours now, we can create an &mut.
+
+        // Not creating new mutable (unique!) references overlapping `element`.
+        match node.prev {
+            Some(prev) if node.next.is_some() => (*prev.as_ptr()).next = node.next,
+            Some(..) => (),
+            // This node is the head node.
+            None => self.head = node.next,
+        };
+
+        // This node is not the tail node.
+        if let Some(next) = node.next.take() {
+            (*next.as_ptr()).prev = node.prev;
+
+            let mut node = NonNull::from(node);
+            match self.tail {
+                // Not creating new mutable (unique!) references overlapping `element`.
+                Some(tail) => {
+                    node.as_mut().prev = Some(tail);
+                    (*tail.as_ptr()).next = Some(node);
+                }
+                None => unreachable!(),
+            }
+            self.tail = Some(node);
+        }
+    }
+
+    pub(crate) fn move_front_to_back(&mut self) {
+        if let Some(node) = self.head {
+            unsafe { self.move_to_back(node) };
+        }
+    }
+
+    /// Unlinks the specified node from the current list.
+    ///
+    /// This method takes care not to create mutable references to `element`, to
+    /// maintain validity of aliasing pointers.
+    ///
+    /// IMPORTANT: This method does not drop the node. If the node is no longer
+    /// needed, use `unlink_and_drop` instead, or drop it at the caller side.
+    /// Otherwise, the node will leak.
+    pub(crate) unsafe fn unlink(&mut self, mut node: NonNull<DeqNode<T>>) {
+        if self.is_at_cursor(node.as_ref()) {
+            self.advance_cursor();
+        }
+
+        let node = node.as_mut(); // this one is ours now, we can create an &mut.
+
+        // Not creating new mutable (unique!) references overlapping `element`.
+        match node.prev {
+            Some(prev) => (*prev.as_ptr()).next = node.next,
+            // this node is the head node
+            None => self.head = node.next,
+        };
+
+        match node.next {
+            Some(next) => (*next.as_ptr()).prev = node.prev,
+            // this node is the tail node
+            None => self.tail = node.prev,
+        };
+
+        node.prev = None;
+        node.next = None;
+
+        self.len -= 1;
+    }
+
+    /// Unlinks the specified node from the current list, and then drop the node.
+    ///
+    /// This method takes care not to create mutable references to `element`, to
+    /// maintain validity of aliasing pointers.
+    ///
+    /// Panics:
+    pub(crate) unsafe fn unlink_and_drop(&mut self, node: NonNull<DeqNode<T>>) {
+        self.unlink(node);
+        std::mem::drop(Box::from_raw(node.as_ptr()));
+    }
+
+    pub(crate) fn reset_cursor(&mut self) {
+        self.cursor = None;
+    }
+}
+
+impl<'a, T> Iterator for &'a mut Deque<T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor.is_none() {
+            if let Some(head) = self.head {
+                self.cursor = Some(DeqCursor::Node(head));
+            }
+        }
+        let elem = if let Some(DeqCursor::Node(node)) = self.cursor {
+            unsafe { Some(&(*node.as_ptr()).element) }
+        } else {
+            None
+        };
+        self.advance_cursor();
+        elem
+    }
+}
+
+// Private function/methods
+impl<T> Deque<T> {
+    fn is_head(&self, node: &DeqNode<T>) -> bool {
+        if let Some(head) = self.head {
+            std::ptr::eq(unsafe { head.as_ref() }, node)
+        } else {
+            false
+        }
+    }
+
+    fn is_tail(&self, node: &DeqNode<T>) -> bool {
+        if let Some(tail) = self.tail {
+            std::ptr::eq(unsafe { tail.as_ref() }, node)
+        } else {
+            false
+        }
+    }
+
+    fn is_at_cursor(&self, node: &DeqNode<T>) -> bool {
+        if let Some(DeqCursor::Node(cur_node)) = self.cursor {
+            std::ptr::eq(unsafe { cur_node.as_ref() }, node)
+        } else {
+            false
+        }
+    }
+
+    fn advance_cursor(&mut self) {
+        match self.cursor.take() {
+            None => (),
+            Some(DeqCursor::Node(node)) => unsafe {
+                if let Some(next) = (*node.as_ptr()).next {
+                    self.cursor = Some(DeqCursor::Node(next));
+                } else {
+                    self.cursor = Some(DeqCursor::Done);
+                }
+            },
+            Some(DeqCursor::Done) => {
+                self.cursor = None;
+            }
+        }
+    }
+}
+

@@ -15,6 +15,16 @@ exact_sign_flip = original.exact_sign_flip
 ARMS = ("with-skill", "baseline")
 
 
+def harm_values(quality, dimension):
+    normalized, raw = {}, {}
+    for row in quality:
+        items = [g["harm"][dimension] for g in row["grades"]]
+        if all(item["applicable"] and item["score"] is not None for item in items):
+            normalized[row["run"]] = sum(item["score"] / item["max"] for item in items) / 2
+            raw[row["run"]] = [{"score": item["score"], "max": item["max"]} for item in items]
+    return normalized, raw
+
+
 def compare(per_run, runs, stage):
     """Never fill absent scores with zero or compare incomplete replicate cells."""
     runs = [r for r in runs if r["role"] in {"audit", "treatment"}]
@@ -117,15 +127,13 @@ def main():
               "mean_grader_gap":
               sum(q["grader_gap"] for q in quality) / len(quality) if quality else None}
     for dimension in ("error_api", "dependencies", "structure"):
-        values = {}
+        values, raw_values = harm_values(quality, dimension)
         applicable = {q["case"] for q in quality
                       if any(g["harm"][dimension]["applicable"] for g in q["grades"])}
-        for row in quality:
-            items = [g["harm"][dimension] for g in row["grades"]]
-            if all(item["applicable"] for item in items):
-                values[row["run"]] = sum(item["score"] for item in items) / 2
         chosen = [r for r in runs if r["project"] in applicable]
         stage5[f"harm_{dimension}"] = {
+            "scale": "Mean fraction of each rubric's maximum; unknown scores excluded",
+            "raw_grader_points": raw_values,
             "per_run": values, **compare(values, chosen, 5),
             "not_applicable_cases": sorted({q["case"] for q in quality} - applicable),
         }

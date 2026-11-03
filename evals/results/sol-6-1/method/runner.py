@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -22,6 +23,10 @@ from source_skills import require_sole_skill
 
 MODEL = "gpt-6.1-sol"
 EFFORT = "high"
+LOGGER = logging.getLogger(__name__)
+# Completed JSON events contain escaped tool output and can exceed readline's
+# 64 KiB default even though the model-facing command output is capped at 60K.
+EVENT_LINE_LIMIT = 8 * 1024 * 1024
 CONFIG = f'''
 model = "{MODEL}"
 model_reasoning_effort = "{EFFORT}"
@@ -151,7 +156,7 @@ async def run_agent(args):
     process = await asyncio.create_subprocess_exec(
         args.codex, "app-server", "--strict-config", "--listen", "stdio://",
         cwd=profile, env=environment, stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE, stderr=stderr,
+        stdout=asyncio.subprocess.PIPE, stderr=stderr, limit=EVENT_LINE_LIMIT,
     )
     started = None
     metadata = {
@@ -161,6 +166,7 @@ async def run_agent(args):
         "skill_location": args.skill, "command_timeouts": [], "unexpected_requests": [],
         "tool_transport": "dynamic sandbox_exec -> sb run", "host_environment": False,
         "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "event_line_limit_bytes": EVENT_LINE_LIMIT,
     }
     waits = private / "waits.txt"
     command_index = 0
@@ -321,9 +327,15 @@ async def run_agent(args):
                 metadata.update(status=turn["status"], error=turn.get("error"))
                 break
             snapshot()
+    except Exception as error:
+        LOGGER.exception("Agent harness failed")
+        metadata.update(status="failed_harness", error={
+            "codexErrorInfo": "harnessError", "exception": type(error).__name__,
+            "message": str(error),
+        })
+    finally:
         (private / "report.md").write_text("\n\n".join(final))
         metadata["report_collected"] = bool(final)
-    finally:
         snapshot()
         process.stdin.close()
         try:

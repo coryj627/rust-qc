@@ -87,7 +87,9 @@ Final message: one JSON object per candidate, no Markdown fences, with this shap
   "limits":[]}}
 Use the rubric's actual criterion IDs/weights and harm scale rather than the
 illustrative values above. For not-applicable harm set score/max null and
-applicable false. For quality_total use awarded lower-bound points if unresolved
+applicable false. For applicable but unknown harm use score null, the actual
+rubric maximum, applicable true, and explain the unresolved evidence in limits.
+For quality_total use awarded lower-bound points if unresolved
 checks require a nontrivial quality_interval, and state precisely what is unknown.
 """
         (scratch / "prompts" / f"{run_id}.txt").write_text(prompt)

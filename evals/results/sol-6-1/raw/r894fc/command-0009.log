@@ -1,0 +1,1107 @@
+    #[inline]
+    pub(crate) fn hash<Q>(&self, key: &Q) -> u64
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        self.inner.hash(key)
+    }
+
+    pub(crate) fn contains_key_with_hash<Q>(&self, key: &Q, hash: u64) -> bool
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        // TODO: Maybe we can just call ScanningGet::scanning_get.
+        self.inner
+            .get_key_value_and(key, hash, |k, entry| {
+                let i = &self.inner;
+                let (ttl, tti, va) = (&i.time_to_live(), &i.time_to_idle(), &i.valid_after());
+                let now = self.current_time();
+
+                !is_expired_by_per_entry_ttl(entry.entry_info(), now)
+                    && !is_expired_entry_wo(ttl, va, entry, now)
+                    && !is_expired_entry_ao(tti, va, entry, now)
+                    && !i.is_invalidated_entry(k, entry)
+            })
+            .unwrap_or_default() // `false` is the default for `bool` type.
+    }
+
+    pub(crate) fn get_with_hash<Q>(&self, key: &Q, hash: u64, need_key: bool) -> Option<Entry<K, V>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        // Define a closure to record a read op.
+        let record = |op, now| {
+            self.record_read_op(op, now)
+                .expect("Failed to record a get op");
+        };
+        let ignore_if = None as Option<&mut fn(&V) -> bool>;
+        self.do_get_with_hash(key, hash, record, ignore_if, need_key)
+    }
+
+    pub(crate) fn get_with_hash_and_ignore_if<Q, I>(
+        &self,
+        key: &Q,
+        hash: u64,
+        ignore_if: Option<&mut I>,
+        need_key: bool,
+    ) -> Option<Entry<K, V>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+        I: FnMut(&V) -> bool,
+    {
+        // Define a closure to record a read op.
+        let record = |op, now| {
+            self.record_read_op(op, now)
+                .expect("Failed to record a get op");
+        };
+        self.do_get_with_hash(key, hash, record, ignore_if, need_key)
+    }
+
+    pub(crate) fn get_with_hash_without_recording<Q, I>(
+        &self,
+        key: &Q,
+        hash: u64,
+        ignore_if: Option<&mut I>,
+    ) -> Option<V>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+        I: FnMut(&V) -> bool,
+    {
+        // Define a closure that skips to record a read op.
+        let record = |_op, _now| {};
+        self.do_get_with_hash(key, hash, record, ignore_if, false)
+            .map(Entry::into_value)
+    }
+
+    fn do_get_with_hash<Q, R, I>(
+        &self,
+        key: &Q,
+        hash: u64,
+        read_recorder: R,
+        mut ignore_if: Option<&mut I>,
+        need_key: bool,
+    ) -> Option<Entry<K, V>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+        R: Fn(ReadOp<K, V>, Instant),
+        I: FnMut(&V) -> bool,
+    {
+        if self.is_map_disabled() {
+            return None;
+        }
+
+        let mut now = self.current_time();
+
+        let maybe_entry = self
+            .inner
+            .get_key_value_and_then(key, hash, move |k, entry| {
+                if let Some(ignore_if) = &mut ignore_if {
+                    if ignore_if(&entry.value) {
+                        // Ignore the entry.
+                        return None;
+                    }
+                }
+
+                let i = &self.inner;
+                let (ttl, tti, va) = (&i.time_to_live(), &i.time_to_idle(), &i.valid_after());
+
+                if is_expired_by_per_entry_ttl(entry.entry_info(), now)
+                    || is_expired_entry_wo(ttl, va, entry, now)
+                    || is_expired_entry_ao(tti, va, entry, now)
+                    || i.is_invalidated_entry(k, entry)
+                {
+                    // Expired or invalidated entry.
+                    None
+                } else {
+                    // Valid entry.
+                    let maybe_key = if need_key { Some(Arc::clone(k)) } else { None };
+                    Some((maybe_key, MiniArc::clone(entry)))
+                }
+            });
+
+        if let Some((maybe_key, entry)) = maybe_entry {
+            let mut is_expiry_modified = false;
+
+            // Call the user supplied `expire_after_read` method if any.
+            if let Some(expiry) = &self.inner.expiration_policy.expiry() {
+                let lm = entry.last_modified().expect("Last modified is not set");
+                // Check if the `last_modified` of entry is earlier than or equals to
+                // `now`. If not, update the `now` to `last_modified`. This is needed
+                // because there is a small chance that other threads have inserted
+                // the entry _after_ we obtained `now`.
+                now = now.max(lm);
+
+                // Convert `last_modified` from `moka::common::time::Instant` to
+                // `std::time::Instant`.
+                let lm = self.inner.clock().to_std_instant(lm);
+
+                // Call the user supplied `expire_after_read` method.
+                //
+                // We will put the return value (`is_expiry_modified: bool`) to a
+                // `ReadOp` so that `apply_reads` method can determine whether or not
+                // to reschedule the timer for the entry.
+                //
+                // NOTE: It is not guaranteed that the `ReadOp` is passed to
+                // `apply_reads`. Here are the corner cases that the `ReadOp` will
+                // not be passed to `apply_reads`:
+                //
+                // - If the bounded `read_op_ch` channel is full, the `ReadOp` will
+                //   be discarded.
+                // - If we were called by `get_with_hash_without_recording` method,
+                //   the `ReadOp` will not be recorded at all.
+                //
+                // These cases are okay because when the timer wheel tries to expire
+                // the entry, it will check if the entry is actually expired. If not,
+                // the timer wheel will reschedule the expiration timer for the
+                // entry.
+                is_expiry_modified = Self::expire_after_read_or_update(
+                    |k, v, t, d| expiry.expire_after_read(k, v, t, d, lm),
+                    &entry.entry_info().key_hash().key,
+                    &entry,
+                    self.inner.expiration_policy.time_to_live(),
+                    self.inner.expiration_policy.time_to_idle(),
+                    now,
+                    self.inner.clock(),
+                );
+            }
+
+            entry.set_last_accessed(now);
+
+            let v = entry.value.clone();
+            let op = ReadOp::Hit {
+                value_entry: entry,
+                is_expiry_modified,
+            };
+            read_recorder(op, now);
+            Some(Entry::new(maybe_key, v, false, false))
+        } else {
+            read_recorder(ReadOp::Miss(hash), now);
+            None
+        }
+    }
+
+    pub(crate) fn get_key_with_hash<Q>(&self, key: &Q, hash: u64) -> Option<Arc<K>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        self.inner
+            .get_key_value_and(key, hash, |k, _entry| Arc::clone(k))
+    }
+
+    #[inline]
+    pub(crate) fn remove_entry<Q>(&self, key: &Q, hash: u64) -> Option<KvEntry<K, V>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        self.inner.remove_entry(key, hash)
+    }
+
+    #[inline]
+    pub(crate) fn apply_reads_writes_if_needed(
+        inner: &impl InnerSync,
+        ch: &Sender<WriteOp<K, V>>,
+        now: Instant,
+        housekeeper: Option<&HouseKeeperArc>,
+    ) {
+        let w_len = ch.len();
+
+        if let Some(hk) = housekeeper {
+            if Self::should_apply_writes(hk, w_len, now) {
+                hk.try_run_pending_tasks(inner);
+            }
+        }
+    }
+
+    pub(crate) fn invalidate_all(&self) {
+        let now = self.current_time();
+        self.inner.set_valid_after(now);
+    }
+
+    pub(crate) fn invalidate_entries_if(
+        &self,
+        predicate: PredicateFun<K, V>,
+    ) -> Result<PredicateId, PredicateError> {
+        let now = self.current_time();
+        self.inner.register_invalidation_predicate(predicate, now)
+    }
+}
+
+//
+// Iterator support
+//
+impl<K, V, S> ScanningGet<K, V> for BaseCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn num_cht_segments(&self) -> usize {
+        self.inner.num_cht_segments()
+    }
+
+    fn scanning_get(&self, key: &Arc<K>) -> Option<V> {
+        let hash = self.hash(&**key);
+        self.inner.get_key_value_and_then(&**key, hash, |k, entry| {
+            let i = &self.inner;
+            let (ttl, tti, va) = (&i.time_to_live(), &i.time_to_idle(), &i.valid_after());
+            let now = self.current_time();
+
+            if is_expired_by_per_entry_ttl(entry.entry_info(), now)
+                || is_expired_entry_wo(ttl, va, entry, now)
+                || is_expired_entry_ao(tti, va, entry, now)
+                || i.is_invalidated_entry(k, entry)
+            {
+                // Expired or invalidated entry.
+                None
+            } else {
+                // Valid entry.
+                Some(entry.value.clone())
+            }
+        })
+    }
+
+    fn keys(&self, cht_segment: usize) -> Option<Vec<Arc<K>>> {
+        self.inner.keys(cht_segment)
+    }
+}
+
+//
+// private methods
+//
+impl<K, V, S> BaseCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    #[inline]
+    fn record_read_op(
+        &self,
+        op: ReadOp<K, V>,
+        now: Instant,
+    ) -> Result<(), TrySendError<ReadOp<K, V>>> {
+        self.apply_reads_if_needed(&self.inner, now);
+        let ch = &self.read_op_ch;
+        match ch.try_send(op) {
+            // Discard the ReadOp when the channel is full.
+            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+            Err(e @ TrySendError::Disconnected(_)) => Err(e),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn do_insert_with_hash(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        value: V,
+    ) -> (WriteOp<K, V>, Instant) {
+        let weight = self.inner.weigh(&key, &value);
+        let op_cnt1 = Rc::new(AtomicU8::new(0));
+        let op_cnt2 = Rc::clone(&op_cnt1);
+        let mut op1 = None;
+        let mut op2 = None;
+
+        // Lock the key for update if blocking removal notification is enabled.
+        let kl = self.maybe_key_lock(&key);
+        let _klg = &kl.as_ref().map(|kl| kl.lock());
+
+        let ts = self.current_time();
+
+        // TODO: Instead using Arc<AtomicU8> to check if the actual operation was
+        // insert or update, check the return value of insert_with_or_modify. If it
+        // is_some, the value was updated, otherwise the value was inserted.
+
+        // Since the cache (cht::SegmentedHashMap) employs optimistic locking
+        // strategy, insert_with_or_modify() may get an insert/modify operation
+        // conflicted with other concurrent hash table operations. In that case, it
+        // has to retry the insertion or modification, so on_insert and/or on_modify
+        // closures can be executed more than once. In order to identify the last
+        // call of these closures, we use a shared counter (op_cnt{1,2}) here to
+        // record a serial number on a WriteOp, and consider the WriteOp with the
+        // largest serial number is the one made by the last call of the closures.
+        self.inner.cache.insert_with_or_modify(
+            Arc::clone(&key),
+            hash,
+            // on_insert
+            || {
+                let (entry, gen) = self.new_value_entry(&key, hash, value.clone(), ts, weight);
+                let ins_op = WriteOp::new_upsert(&key, hash, &entry, gen, 0, weight);
+                let cnt = op_cnt1.fetch_add(1, Ordering::Relaxed);
+                op1 = Some((cnt, ins_op));
+                entry
+            },
+            // on_modify
+            |_k, old_entry| {
+                let old_weight = old_entry.policy_weight();
+
+                // Create this OldEntryInfo _before_ creating a new ValueEntry, so
+                // that the OldEntryInfo can preserve the old EntryInfo's
+                // last_accessed and last_modified timestamps.
+                let old_info = OldEntryInfo::new(old_entry);
+                let (entry, gen) = self.new_value_entry_from(value.clone(), ts, weight, old_entry);
+                let upd_op = WriteOp::new_upsert(&key, hash, &entry, gen, old_weight, weight);
+                let cnt = op_cnt2.fetch_add(1, Ordering::Relaxed);
+                op2 = Some((cnt, old_info, upd_op));
+                entry
+            },
+        );
+
+        match (op1, op2) {
+            (Some((_cnt, ins_op)), None) => self.do_post_insert_steps(ts, &key, ins_op),
+            (Some((cnt1, ins_op)), Some((cnt2, ..))) if cnt1 > cnt2 => {
+                self.do_post_insert_steps(ts, &key, ins_op)
+            }
+            (_, Some((_cnt, old_info, upd_op))) => {
+                self.do_post_update_steps(ts, key, old_info, upd_op)
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+
+    fn do_post_insert_steps(
+        &self,
+        ts: Instant,
+        key: &Arc<K>,
+        ins_op: WriteOp<K, V>,
+    ) -> (WriteOp<K, V>, Instant) {
+        if let (Some(expiry), WriteOp::Upsert { value_entry, .. }) =
+            (&self.inner.expiration_policy.expiry(), &ins_op)
+        {
+            Self::expire_after_create(expiry, key, value_entry, ts, self.inner.clock());
+        }
+        (ins_op, ts)
+    }
+
+    fn do_post_update_steps(
+        &self,
+        ts: Instant,
+        key: Arc<K>,
+        old_info: OldEntryInfo<K, V>,
+        upd_op: WriteOp<K, V>,
+    ) -> (WriteOp<K, V>, Instant) {
+        if let (Some(expiry), WriteOp::Upsert { value_entry, .. }) =
+            (&self.inner.expiration_policy.expiry(), &upd_op)
+        {
+            Self::expire_after_read_or_update(
+                |k, v, t, d| expiry.expire_after_update(k, v, t, d),
+                &key,
+                value_entry,
+                self.inner.expiration_policy.time_to_live(),
+                self.inner.expiration_policy.time_to_idle(),
+                ts,
+                self.inner.clock(),
+            );
+        }
+
+        if self.is_removal_notifier_enabled() {
+            self.inner.notify_upsert(
+                key,
+                &old_info.entry,
+                old_info.last_accessed,
+                old_info.last_modified,
+            );
+        }
+        crossbeam_epoch::pin().flush();
+        (upd_op, ts)
+    }
+
+    #[inline]
+    fn apply_reads_if_needed(&self, inner: &Inner<K, V, S>, now: Instant) {
+        let len = self.read_op_ch.len();
+
+        if let Some(hk) = &self.housekeeper {
+            if Self::should_apply_reads(hk, len, now) {
+                hk.try_run_pending_tasks(inner);
+            }
+        }
+    }
+
+    #[inline]
+    fn should_apply_reads(hk: &HouseKeeperArc, ch_len: usize, now: Instant) -> bool {
+        hk.should_apply_reads(ch_len, now)
+    }
+
+    #[inline]
+    fn should_apply_writes(hk: &HouseKeeperArc, ch_len: usize, now: Instant) -> bool {
+        hk.should_apply_writes(ch_len, now)
+    }
+}
+
+impl<K, V, S> BaseCache<K, V, S> {
+    #[inline]
+    fn new_value_entry(
+        &self,
+        key: &Arc<K>,
+        hash: u64,
+        value: V,
+        timestamp: Instant,
+        policy_weight: u32,
+    ) -> (MiniArc<ValueEntry<K, V>>, u16) {
+        let key_hash = KeyHash::new(Arc::clone(key), hash);
+        let info = MiniArc::new(EntryInfo::new(key_hash, timestamp, policy_weight));
+        let gen: u16 = info.entry_gen();
+        (MiniArc::new(ValueEntry::new(value, info)), gen)
+    }
+
+    #[inline]
+    fn new_value_entry_from(
+        &self,
+        value: V,
+        timestamp: Instant,
+        policy_weight: u32,
+        other: &ValueEntry<K, V>,
+    ) -> (MiniArc<ValueEntry<K, V>>, u16) {
+        let info = MiniArc::clone(other.entry_info());
+        // To prevent this updated ValueEntry from being evicted by an expiration
+        // policy, increment the entry generation.
+        let gen = info.incr_entry_gen();
+        info.set_last_accessed(timestamp);
+        info.set_last_modified(timestamp);
+        info.set_policy_weight(policy_weight);
+        (MiniArc::new(ValueEntry::new_from(value, info, other)), gen)
+    }
+
+    fn expire_after_create(
+        expiry: &Arc<dyn Expiry<K, V> + Send + Sync + 'static>,
+        key: &K,
+        value_entry: &ValueEntry<K, V>,
+        ts: Instant,
+        clock: &Clock,
+    ) {
+        let duration =
+            expiry.expire_after_create(key, &value_entry.value, clock.to_std_instant(ts));
+        let expiration_time = duration.map(|duration| ts.saturating_add(duration));
+        value_entry
+            .entry_info()
+            .set_expiration_time(expiration_time);
+    }
+
+    fn expire_after_read_or_update(
+        expiry: impl FnOnce(&K, &V, StdInstant, Option<Duration>) -> Option<Duration>,
+        key: &K,
+        value_entry: &ValueEntry<K, V>,
+        ttl: Option<Duration>,
+        tti: Option<Duration>,
+        ts: Instant,
+        clock: &Clock,
+    ) -> bool {
+        let current_time = clock.to_std_instant(ts);
+        let ei = &value_entry.entry_info();
+
+        let exp_time = IntoIterator::into_iter([
+            ei.expiration_time(),
+            ttl.and_then(|dur| ei.last_modified().map(|ts| ts.saturating_add(dur))),
+            tti.and_then(|dur| ei.last_accessed().map(|ts| ts.saturating_add(dur))),
+        ])
+        .flatten()
+        .min();
+
+        let current_duration = exp_time.and_then(|time| {
+            let std_time = clock.to_std_instant(time);
+            std_time.checked_duration_since(current_time)
+        });
+
+        let duration = expiry(key, &value_entry.value, current_time, current_duration);
+
+        if duration != current_duration {
+            let expiration_time = duration.map(|duration| ts.saturating_add(duration));
+            value_entry
+                .entry_info()
+                .set_expiration_time(expiration_time);
+            // The `expiration_time` has changed from `None` to `Some` or vice versa.
+            true
+        } else {
+            false
+        }
+    }
+}
+
+//
+// for testing
+//
+#[cfg(test)]
+impl<K, V, S> BaseCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn invalidation_predicate_count(&self) -> usize {
+        self.inner.invalidation_predicate_count()
+use async_lock::{RwLock, RwLockWriteGuard};
+use futures_util::FutureExt;
+use std::{
+    any::{Any, TypeId},
+    fmt,
+    future::Future,
+    hash::{BuildHasher, Hash},
+    pin::Pin,
+    sync::Arc,
+};
+
+use crate::{
+    common::concurrent::arc::MiniArc,
+    ops::compute::{CompResult, Op},
+    Entry,
+};
+
+use super::{Cache, ComputeNone, OptionallyNone};
+
+const WAITER_MAP_NUM_SEGMENTS: usize = 64;
+
+type ErrorObject = Arc<dyn Any + Send + Sync + 'static>;
+
+pub(crate) enum InitResult<V, E> {
+    Initialized(V),
+    ReadExisting(V),
+    InitErr(Arc<E>),
+}
+
+enum WaiterValue<V> {
+    Computing,
+    Ready(Result<V, ErrorObject>),
+    ReadyNone,
+    // https://github.com/moka-rs/moka/issues/43
+    InitFuturePanicked,
+    // https://github.com/moka-rs/moka/issues/59
+    EnclosingFutureAborted,
+}
+
+impl<V> fmt::Debug for WaiterValue<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WaiterValue::Computing => write!(f, "Computing"),
+            WaiterValue::Ready(_) => write!(f, "Ready"),
+            WaiterValue::ReadyNone => write!(f, "ReadyNone"),
+            WaiterValue::InitFuturePanicked => write!(f, "InitFuturePanicked"),
+            WaiterValue::EnclosingFutureAborted => write!(f, "EnclosingFutureAborted"),
+        }
+    }
+}
+
+type Waiter<V> = MiniArc<RwLock<WaiterValue<V>>>;
+type WaiterMap<K, V, S> = crate::cht::SegmentedHashMap<(Arc<K>, TypeId), Waiter<V>, S>;
+
+struct WaiterGuard<'a, K, V, S>
+// NOTE: We usually do not attach trait bounds to here at the struct definition, but
+// the Drop trait requires these bounds here.
+where
+    K: Eq + Hash,
+    V: Clone,
+    S: BuildHasher,
+{
+    w_key: Option<(Arc<K>, TypeId)>,
+    w_hash: u64,
+    waiters: &'a WaiterMap<K, V, S>,
+    write_lock: RwLockWriteGuard<'a, WaiterValue<V>>,
+}
+
+impl<'a, K, V, S> WaiterGuard<'a, K, V, S>
+where
+    K: Eq + Hash,
+    V: Clone,
+    S: BuildHasher,
+{
+    fn new(
+        w_key: (Arc<K>, TypeId),
+        w_hash: u64,
+        waiters: &'a WaiterMap<K, V, S>,
+        write_lock: RwLockWriteGuard<'a, WaiterValue<V>>,
+    ) -> Self {
+        Self {
+            w_key: Some(w_key),
+            w_hash,
+            waiters,
+            write_lock,
+        }
+    }
+
+    fn set_waiter_value(mut self, v: WaiterValue<V>) {
+        *self.write_lock = v;
+        if let Some(w_key) = self.w_key.take() {
+            remove_waiter(self.waiters, w_key, self.w_hash);
+        }
+    }
+}
+
+impl<K, V, S> Drop for WaiterGuard<'_, K, V, S>
+where
+    K: Eq + Hash,
+    V: Clone,
+    S: BuildHasher,
+{
+    fn drop(&mut self) {
+        if let Some(w_key) = self.w_key.take() {
+            // Value is not set. This means the future containing `*get_with` method
+            // has been aborted. Remove our waiter to prevent the issue described in
+            // https://github.com/moka-rs/moka/issues/59
+            *self.write_lock = WaiterValue::EnclosingFutureAborted;
+            remove_waiter(self.waiters, w_key, self.w_hash);
+        }
+    }
+}
+
+pub(crate) struct ValueInitializer<K, V, S> {
+    // TypeId is the type ID of the concrete error type of generic type E in the
+    // try_get_with method. We use the type ID as a part of the key to ensure that we
+    // can always downcast the trait object ErrorObject (in Waiter<V>) into its
+    // concrete type.
+    waiters: MiniArc<WaiterMap<K, V, S>>,
+}
+
+impl<K, V, S> ValueInitializer<K, V, S>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn with_hasher(hasher: S) -> Self {
+        Self {
+            waiters: MiniArc::new(crate::cht::SegmentedHashMap::with_num_segments_and_hasher(
+                WAITER_MAP_NUM_SEGMENTS,
+                hasher,
+            )),
+        }
+    }
+
+    //
+    // NOTES: We use `Pin<&mut impl Future>` instead of `impl Future` here for the
+    // `init` argument. This is because we want to avoid the future size inflation
+    // caused by calling nested async functions. See the following links for more
+    // details:
+    //
+    // - https://github.com/moka-rs/moka/issues/212
+    // - https://swatinem.de/blog/future-size/
+    //
+
+    /// # Panics
+    /// Panics if the `init` future has been panicked.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn try_init_or_read<I, O, E>(
+use crate::common::{concurrent::arc::MiniArc, deque::DeqNode, time::Instant};
+
+use parking_lot::Mutex;
+use std::{fmt, ptr::NonNull, sync::Arc};
+use tagptr::TagNonNull;
+
+pub(crate) mod arc;
+pub(crate) mod constants;
+pub(crate) mod deques;
+pub(crate) mod entry_info;
+
+#[cfg(feature = "sync")]
+pub(crate) mod housekeeper;
+
+#[cfg(feature = "unstable-debug-counters")]
+pub(crate) mod debug_counters;
+
+use self::entry_info::EntryInfo;
+
+use super::timer_wheel::TimerNode;
+
+pub(crate) type Weigher<K, V> = Arc<dyn Fn(&K, &V) -> u32 + Send + Sync + 'static>;
+
+pub(crate) trait AccessTime {
+    fn last_accessed(&self) -> Option<Instant>;
+    fn set_last_accessed(&self, timestamp: Instant);
+    fn last_modified(&self) -> Option<Instant>;
+    fn set_last_modified(&self, timestamp: Instant);
+}
+
+#[derive(Debug)]
+pub(crate) struct KeyHash<K> {
+    pub(crate) key: Arc<K>,
+    pub(crate) hash: u64,
+}
+
+impl<K> KeyHash<K> {
+    pub(crate) fn new(key: Arc<K>, hash: u64) -> Self {
+        Self { key, hash }
+    }
+}
+
+impl<K> Clone for KeyHash<K> {
+    fn clone(&self) -> Self {
+        Self {
+            key: Arc::clone(&self.key),
+            hash: self.hash,
+        }
+    }
+}
+
+pub(crate) struct KeyHashDate<K> {
+    entry_info: MiniArc<EntryInfo<K>>,
+}
+
+impl<K> KeyHashDate<K> {
+    pub(crate) fn new(entry_info: &MiniArc<EntryInfo<K>>) -> Self {
+        Self {
+            entry_info: MiniArc::clone(entry_info),
+        }
+    }
+
+    pub(crate) fn key(&self) -> &Arc<K> {
+        &self.entry_info.key_hash().key
+    }
+
+    pub(crate) fn hash(&self) -> u64 {
+        self.entry_info.key_hash().hash
+    }
+
+    pub(crate) fn entry_info(&self) -> &EntryInfo<K> {
+        &self.entry_info
+    }
+
+    pub(crate) fn last_modified(&self) -> Option<Instant> {
+        self.entry_info.last_modified()
+    }
+
+    pub(crate) fn last_accessed(&self) -> Option<Instant> {
+        self.entry_info.last_accessed()
+    }
+
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.entry_info.is_dirty()
+    }
+}
+
+pub(crate) struct KvEntry<K, V> {
+    pub(crate) key: Arc<K>,
+    pub(crate) entry: MiniArc<ValueEntry<K, V>>,
+}
+
+impl<K, V> KvEntry<K, V> {
+    pub(crate) fn new(key: Arc<K>, entry: MiniArc<ValueEntry<K, V>>) -> Self {
+        Self { key, entry }
+    }
+}
+
+impl<K, V> Clone for KvEntry<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            key: Arc::clone(&self.key),
+            entry: MiniArc::clone(&self.entry),
+        }
+    }
+}
+
+impl<K> AccessTime for DeqNode<KeyHashDate<K>> {
+    #[inline]
+    fn last_accessed(&self) -> Option<Instant> {
+        self.element.entry_info.last_accessed()
+    }
+
+    #[inline]
+    fn set_last_accessed(&self, timestamp: Instant) {
+        self.element.entry_info.set_last_accessed(timestamp);
+    }
+
+    #[inline]
+    fn last_modified(&self) -> Option<Instant> {
+        self.element.entry_info.last_modified()
+    }
+
+    #[inline]
+    fn set_last_modified(&self, timestamp: Instant) {
+        self.element.entry_info.set_last_modified(timestamp);
+    }
+}
+
+// DeqNode for an access order queue.
+type KeyDeqNodeAo<K> = TagNonNull<DeqNode<KeyHashDate<K>>, 2>;
+
+// DeqNode for the write order queue.
+type KeyDeqNodeWo<K> = NonNull<DeqNode<KeyHashDate<K>>>;
+
+// DeqNode for the timer wheel.
+type DeqNodeTimer<K> = NonNull<DeqNode<TimerNode<K>>>;
+
+pub(crate) struct DeqNodes<K> {
+    access_order_q_node: Option<KeyDeqNodeAo<K>>,
+    write_order_q_node: Option<KeyDeqNodeWo<K>>,
+    timer_node: Option<DeqNodeTimer<K>>,
+}
+
+impl<K> Default for DeqNodes<K> {
+    fn default() -> Self {
+        Self {
+            access_order_q_node: None,
+            write_order_q_node: None,
+            timer_node: None,
+        }
+    }
+}
+
+// We need this `unsafe impl` as DeqNodes have NonNull pointers.
+unsafe impl<K> Send for DeqNodes<K> {}
+
+impl<K> DeqNodes<K> {
+    pub(crate) fn set_timer_node(&mut self, timer_node: Option<DeqNodeTimer<K>>) {
+        self.timer_node = timer_node;
+    }
+}
+
+pub(crate) struct ValueEntry<K, V> {
+    pub(crate) value: V,
+    info: MiniArc<EntryInfo<K>>,
+    nodes: MiniArc<Mutex<DeqNodes<K>>>,
+}
+
+impl<K, V> ValueEntry<K, V> {
+    pub(crate) fn new(value: V, entry_info: MiniArc<EntryInfo<K>>) -> Self {
+        #[cfg(feature = "unstable-debug-counters")]
+        self::debug_counters::InternalGlobalDebugCounters::value_entry_created();
+
+        Self {
+            value,
+            info: entry_info,
+            nodes: MiniArc::new(Mutex::new(DeqNodes::default())),
+        }
+    }
+
+    pub(crate) fn new_from(value: V, entry_info: MiniArc<EntryInfo<K>>, other: &Self) -> Self {
+        #[cfg(feature = "unstable-debug-counters")]
+        self::debug_counters::InternalGlobalDebugCounters::value_entry_created();
+        Self {
+            value,
+            info: entry_info,
+            nodes: MiniArc::clone(&other.nodes),
+        }
+    }
+
+    pub(crate) fn entry_info(&self) -> &MiniArc<EntryInfo<K>> {
+        &self.info
+    }
+
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.info.is_admitted()
+    }
+
+    pub(crate) fn set_admitted(&self, value: bool) {
+        self.info.set_admitted(value);
+    }
+
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.info.is_dirty()
+    }
+
+    #[inline]
+    pub(crate) fn policy_weight(&self) -> u32 {
+        self.info.policy_weight()
+    }
+
+    pub(crate) fn deq_nodes(&self) -> &MiniArc<Mutex<DeqNodes<K>>> {
+        &self.nodes
+    }
+
+    pub(crate) fn access_order_q_node(&self) -> Option<KeyDeqNodeAo<K>> {
+        self.nodes.lock().access_order_q_node
+    }
+
+    pub(crate) fn set_access_order_q_node(&self, node: Option<KeyDeqNodeAo<K>>) {
+        self.nodes.lock().access_order_q_node = node;
+    }
+
+    pub(crate) fn take_access_order_q_node(&self) -> Option<KeyDeqNodeAo<K>> {
+        self.nodes.lock().access_order_q_node.take()
+    }
+
+    pub(crate) fn write_order_q_node(&self) -> Option<KeyDeqNodeWo<K>> {
+        self.nodes.lock().write_order_q_node
+    }
+
+    pub(crate) fn set_write_order_q_node(&self, node: Option<KeyDeqNodeWo<K>>) {
+        self.nodes.lock().write_order_q_node = node;
+    }
+
+    pub(crate) fn take_write_order_q_node(&self) -> Option<KeyDeqNodeWo<K>> {
+        self.nodes.lock().write_order_q_node.take()
+    }
+
+    pub(crate) fn timer_node(&self) -> Option<DeqNodeTimer<K>> {
+        self.nodes.lock().timer_node
+    }
+
+    pub(crate) fn set_timer_node(&self, node: Option<DeqNodeTimer<K>>) {
+        self.nodes.lock().timer_node = node;
+    }
+
+    pub(crate) fn take_timer_node(&self) -> Option<DeqNodeTimer<K>> {
+        self.nodes.lock().timer_node.take()
+    }
+
+    pub(crate) fn unset_q_nodes(&self) {
+        let mut nodes = self.nodes.lock();
+        nodes.access_order_q_node = None;
+        nodes.write_order_q_node = None;
+    }
+}
+
+#[cfg(feature = "unstable-debug-counters")]
+use std::time::{Duration, Instant as StdInstant};
+
+#[cfg(test)]
+use std::sync::Arc;
+
+#[cfg(test)]
+use parking_lot::RwLock;
+
+// This is `moka`'s `Instant` struct.
+use super::Instant;
+
+#[derive(Default, Clone)]
+pub(crate) struct Clock {
+    ty: ClockType,
+}
+
+#[derive(Clone)]
+enum ClockType {
+    /// A clock that uses `std::time::Instant` as the source of time.
+    Standard { origin: StdInstant },
+    #[cfg(feature = "quanta")]
+    /// A clock that uses both `std::time::Instant` and `quanta::Instant` as the
+    /// sources of time.
+    Hybrid {
+        std_origin: StdInstant,
+        quanta_origin: quanta::Instant,
+    },
+    #[cfg(test)]
+    /// A clock that uses a mocked source of time.
+    Mocked { mock: Arc<Mock> },
+}
+
+impl Default for ClockType {
+    /// Create a new `ClockType` with the current time as the origin.
+    ///
+    /// If the `quanta` feature is enabled, `Hybrid` will be used. Otherwise,
+    /// `Standard` will be used.
+    fn default() -> Self {
+        #[cfg(feature = "quanta")]
+        {
+            return ClockType::Hybrid {
+                std_origin: StdInstant::now(),
+                quanta_origin: quanta::Instant::now(),
+            };
+        }
+
+        #[allow(unreachable_code)]
+        ClockType::Standard {
+            origin: StdInstant::now(),
+        }
+    }
+}
+
+impl Clock {
+    #[cfg(test)]
+    /// Creates a new `Clock` with a mocked source of time.
+    pub(crate) fn mock() -> (Clock, Arc<Mock>) {
+        let mock = Arc::new(Mock::default());
+        let clock = Clock {
+            ty: ClockType::Mocked {
+                mock: Arc::clone(&mock),
+            },
+        };
+        (clock, mock)
+    }
+
+    /// Returns the current time using a reliable source of time.
+    ///
+    /// When the type is `Standard` or `Hybrid`, the time is based on
+    /// `std::time::Instant`. When the type is `Mocked`, the time is based on the
+    /// mocked source of time.
+    pub(crate) fn now(&self) -> Instant {
+        match &self.ty {
+            ClockType::Standard { origin } => {
+                Instant::from_duration_since_clock_start(origin.elapsed())
+            }
+            #[cfg(feature = "quanta")]
+            ClockType::Hybrid { std_origin, .. } => {
+                Instant::from_duration_since_clock_start(std_origin.elapsed())
+            }
+            #[cfg(test)]
+            ClockType::Mocked { mock } => Instant::from_duration_since_clock_start(mock.elapsed()),
+        }
+    }
+
+    /// Returns the current time _maybe_ using a fast but less reliable source of
+    /// time. The time may drift from the time returned by `now`, or not be
+    /// monotonically increasing.
+    ///
+    /// This is useful for performance critical code that does not require the same
+    /// level of precision as `now`. (e.g. measuring the time between two events for
+    /// metrics)
+    ///
+    /// When the type is `Standard` or `Mocked`, `now` is internally called. So there
+    /// is no performance benefit.
+    ///
+    /// When the type is `Hybrid`, the time is based on `quanta::Instant`, which can
+    /// be faster than `std::time::Instant`, depending on the CPU architecture.
+    pub(crate) fn fast_now(&self) -> Instant {
+        match &self.ty {
+            #[cfg(feature = "quanta")]
+            ClockType::Hybrid { quanta_origin, .. } => {
+                Instant::from_duration_since_clock_start(quanta_origin.elapsed())
+            }
+            ClockType::Standard { .. } => self.now(),
+            #[cfg(test)]
+            ClockType::Mocked { .. } => self.now(),
+        }
+    }
+
+    /// Converts an `Instant` to a `std::time::Instant`.
+    ///
+    /// **IMPORTANT**: The caller must ensure that the `Instant` was created by this
+    /// `Clock`, otherwise the resulting `std::time::Instant` will be incorrect.
+    pub(crate) fn to_std_instant(&self, instant: Instant) -> StdInstant {
+        match &self.ty {
+            ClockType::Standard { origin } => {
+                let duration = Duration::from_nanos(instant.as_nanos());
+                *origin + duration
+            }
+            #[cfg(feature = "quanta")]
+            ClockType::Hybrid { std_origin, .. } => {
+                let duration = Duration::from_nanos(instant.as_nanos());
+                *std_origin + duration
+            }
+            #[cfg(test)]
+            ClockType::Mocked { mock } => {
+                let duration = Duration::from_nanos(instant.as_nanos());
+                // https://github.com/moka-rs/moka/issues/487
+                //
+                // This `dbg!` will workaround an incorrect compilation by Rust
+                // 1.84.0 for the armv7-unknown-linux-musleabihf target in the
+                // release build of the tests.
+                dbg!(mock.origin + duration)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct Mock {
+    origin: StdInstant,
+    now: RwLock<StdInstant>,
+}
+
+#[cfg(test)]
+impl Default for Mock {
+    fn default() -> Self {
+        let origin = StdInstant::now();
+        Self {
+            origin,
+            now: RwLock::new(origin),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Mock {
+    pub(crate) fn increment(&self, amount: Duration) {
+        *self.now.write() += amount;
+    }
+
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.now.read().duration_since(self.origin)
+    }
+}

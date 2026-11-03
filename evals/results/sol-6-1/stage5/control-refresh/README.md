@@ -1,5 +1,12 @@
 # Native fixed-control validation before treatment
 
+The `just/` refresh below used the original author's oracle. That author was
+subsequently invalidated because another source-bundled skill was readable.
+These deterministic operator logs remain historical evidence, but do not define
+the valid coding case. The replacement `author-just-v2` independently validated
+both upstream regressions and nine neighbors using the native offline builds;
+see `../cases/just/logs/validation-summary.md`.
+
 The independent authors initially had only baseline dependency caches. Their
 blocked native checks and supplemental source checks remain in the case bundles.
 The operator then copied each pinned fixed snapshot into a separate control

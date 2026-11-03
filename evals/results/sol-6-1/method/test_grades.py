@@ -47,6 +47,16 @@ class CollectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "criterion score"):
             quality_sheet([row], {"A": "run-a"})
 
+    def test_unknown_harm_is_preserved_separately_from_not_applicable(self):
+        row = {"candidate": "A", "criteria": [{"id": "all", "score": 12, "max": 12}],
+               "quality_total": 12, "quality_interval": [12, 12],
+               "harm": {"error_api": {"score": None, "max": None, "applicable": False},
+                        "dependencies": {"score": None, "max": 3, "applicable": True},
+                        "structure": {"score": 0, "max": 3, "applicable": True}}}
+        result = quality_sheet([row], {"A": "run-a"})
+        self.assertIsNone(result["A"]["harm"]["dependencies"]["score"])
+        self.assertTrue(result["A"]["harm"]["dependencies"]["applicable"])
+
 
 if __name__ == "__main__":
     unittest.main()

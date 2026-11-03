@@ -1,0 +1,425 @@
+    }
+}
+
+impl fmt::Debug for OpaqueStreamRef {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        use std::sync::TryLockError::*;
+
+        match self.inner.try_lock() {
+            Ok(me) => {
+                let stream = &me.store[self.key];
+                fmt.debug_struct("OpaqueStreamRef")
+                    .field("stream_id", &stream.id)
+                    .field("ref_count", &stream.ref_count)
+                    .finish()
+            }
+            Err(Poisoned(_)) => fmt
+                .debug_struct("OpaqueStreamRef")
+                .field("inner", &"<Poisoned>")
+                .finish(),
+            Err(WouldBlock) => fmt
+                .debug_struct("OpaqueStreamRef")
+                .field("inner", &"<Locked>")
+                .finish(),
+        }
+    }
+}
+
+impl Clone for OpaqueStreamRef {
+    fn clone(&self) -> Self {
+        // Increment the ref count
+        let mut inner = self.inner.lock().unwrap();
+        inner.store.resolve(self.key).ref_inc();
+        inner.refs += 1;
+
+        OpaqueStreamRef {
+            inner: self.inner.clone(),
+            key: self.key,
+        }
+    }
+}
+
+impl Drop for OpaqueStreamRef {
+    fn drop(&mut self) {
+        drop_stream_ref(&self.inner, self.key);
+    }
+}
+
+// TODO: Move back in fn above
+fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
+    let mut me = match inner.lock() {
+        Ok(inner) => inner,
+        Err(_) => {
+            if ::std::thread::panicking() {
+                tracing::trace!("StreamRef::drop; mutex poisoned");
+                return;
+            } else {
+                panic!("StreamRef::drop; mutex poisoned");
+            }
+        }
+    };
+
+    let me = &mut *me;
+    me.refs -= 1;
+    let mut stream = me.store.resolve(key);
+
+    tracing::trace!("drop_stream_ref; stream={:?}", stream);
+
+    // decrement the stream's ref count by 1.
+    stream.ref_dec();
+
+    let actions = &mut me.actions;
+
+    // If the stream is not referenced and it is already
+    // closed (does not have to go through logic below
+    // of canceling the stream), we should notify the task
+    // (connection) so that it can close properly
+    if stream.ref_count == 0 && stream.is_closed() {
+        if let Some(task) = actions.task.take() {
+            task.wake();
+        }
+    }
+
+    me.counts.transition(stream, |counts, stream| {
+        maybe_cancel(stream, actions, counts);
+
+        if stream.ref_count == 0 {
+            // Release any recv window back to connection, no one can access
+            // it anymore.
+            actions
+                .recv
+                .release_closed_capacity(stream, &mut actions.task);
+
+            // We won't be able to reach our push promises anymore
+            let mut ppp = stream.pending_push_promises.take();
+            while let Some(promise) = ppp.pop(stream.store_mut()) {
+                counts.transition(promise, |counts, stream| {
+                    maybe_cancel(stream, actions, counts);
+                });
+            }
+        }
+    });
+}
+
+fn maybe_cancel(stream: &mut store::Ptr, actions: &mut Actions, counts: &mut Counts) {
+    if stream.is_canceled_interest() {
+        // Server is allowed to early respond without fully consuming the client input stream
+        // But per the RFC, must send a RST_STREAM(NO_ERROR) in such cases. https://www.rfc-editor.org/rfc/rfc7540#section-8.1
+        // Some other http2 implementation may interpret other error code as fatal if not respected (i.e: nginx https://trac.nginx.org/nginx/ticket/2376)
+        let reason = if counts.peer().is_server()
+            && stream.state.is_send_closed()
+            && stream.state.is_recv_streaming()
+        {
+            Reason::NO_ERROR
+        } else {
+            Reason::CANCEL
+        };
+    pub fn recv_headers(
+        &mut self,
+        frame: frame::Headers,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) -> Result<(), RecvHeaderBlockError<Option<frame::Headers>>> {
+        tracing::trace!("opening stream; init_window={}", self.init_window_sz);
+        let is_initial = stream.state.recv_open(&frame)?;
+
+        if is_initial {
+            // TODO: be smarter about this logic
+            if frame.stream_id() > self.last_processed_id {
+                self.last_processed_id = frame.stream_id();
+            }
+
+            // Increment the number of concurrent streams
+            counts.inc_num_recv_streams(stream);
+        }
+
+        if !stream.content_length.is_head() {
+            use super::stream::ContentLength;
+            use http::header;
+
+            if let Some(content_length) = frame.fields().get(header::CONTENT_LENGTH) {
+                let content_length = match frame::parse_u64(content_length.as_bytes()) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        proto_err!(stream: "could not parse content-length; stream={:?}", stream.id);
+                        return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+                    }
+                };
+
+                stream.content_length = ContentLength::Remaining(content_length);
+                // END_STREAM on headers frame with non-zero content-length is malformed.
+                // https://datatracker.ietf.org/doc/html/rfc9113#section-8.1.1
+                if frame.is_end_stream()
+                    && content_length > 0
+                    && frame
+                        .pseudo()
+                        .status
+                        .map_or(true, |status| status != 204 && status != 304)
+                {
+                    proto_err!(stream: "recv_headers with END_STREAM: content-length is not zero; stream={:?};", stream.id);
+                    return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+                }
+            }
+        }
+
+        if frame.is_over_size() {
+            // A frame is over size if the decoded header block was bigger than
+            // SETTINGS_MAX_HEADER_LIST_SIZE.
+            //
+            // > A server that receives a larger header block than it is willing
+            // > to handle can send an HTTP 431 (Request Header Fields Too
+            // > Large) status code [RFC6585]. A client can discard responses
+            // > that it cannot process.
+            //
+            // So, if peer is a server, we'll send a 431. In either case,
+            // an error is recorded, which will send a REFUSED_STREAM,
+            // since we don't want any of the data frames either.
+            tracing::debug!(
+                "stream error REQUEST_HEADER_FIELDS_TOO_LARGE -- \
+                 recv_headers: frame is over size; stream={:?}",
+                stream.id
+            );
+            return if counts.peer().is_server() && is_initial {
+                let mut res = frame::Headers::new(
+                    stream.id,
+                    frame::Pseudo::response(::http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE),
+                    HeaderMap::new(),
+                );
+                res.set_end_stream();
+                Err(RecvHeaderBlockError::Oversize(Some(res)))
+            } else {
+                Err(RecvHeaderBlockError::Oversize(None))
+            };
+        }
+
+        let stream_id = frame.stream_id();
+        let (pseudo, fields) = frame.into_parts();
+
+        if pseudo.protocol.is_some()
+            && counts.peer().is_server()
+            && !self.is_extended_connect_protocol_enabled
+        {
+            proto_err!(stream: "cannot use :protocol if extended connect protocol is disabled; stream={:?}", stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+        }
+
+        if pseudo.status.is_some() && counts.peer().is_server() {
+            proto_err!(stream: "cannot use :status header for requests; stream={:?}", stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+        }
+
+        if !pseudo.is_informational() {
+            let message = counts
+        tracing::trace!(
+            "  sent stream data; available={}; buffered={}; id={:?}; max_buffer_size={} prev={}",
+            self.send_flow.available(),
+            self.buffered_send_data,
+            self.id,
+            max_buffer_size,
+            prev_capacity,
+        );
+
+        if prev_capacity < self.capacity(max_buffer_size) {
+            self.notify_capacity();
+        }
+    }
+
+    /// If the capacity was limited because of the max_send_buffer_size,
+    /// then consider waking the send task again...
+    pub fn notify_capacity(&mut self) {
+        self.send_capacity_inc = true;
+        tracing::trace!("  notifying task");
+        self.notify_send();
+    }
+
+    /// Returns `Err` when the decrement cannot be completed due to overflow.
+    pub fn dec_content_length(&mut self, len: usize) -> Result<(), ()> {
+        match self.content_length {
+            ContentLength::Remaining(ref mut rem) => match rem.checked_sub(len as u64) {
+                Some(val) => *rem = val,
+                None => return Err(()),
+            },
+            ContentLength::Head => {
+                if len != 0 {
+                    return Err(());
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    pub fn ensure_content_length_zero(&self) -> Result<(), ()> {
+        match self.content_length {
+            ContentLength::Remaining(0) => Ok(()),
+            ContentLength::Remaining(_) => Err(()),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn notify_send(&mut self) {
+        if let Some(task) = self.send_task.take() {
+            task.wake();
+        request.extensions_mut().clear();
+
+        // TODO: There is a hazard with assigning a stream ID before the
+        // prioritize layer. If prioritization reorders new streams, this
+        // implicitly closes the earlier stream IDs.
+        //
+        // See: hyperium/h2#11
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut send_buffer = self.send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        me.actions.ensure_no_conn_error()?;
+        me.actions.send.ensure_next_stream_id()?;
+
+        // The `pending` argument is provided by the `Client`, and holds
+        // a store `Key` of a `Stream` that may have been not been opened
+        // yet.
+        //
+        // If that stream is still pending, the Client isn't allowed to
+        // queue up another pending stream. They should use `poll_ready`.
+        if let Some(stream) = pending {
+            if me.store.resolve(stream.key).is_pending_open {
+                return Err(UserError::Rejected.into());
+            }
+        }
+
+        if me.counts.peer().is_server() {
+            // Servers cannot open streams. PushPromise must first be reserved.
+            return Err(UserError::UnexpectedFrameType.into());
+        }
+
+        let stream_id = me.actions.send.open()?;
+
+        let mut stream = Stream::new(
+            stream_id,
+            me.actions.send.init_window_sz(),
+            me.actions.recv.init_window_sz(),
+        );
+
+        if *request.method() == Method::HEAD {
+            stream.content_length = ContentLength::Head;
+        }
+
+        // Convert the message
+        let headers =
+            client::Peer::convert_send_message(stream_id, request, protocol, end_of_stream)?;
+
+        let mut stream = me.store.insert(stream.id, stream);
+
+    /// Request capacity to send data
+    pub fn reserve_capacity(
+        &mut self,
+        capacity: WindowSize,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) {
+        let span = tracing::trace_span!(
+            "reserve_capacity",
+            ?stream.id,
+            requested = capacity,
+            effective = (capacity as usize) + stream.buffered_send_data,
+            curr = stream.requested_send_capacity
+        );
+        let _e = span.enter();
+
+        // Actual capacity is `capacity` + the current amount of buffered data.
+        // If it were less, then we could never send out the buffered data.
+        let capacity = (capacity as usize) + stream.buffered_send_data;
+
+        match capacity.cmp(&(stream.requested_send_capacity as usize)) {
+            Ordering::Equal => {
+                // Nothing to do
+            }
+            Ordering::Less => {
+                // Update the target requested capacity
+                stream.requested_send_capacity = capacity as WindowSize;
+
+                // Currently available capacity assigned to the stream
+                let available = stream.send_flow.available().as_size();
+
+                // If the stream has more assigned capacity than requested, reclaim
+                // some for the connection
+                if available as usize > capacity {
+                    let diff = available - capacity as WindowSize;
+
+                    // TODO: proper error handling
+                    let _res = stream.send_flow.claim_capacity(diff);
+                    debug_assert!(_res.is_ok());
+
+                    self.assign_connection_capacity(diff, stream, counts);
+                }
+            }
+            Ordering::Greater => {
+                // If trying to *add* capacity, but the stream send side is closed,
+                // there's nothing to be done.
+            }
+        }
+        // if next_stream_id is overflowed, that's ok.
+
+        Ok(())
+    }
+
+    pub fn ensure_next_stream_id(&self) -> Result<StreamId, UserError> {
+        self.next_stream_id
+            .map_err(|_| UserError::OverflowedStreamId)
+    }
+
+    pub fn may_have_created_stream(&self, id: StreamId) -> bool {
+        if let Ok(next_id) = self.next_stream_id {
+
+#[tokio::test]
+async fn errors_if_recv_frame_exceeds_max_frame_size() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let h2 = async move {
+        let (mut client, h2) = client::handshake(io).await.unwrap();
+        let req = async move {
+            let resp = client.get("https://example.com/").await.expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_parts().1;
+            let res = util::concat(body).await;
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "connection error detected: frame with invalid size"
+            );
+        };
+
+        // client should see a conn error
+        let conn = async move {
+            let err = h2.await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "connection error detected: frame with invalid size"
+            );
+        };
+        join(conn, req).await;
+    };
+
+    // a bad peer
+    srv.codec_mut().set_max_send_frame_size(16_384 * 4);
+
+    let srv = async move {
+        let _ = srv.assert_client_handshake().await;
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200)).await;
+        srv.send_frame(frames::data(1, vec![0; 16_385]).eos()).await;
+        srv.recv_frame(frames::go_away(0).frame_size()).await;
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]

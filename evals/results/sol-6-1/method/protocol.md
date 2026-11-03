@@ -141,6 +141,15 @@ observed so far. Exit-137 command records are possible timeout **or** memory
 kills; the original sandbox does not distinguish these causes. Do not interpret
 the legacy `command_timeouts` field as proof of a timeout.
 
+The first `control-h2` author stopped at about 3.4 minutes when an app-server
+JSON event exceeded Python's default 64 KiB line-reader limit. Its metadata was
+left incorrectly marked running by an uncaught exception; the operator preserved
+that state and recorded the correction to a harness failure. No final report was
+collected. New runners allow 8 MiB per event, retain exception/report status in
+all exit paths, and are tested with a 360 KiB escaped result. The failed author
+is excluded and replaced by a fresh author with the full 45-minute budget, the
+same source/prompt, and no prior output. Existing running agents are not restarted.
+
 ## Case preparation and remaining gates
 
 Six separate clean-profile agents author the Stage 5 cases and rubrics. They
@@ -171,7 +180,13 @@ five false passages inserted among them. Private maps identify controls for
 exclusion from totals. Every redacted line replacement/drop is recorded; text
 inside code fences and trailing blank lines are preserved. Two independent key
 graders and one verifier are provisioned per audit cell. Missing reports remain
-absent. A separate random 10% recheck must use unredacted reports.
+absent. A separate random 10% recheck uses unredacted reports. The population is
+every independent key-grader verdict (including decoys), sampled without
+replacement after grading finishes, rounded upward. Seed, source hashes and
+selected judgments are frozen privately. A fresh rechecker for each sampled
+cell sees only selected pairs, the blind key, and full unredacted reports;
+original judgments and maps are withheld. This checks key-report matching, not
+the Stage 5 quality rubrics, which have their own two independent graders.
 
 Recommendations must wait until all grading finishes and come from a new agent
 that has not audited, graded, read Claude's results, or seen Sol's arm mapping
@@ -190,6 +205,10 @@ beforehand. No recommendation has been made during preparation.
   both sheets and their difference remain visible. Unresolved intervals remain
   intervals and do not enter point comparisons. Harm dimensions are reported
   separately, with not-applicable cases distinguished from missing scores.
+  Independent authors chose different harm maxima (including 2 and 3). Before
+  grading, pooled harm comparisons were defined as the mean fraction of each
+  rubric's maximum, retaining the original points/maxima alongside them. Unknown
+  applicable harm is null and is excluded, never converted to no harm.
 - Each comparison requires two scored runs in each arm for that project/case.
   Missing runs/grades are not zero. Every reported gap includes both replicate
   values and within-arm absolute differences. The exact sign-flip function is
@@ -205,6 +224,11 @@ logs, excluding reasoning, sessions, profiles and transport metadata. Agent-crea
 symlinks cannot be followed into host files. Changed sources and probe artifacts
 are retained; build caches, compiled binaries/core dumps and files above 10 MB
 are excluded with a per-export record. Deleted source paths are also recorded.
-The current privacy review retains three nonsecret PATH matches: a container-local
-fake-fzf probe and the container's standard tool PATH. Their file hashes and
-dispositions are recorded in `../export-scans/privacy-review.json`.
+The privacy review retains three nonsecret PATH matches: a container-local
+fake-fzf probe and the container's standard tool PATH. It also records a random
+personal-name match in compressed public source bytes. All 324 regular files in
+that archive were checked against the pinned baseline; an upstream terminal
+recording contains public fixture paths, not host data from this evaluation.
+Hashes and dispositions are in `../export-scans/privacy-review.json` and
+`baseline-archive-review.json`. Scanning covers raw evidence, reports, artifacts,
+control bundles and all Stage 5 preparation/assessment files.

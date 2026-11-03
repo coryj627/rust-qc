@@ -105,8 +105,12 @@ def quality_sheet(rows, reports):
                 raise ValueError("Invalid rubric criterion score")
         for dimension in ("error_api", "dependencies", "structure"):
             item = row["harm"][dimension]
-            if item["applicable"] and not 0 <= item["score"] <= item["max"]:
-                raise ValueError("Invalid harm score")
+            if item["applicable"]:
+                if not isinstance(item["max"], (int, float)) or \
+                        not math.isfinite(item["max"]) or item["max"] <= 0:
+                    raise ValueError("Invalid harm maximum")
+                if item["score"] is not None and not 0 <= item["score"] <= item["max"]:
+                    raise ValueError("Invalid harm score")
             if not item["applicable"] and (item["score"] is not None or item["max"] is not None):
                 raise ValueError("Not-applicable harm must have null score and maximum")
         result[label] = row

@@ -1,0 +1,647 @@
+            if !cfg!(skip_large_mem_tests) {
+                // due to ceiling to next_power_of_two
+                ensure_sketch_len(pot30 - 1, pot30, "pot30- 1");
+                ensure_sketch_len(pot30, pot30, "pot30");
+                ensure_sketch_len(u64::MAX, pot30, "u64::MAX");
+            }
+        };
+    }
+
+    #[test]
+    fn test_per_entry_expiration() {
+        use super::InnerSync;
+        use crate::{common::time::Clock, Entry, Expiry};
+
+        use std::{
+            collections::hash_map::RandomState,
+            sync::{Arc, Mutex},
+            time::{Duration, Instant as StdInstant},
+        };
+
+        type Key = u32;
+        type Value = char;
+
+        fn current_time(cache: &BaseCache<Key, Value>) -> StdInstant {
+            cache.inner.clock().to_std_instant(cache.current_time())
+        }
+
+        fn insert(cache: &BaseCache<Key, Value>, key: Key, hash: u64, value: Value) {
+            let (op, _now) = cache.do_insert_with_hash(Arc::new(key), hash, value);
+            cache.write_op_ch.send(op).expect("Failed to send");
+        }
+
+        macro_rules! assert_params_eq {
+            ($left:expr, $right:expr, $param_name:expr, $line:expr) => {
+                assert_eq!(
+                    $left, $right,
+                    "Mismatched `{}`s. line: {}",
+                    $param_name, $line
+                );
+            };
+        }
+
+        macro_rules! assert_expiry {
+            ($cache:ident, $key:ident, $hash:ident, $mock:ident, $duration_secs:expr) => {
+                // Increment the time.
+                $mock.increment(Duration::from_millis($duration_secs * 1000 - 1));
+                $cache.inner.run_pending_tasks(None, 1, 10);
+                assert!($cache.contains_key_with_hash(&$key, $hash));
+                assert_eq!($cache.entry_count(), 1);
+
+                // Increment the time by 1ms (3). The entry should be expired.
+                $mock.increment(Duration::from_millis(1));
+                $cache.inner.run_pending_tasks(None, 1, 10);
+                assert!(!$cache.contains_key_with_hash(&$key, $hash));
+
+                // Increment the time again to ensure the entry has been evicted from the
+                // cache.
+                $mock.increment(Duration::from_secs(1));
+                $cache.inner.run_pending_tasks(None, 1, 10);
+                assert_eq!($cache.entry_count(), 0);
+            };
+        }
+
+        /// Contains expected call parameters and also a return value.
+        #[derive(Debug)]
+        enum ExpiryExpectation {
+            NoCall,
+            AfterCreate {
+                caller_line: u32,
+                key: Key,
+                value: Value,
+                current_time: StdInstant,
+                new_duration_secs: Option<u64>,
+            },
+            AfterRead {
+                caller_line: u32,
+                key: Key,
+                value: Value,
+                current_time: StdInstant,
+                current_duration_secs: Option<u64>,
+                last_modified_at: StdInstant,
+                new_duration_secs: Option<u64>,
+            },
+            AfterUpdate {
+                caller_line: u32,
+                key: Key,
+                value: Value,
+                current_time: StdInstant,
+                current_duration_secs: Option<u64>,
+                new_duration_secs: Option<u64>,
+            },
+        }
+
+        impl ExpiryExpectation {
+            fn after_create(
+                caller_line: u32,
+                key: Key,
+                value: Value,
+                current_time: StdInstant,
+                new_duration_secs: Option<u64>,
+            ) -> Self {
+                Self::AfterCreate {
+                    caller_line,
+                    key,
+                    value,
+                    current_time,
+                    new_duration_secs,
+                }
+            }
+
+            fn after_read(
+                caller_line: u32,
+                key: Key,
+                value: Value,
+                current_time: StdInstant,
+                current_duration_secs: Option<u64>,
+                last_modified_at: StdInstant,
+                new_duration_secs: Option<u64>,
+            ) -> Self {
+                Self::AfterRead {
+                    caller_line,
+                    key,
+                    value,
+                    current_time,
+                    current_duration_secs,
+                    last_modified_at,
+                    new_duration_secs,
+                }
+            }
+
+            fn after_update(
+                caller_line: u32,
+                key: Key,
+                value: Value,
+                current_time: StdInstant,
+                current_duration_secs: Option<u64>,
+                new_duration_secs: Option<u64>,
+            ) -> Self {
+                Self::AfterUpdate {
+                    caller_line,
+                    key,
+                    value,
+                    current_time,
+                    current_duration_secs,
+                    new_duration_secs,
+                }
+            }
+        }
+
+        let expectation = Arc::new(Mutex::new(ExpiryExpectation::NoCall));
+
+        struct MyExpiry {
+            expectation: Arc<Mutex<ExpiryExpectation>>,
+        }
+
+        impl Expiry<u32, char> for MyExpiry {
+            fn expire_after_create(
+                &self,
+                actual_key: &u32,
+                actual_value: &char,
+                actual_current_time: StdInstant,
+            ) -> Option<Duration> {
+                use ExpiryExpectation::*;
+
+                let lock = &mut *self.expectation.lock().unwrap();
+                let expected = std::mem::replace(lock, NoCall);
+                match expected {
+                    AfterCreate {
+                        caller_line,
+                        key,
+                        value,
+                        current_time,
+                        new_duration_secs: new_duration,
+                    } => {
+                        assert_params_eq!(*actual_key, key, "key", caller_line);
+                        assert_params_eq!(*actual_value, value, "value", caller_line);
+                        assert_params_eq!(
+                            actual_current_time,
+                            current_time,
+                            "current_time",
+                            caller_line
+                        );
+                        new_duration.map(Duration::from_secs)
+                    }
+                    expected => {
+                        panic!(
+                            "Unexpected call to expire_after_create: caller_line {}, expected: {expected:?}",
+                            line!()
+                        );
+                    }
+                }
+            }
+
+            fn expire_after_read(
+                &self,
+                actual_key: &u32,
+                actual_value: &char,
+                actual_current_time: StdInstant,
+                actual_current_duration: Option<Duration>,
+                actual_last_modified_at: StdInstant,
+            ) -> Option<Duration> {
+                use ExpiryExpectation::*;
+
+                let lock = &mut *self.expectation.lock().unwrap();
+                let expected = std::mem::replace(lock, NoCall);
+                match expected {
+                    AfterRead {
+                        caller_line,
+                        key,
+                        value,
+                        current_time,
+                        current_duration_secs,
+                        last_modified_at,
+                        new_duration_secs,
+                    } => {
+                        assert_params_eq!(*actual_key, key, "key", caller_line);
+                        assert_params_eq!(*actual_value, value, "value", caller_line);
+                        assert_params_eq!(
+                            actual_current_time,
+                            current_time,
+                            "current_time",
+                            caller_line
+                        );
+                        assert_params_eq!(
+                            actual_current_duration,
+                            current_duration_secs.map(Duration::from_secs),
+                            "current_duration",
+                            caller_line
+                        );
+                        assert_params_eq!(
+                            actual_last_modified_at,
+                            last_modified_at,
+                            "last_modified_at",
+                            caller_line
+                        );
+                        new_duration_secs.map(Duration::from_secs)
+                    }
+                    expected => {
+                        panic!(
+                            "Unexpected call to expire_after_read: caller_line {}, expected: {expected:?}",
+                            line!()
+                        );
+                    }
+                }
+            }
+
+            fn expire_after_update(
+                &self,
+                actual_key: &u32,
+                actual_value: &char,
+                actual_current_time: StdInstant,
+                actual_current_duration: Option<Duration>,
+            ) -> Option<Duration> {
+                use ExpiryExpectation::*;
+
+                let lock = &mut *self.expectation.lock().unwrap();
+                let expected = std::mem::replace(lock, NoCall);
+                match expected {
+                    AfterUpdate {
+                        caller_line,
+                        key,
+                        value,
+                        current_time,
+                        current_duration_secs,
+                        new_duration_secs,
+                    } => {
+                        assert_params_eq!(*actual_key, key, "key", caller_line);
+                        assert_params_eq!(*actual_value, value, "value", caller_line);
+                        assert_params_eq!(
+                            actual_current_time,
+                            current_time,
+                            "current_time",
+                            caller_line
+                        );
+                        assert_params_eq!(
+                            actual_current_duration,
+                            current_duration_secs.map(Duration::from_secs),
+                            "current_duration",
+                            caller_line
+                        );
+                        new_duration_secs.map(Duration::from_secs)
+                    }
+                    expected => {
+                        panic!(
+                            "Unexpected call to expire_after_update: caller_line {}, expected: {expected:?}",
+                            line!()
+                        );
+                    }
+                }
+            }
+        }
+
+        const TTL: u64 = 16;
+        const TTI: u64 = 7;
+        let expiry: Option<Arc<dyn Expiry<_, _> + Send + Sync + 'static>> =
+            Some(Arc::new(MyExpiry {
+314:///     fn expire_after_create(
+321:///         println!("MyExpiry: expire_after_create called with key {_key} and value {value:?}. Returning {duration:?}.");
+326:/// // Create a `Cache<u32, (Expiration, String)>` with an expiry `MyExpiry` and
+328:/// let expiry = MyExpiry;
+336:///     .expire_after(expiry)
+340:/// // Insert some entries into the cache with different expirations.
+350:/// // Sleep for 6 seconds. Key 0 should expire.
+360:/// // Sleep for 10 more seconds. Key 1 should expire.
+392:/// time-to-live expiration to manage the lifecycle of temporary files on a
+394:/// expired, the eviction listener will be called with the path, so it can remove the
+485:///         // error cases here to prevent the listener from panicking.
+537:///     // will be expired and evicted, so the eviction listener will be called to
+547:/// ## You should avoid eviction listener to panic
+549:/// It is very important to make an eviction listener closure not to panic.
+550:/// Otherwise, the cache will stop calling the listener after a panic. This is an
+552:/// to call the panicked listener again.
+554:/// When a listener panics, the cache will swallow the panic and disable the
+555:/// listener. If you want to know when a listener panics and the reason of the panic,
+642:    /// to expiration. This inaccuracy can be mitigated by performing a
+679:    /// to expiration. This inaccuracy can be mitigated by performing a
+740:        expiration_policy: ExpirationPolicy<K, V>,
+754:                expiration_policy,
+940:    /// This method panics when the `init` closure has panicked. When it happens,
+941:    /// only the caller whose `init` closure panicked will get the panic (e.g. only
+1170:    /// This method panics when the `init` closure has panicked. When it happens,
+1171:    /// only the caller whose `init` closure panicked will get the panic (e.g. only
+1361:    /// This method panics when the `init` closure has panicked. When it happens,
+1362:    /// only the caller whose `init` closure panicked will get the panic (e.g. only
+2591:    fn time_to_live_by_expiry_type() {
+2592:        // Define an expiry type.
+2604:            fn expire_after_create(
+2614:            fn expire_after_update(
+2630:        // Create expiry counters and the expiry.
+2631:        let expiry_counters = Arc::new(ExpiryCallCounters::default());
+2632:        let expiry = MyExpiry::new(Arc::clone(&expiry_counters));
+2643:            .expire_after(expiry)
+2653:        expiry_counters.incl_expected_creations();
+2673:        expiry_counters.incl_expected_creations();
+2687:        expiry_counters.incl_expected_updates();
+2710:        expiry_counters.verify();
+2715:    fn time_to_idle_by_expiry_type() {
+2716:        // Define an expiry type.
+2728:            fn expire_after_read(
+2745:        // Create expiry counters and the expiry.
+2746:        let expiry_counters = Arc::new(ExpiryCallCounters::default());
+2747:        let expiry = MyExpiry::new(Arc::clone(&expiry_counters));
+2758:            .expire_after(expiry)
+2774:        expiry_counters.incl_expected_reads();
+2799:        expiry_counters.incl_expected_reads();
+2821:        expiry_counters.verify();
+2825:    /// Verify that the `Expiry::expire_after_read()` method is called in `get_with`
+2828:    fn test_expiry_using_get_with() {
+2829:        // Define an expiry type, which always return `None`.
+2841:            fn expire_after_create(
+2851:            fn expire_after_read(
+2863:            fn expire_after_update(
+2870:                unreachable!("The `expire_after_update()` method should not be called.");
+2874:        // Create expiry counters and the expiry.
+2875:        let expiry_counters = Arc::new(ExpiryCallCounters::default());
+2876:        let expiry = NoExpiry::new(Arc::clone(&expiry_counters));
+2878:        // Create a cache with the expiry and eviction listener.
+2881:            .expire_after(expiry)
+2890:        expiry_counters.incl_expected_creations();
+2895:        expiry_counters.incl_expected_reads();
+2901:        expiry_counters.incl_expected_creations();
+2904:        expiry_counters.verify();
+2928:        //    (4) "a" will be evicted due to expiration.
+2929:        //    (5) "b" will be evicted due to expiration.
+4258:            panic!("Expected `Inserted`. Got {res1:?}")
+4266:            panic!("Expected `ReplacedWith`. Got {res2:?}")
+4271:            panic!("Expected `Removed`. Got {res3:?}")
+4276:            panic!("Expected `StillNone`. Got {res4:?}")
+4281:            panic!("Expected `Inserted`. Got {res5:?}")
+4286:            panic!("Expected `Unchanged`. Got {res6:?}")
+4387:            panic!("Expected `Inserted`. Got {res1:?}")
+4395:            panic!("Expected `ReplacedWith`. Got {res2:?}")
+4402:            panic!("Expected `Removed`. Got {res4:?}")
+4414:    fn handle_panic_in_get_with() {
+4426:                    panic!("Panic during get_with");
+4439:    fn handle_panic_in_try_get_with() {
+4451:                    panic!("Panic during try_get_with");
+4550:        // Now alice (a0) has been expired by the idle timeout (TTI).
+4554:        // We have not ran sync after the expiration of alice (a0), so it is
+4576:        // Now alice has been expired by time-to-live (TTL).
+4597:        // Now alice (a2) has been expired by the idle timeout.
+4614:        // Re-insert, and this time, make it expired by the TTL.
+4692:        // 0500: a0 expired
+4693:        // 0600: Insert value a1 -> expired a0 (N-A0)
+4719:        // this entry should expire in 1000 ms from now.
+4722:        // 0500: Insert value a1 -> expired a0 (N-A0)
+4923:    // NOTE: To enable the panic logging, run the following command:
+4926:    //   sync::cache::tests::recover_from_panicking_eviction_listener --exact --nocapture
+4929:    fn recover_from_panicking_eviction_listener() {
+4937:        // Create an eviction listener that panics when it see
+4938:        // a value "panic now!".
+4941:            if v == "panic now!" {
+4942:                panic!("Panic now!");
+4961:        // Insert a value that will cause the eviction listener to panic.
+4962:        cache.insert("alice", "panic now!");
+4967:        // value "panic now!" so the eviction listener will panic.
+pub(crate) const DEFAULT_MAX_LOG_SYNC_REPEATS: usize = 4;
+pub(crate) const LOG_SYNC_INTERVAL_MILLIS: u64 = 300;
+
+pub(crate) const READ_LOG_FLUSH_POINT: usize = 64;
+pub(crate) const WRITE_LOG_FLUSH_POINT: usize = 64;
+
+// 384 elements
+pub(crate) const READ_LOG_CH_SIZE: usize =
+    READ_LOG_FLUSH_POINT * (DEFAULT_MAX_LOG_SYNC_REPEATS + 2);
+
+// 384 elements
+pub(crate) const WRITE_LOG_CH_SIZE: usize =
+    WRITE_LOG_FLUSH_POINT * (DEFAULT_MAX_LOG_SYNC_REPEATS + 2);
+
+// TODO: Calculate the batch size based on the number of entries in the cache (or an
+// estimated number of entries to evict)
+pub(crate) const DEFAULT_EVICTION_BATCH_SIZE: u32 = WRITE_LOG_CH_SIZE as u32;
+
+/// The default timeout duration for the `run_pending_tasks` method.
+pub(crate) const DEFAULT_MAINTENANCE_TASK_TIMEOUT_MILLIS: u64 = 100;
+
+#[cfg(feature = "sync")]
+pub(crate) const WRITE_RETRY_INTERVAL_MICROS: u64 = 50;
+//! Common data types for notifications.
+
+#[cfg(feature = "sync")]
+pub(crate) mod notifier;
+
+use std::{future::Future, pin::Pin, sync::Arc};
+
+/// A future returned by an eviction listener.
+///
+/// You can use the [`boxed` method][boxed-method] of `FutureExt` trait to convert a
+/// regular `Future` object into `ListenerFuture`.
+///
+/// [boxed-method]: ../future/trait.FutureExt.html#method.boxed
+pub type ListenerFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+#[cfg(feature = "sync")]
+pub(crate) type EvictionListener<K, V> =
+    Arc<dyn Fn(Arc<K>, V, RemovalCause) + Send + Sync + 'static>;
+
+#[cfg(feature = "future")]
+pub(crate) type AsyncEvictionListener<K, V> =
+    Box<dyn Fn(Arc<K>, V, RemovalCause) -> ListenerFuture + Send + Sync + 'static>;
+
+// NOTE: Currently, dropping the cache will drop all entries without sending
+// notifications. Calling `invalidate_all` method of the cache will trigger
+// the notifications, but currently there is no way to know when all entries
+// have been invalidated and their notifications have been sent.
+
+/// Indicates the reason why a cached entry was removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemovalCause {
+    /// The entry's expiration timestamp has passed.
+    Expired,
+    /// The entry was manually removed by the user.
+    Explicit,
+    /// The entry itself was not actually removed, but its value was replaced by
+    /// the user.
+    Replaced,
+    /// The entry was evicted due to size constraints.
+    Size,
+}
+
+impl RemovalCause {
+    pub fn was_evicted(&self) -> bool {
+        matches!(self, Self::Expired | Self::Size)
+    }
+}
+            weigher: Some(Arc::new(weigher)),
+            ..self
+        }
+    }
+
+    /// Sets the eviction listener closure to the cache.
+    ///
+    /// The closure should take `Arc<K>`, `V` and [`RemovalCause`][removal-cause] as
+    /// the arguments.
+    ///
+    /// # Panics
+    ///
+    /// It is very important to make the listener closure not to panic. Otherwise,
+    /// the cache will stop calling the listener after a panic. This is an intended
+    /// behavior because the cache cannot know whether it is memory safe or not to
+    /// call the panicked listener again.
+    ///
+    /// [removal-cause]: ../notification/enum.RemovalCause.html
+    pub fn eviction_listener(
+        self,
+        listener: impl Fn(Arc<K>, V, RemovalCause) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            eviction_listener: Some(Arc::new(listener)),
+            ..self
+        }
+    }
+
+    /// Sets the time to live of the cache.
+    ///
+    /// A cached entry will be expired after the specified duration past from
+    /// `insert`.
+    ///
+    /// # Panics
+    ///
+    /// `CacheBuilder::build*` methods will panic if the given `duration` is longer
+    /// than 1000 years. This is done to protect against overflow when computing key
+    /// expiration.
+    pub fn time_to_live(self, duration: Duration) -> Self {
+        let mut builder = self;
+        builder.expiration_policy.set_time_to_live(duration);
+        builder
+    }
+
+    /// Sets the time to idle of the cache.
+    ///
+    /// A cached entry will be expired after the specified duration past from `get`
+    /// or `insert`.
+    ///
+    /// # Panics
+    ///
+    /// `CacheBuilder::build*` methods will panic if the given `duration` is longer
+    /// than 1000 years. This is done to protect against overflow when computing key
+    /// expiration.
+    pub fn time_to_idle(self, duration: Duration) -> Self {
+        let mut builder = self;
+        builder.expiration_policy.set_time_to_idle(duration);
+        builder
+    }
+
+    /// Sets the given `expiry` to the cache.
+    ///
+    /// See [the example][per-entry-expiration-example] for per-entry expiration
+    /// policy in the `Cache` documentation.
+    ///
+    /// [per-entry-expiration-example]:
+    ///     ./struct.Cache.html#per-entry-expiration-policy
+    pub fn expire_after(self, expiry: impl Expiry<K, V> + Send + Sync + 'static) -> Self {
+        let mut builder = self;
+        builder.expiration_policy.set_expiry(Arc::new(expiry));
+        builder
+    }
+
+    #[cfg(test)]
+    pub(crate) fn housekeeper_config(self, conf: HousekeeperConfig) -> Self {
+        Self {
+            housekeeper_config: conf,
+            ..self
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clock(self, clock: Clock) -> Self {
+        Self { clock, ..self }
+    }
+
+    /// Enables support for [`Cache::invalidate_entries_if`][cache-invalidate-if]
+    /// method.
+    ///
+    /// The cache will maintain additional internal data structures to support
+    /// `invalidate_entries_if` method.
+    ///
+    /// [cache-invalidate-if]: ./struct.Cache.html#method.invalidate_entries_if
+    pub fn support_invalidation_closures(self) -> Self {
+        Self {
+            invalidator_enabled: true,
+            ..self
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CacheBuilder;
+
+    use std::time::Duration;
+
+    #[test]
+    fn build_cache() {
+        // Cache<char, String>
+        let cache = CacheBuilder::new(100).build();
+        let policy = cache.policy();
+
+        assert_eq!(policy.max_capacity(), Some(100));
+        assert_eq!(policy.time_to_live(), None);
+        assert_eq!(policy.time_to_idle(), None);
+        assert_eq!(policy.num_segments(), 1);
+
+        cache.insert('a', "Alice");
+        assert_eq!(cache.get(&'a'), Some("Alice"));
+
+        let cache = CacheBuilder::new(100)
+            .time_to_live(Duration::from_secs(45 * 60))
+            .time_to_idle(Duration::from_secs(15 * 60))
+            .build();
+        let config = cache.policy();
+
+        assert_eq!(config.max_capacity(), Some(100));
+        assert_eq!(config.time_to_live(), Some(Duration::from_secs(45 * 60)));
+        assert_eq!(config.time_to_idle(), Some(Duration::from_secs(15 * 60)));
+        assert_eq!(config.num_segments(), 1);
+
+        cache.insert('a', "Alice");
+        assert_eq!(cache.get(&'a'), Some("Alice"));
+    }
+
+    #[test]
+    fn build_segmented_cache() {
+        // SegmentCache<char, String>
+        let cache = CacheBuilder::new(100).segments(15).build();
+        let policy = cache.policy();
+
+        assert_eq!(policy.max_capacity(), Some(100));
+        assert!(policy.time_to_live().is_none());
+        assert!(policy.time_to_idle().is_none());
+        assert_eq!(policy.num_segments(), 16_usize.next_power_of_two());
+
+        cache.insert('b', "Bob");
+        assert_eq!(cache.get(&'b'), Some("Bob"));
+
+        let listener = move |_key, _value, _cause| ();
+
+        let builder = CacheBuilder::new(400)
+            .time_to_live(Duration::from_secs(45 * 60))
+            .time_to_idle(Duration::from_secs(15 * 60))
+            .eviction_listener(listener)
+            .name("tracked_sessions")
+            // Call segments() at the end to check all field values in the current
+            // builder struct are copied to the new builder:
+            // https://github.com/moka-rs/moka/issues/207
+            .segments(24);
+
+        assert!(builder.eviction_listener.is_some());
+
+        let cache = builder.build();
+        let policy = cache.policy();
+
+        assert_eq!(policy.max_capacity(), Some(400));
+        assert_eq!(policy.time_to_live(), Some(Duration::from_secs(45 * 60)));
+        assert_eq!(policy.time_to_idle(), Some(Duration::from_secs(15 * 60)));
+        assert_eq!(policy.num_segments(), 24_usize.next_power_of_two());
+        assert_eq!(cache.name(), Some("tracked_sessions"));
+
+        cache.insert('b', "Bob");
+        assert_eq!(cache.get(&'b'), Some("Bob"));
+    }
+
+    #[test]
+    #[should_panic(expected = "time_to_live is longer than 1000 years")]
+    fn build_cache_too_long_ttl() {
+        let thousand_years_secs: u64 = 1000 * 365 * 24 * 3600;
