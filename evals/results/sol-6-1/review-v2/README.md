@@ -2,8 +2,8 @@
 
 The readiness pilot and the separately frozen 52-attempt review batch have closed.
 The batch produced 51 valid reports and one preserved capacity failure, with no
-policy block. Independent controls and blind grading are underway; there is no
-scored outcome yet. The [comparison plan](comparison-plan.json), [analysis protocol](protocol.md)
+policy block. Independent controls are validated and blind grading is prepared;
+there is no scored outcome yet. The [comparison plan](comparison-plan.json), [analysis protocol](protocol.md)
 and [workspace preparation](comparison-preparation.json) precede its dispatch.
 No dedicated security assessment, threat modeling, exploitability analysis or
 exploit development is requested. The pilot's complete
@@ -68,7 +68,9 @@ departure.
 
 The [recovery record](capacity-recovery-outcome.json) and completion gate confirm
 that the original schedule and all 52 prompt hashes were preserved. The capacity
-failure remains missing, with no replacement. Ten fresh control authors now work
-from source without review outputs; two blind key graders and one independent
-verifier per cell follow after control validation. Main and short paired effects
-can include at most nine and three projects respectively.
+failure remains missing, with no replacement. Ten fresh control authors worked
+from source without review outputs. All 70 false controls have passing ordinary
+regression evidence and unchanged baseline source; see [validation](controls-validation.json).
+The [grading-input freeze](grading-input-checks.json) records 26 blind key graders
+and 13 independent verifiers, exact input round trips and zero dropped sections.
+Main and short paired effects can include at most nine and three projects respectively.
