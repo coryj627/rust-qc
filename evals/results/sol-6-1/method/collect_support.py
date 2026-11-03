@@ -42,7 +42,9 @@ def main():
         controls = json.loads((source / "controls.json").read_text())
         decoy_ids = {c["id"] for c in controls["decoys"]}
         false_ids = {c["id"] for c in controls["false_findings"]}
-        if decoy_ids != {"decoy-1", "decoy-2"} or false_ids != {f"false-{i}" for i in range(1, 6)}:
+        if (len(controls["decoys"]) != 2 or len(controls["false_findings"]) != 5 or
+                decoy_ids != {"decoy-1", "decoy-2"} or
+                false_ids != {f"false-{i}" for i in range(1, 6)}):
             raise ValueError(f"Wrong control IDs/counts for {project}")
         for entry in controls["decoys"] + controls["false_findings"]:
             refutation = entry["refutation"]

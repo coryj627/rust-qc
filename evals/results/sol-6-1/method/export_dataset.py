@@ -35,7 +35,14 @@ def publish(source, target, scratch):
     return {"file": str(target.name), "scrubbed": clean != text}
 
 
-def workspace_files(workspace):
+def cargo_cache(path):
+    tag = path / "CACHEDIR.TAG"
+    return not tag.is_symlink() and tag.is_file() and tag.read_bytes().startswith(
+        b"Signature: 8a477f597d28d172789f06886806bc55"
+    )
+
+
+def workspace_files(workspace, skipped=None):
     """Do not follow agent-created links out into the exporter's host filesystem."""
     excluded = {"target", ".cargo-home", ".git", "__pycache__", ".pytest_cache"}
     if workspace.is_symlink():
@@ -43,8 +50,21 @@ def workspace_files(workspace):
     resolved = workspace.resolve()
     for directory, folders, files in os.walk(workspace, followlinks=False):
         parent = Path(directory)
-        folders[:] = [name for name in folders
-                      if name not in excluded and not (parent / name).is_symlink()]
+        kept = []
+        for name in folders:
+            folder = parent / name
+            if folder.is_symlink():
+                reason = "symlink_directory"
+            elif name in excluded:
+                reason = "cache_or_repository_metadata"
+            elif cargo_cache(folder):
+                reason = "cargo_build_cache"
+            else:
+                kept.append(name)
+                continue
+            if skipped is not None:
+                skipped.append({"path": str(folder.relative_to(workspace)), "reason": reason})
+        folders[:] = kept
         for name in files:
             path = parent / name
             if (not path.is_symlink() and path.is_file()
@@ -55,9 +75,10 @@ def workspace_files(workspace):
 def export_artifacts(scratch, run_id, output, template=None):
     workspace = scratch / "audits/projects" / run_id
     copied, excluded = [], []
-    for path, relative in workspace_files(workspace):
+    for path, relative in workspace_files(workspace, excluded):
         if relative.parts[0] in {"skill", ".agents"} or relative.name in {
             ".budget.json", "clock", "run", ".clock-start", ".clock-log", ".waits",
+            ".rustc_info.json",
         }:
             continue
         if template is not None:
@@ -70,7 +91,8 @@ def export_artifacts(scratch, run_id, output, template=None):
             excluded.append({"path": str(relative), "reason": "over_10MB_regenerate_from_probe"})
             continue
         data = path.read_bytes()
-        if data.startswith((b"\x7fELF", b"\xcf\xfa\xed\xfe", b"MZ", b"!<arch>\n")):
+        if data.startswith((b"\x7fELF", b"\xcf\xfa\xed\xfe", b"MZ", b"!<arch>\n",
+                            b"rust\x00\x00\x00")):
             excluded.append({"path": str(relative), "reason": "compiled_binary_or_core"})
             continue
         target.parent.mkdir(parents=True, exist_ok=True)

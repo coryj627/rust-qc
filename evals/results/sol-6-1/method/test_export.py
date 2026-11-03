@@ -31,6 +31,21 @@ class ExportTests(unittest.TestCase):
         self.assertNotIn("user@example.invalid", cleaned)
         self.assertNotIn("sk-12345678901234567890", cleaned)
 
+    def test_custom_cargo_output_directory_is_pruned_and_recorded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary)
+            build = work / "tmp/candidate-target/debug"
+            build.mkdir(parents=True)
+            (build.parent / "CACHEDIR.TAG").write_text(
+                "Signature: 8a477f597d28d172789f06886806bc55\n# Cargo cache\n"
+            )
+            (build / "metadata.rmeta").write_bytes(b"rust\x00\x00\x00\ncompiled data")
+            (work / "tmp/probe.rs").write_text("fn main() {}\n")
+            skipped = []
+            self.assertEqual([str(p) for _, p in workspace_files(work, skipped)], ["tmp/probe.rs"])
+            self.assertEqual(skipped, [{"path": "tmp/candidate-target",
+                                        "reason": "cargo_build_cache"}])
+
 
 if __name__ == "__main__":
     unittest.main()

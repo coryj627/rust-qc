@@ -30,6 +30,14 @@ class PassageTests(unittest.TestCase):
         inline = 'Evidence: `let a = **ptr;` is unchanged.\n'
         self.assertEqual(verifier_text(inline), (inline, []))
 
+    def test_summary_count_does_not_reveal_injected_controls(self):
+        text = ("The audit found 13 defects: 2 High, 8 Medium, and 3 Low. "
+                "Nine runtime defects were reproduced, including a use-after-free.\n")
+        clean, edits = verifier_text(text)
+        self.assertEqual(clean,
+                         "Nine runtime defects were reproduced, including a use-after-free.\n")
+        self.assertEqual(edits[0]["reason"], "report_count_removed_before_control_insertion")
+
 
 if __name__ == "__main__":
     unittest.main()

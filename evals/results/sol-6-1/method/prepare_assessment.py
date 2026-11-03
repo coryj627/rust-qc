@@ -121,7 +121,9 @@ Place every new adapter, probe, or orchestration script needed to reproduce thos
 checks under that results directory too; keep copies there if executed elsewhere.
 Record compile failures, assertion failures, environmental blocks and unrun
 checks distinctly. A nonzero Cargo exit is not by itself a behavioral failure.
-Write /work/results/assessment.json with one record per candidate, listing each
+Write /work/results/assessment.json as an object with keys "case" and "candidates".
+The candidates value must be an object keyed by the exact candidate letters,
+with one record per candidate, listing each
 check's command, exit_code, log path, observed outcome and any adaptation/limit.
 Include gate results and hidden-test pass/fail counts where available. Record
 any changed submission files caused by normal Cargo verification separately;

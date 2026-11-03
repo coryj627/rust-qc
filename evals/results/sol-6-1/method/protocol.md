@@ -178,7 +178,10 @@ findings per project. Graders see anonymized key IDs with decoys mixed in.
 Verifiers receive the redacted reports as ordered, lossless text passages, with
 five false passages inserted among them. Private maps identify controls for
 exclusion from totals. Every redacted line replacement/drop is recorded; text
-inside code fences and trailing blank lines are preserved. Two independent key
+inside code fences and trailing blank lines are preserved. The verifier's input
+also removes the opening numeric finding/severity tally, while preserving the
+remaining evidence summary, so the tally does not reveal injected controls.
+This replacement is logged separately from report redaction. Two independent key
 graders and one verifier are provisioned per audit cell. Missing reports remain
 absent. A separate random 10% recheck uses unredacted reports. The population is
 every independent key-grader verdict (including decoys), sampled without
@@ -201,14 +204,30 @@ beforehand. No recommendation has been made during preparation.
   total, regardless of whether graders/verifiers believe them. A verifier item
   that mixes a planted and real claim is flagged for review and prevents that
   project's union metrics from entering a comparison until resolved.
-- Stage 5 quality is the mean of the two independent 12-point rubric scores;
-  both sheets and their difference remain visible. Unresolved intervals remain
+- Stage 5 follows the frozen authors' reconciliation instructions: two independent
+  12-point sheets are preserved, then disagreements go to a fresh blind adjudicator
+  with source, test evidence and both sheets. Final scores use agreement or the
+  separately recorded reconciliation, never a simple mean. The original mean
+  and grader difference are descriptive only. Unresolved intervals remain
   intervals and do not enter point comparisons. Harm dimensions are reported
   separately, with not-applicable cases distinguished from missing scores.
-  Independent authors chose different harm maxima (including 2 and 3). Before
-  grading, pooled harm comparisons were defined as the mean fraction of each
-  rubric's maximum, retaining the original points/maxima alongside them. Unknown
-  applicable harm is null and is excluded, never converted to no harm.
+  Independent authors chose different harm scales: numeric maxima of 2 or 3,
+  and a categorical checklist for DECOM. Before grading, pooled harm comparisons
+  were therefore defined as resolved harm presence (0 absent, 1 present),
+  retaining original points/maxima and checklist states alongside them.
+  This measures presence, not a shared severity unit. DECOM's runtime/test
+  dependencies map to the common dependency axis; its modules/unrelated edits
+  map to the common structure axis. Any present item makes that axis present;
+  otherwise an unresolved item remains unknown. Its additional regression/test
+  suppression checklist is retained separately. Unknown applicable harm is null
+  and excluded, never converted to no harm. No quality points are deducted again.
+- DECOM's rubric forbids consulting other candidates. Its four submissions each
+  receive two separate fresh grader profiles (and separate reconciliation when
+  needed). Other cases use two independent graders per case, applying the rubric
+  independently to each anonymous submission. All grader inputs exclude other
+  graders' outputs until the reconciliation stage. Criterion IDs, maxima and
+  increments are transcribed in `../stage5/rubric-structure.json`, with hashes of
+  the unchanged frozen rubrics, and validated when sheets are collected.
 - Each comparison requires two scored runs in each arm for that project/case.
   Missing runs/grades are not zero. Every reported gap includes both replicate
   values and within-arm absolute differences. The exact sign-flip function is
@@ -224,7 +243,14 @@ logs, excluding reasoning, sessions, profiles and transport metadata. Agent-crea
 symlinks cannot be followed into host files. Changed sources and probe artifacts
 are retained; build caches, compiled binaries/core dumps and files above 10 MB
 are excluded with a per-export record. Deleted source paths are also recorded.
-The privacy review retains three nonsecret PATH matches: a container-local
+Cargo's CACHEDIR.TAG signature identifies custom build-output directories as
+well as directories literally named target. The privacy scan caught Rust
+metadata in one such directory before commit; that artifact export was rebuilt
+with directory pruning and a regression test. A scan for the same cache marker
+also found generated files in the first coding run's earlier local commit. That
+unpublished commit was amended to remove them; source/probe evidence was retained.
+No generated cache data was published.
+The privacy review retains nonsecret PATH matches: a container-local
 fake-fzf probe and the container's standard tool PATH. It also records a random
 personal-name match in compressed public source bytes. All 324 regular files in
 that archive were checked against the pinned baseline; an upstream terminal

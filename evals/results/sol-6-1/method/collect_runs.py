@@ -23,7 +23,8 @@ def main():
             for row in json.loads(schedule.read_text()):
                 rows[row["run_id"]] = dict(row, role="audit" if stage in (3, 4) else "treatment")
     for pattern in ("controls-schedule.json", "grading-*.json", "assessment-*.json",
-                    "quality-*.json", "adjudication-*.json", "recheck-*.json"):
+                    "quality-*.json", "adjudication-*.json", "recheck-s[34]-*.json",
+                    "reconciliation-*.json"):
         for schedule in scratch.glob(pattern):
             for row in json.loads(schedule.read_text()):
                 rows[row["run_id"]] = dict(row, stage=row.get("stage", "preparation-or-grading"))

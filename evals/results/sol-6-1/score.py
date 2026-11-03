@@ -19,8 +19,9 @@ def harm_values(quality, dimension):
     normalized, raw = {}, {}
     for row in quality:
         items = [g["harm"][dimension] for g in row["grades"]]
-        if all(item["applicable"] and item["score"] is not None for item in items):
-            normalized[row["run"]] = sum(item["score"] / item["max"] for item in items) / 2
+        resolved = row["resolved_harm"][dimension]
+        if resolved and resolved["applicable"] and resolved["score"] is not None:
+            normalized[row["run"]] = int(resolved["score"] > 0)
             raw[row["run"]] = [{"score": item["score"], "max": item["max"]} for item in items]
     return normalized, raw
 
@@ -121,8 +122,9 @@ def main():
             "false_findings_refuted": sum(c["refuted"] for c in selected_controls),
             "false_findings_injected": len(selected_controls),
         }
-    quality_values = {q["run"]: q["mean_quality"] for q in quality
-                      if q["quality_interval"][0] == q["quality_interval"][1]}
+    quality_values = {q["run"]: q["final_quality"] for q in quality
+                      if q["final_quality"] is not None and
+                      q["quality_interval"][0] == q["quality_interval"][1]}
     stage5 = {"quality": {"per_run": quality_values, **compare(quality_values, runs, 5)},
               "mean_grader_gap":
               sum(q["grader_gap"] for q in quality) / len(quality) if quality else None}
@@ -132,7 +134,7 @@ def main():
                       if any(g["harm"][dimension]["applicable"] for g in q["grades"])}
         chosen = [r for r in runs if r["project"] in applicable]
         stage5[f"harm_{dimension}"] = {
-            "scale": "Mean fraction of each rubric's maximum; unknown scores excluded",
+            "scale": "Resolved harm presence (0 absent, 1 present); unknown scores excluded",
             "raw_grader_points": raw_values,
             "per_run": values, **compare(values, chosen, 5),
             "not_applicable_cases": sorted({q["case"] for q in quality} - applicable),

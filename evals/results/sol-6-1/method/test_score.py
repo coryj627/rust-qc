@@ -38,17 +38,21 @@ class ScoreTests(unittest.TestCase):
         self.assertEqual(score.exact_sign_flip([1, 1]), 0.5)
         self.assertEqual(score.exact_sign_flip([0, 0]), 1)
 
-    def test_harm_uses_rubric_maximum_and_excludes_unknown(self):
+    def test_harm_presence_does_not_confuse_severity_scales_or_unknown(self):
         def grade(value, maximum, applicable=True):
             return {"harm": {"dependencies": {
                 "score": value, "max": maximum, "applicable": applicable}}}
 
         quality = [{"run": "a", "grades": [grade(1, 2), grade(2, 2)]},
                    {"run": "b", "grades": [grade(1.5, 3), grade(3, 3)]},
+                   {"run": "c", "grades": [grade(0, 2), grade(1, 2)]},
                    {"run": "unknown", "grades": [grade(None, 3), grade(0, 3)]},
                    {"run": "na", "grades": [grade(None, None, False)] * 2}]
+        for row in quality:
+            row["resolved_harm"] = row["grades"][-1]["harm"]
+        quality[-2]["resolved_harm"] = {"dependencies": None}
         values, raw = score.harm_values(quality, "dependencies")
-        self.assertEqual(values, {"a": 0.75, "b": 0.75})
+        self.assertEqual(values, {"a": 1, "b": 1, "c": 1})
         self.assertEqual(raw["b"][1], {"score": 3, "max": 3})
 
 
