@@ -146,7 +146,7 @@ def main():
     report_map, redactions, text_by_report = {}, {}, {}
     for label, row in zip("ABCD", runs, strict=False):
         original = (scratch / "private" / row["run_id"] / "report.md").read_text()
-        redacted, edits = redact(original)
+        redacted, edits = redact(original, preserve_verification=args.functional_review)
         text_by_report[label] = redacted
         report_map[label] = row["run_id"]
         redactions[label] = edits

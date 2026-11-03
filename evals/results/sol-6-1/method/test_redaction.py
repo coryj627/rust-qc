@@ -35,6 +35,15 @@ class RedactionTests(unittest.TestCase):
         self.assertEqual(result, text)
         self.assertEqual(changes, [])
 
+    def test_preserved_verification_keeps_regression_evidence_but_hides_tool_name(self):
+        text = ("# Findings\nIncorrect boundary result.\n## Verification\n"
+                "check.sh completed; the boundary probe returned 600 instead of 599.\n")
+        clean, edits = redact(text, preserve_verification=True)
+        self.assertIn("the boundary probe returned 600 instead of 599.", clean)
+        self.assertNotIn("check.sh", clean)
+        self.assertFalse(any(e["action"] == "drop" for e in edits))
+        self.assertNotIn("the boundary probe", redact(text)[0])
+
 
 if __name__ == "__main__":
     unittest.main()

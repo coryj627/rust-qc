@@ -17,7 +17,7 @@ MENTIONS = re.compile(r"rust-qc|SKILL\.md|check\.sh|audit_scan\.py|\bskill(?:'s)
                       re.IGNORECASE)
 
 
-def redact(text):
+def redact(text, *, preserve_verification=False):
     output = []
     edits = []
     verification_level = None
@@ -28,7 +28,7 @@ def redact(text):
         heading = HEADING.match(line) if fence is None else None
         if heading and verification_level is not None and len(heading[1]) <= verification_level:
             verification_level = None
-        if heading and VERIFICATION.fullmatch(heading[2]):
+        if heading and VERIFICATION.fullmatch(heading[2]) and not preserve_verification:
             verification_level = len(heading[1])
         if verification_level is not None:
             edits.append({"line": number, "action": "drop", "reason": "verification_section",
@@ -60,8 +60,11 @@ def main():
     parser.add_argument("report", type=Path)
     parser.add_argument("redacted", type=Path)
     parser.add_argument("edit_log", type=Path)
+    parser.add_argument("--preserve-verification", action="store_true",
+                        help="Keep verification evidence while redacting tool names")
     args = parser.parse_args()
-    text, edits = redact(args.report.read_text())
+    text, edits = redact(args.report.read_text(),
+                         preserve_verification=args.preserve_verification)
     args.redacted.parent.mkdir(parents=True, exist_ok=True)
     args.edit_log.parent.mkdir(parents=True, exist_ok=True)
     args.redacted.write_text(text)

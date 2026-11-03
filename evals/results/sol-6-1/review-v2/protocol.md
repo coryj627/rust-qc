@@ -14,7 +14,10 @@ private until grading ends. No primary review has the pilot's profile or outputs
 
 The primary known-bug measure is functional-contract recall against the 50
 eligible entries in `comparison-eligibility.json`. The other 42 entries are
-outside that denominator, not misses. These are operator scope decisions made
+outside that denominator, not misses. As in the original scorer, report the
+47 reproduced entries as the primary subset and all 50 eligible entries as a
+separate secondary measure. With two replicates, the detailed cell has 94
+primary run/bug pairs per arm; the short cell has 36 per arm. These are operator scope decisions made
 before reading the pilot report. They do not imply an included bug has no
 possible security impact. Reviewers receive no key or eligibility answers.
 
@@ -22,7 +25,11 @@ Before grading, separate clean agents prepare two confirmed false functional key
 entries and five confirmed false functional findings per project, without reading
 review outputs. Two independent blind key graders and one verifier assess each
 stage/project cell. False controls are mixed into their inputs and excluded from
-every substantive total. Redaction replacements and drops are logged. Verification
+every substantive total. Redaction replacements and drops are logged. In v2,
+verification sections are retained because they can contain regression evidence;
+tool names are redacted within them. The original study's section-dropping mode
+is unchanged. Overall finding counts are normalized before control insertion,
+with each change logged and numeric defect evidence preserved. Verification
 uses ordinary functional evidence only; claims requiring dedicated security work
 are left unverified with the scope reason, not subjected to that investigation.
 
