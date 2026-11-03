@@ -55,6 +55,7 @@ The skill never installs toolchains or tools on its own.
 - `.agents/skills/rust-qc/scripts/check.sh`: the verification gate.
 - `.agents/skills/rust-qc/scripts/audit_scan.py`: a scan for problems clippy cannot see.
 - `tests/`: tests for both scripts.
+- `evals/candidates.md`: the projects chosen for answer-key evaluation, with their candidate key bugs.
 
 ## The scripts
 
