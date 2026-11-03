@@ -9,6 +9,7 @@ Each version lists what changed in the rules and scripts. A rule change names th
 These came from a review of the repository, not from an evaluation.
 
 - `check.sh` now stops with exit 2 on rustup older than 1.28. Those versions have no way to turn off automatic downloads, so the statement in 1.0.0 that the script never installs a toolchain did not hold for them.
+- The README no longer says 1.0.0 is the final evaluated version plus later additions. The evaluated versions are not in the repository, so that could not be confirmed. It now says only what the repository's history shows.
 
 ## 1.0.0 - 2026-11-02
 
