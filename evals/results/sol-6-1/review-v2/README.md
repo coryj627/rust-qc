@@ -38,7 +38,7 @@ a block. Usage or disk limits retain the existing global stop behavior.
 
 The new batch-stop behavior was tested first against the old implementation:
 both new tests failed because it continued to an independent project. The updated
-dispatch and grading harness passes 58 tests, Ruff and the namespace shim's
+dispatch and grading harness passes 59 tests, Ruff and the namespace shim's
 ShellCheck check. Rust candidate code
 was not built or run on the host during those Python tests.
 

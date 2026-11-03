@@ -58,6 +58,13 @@ def verifier_text(text, *, functional=False):
             continue
         clean = re.sub(r"^\s*(?:\d+[.)]\s+|#{1,6}\s+)", "", line)
         clean = re.sub(r"^\*\*(.*?)\*\*(?=\s|$)", r"\1", clean)
+        if functional:
+            while True:
+                previous = clean
+                clean = re.sub(r"^\s*(?:\d+[.)]\s+|#{1,6}\s+)", "", clean)
+                clean = re.sub(r"^\*\*(.*?)\*\*(?=\s|$)", r"\1", clean)
+                if clean == previous:
+                    break
         clean = re.sub(r"^(?:High|Medium|Low|Blocker|Major|Minor)\s*[—–:-]\s*", "", clean)
         without_count = re.sub(
             r"^The audit found \d+ defects: \d+ High, \d+ Medium, and \d+ Low\.\s*",

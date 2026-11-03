@@ -59,6 +59,18 @@ class PassageTests(unittest.TestCase):
         text = '```text\nFinding count: 19 — 15 Major, four Minor.\n```\n'
         self.assertEqual(verifier_text(text, functional=True), (text, []))
 
+    def test_functional_nested_heading_labels_match_unlabelled_controls(self):
+        for heading in ("### 1. **Major — Boundary result.**\n",
+                        "## **2. Medium — Boundary result.**\n"):
+            with self.subTest(heading=heading):
+                text = heading + "Observed 600 references instead of 599.\n"
+                clean, edits = verifier_text(text, functional=True)
+                expected = "Boundary result.\nObserved 600 references instead of 599.\n"
+                self.assertEqual(clean, expected)
+                self.assertEqual(edits[0]["before"], heading)
+                self.assertEqual(edits[0]["after"], "Boundary result.\n")
+                self.assertRegex(verifier_text(text)[0], r"^[12][.]")
+
 
 if __name__ == "__main__":
     unittest.main()
