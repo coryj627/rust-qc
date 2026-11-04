@@ -15,6 +15,12 @@ preflight alone do not establish a skill effect.
   and effort before submitting a task. Per-run requests and metadata retain both.
 - Codex CLI: `0.166.0`. Host: macOS arm64. Container: aarch64 Linux, installed
   Rust `1.99.1`, installed nightly `nightly-2026-10-01` with Miri.
+- Operator preparation helpers use macOS `/bin/cp -cR` and require that host's
+  copy semantics; they are not a portable Linux preparation CLI. Hosted Linux
+  checks do not certify that entire preparation workflow. The observed operator
+  Python runtime is recorded in the post-study [publication review checks](publication-review-probes.json);
+  older Python runtimes are not newly certified. See the [review triage](publication-review-triage.md)
+  for remaining diagnostic limitations on unmet helper prerequisites.
 - The existing `rqc-eval:2` image is reused. Its Dockerfile is not rebuilt because
   it installs a Rust toolchain. No Rust toolchain or component is installed.
 - Initial host free space: 141 GiB as displayed by `df -h`; Docker filesystem
