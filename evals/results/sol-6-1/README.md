@@ -111,7 +111,9 @@ evaluation under its original frozen prompts.
 
 Two provider-failed just runs also had invalid source inputs; the mutually
 exclusive table counts them under provider failure. Missing observations are
-never zero scores. No blocked audit was retried or rephrased. Stage 4 changed
+never zero scores. Within this condition, no blocked audit was retried or
+rephrased; the later v2 condition reviewed the same crates under a narrower
+prompt. Stage 4 changed
 budget and prompt together and remains separate from Stage 3. Associated grading
 and verifier cells are absent wherever no valid report exists.
 
@@ -296,5 +298,5 @@ results and the Sol arm mapping for the first time then. Its
 [document validation](method/recommendation-validation.json) record that boundary.
 All 75 local evidence links resolve and both proposed diffs pass `git apply --check`
 against the archived skill; neither diff was applied. Claude's planned cross-family
-sample regrading, evidence checks and sandbox probe reruns remain review work;
-they have not been performed in this Sol evaluation.
+sample regrading, evidence checks and sandbox probe reruns were not part of this
+Sol evaluation. They are recorded in the [Claude review](claude-review/README.md).

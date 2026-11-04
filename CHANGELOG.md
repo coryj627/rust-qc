@@ -11,6 +11,10 @@ These came from a review of the repository, not from an evaluation.
 - `check.sh` now stops with exit 2 on rustup older than 1.28. Those versions have no way to turn off automatic downloads, so the statement in 1.0.0 that the script never installs a toolchain did not hold for them.
 - The README no longer says 1.0.0 is the final evaluated version plus later additions. The evaluated versions are not in the repository, so that could not be confirmed. It now says only what the repository's history shows.
 
+### Documentation
+
+- The README now reports the answer-key evaluations of 1.0.0 on Opus 5.5 and Sol 6.1 and the Sol 6.1 coding runs. They did not show the skill helping either model find more known bugs. No rule or script changed because of them.
+
 ## 1.0.0 - 2026-11-02
 
 The first versioned release. It summarizes the changes made so far. The earlier development versions were not numbered, so they cannot be pinned or compared directly.

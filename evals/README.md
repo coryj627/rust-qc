@@ -6,7 +6,8 @@ Answer-key evaluation scores audit findings against real bugs that upstream fixe
 - `keys/`: one answer key per project, in the format described in `candidates.md`.
 - `repro/`: the reproducer for each key bug and its recorded output. `repro/rerun.tsv` holds the clean re-run results.
 - `sandbox/`: the container used to build and run upstream code.
-- `results/`: the 40 audit reports, their scores and the verified findings. Start with `results/README.md`.
+- `results/`: the 40 Opus 5.5 audit reports, their scores and the verified findings. Start with `results/README.md`.
+- `results/sol-6-1/`: the Sol 6.1 evaluation, and `claude-review/` inside it. Start with `results/sol-6-1/README.md`.
 
 Never give an audit agent this folder. A workspace for an audit holds only the crate at its baseline tag.
 
