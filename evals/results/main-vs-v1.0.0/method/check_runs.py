@@ -6,54 +6,109 @@ Adapted from evals/results/method/check_runs.py to read claude -p stream-json.
 Usage: check_runs.py <run_id>=<stream.jsonl> ...
 
 Flags forbidden tools (web, Skill, Agent, MCP), file tools used outside the workspace, and Bash
-commands that name other folders, use the network, or run anything other than ./run and ./clock.
+commands that name other folders, use the network, or start a host program other than ./run,
+./clock or a read-only tool on the READ_ONLY list.
+Calls that Claude Code's permissions refused are counted, not flagged, because they did not run.
 Prints only a summary and the flagged commands, never transcript text. Exits 1 if any run has a
 flag.
 """
 
 import collections
+import os
 import pathlib
 import re
 import sys
+import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from common import AUDITS
-from streams import summary, tool_uses
+from streams import summary, tool_calls
 
+# Claude Code keeps each session's background-task output here, keyed by working folder.
+AGENT_TMP = f"{tempfile.gettempdir()}/claude-{os.getuid()}"
 FORBIDDEN_TOOLS = {"WebSearch", "WebFetch", "Skill", "Agent", "Task", "ToolSearch", "NotebookEdit"}
 FILE_TOOLS = {"Read", "Write", "Edit", "Grep", "Glob"}
 BAD_TEXT = re.compile(
     r"evals|/keys\b|audits/private|audits/projects/(?!{run})\w|/home/|\.claude"
     r"|\bcurl\b|\bwget\b|git clone|git fetch|\bsb fetch\b|crates\.io|github\.com"
 )
-WRAPPER = re.compile(r"^\s*(\./run\s|\./clock\s*$)")
+# Claude Code allows these read-only programs on files inside the working folder; the maintainer
+# accepted that boundary in Stage 1. Anything else on the host is a flag.
+READ_ONLY = {
+    "./run",
+    "./clock",
+    "cat",
+    "ls",
+    "sed",
+    "grep",
+    "head",
+    "tail",
+    "wc",
+    "find",
+    "sort",
+    "uniq",
+    "cd",
+    "echo",
+    "xargs",
+    "cut",
+    "tr",
+    "diff",
+    "file",
+    "stat",
+    "pwd",
+    "true",
+}
+
+
+def programs(command):
+    """The program each segment of a shell command starts, ignoring quoted text and ./run's args."""
+    bare = re.sub(
+        r"<<-?\s*['\"]?(\w+)['\"]?.*?\n.*?\n\s*\1\s*(\n|$)", "\n", command, flags=re.DOTALL
+    )
+    bare = re.sub(r"\d*>&\d+|\d*[<>]+\s*\S+", " ", bare)
+    bare = re.sub(r"'[^']*'", "''", bare)
+    bare = re.sub(r'"[^"]*"', '""', bare)
+    bare = re.sub(r"\./run\s[^;&|\n]*", "./run", bare)
+    for segment in re.split(r"[;&|\n()]+", bare):
+        words = [w for w in segment.split() if not re.match(r"^\w+=", w)]
+        if words:
+            yield words[0]
 
 
 def check(run_id, stream):
     workspace = str(AUDITS / "projects" / run_id)
     bad_text = re.compile(BAD_TEXT.pattern.replace("{run}", run_id))
-    counts, flags = collections.Counter(), []
-    for name, data in tool_uses(stream):
+    counts, refused, flags = collections.Counter(), 0, []
+    for name, data, ran in tool_calls(stream):
         counts[name] += 1
+        if not ran:
+            refused += 1
+            continue
         if name in FORBIDDEN_TOOLS or (name or "").startswith("mcp__"):
             flags.append(f"TOOL {name}: {str(data)[:120]}")
         if name in FILE_TOOLS:
             target = str(data.get("file_path") or data.get("path") or "")
-            if target and not (target == workspace or target.startswith(workspace + "/")):
+            if target and not target.startswith("/"):
+                target = f"{workspace}/{target}"
+            target = str(pathlib.PurePosixPath(target))
+            own = f"{AGENT_TMP}/{workspace.replace('/', '-')}/"
+            if target.startswith(own) and ("/tasks/" in target or "/tool-results/" in target):
+                continue  # the agent's own background-task and large-output files
+            if not (target == workspace or target.startswith(workspace + "/")) or ".." in target:
                 flags.append(f"{name} outside workspace: {target[-120:]}")
         if name == "Bash":
             command = data.get("command", "").replace(workspace, "<ws>")
             if bad_text.search(command):
                 flags.append("BASH text: " + command[:200].replace("\n", " "))
-            if not WRAPPER.match(command):
-                flags.append("BASH not a wrapper: " + command[:200].replace("\n", " "))
-            unquoted = re.sub(r'"[^"]*"', '""', re.sub(r"'[^']*'", "''", command))
-            if re.search(r"[;&|`\n]|\$\(", unquoted):
-                flags.append("BASH runs more than the wrapper: " + command[:200].replace("\n", " "))
+            for program in programs(command):
+                if program not in READ_ONLY:
+                    flags.append(
+                        f"BASH runs {program} on the host: " + command[:160].replace("\n", " ")
+                    )
     s = summary(stream)
     print(
         f"{run_id}: models={s['models']} tools={dict(counts)} out={s['output_tokens']}"
-        f" cost={s['reported_cost_usd']} flags={len(flags)}"
+        f" cost={s['reported_cost_usd']} refused={refused} flags={len(flags)}"
     )
     for flag in flags[:15]:
         print("   ", flag)
