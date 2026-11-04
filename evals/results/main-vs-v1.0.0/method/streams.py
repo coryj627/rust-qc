@@ -26,8 +26,14 @@ def tool_uses(path):
 
 
 def summary(path):
-    """Models seen, the init event's tool and skill counts, and the result's text and usage."""
-    models, init, result = set(), {}, {}
+    """Models seen, the init event's tool and skill counts, and the run's report and usage.
+
+    A run can end more than once: when a background command finishes after the agent's final
+    message, Claude Code wakes it for another turn, which ends with a second result. The report
+    is the first result's text, the one the agent returned when it finished. Token usage is per
+    result, so it is summed; total_cost_usd is cumulative, so the last result's is the run's cost.
+    """
+    models, init, results = set(), {}, []
     for event in events(path):
         if event.get("type") == "assistant":
             message = event.get("message")
@@ -37,8 +43,14 @@ def summary(path):
         elif event.get("subtype") == "init":
             init = event
         elif event.get("type") == "result":
-            result = event
-    usage = result.get("usage") or {}
+            results.append(event)
+    first = results[0] if results else {}
+    last = results[-1] if results else {}
+
+    def total(field):
+        values = [(r.get("usage") or {}).get(field) for r in results]
+        return sum(v for v in values if v is not None) if results else None
+
     return {
         "models": sorted(models),
         "init_model": init.get("model"),
@@ -46,15 +58,16 @@ def summary(path):
         "slash_commands": len(init.get("slash_commands") or []),
         "mcp_servers": len(init.get("mcp_servers") or []),
         "plugins": [p.get("name") for p in init.get("plugins") or []],
-        "result": result.get("result"),
-        "is_error": result.get("is_error"),
-        "subtype": result.get("subtype"),
-        "num_turns": result.get("num_turns"),
-        "input_tokens": usage.get("input_tokens"),
-        "output_tokens": usage.get("output_tokens"),
-        "cache_read_tokens": usage.get("cache_read_input_tokens"),
-        "cache_write_tokens": usage.get("cache_creation_input_tokens"),
-        "reported_cost_usd": result.get("total_cost_usd"),
+        "result": first.get("result"),
+        "later_results": [r.get("result") for r in results[1:]],
+        "is_error": first.get("is_error"),
+        "subtype": first.get("subtype"),
+        "num_turns": first.get("num_turns"),
+        "input_tokens": total("input_tokens"),
+        "output_tokens": total("output_tokens"),
+        "cache_read_tokens": total("cache_read_input_tokens"),
+        "cache_write_tokens": total("cache_creation_input_tokens"),
+        "reported_cost_usd": last.get("total_cost_usd"),
     }
 
 

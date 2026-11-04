@@ -1,7 +1,5 @@
 # Audit report: moka 0.12.11 (`crate/src/`)
 
-This replaces my earlier report. The only change is the Miri result, which has now finished.
-
 ## Summary
 
 moka is a mature library. Its own test suite passes with `sync,future`, and every behavior probe of the normal API matched what a user should get, except one. The serious defect is a use-after-free in the shared timer wheel, which I triggered from safe public API and confirmed with AddressSanitizer. 
@@ -13,7 +11,7 @@ moka is a mature library. Its own test suite passes with `sync,future`, and ever
 
 when a popped timer node has no expiration time, the code skips the whole `if let Some(t) = expiration_time` block. The `Box` is then dropped at the end of the branch. Nothing calls `unset_timer_node_in_deq_nodes()`, so the entry's `DeqNodes` keeps a dangling timer pointer. When the entry's pending `ReadOp` or `WriteOp` is applied later, or the entry is removed, `deschedule` runs on freed memory.
 
-An entry's expiration can be cleared while it is still scheduled. This happens when `Expiry::expire_after_read` or `expire_after_update` returns `None` on another thread while housekeeping is advancing the wheel. It also happens when the `ReadOp` is dropped or not recorded, a case the comment at `src/sync/base_cache.rs:333-345` says is fine.
+An entry's expiration can be cleared while it is still scheduled. This happens when `Expiry::expire_after_read` or `expire_after_update` returns `None` on another thread while housekeeping is advancing the wheel. It also happens when the `ReadOp` is dropped or not recorded, a case the comment at `src/sync/base_cache.rs:333-345` explicitly says is fine.
 
 Reproduction: `tmp/probe/src/main.rs` (a throwaway crate outside `crate/`) uses only the public API:
 - Build a `sync::Cache` with `expire_after`. `expire_after_create` returns 300 ms for key "w" and 1.9 s for key "y". `expire_after_read` returns `None`.
@@ -85,5 +83,5 @@ across the crate.
 **Bare TODOs and a missing lint baseline**
 There are about 40 TODOs without an owner or issue number, for example `src/common/concurrent/deques.rs:206`, which says "Add tests and run Miri with them". `[lints]` only configures `unexpected_cfgs`. Recommend adding clippy lints for undocumented unsafe, `unwrap_used` and `missing_errors_doc`.
 
-**Miri does not cover the code path with the bug**
-The existing deque, timer-wheel, frequency-sketch and `MiniArc` unit tests are clean under Miri. None of them exercises a timer node whose expiration was cleared, so Miri cannot catch the High. Recommend adding a mock-clock unit test for that case and running it under Miri in CI.
+**Miri coverage**
+The crate is heavy with `unsafe`. Recommend running `cargo miri test` regularly on the deque, timer-wheel and `MiniArc` tests, plus a mock-clock test for the High above.

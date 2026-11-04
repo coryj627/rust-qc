@@ -128,6 +128,4 @@ Adding a variant later would be a breaking change. Consider `#[non_exhaustive]` 
 
 - **`Send`/`Sync` bounds** on `Cache` and `SegmentedCache` (`S: Send` for `Send`): I found no safe-code path to a data race. See the unsafe finding.
 - **Miri, Stacked Borrows:** it reports undefined behaviour in `cht::segment::tests::drop_value`, but the violation is inside crossbeam-epoch 0.9.21 (`internal.rs:567`, its intrusive `Local` list during `pin()`), not in moka code.
-- **Miri, Tree Borrows:** the moka `cht` unsafe code is still unverified under Miri.
-  - The first run of the same tests finished. But I had cut its output short, and the saved part shows only crossbeam-epoch integer-to-pointer warnings, with no error and no result line.
-  - The rerun hit my 800-second timeout before printing a result.
+- **Miri, Tree Borrows:** I started a rerun of the same tests under Tree Borrows, but it had not finished when I wrote this. Moka's own `cht` unsafe code is therefore not verified under Miri.

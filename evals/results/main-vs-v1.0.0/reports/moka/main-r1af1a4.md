@@ -147,9 +147,7 @@ Adding a variant later would be a breaking change. Consider `#[non_exhaustive]` 
 
 - **`Send`/`Sync` bounds** on `Cache` and `SegmentedCache` (`S: Send` for `Send`): I found no safe-code path to a data race. See the unsafe finding.
 - **Miri, Stacked Borrows:** it reports undefined behaviour in `cht::segment::tests::drop_value`, but the violation is inside crossbeam-epoch 0.9.21 (`internal.rs:567`, its intrusive `Local` list during `pin()`), not in moka code.
-- **Miri, Tree Borrows:** the moka `cht` unsafe code is still unverified under Miri.
-  - The first run of the same tests finished. But I had cut its output short, and the saved part shows only crossbeam-epoch integer-to-pointer warnings, with no error and no result line.
-  - The rerun hit my 800-second timeout before printing a result.
+- **Miri, Tree Borrows:** I started a rerun of the same tests under Tree Borrows, but it had not finished when I wrote this. Moka's own `cht` unsafe code is therefore not verified under Miri.
 
 ## Verification commands
 
@@ -161,7 +159,7 @@ All commands run from `crate/` unless stated otherwise.
 - `cargo test --workspace --features sync,future`: pass. Lib tests 150 passed with 5 ignored; integration tests and doctests passed, including 67 passed with 2 ignored.
 - `cargo +nightly-2026-10-01 miri test --features sync --lib -- common::deque common::concurrent::arc common::timer_wheel common::frequency_sketch`: pass, 16 tests.
 - `cargo +nightly-2026-10-01 miri test --features sync --lib -- cht::segment::tests::drop_value`: fail, Stacked Borrows violation inside crossbeam-epoch.
-- `MIRIFLAGS=-Zmiri-tree-borrows cargo +nightly-2026-10-01 miri test --features sync --lib -- cht::segment::tests::{single_segment,insertion,removal,insert_with_or_modify,drop_value} cht::map::bucket::tests`: inconclusive (truncated output, then a timeout).
+- `MIRIFLAGS=-Zmiri-tree-borrows cargo +nightly-2026-10-01 miri test --features sync --lib -- cht::…`: not finished.
 - Probes: a throwaway crate in `tmp/probe` with a path dependency on `crate`, built with `cargo run --offline --bin p2` through `p14`. The concurrency probes use `--release`. The failing ones are `p3` (panic), `p5` (`remove` and `or_insert_with_if`), `p7` (segment capacity), and `p9` through `p13` (counter drift).
 
 ## Closing summary
@@ -169,11 +167,13 @@ All commands run from `crate/` unless stated otherwise.
 I covered the gate, the heuristic scan, and probes of eviction (TinyLFU and LRU, weigher), TTL, TTI and `Expiry`, invalidation, listeners, the entry and compute APIs, `SegmentedCache`, the async cache, a seeded model test and multithreaded stress. I also read the timer wheel, deque, frequency sketch, `MiniArc`, value initializer, key lock, invalidator and the core of `cht`.
 
 I left some things unchecked:
-- the `cht` rehash and concurrency paths under Miri: the Tree Borrows rerun timed out, and another one would not fit in the remaining time;
+- the `cht` rehash and concurrency paths under Miri, since the Tree Borrows run did not finish;
 - the `quanta` and `logging` features;
 - builds at the MSRV of 1.70;
 - line-by-line reading of the 5,000-line `cache.rs` files.
 
-I also could not tell which defects predate this release and which are local changes, since there is no git history to compare against. Nothing in the repository or its output tried to give me instructions. I stopped at 33 minutes to leave time for the report.
+I also could not tell which defects predate this release and which are local changes, since there is no git history to compare against. Nothing in the repository or its output tried to give me instructions.
 
-Final clock: 33 minutes used of 45.
+I stopped at 14 of 45 minutes. The remaining checks needed long Miri runs, and I could not wait on them in the foreground.
+
+Final clock: 14 minutes used of 45.

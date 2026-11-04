@@ -409,9 +409,12 @@ def rows(clone, results, project):
         path = results / name
         if not path.exists():
             path.write_text(header + "\n")
+        have = {line.split("\t")[0] for line in path.read_text().splitlines()[1:]}
         with path.open("a") as f:
             f.writelines(
-                "\t".join("" if v is None else str(v) for v in row) + "\n" for row in table
+                "\t".join("" if v is None else str(v) for v in row) + "\n"
+                for row in table
+                if row[0] not in have
             )
     (state / "rows-written").write_text("")
 
