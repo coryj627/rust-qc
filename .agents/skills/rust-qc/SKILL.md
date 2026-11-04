@@ -158,6 +158,8 @@ It stops immediately if `cargo`, rustfmt, clippy, the project's pinned toolchain
 
 Recommend, and run when already installed: `cargo miri test` for crates with `unsafe`; `cargo hack check --feature-powerset` for crates with several features; a build at the declared `rust-version`. Report each result honestly. A failure that predates your change is reported as pre-existing, not hidden.
 
+When you finish create or modify work, list the verification commands you ran, written as plain `cargo` commands the user can rerun without this skill, with the outcome of each: pass, fail, skipped, or blocked, and why. Include the feature and target flags you used, and the directory if it is not the crate root. Test counts alone do not let anyone reproduce the result.
+
 ## Reference files
 
 Read the one that matches what you are doing; do not load them all.
