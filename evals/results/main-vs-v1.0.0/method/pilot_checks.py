@@ -19,6 +19,8 @@ from common import AUDITS
 from redact import redact
 from streams import events, summary, tool_calls
 
+CLOSING = re.compile(r"^#{1,3}\s+Closing summary\b", re.MULTILINE)
+
 
 def last_assistant_text(stream):
     text = None
@@ -124,7 +126,7 @@ def main():
             "finding_headings": len(headings),
             "headings_after_redaction": sum(f"**{h}**" in redacted for h in headings),
             "dropped_lines": len(dropped),
-            "closing_summary": bool(re.search(r"^#{1,3}\s+Closing summary\b", report, re.M)),
+            "closing_summary": bool(CLOSING.search(report)),
             "closing_summary_removed": "Closing summary" not in redacted,
             "result_equals_last_text": (s["result"] or "") == (last_assistant_text(stream) or ""),
             "ends_with_clock": bool(
