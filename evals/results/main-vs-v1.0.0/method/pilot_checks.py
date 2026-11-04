@@ -124,6 +124,8 @@ def main():
             "finding_headings": len(headings),
             "headings_after_redaction": sum(f"**{h}**" in redacted for h in headings),
             "dropped_lines": len(dropped),
+            "closing_summary": bool(re.search(r"^#{1,3}\s+Closing summary\b", report, re.M)),
+            "closing_summary_removed": "Closing summary" not in redacted,
             "result_equals_last_text": (s["result"] or "") == (last_assistant_text(stream) or ""),
             "ends_with_clock": bool(
                 re.search(r"\b\d+\s*(?:minutes?|min)\b[^\n]*$", (s["result"] or "").strip())
