@@ -4,6 +4,10 @@ Each version lists what changed in the rules and scripts. A rule change names th
 
 ## Unreleased
 
+### Rule changes
+
+- Audit reports now keep QA hygiene and its counts in a separate section from defects. Skill runs reported far more items that are not defects on both models tested: 111 against 12 on Opus 5.5, and 86 against 28 hygiene items on Sol 6.1. This changes how results are presented, not what an audit checks. It has not been tested, and nothing here is expected to find more bugs.
+
 ### Fixed
 
 These came from a review of the repository, not from an evaluation.

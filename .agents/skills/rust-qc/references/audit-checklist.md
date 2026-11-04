@@ -4,11 +4,13 @@ Walk these in order. The first two are mechanical; the rest need reading. Rule I
 
 ## 1. Toolchain results
 
-Run `scripts/check.sh --audit <crate-root>`. A failing build or test is a Blocker. A gate command that fails with the project's own toolchain (its `rust-toolchain.toml` or CI configuration) is Major; one that fails only on a newer toolchain is toolchain drift, reported as one Minor finding. Record pre-existing failures as such. Group the advisory warnings into one Minor finding per category with a count, except unsafe, unwrap, and panic warnings, which are judged one by one. Map each advisory-pass warning to its rule: `undocumented_unsafe_blocks` and `missing_safety_doc` to UNSAFE-1 and UNSAFE-2 (Major, or Blocker only if you can show or plausibly argue a path to undefined behavior), `missing_docs` to DOC-1, `missing_errors_doc` and `missing_panics_doc` to DOC-3 and PANIC-5, `unwrap_used` to PANIC-1, `allow_attributes_without_reason` to LINT, `wildcard_imports` to ORG-15, `missing_assert_message` to PANIC-4, `map_err_ignore` to ERR-5, `dbg_macro`/`todo`/`unimplemented` to PANIC-6, `missing_debug_implementations` to API-19.
+Run `scripts/check.sh --audit <crate-root>`. A failing build or test is a Blocker. A gate command that fails with the project's own toolchain (its `rust-toolchain.toml` or CI configuration) is Major; one that fails only on a newer toolchain is toolchain drift, reported as one Minor QA hygiene item. Record pre-existing failures as such. Group the advisory warnings into one Minor QA hygiene item per category with a count, except unsafe, unwrap, and panic warnings, which are judged one by one. Map each advisory-pass warning to its rule: `undocumented_unsafe_blocks` and `missing_safety_doc` to UNSAFE-1 and UNSAFE-2 (Major, or Blocker only if you can show or plausibly argue a path to undefined behavior), `missing_docs` to DOC-1, `missing_errors_doc` and `missing_panics_doc` to DOC-3 and PANIC-5, `unwrap_used` to PANIC-1, `allow_attributes_without_reason` to LINT, `wildcard_imports` to ORG-15, `missing_assert_message` to PANIC-4, `map_err_ignore` to ERR-5, `dbg_macro`/`todo`/`unimplemented` to PANIC-6, `missing_debug_implementations` to API-19.
+
+In the report, keep QA hygiene and its counts separate from defects. Keep failing commands and useful maintenance advice. A diagnostic shows what the tool checked; it is not by itself evidence of incorrect behavior.
 
 ## 2. Heuristic scan
 
-Run `python3 -I scripts/audit_scan.py <crate-root>`. Confirm every hit by reading the surrounding code. Discard false positives silently; do not pad the report with them.
+Run `python3 -I scripts/audit_scan.py <crate-root>`. Confirm every hit by reading the surrounding code. Discard false positives silently; do not pad the report with them. Hits that are only style or convention go in the QA hygiene section.
 
 ## 3. Behavior probes
 
