@@ -27,7 +27,7 @@ One baseline run, `v2-s3-pulldown-cmark-811a0b06`, ran a `find` for files named 
 
 ## The blind regrade
 
-Two fresh Opus 5.5 agents scored 62 pairs using [this brief](regrade-brief.md). The sample used a fixed seed and was stratified: 20 `found` and 10 `missed` scores from each arm, plus both `partial` scores among the reproduced entries. Reports were given random names, but they were unredacted, so style could hint at the arm. The results are in [`regrade.jsonl`](regrade.jsonl).
+Two fresh Opus 5.5 agents scored 62 pairs using [this brief](regrade-brief.md). The sample used a fixed seed and was stratified: 20 `found` and 10 `missed` scores from each arm, plus both `partial` scores among the reproduced entries. Reports were given random names, but they were unredacted, so style could hint at the arm. The results are in [`regrade.jsonl`](regrade.jsonl). That file is a summary, not the graders' raw lines: it replaces each anonymous pair and report with its project, bug, run and arm, adds the primary score, and leaves out the grader's `rule` label.
 
 Agreement was complete, but **it shows stability, not strictness**. The brief told graders that a symptom alone is `partial` when a rule requires a mechanism. They still gave `found` for `just-3` on report `v2-s3-just-fc32aea1`, which describes the panic and never names its cause.
 
