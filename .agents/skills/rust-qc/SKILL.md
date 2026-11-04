@@ -83,8 +83,8 @@ The goal is the smallest correct change that leaves the touched code at least as
 
 ## Auditing code
 
-1. Run `scripts/check.sh --audit <crate-root>` (plus `--target` per step 1). The `--audit` pass reports, with public-API reachability, undocumented `unsafe`, missing docs and `# Errors`/`# Panics` sections, `unwrap` outside tests, `#[allow]` without a reason, `dbg!`/`todo!`, glob imports, and assertions without messages. Report these hygiene results compactly: one Minor finding per category (documentation, `Debug`, SAFETY comments, lint configuration), each with a count and the few instances that matter most. A gate step that fails only because the toolchain here is newer than the one the project's CI or `rust-toolchain.toml` uses is toolchain drift: one Minor finding, not a Major.
-2. Run `python3 -I scripts/audit_scan.py <crate-root>` for what clippy cannot see: glob re-exports, weasel-word type names, ASCII-art comments, design-history docs, parameter tables, bare TODOs, empty `expect` messages, and print macros in library code. Confirm each hit by reading the code; discard false positives.
+1. Run `scripts/check.sh --audit <crate-root>` (plus `--target` per step 1). The `--audit` pass reports, with public-API reachability, undocumented `unsafe`, missing docs and `# Errors`/`# Panics` sections, `unwrap` outside tests, `#[allow]` without a reason, `dbg!`/`todo!`, glob imports, and assertions without messages. Report these hygiene results compactly in a separate QA hygiene section: one Minor item per category (documentation, `Debug`, SAFETY comments, lint configuration), each with a count and the few instances that matter most. Keep hygiene counts separate from defect counts. A result that meets a higher severity below, such as `unsafe` that appears sound but lacks SAFETY justification, stays with the defects. A gate step that fails only because the toolchain here is newer than the one the project's CI or `rust-toolchain.toml` uses is toolchain drift: one Minor item in that section, not a Major.
+2. Run `python3 -I scripts/audit_scan.py <crate-root>` for what clippy cannot see: glob re-exports, weasel-word type names, ASCII-art comments, design-history docs, parameter tables, bare TODOs, empty `expect` messages, and print macros in library code. Confirm each hit by reading the code; discard false positives. Hits that are only style or convention go in the QA hygiene section.
 3. **Probe behavior the way users meet it.** This is where most user-facing bugs in real crates are found, so spend most of the audit here and in step 5. Read the crate's docs, spec, and tests to list the input features it claims to handle. For each, build a small realistic input that the existing tests do not cover, run it through the public API from a throwaway crate outside the workspace, and compare the output with what a user should get. Cover the features the format allows but the fixtures skip:
    - inherited, indirect, or defaulted values
    - duplicates
@@ -119,9 +119,10 @@ Calibrate honestly: missing comments on correct code are not Blockers, and a lon
 
 Plain text with headings, so it reads well in a screen reader and pastes cleanly into an issue. No emoji and no decorative tables. Structure:
 
-1. A verdict of two to four sentences, including a count of findings per severity.
-2. One section per severity, in order. Each finding is a heading that names the problem in a few words, followed by a location line and a short problem and fix. One problem per finding. Within a severity, put what users hit first, then soundness, then maintainability.
-3. The verification commands, written as plain `cargo` commands the user can rerun without this skill, with pass, fail, or skipped and why.
+1. A verdict of two to four sentences, including defect counts per severity and a separate count of QA hygiene items.
+2. One section per severity for defects, in order. Each finding is a heading that names the problem in a few words, followed by a location line and a short problem and fix. One problem per finding. Within a severity, put what users hit first, then soundness, then maintainability.
+3. A QA hygiene section after the defects, with the grouped items and their practical impact. A convention omission alone belongs here; a demonstrated violation of a documented contract belongs with the defects. Cross-reference overlapping evidence rather than counting it twice.
+4. The verification commands, written as plain `cargo` commands the user can rerun without this skill, with pass, fail, or skipped and why. Keep failing commands here even when the result is reported as hygiene.
 
 ```text
 ## Blocker
@@ -130,6 +131,12 @@ Plain text with headings, so it reads well in a screen reader and pastes cleanly
 Location: src/lib.rs:1044 (insert_many).
 Problem: the length is set to 0 as a panic guard, so reserve(1) sees spare capacity and never grows; later writes go past the allocation. Any .filter() iterator triggers it.
 Fix: restore the length before reserving, or collect the surplus items and insert them in a second pass.
+
+## QA hygiene
+
+### Public fallible functions without an Errors section: 20
+Most already describe their errors in prose. Start with Store::open (src/store.rs:88), which does not.
+Fix: add an Errors section to each.
 ```
 
 Leave rule IDs out of the report: a reader without this skill cannot look them up. Name the rule in words when it helps, for example "undocumented unsafe". Keep code snippets to the lines that carry the fix. Aim for the shortest report that a busy reviewer can act on; do not add a closing summary that repeats the findings.
