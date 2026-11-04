@@ -28,3 +28,11 @@ moka's four redacted reports were regraded by one agent with the earlier rounds'
 ## zip
 
 zip's four audits were stopped at 5 to 9 clock minutes when the driver was stopped, and wrote no report. They are not usable and need new runs.
+
+## Brief test
+
+Four new moka audits ran for the v1.0.0 arm with the earlier rounds' exact brief, from `evals/results/method/write_briefs.py` with the skill paragraph. The only change was "It is aarch64 Linux, so x86-only code cannot run natively." to "It is x86_64 Linux." Everything else was as in this round: `claude -p`, the same flags, model, effort, sandbox and template.
+
+One agent graded the four redacted reports with the earlier rounds' grader brief, as in the regrading test. It found 0 of 20; the earlier rounds found 17 of 20. The audits used 4 to 10 clock minutes, wrote 509 to 1,136 words and cost 4.38 to 6.02 USD each, 20.58 USD in all, plus 0.12 USD for grading.
+
+So the Report wording does not explain the drop. What remains is how agents are started (`claude -p` here, subagents of an interactive session before) and the effort level, which no event confirms.
