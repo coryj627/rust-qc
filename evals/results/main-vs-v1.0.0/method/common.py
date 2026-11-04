@@ -5,6 +5,7 @@ two lines. audit-brief.md is the with-skill brief from evals/results/method/writ
 the changes listed in changes.md.
 """
 
+import importlib.util
 import pathlib
 
 AUDITS = pathlib.Path("/srv/rqc/audits")
@@ -36,7 +37,18 @@ echo "$used minutes used of 45"
 # They are renamed in crate/ before any audit.
 QUARANTINE = {"CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", "SKILL.md", ".claude"}
 
+
+def _earlier_notes():
+    """Name, audited path and build notes for the 10 keyed projects, from earlier rounds."""
+    source = pathlib.Path(__file__).parents[2] / "method" / "write_briefs.py"
+    spec = importlib.util.spec_from_file_location("write_briefs", source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.NOTES
+
+
 NOTES = {
+    **_earlier_notes(),
     "alacritty_terminal": (
         "alacritty_terminal 0.25.0",
         "crate/alacritty_terminal/src/",
@@ -54,8 +66,9 @@ ALLOWED = ["Bash(./run *)", "Bash(./clock)", "Edit(./crate/**)", "Edit(./tmp/**)
 ENV = {"BASH_DEFAULT_TIMEOUT_MS": "960000", "BASH_MAX_TIMEOUT_MS": "960000"}
 
 
-def agent_command(prompt, model=MODEL, effort=EFFORT):
+def agent_command(prompt, model=MODEL, effort=EFFORT, tools=TOOLS, allowed=None):
     """The exact claude -p command line for an agent, from the Execution design comment."""
+    allowed = ALLOWED if allowed is None else allowed
     return [
         "timeout",
         "90m",
@@ -71,9 +84,8 @@ def agent_command(prompt, model=MODEL, effort=EFFORT):
         "--strict-mcp-config",
         "--disable-slash-commands",
         "--tools",
-        TOOLS,
-        "--allowedTools",
-        *ALLOWED,
+        tools,
+        *(["--allowedTools", *allowed] if allowed else []),
         "--output-format",
         "stream-json",
         "--verbose",

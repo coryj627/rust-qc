@@ -6,6 +6,8 @@ Adapted from evals/results/method/prep_audits.py.
 Usage:
   prep_workspaces.py template <project> <repo> <tag>
       Put the crate at the tag in a template, rename instruction files, and fetch dependencies.
+  prep_workspaces.py keyed <clone> <project>...
+      The same for keyed projects, with the repo, tag and lockfile their keys and evals/repro name.
   prep_workspaces.py runs <project> <runs-per-arm>
       Copy the template per run, and add the wrappers, the arm's skill and the brief.
 
@@ -19,23 +21,52 @@ import shutil
 import subprocess
 import sys
 
+import yaml
+
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from common import ARMS, AUDITS, BRIEF, CLOCK, NOTES, QUARANTINE, RUN
 
 SB = str(AUDITS / "sb")
 
 
-def template(project, repo, tag):
+def template(project, repo, tag, lock=None):
+    """Crate at the tag in projects/tmpl-<project>, instruction files renamed, deps fetched.
+
+    lock is a lockfile to use when the tag has none (evals/repro/<project>/base-Cargo.lock).
+    git2's libgit2 is a submodule, so its sources are copied in without their .git.
+    """
     name = f"tmpl-{project.replace('_', '-')}"
-    fetch = (
-        f"git clone -q --depth 1 --branch {tag} https://github.com/{repo} /work/clone"
-        " && mkdir /work/crate /work/tmp"
-        f" && git -C /work/clone archive {tag} | tar -x -C /work/crate"
-        " && rm -rf /work/clone && cd /work/crate && cargo fetch --locked"
-    )
-    subprocess.run([SB, "fetch", name, "sh", "-c", fetch], check=True)
-    renamed = quarantine(AUDITS / "projects" / name / "crate")
+    folder = AUDITS / "projects" / name
+    folder.mkdir(parents=True, exist_ok=True)
+    steps = [
+        f"git clone -q --depth 1 --branch {tag} https://github.com/{repo} /work/clone",
+        "mkdir -p /work/crate /work/tmp",
+        f"git -C /work/clone archive {tag} | tar -x -C /work/crate",
+    ]
+    if project == "git2":
+        steps += [
+            "git -C /work/clone submodule update -q --init --depth 1 libgit2-sys/libgit2",
+            "cp -r /work/clone/libgit2-sys/libgit2/. /work/crate/libgit2-sys/libgit2/",
+            "rm -rf /work/crate/libgit2-sys/libgit2/.git",
+        ]
+    steps.append("rm -rf /work/clone")
+    if lock:
+        shutil.copy(lock, folder / "base-Cargo.lock")
+        steps += [
+            "test ! -f /work/crate/Cargo.lock",
+            "mv /work/base-Cargo.lock /work/crate/Cargo.lock",
+        ]
+    steps.append("cd /work/crate && cargo fetch --locked")
+    subprocess.run([SB, "fetch", name, "sh", "-c", " && ".join(steps)], check=True)
+    renamed = quarantine(folder / "crate")
     print(f"{name}: renamed {renamed or 'nothing'}")
+
+
+def keyed(clone, project):
+    """Template for a keyed project, with the repo, tag and lockfile its answer key names."""
+    key = yaml.safe_load((clone / "evals" / "keys" / f"{project}.yaml").read_text())
+    lock = clone / "evals" / "repro" / project / "base-Cargo.lock"
+    template(project, key["repo"], key["baseline"]["tag"], lock if lock.exists() else None)
 
 
 def quarantine(crate):
@@ -84,6 +115,9 @@ def main():
     action = sys.argv[1]
     if action == "template":
         template(*sys.argv[2:5])
+    elif action == "keyed":
+        for project in sys.argv[3:]:
+            keyed(pathlib.Path(sys.argv[2]), project)
     elif action == "runs":
         runs(sys.argv[2], int(sys.argv[3]))
     else:

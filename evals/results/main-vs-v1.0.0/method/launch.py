@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Start agents in their workspaces at once, in the order given, and wait for all of them.
 
-Usage: launch.py <run_id>... [--model M]
+Usage: launch.py <run_id>... [--model M] [--root DIR] [--read-only]
+
+--root is the folder that holds the workspaces (default: the audit projects folder).
+--read-only gives the agent only Read, Grep and Glob, and no pre-approved commands.
 
 Each agent reads its workspace's BRIEF.md as the prompt, runs from the workspace with stdin closed,
 and writes its stream-json to private/streams/<run_id>.jsonl. Start time, end time and exit code go
@@ -10,6 +13,7 @@ to private/agents.tsv. The command line is common.agent_command.
 
 import datetime
 import os
+import pathlib
 import subprocess
 import sys
 import time
@@ -24,16 +28,25 @@ def now():
 
 def main():
     args = sys.argv[1:]
-    model = MODEL
+    model, root, tools, allowed = MODEL, AUDITS / "projects", None, None
     if "--model" in args:
         i = args.index("--model")
         model = args[i + 1]
         del args[i : i + 2]
+    if "--root" in args:
+        i = args.index("--root")
+        root = pathlib.Path(args[i + 1])
+        del args[i : i + 2]
+    if "--read-only" in args:
+        args.remove("--read-only")
+        tools, allowed = "Read,Grep,Glob", []
     procs = []
     for run_id in args:
-        folder = AUDITS / "projects" / run_id
+        folder = root / run_id
         stream = (AUDITS / "private" / "streams" / f"{run_id}.jsonl").open("w")
-        command = agent_command((folder / "BRIEF.md").read_text(), model=model)
+        brief = (folder / "BRIEF.md").read_text()
+        extra = {"tools": tools, "allowed": allowed} if tools else {}
+        command = agent_command(brief, model=model, **extra)
         proc = subprocess.Popen(
             command,
             cwd=folder,
