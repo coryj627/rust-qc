@@ -93,7 +93,7 @@ The goal is the smallest correct change that leaves the touched code at least as
    - non-ASCII text and legacy encodings
    - large but legitimate sizes
 
-   Report each confirmed problem with the input that shows it.
+   Report each confirmed problem with the input that shows it and the code that causes it.
 4. **Harness untrusted input.** For every public function that parses untrusted bytes or text, feed it every short input over a relevant alphabet or a few million seeded random mutations, and catch panics. Also try crafted structures that make work grow faster than input size (shared or recursive references, deep nesting) under a timeout.
 5. Read the code for what tools cannot judge: soundness of each `unsafe` block, error design, API shape, module boundaries, naming, test quality, and whether comments explain why. In code that talks to the operating system, also check:
    - panics on a syscall, I/O, or environment failure (`assert!` or `unwrap` on a return value, a non-UTF-8 environment variable or passwd field)
@@ -120,7 +120,7 @@ Calibrate honestly: missing comments on correct code are not Blockers, and a lon
 Plain text with headings, so it reads well in a screen reader and pastes cleanly into an issue. No emoji and no decorative tables. Structure:
 
 1. A verdict of two to four sentences, including defect counts per severity and a separate count of QA hygiene items.
-2. One section per severity for defects, in order. Each finding is a heading that names the problem in a few words, followed by a location line, a short problem, its evidence, and a fix. One problem per finding. Within a severity, put what users hit first, then soundness, then maintainability.
+2. One section per severity for defects, in order. Each finding is a heading that names the problem in a few words, followed by a location line, a short problem, its cause, its evidence, and a fix. One problem per finding. Within a severity, put what users hit first, then soundness, then maintainability.
 3. A QA hygiene section after the defects, with the grouped items and their practical impact. A convention omission alone belongs here; a demonstrated violation of a documented contract belongs with the defects. Cross-reference overlapping evidence rather than counting it twice.
 4. An Unverified section, if needed, for concerns you could neither establish nor rule out. These stay out of every count.
 5. The verification commands, written as plain `cargo` commands the user can rerun without this skill, with pass, fail, or skipped and why. Keep failing commands here even when the result is reported as hygiene.
@@ -130,7 +130,8 @@ Plain text with headings, so it reads well in a screen reader and pastes cleanly
 
 ### Heap overflow when the iterator outruns its size hint
 Location: src/lib.rs:1044 (insert_many).
-Problem: the length is set to 0 as a panic guard, so reserve(1) sees spare capacity and never grows; later writes go past the allocation. Any .filter() iterator triggers it.
+Problem: later writes go past the allocation. Any .filter() iterator triggers it.
+Cause: the length is set to 0 as a panic guard, so reserve(1) sees spare capacity and never grows.
 Evidence (ran): `cargo miri test --test probe insert_many_filter` reports an out-of-bounds write. The probe calls insert_many with (0..100).filter(|n| n % 2 == 0).
 Fix: restore the length before reserving, or collect the surplus items and insert them in a second pass.
 
@@ -146,7 +147,7 @@ Every defect says what the code should do and how you established that it does n
 - **Ran:** the smallest input or command that shows the problem, and the result you saw. If it is too long to quote, describe it so someone can rebuild it.
 - **Read:** the lines that establish it, when running it is impractical.
 
-Report the failure you saw separately from its cause, and mark a cause you have not traced in the source as a hypothesis. An unknown cause does not weaken a demonstrated failure, so do not guess one. QA hygiene items need only their count and the check that reported them.
+Name the cause of each failure: the call or condition in the code that produces it. Trace it in the source, and keep it separate from the failure you saw. If you could not trace it, say so, or mark your best explanation as a hypothesis. An unknown cause does not weaken a demonstrated failure, so report the failure anyway and do not present a guess as fact. QA hygiene items need only their count and the check that reported them.
 
 Leave rule IDs out of the report: a reader without this skill cannot look them up. Name the rule in words when it helps, for example "undocumented unsafe". Keep code snippets to the lines that carry the fix, and evidence to the line or two that lets someone check the finding. Aim for the shortest report that a busy reviewer can act on; do not add a closing summary that repeats the findings.
 
