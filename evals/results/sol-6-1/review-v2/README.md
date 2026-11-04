@@ -139,6 +139,14 @@ active minutes, 47 commands and 19 unverified candidate findings are recorded
 in the [pilot report](reports/v2-pilot-pulldown-cmark.md) and [checks](pilot-checks.json).
 It supplies no effect estimate.
 
-Independent recommendations are pending a fresh agent that did not review or
-grade and receives the arm mapping and historical Claude results only after
-this evidence is committed. The tested skill has not been edited.
+The [independent recommendations](recommended-skill-fixes.md) propose separate QA
+hygiene counts and clearer reproduction/verification evidence. Both are untested
+reporting changes; the existing discovery and coding rules are retained. The
+[validation](recommendation-validation.json) checks 85 local evidence links, both
+patch contexts and all 10,492 frozen input files. The tested skill is unchanged.
+
+The recommendation profile first received arm mappings and historical Claude
+results after [data commit 6d5a0c6](https://github.com/coryj627/rust-qc/tree/6d5a0c6006ce1b1b9b8dbc280fa86d6c74c479aa/evals/results/sol-6-1/review-v2).
+`publication-manifest.json` describes that pre-recommendation tree. The final
+run table adds only the recommender's provenance; frozen grades and numerical
+results remain unchanged. See [recommendation provenance](recommendation-provenance.json).

@@ -4,6 +4,8 @@ The separate [revised ordinary QA comparison](review-v2/README.md) is graded:
 51 valid reports from 52 planned attempts, no policy blocks, and no reliable
 known-bug recall advantage. It uses a narrower task and eligible key set. The
 sections below preserve the original broader condition and coding results.
+The [new independent recommendations](review-v2/recommended-skill-fixes.md)
+propose two untested reporting changes; the tested skill remains unchanged.
 
 All **24 writing/changing submissions passed their frozen hidden checks**. Quality
 was close to the 12-point ceiling in both arms: the mean case difference was
