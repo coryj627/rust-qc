@@ -44,17 +44,23 @@ def used_skill(stream):
 
 
 def disk_mb(run_id):
-    folder = subprocess.run(
-        ["du", "-sm", str(AUDITS / "projects" / run_id)], capture_output=True, text=True
-    )
-    mount = subprocess.run(
+    """Workspace size plus its build volume, in MB. A run that never built has no volume."""
+
+    def du(path):
+        return int(
+            subprocess.run(
+                ["du", "-sm", path], capture_output=True, text=True, check=True
+            ).stdout.split()[0]
+        )
+
+    inspect = subprocess.run(
         ["docker", "volume", "inspect", f"rqc-target-{run_id}", "--format", "{{.Mountpoint}}"],
         capture_output=True,
         text=True,
-    ).stdout.strip()
-    volume = subprocess.run(["du", "-sm", mount], capture_output=True, text=True) if mount else None
-    total = int(folder.stdout.split()[0])
-    return total + (int(volume.stdout.split()[0]) if volume and volume.stdout else 0)
+        check=False,
+    )
+    mount = inspect.stdout.strip() if inspect.returncode == 0 else ""
+    return du(str(AUDITS / "projects" / run_id)) + (du(mount) if mount else 0)
 
 
 def minutes(run_id):
