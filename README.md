@@ -16,7 +16,7 @@ The skill lives in `.agents/skills/rust-qc/`. Its name, for agents that invoke s
 - a harness that feeds untrusted-input parsers short inputs, random mutations and crafted structures
 - a read-through for soundness, error design and API shape, and for problems in code that talks to the operating system
 
-The report is ordered by severity, with lint, documentation and style hygiene counted in its own section. Each finding is headed by a plain description of the problem, so it reads well with a screen reader and pastes cleanly into an issue. It also says how the problem was established: what was run and the result, or the lines that show it.
+The report is ordered by severity, with lint, documentation and style hygiene counted in its own section. Each finding is headed by a plain description of the problem, so it reads well with a screen reader and pastes cleanly into an issue. It also names the cause and says how the problem was established: what was run and the result, or the lines that show it.
 
 **Auditing a repository runs its code.** `check.sh` and the audit's harnesses build and run the crate's build scripts, procedural macros and tests with your permissions. Audit untrusted code inside a sandbox, container or disposable VM. Only `audit_scan.py` is read-only: it reads the source without building or running it.
 
