@@ -17,7 +17,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from common import AUDITS
 from redact import redact
-from streams import events, summary, tool_uses
+from streams import events, summary, tool_calls
 
 
 def last_assistant_text(stream):
@@ -33,13 +33,19 @@ def last_assistant_text(stream):
 
 
 def used_skill(stream):
+    """Whether the agent read skill/SKILL.md (Read or a Bash cat that ran) and ran both scripts."""
     read_skill = ran_check = ran_scan = False
-    for name, data in tool_uses(stream):
+    for name, data, ran in tool_calls(stream):
+        if not ran:
+            continue
+        command = data.get("command", "") if name == "Bash" else ""
         if name == "Read" and str(data.get("file_path", "")).endswith("/skill/SKILL.md"):
             read_skill = True
-        if name == "Bash" and data.get("command", "").lstrip().startswith("./run"):
-            ran_check |= "check.sh" in data["command"]
-            ran_scan |= "audit_scan.py" in data["command"]
+        if name == "Bash" and "cat skill/SKILL.md" in command:
+            read_skill = True
+        if name == "Bash" and command.lstrip().startswith("./run"):
+            ran_check |= "check.sh" in command
+            ran_scan |= "audit_scan.py" in command
     return read_skill, ran_check, ran_scan
 
 

@@ -12,6 +12,7 @@ import datetime
 import os
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import AUDITS, ENV, MODEL, agent_command
@@ -44,11 +45,18 @@ def main():
         procs.append((run_id, now(), proc, stream))
         print(f"{run_id} started", flush=True)
     with (AUDITS / "private" / "agents.tsv").open("a") as log:
-        for run_id, started, proc, stream in procs:
-            code = proc.wait()
-            stream.close()
-            log.write(f"{run_id}\t{model}\t{started}\t{now()}\t{code}\n")
-            print(f"{run_id} exit={code}", flush=True)
+        while procs:
+            for item in list(procs):
+                run_id, started, proc, stream = item
+                code = proc.poll()
+                if code is None:
+                    continue
+                stream.close()
+                log.write(f"{run_id}\t{model}\t{started}\t{now()}\t{code}\n")
+                log.flush()
+                print(f"{run_id} exit={code}", flush=True)
+                procs.remove(item)
+            time.sleep(5)
 
 
 if __name__ == "__main__":

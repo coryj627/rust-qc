@@ -32,3 +32,13 @@ The template step reported no instruction files to rename.
     python3 -I check_runs.py rplant1=fixtures/planted-stream.jsonl
     python3 -I host_builds.py rplant1=fixtures/clean-stream.jsonl
     python3 -I host_builds.py rplant1=fixtures/planted-stream.jsonl
+
+## Pilot
+
+    # start order drawn at random: r2a990b, then rde3dd6
+    python3 -I launch.py r2a990b rde3dd6
+    python3 -I check_runs.py r2a990b=private/streams/r2a990b.jsonl rde3dd6=private/streams/rde3dd6.jsonl
+    python3 -I host_builds.py r2a990b=private/streams/r2a990b.jsonl rde3dd6=private/streams/rde3dd6.jsonl
+    python3 -I pilot_checks.py <results>/stage1
+
+Both transcript checks found nothing in either pilot run. check_runs.py counted 9 and 6 calls that Claude Code's permissions refused.
