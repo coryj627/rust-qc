@@ -1,0 +1,1038 @@
+  ) -> RunResult<'src, String> {
+    match function {
+      Function::Nullary(f) => f(self.function_context(name).unwrap()),
+      Function::Unary(f) => {
+        let a = self.evaluate_expression(&arguments[0])?;
+        f(self.function_context(name).unwrap(), &a)
+      }
+      Function::UnaryOpt(f) => {
+        let a = self.evaluate_expression(&arguments[0])?;
+        let b = if arguments.len() > 1 {
+          Some(self.evaluate_expression(&arguments[1])?)
+        } else {
+          None
+        };
+        f(self.function_context(name).unwrap(), &a, b.as_deref())
+      }
+      Function::UnaryPlus(f) => {
+        let a = self.evaluate_expression(&arguments[0])?;
+        let mut rest = Vec::new();
+        for arg in &arguments[1..] {
+          rest.push(self.evaluate_expression(arg)?);
+        }
+        f(self.function_context(name).unwrap(), &a, &rest)
+      }
+      Function::Binary(f) => {
+        let a = self.evaluate_expression(&arguments[0])?;
+        let b = self.evaluate_expression(&arguments[1])?;
+        f(self.function_context(name).unwrap(), &a, &b)
+      }
+      Function::BinaryPlus(f) => {
+        let a = self.evaluate_expression(&arguments[0])?;
+        let b = self.evaluate_expression(&arguments[1])?;
+        let mut rest = Vec::new();
+        for arg in &arguments[2..] {
+          rest.push(self.evaluate_expression(arg)?);
+        }
+        f(self.function_context(name).unwrap(), &a, &b, &rest)
+      }
+      Function::Ternary(f) => {
+        let a = self.evaluate_expression(&arguments[0])?;
+        let b = self.evaluate_expression(&arguments[1])?;
+        let c = self.evaluate_expression(&arguments[2])?;
+        f(self.function_context(name).unwrap(), &a, &b, &c)
+      }
+    }
+    .map_err(|message| Error::FunctionCall {
+      function: name,
+      message,
+    })
+  }
+
+  pub(crate) fn evaluate_expression(
+    &mut self,
+    expression: &Expression<'src>,
+  ) -> RunResult<'src, String> {
+    match expression {
+      Expression::And { lhs, rhs } => {
+        let lhs = self.evaluate_expression(lhs)?;
+        if lhs.is_empty() {
+          return Ok(String::new());
+        }
+        self.evaluate_expression(rhs)
+      }
+      Expression::Assert {
+        condition,
+        error,
+        name,
+      } => {
+        if self.evaluate_condition(condition)? {
+          Ok(String::new())
+        } else {
+          Err(Error::Assert {
+            message: self.evaluate_expression(error)?,
+            name: *name,
+          })
+        }
+      }
+      Expression::Backtick { contents, token } => {
+        let context = self.context(ConstError::Backtick(*token))?;
+
+        if context.config.dry_run {
+          return Ok(format!("`{contents}`"));
+        }
+
+        Self::run_command(context, &self.env, &self.scope, contents, None).map_err(|output_error| {
+          Error::Backtick {
+            token: *token,
+            output_error,
+          }
+        })
+      }
+      Expression::Call { name, arguments } => {
+        let module = self.context(ConstError::FunctionCall(*name))?.module;
+        if let Some(function) = module.functions.get(name.lexeme()) {
+          self.evaluate_defined_function(function, arguments)
+        } else if let Some(builtin) = function::get(name.lexeme()) {
+          self.evaluate_builtin_function(*name, builtin, arguments)
+        } else {
+          unreachable!();
+        }
+      }
+      Expression::Concatenation { lhs, rhs } => {
+        let lhs = self.evaluate_expression(lhs)?;
+        let rhs = self.evaluate_expression(rhs)?;
+        Ok(lhs + &rhs)
+      }
+      Expression::Conditional {
+        condition,
+        then,
+        otherwise,
+      } => {
+        if self.evaluate_condition(condition)? {
+          self.evaluate_expression(then)
+        } else {
+          self.evaluate_expression(otherwise)
+        }
+      }
+      Expression::FormatString { start, expressions } => {
+        let mut value = start.cooked.clone();
+
+        for (expression, string) in expressions {
+          value.push_str(&self.evaluate_expression(expression)?);
+          value.push_str(&string.cooked);
+        }
+
+        if start.kind.indented {
+          Ok(unindent(&value))
+        } else {
+          Ok(value)
+        }
+      }
+      Expression::Group { contents } => self.evaluate_expression(contents),
+      Expression::Join { lhs: None, rhs } => Ok("/".to_string() + &self.evaluate_expression(rhs)?),
+      Expression::Join {
+        lhs: Some(lhs),
+        rhs,
+      } => {
+        let lhs = self.evaluate_expression(lhs)?;
+        let rhs = self.evaluate_expression(rhs)?;
+        Ok(lhs + "/" + &rhs)
+      }
+      Expression::Or { lhs, rhs } => {
+        let lhs = self.evaluate_expression(lhs)?;
+        if !lhs.is_empty() {
+          return Ok(lhs);
+        }
+        self.evaluate_expression(rhs)
+      }
+      Expression::StringLiteral { string_literal } => Ok(string_literal.cooked.clone()),
+      Expression::Variable { name, .. } => {
+        let variable = name.lexeme();
+        if let Some(value) = self.scope.value(variable) {
+          Ok(value.to_owned())
+        } else if self.non_const_assignments.contains_key(name.lexeme()) {
+          Err(ConstError::Variable(*name).into())
+        } else if let Some(assignment) = self
+          .assignments
+          .and_then(|assignments| assignments.get(variable))
+        {
+          Ok(self.evaluate_assignment(assignment)?.to_owned())
+        } else {
+          Err(Error::internal(format!(
+            "attempted to evaluate undefined variable `{variable}`"
+          )))
+        }
+      }
+    }
+  }
+
+  fn evaluate_condition(&mut self, condition: &Condition<'src>) -> RunResult<'src, bool> {
+    let lhs_value = self.evaluate_expression(&condition.lhs)?;
+    let rhs_value = self.evaluate_expression(&condition.rhs)?;
+    let condition = match condition.operator {
+      ConditionalOperator::Equality => lhs_value == rhs_value,
+      ConditionalOperator::Inequality => lhs_value != rhs_value,
+      ConditionalOperator::RegexMatch => Regex::new(&rhs_value)
+        .map_err(|source| Error::RegexCompile { source })?
+        .is_match(&lhs_value),
+      ConditionalOperator::RegexMismatch => !Regex::new(&rhs_value)
+        .map_err(|source| Error::RegexCompile { source })?
+        .is_match(&lhs_value),
+    };
+    Ok(condition)
+  }
+
+  pub(crate) fn run_command(
+    context: &ExecutionContext,
+    env: &BTreeMap<String, String>,
+    scope: &Scope,
+    command: &str,
+    args: Option<&[String]>,
+  ) -> Result<String, OutputError> {
+    let mut cmd = context.module.settings.shell_command(context.config);
+
+    cmd.arg(command);
+
+    if let Some(args) = args {
+      if ShellKind::from(&cmd).takes_shell_name() {
+        cmd.arg(command);
+      }
+
+      cmd.args(args);
+    }
+
+    cmd
+      .current_dir(context.working_directory())
+      .export(
+        &context.module.settings,
+        context.dotenv,
+        scope,
+        &context.module.unexports,
+      )
+      .stdin(Stdio::inherit())
+      .stderr(if context.config.verbosity.quiet() {
+        Stdio::null()
+      } else {
+        Stdio::inherit()
+      })
+      .stdout(Stdio::piped());
+
+    for (key, value) in env {
+      cmd.env(key, value);
+    }
+
+    cmd.output_guard_stdout()
+  }
+
+  pub(crate) fn evaluate_line(
+    &mut self,
+    line: &Line<'src>,
+    continued: bool,
+  ) -> RunResult<'src, String> {
+    let mut evaluated = String::new();
+    for (i, fragment) in line.fragments.iter().enumerate() {
+      match fragment {
+        Fragment::Text { token } => {
+          let lexeme = token
+            .lexeme()
+            .replace(Lexer::INTERPOLATION_ESCAPE, Lexer::INTERPOLATION_START);
+
+          if i == 0 && continued {
+            evaluated += lexeme.trim_start();
+          } else {
+            evaluated += &lexeme;
+          }
+        }
+        Fragment::Interpolation { expression } => {
+          evaluated += &self.evaluate_expression(expression)?;
+        }
+      }
+    }
+    Ok(evaluated)
+  }
+
+  pub(crate) fn evaluate_parameters(
+    arguments: &[Vec<String>],
+    context: &ExecutionContext<'src, 'run>,
+    is_dependency: bool,
+    parameters: &[Parameter<'src>],
+    recipe: &Recipe<'src>,
+    scope: &'run Scope<'src, 'run>,
+  ) -> RunResult<'src, (Scope<'src, 'run>, Vec<String>)> {
+    let env = recipe
+      .attributes
+      .iter()
+      .filter_map(|attribute| {
+        if let Attribute::Env(key, value) = attribute {
+          Some((key.cooked.clone(), value.cooked.clone()))
+        } else {
+          None
+        }
+      })
+      .collect();
+
+    let mut evaluator = Self::new(context, env, is_dependency, scope);
+
+    let mut positional = Vec::new();
+
+    if arguments.len() != parameters.len() {
+      return Err(Error::internal("arguments do not match parameter count"));
+    }
+
+    for (parameter, group) in parameters.iter().zip(arguments) {
+      let values = if group.is_empty() {
+        if let Some(ref default) = parameter.default {
+          let value = evaluator.evaluate_expression(default)?;
+          positional.push(value.clone());
+          vec![value]
+        } else if parameter.kind == ParameterKind::Star {
+          Vec::new()
+        } else {
+          return Err(Error::internal("missing parameter without default"));
+        }
+      } else if parameter.kind.is_variadic() {
+        positional.extend_from_slice(group);
+        group.clone()
+      } else {
+        if group.len() != 1 {
+          return Err(Error::internal(
+            "multiple values for non-variadic parameter",
+          ));
+        }
+        let value = group[0].clone();
+        positional.push(value.clone());
+        vec![value]
+      };
+
+      for value in &values {
+        parameter.check_pattern_match(recipe, value)?;
+      }
+
+      evaluator.scope.bind(Binding {
+        eager: false,
+        export: parameter.export,
+        file_depth: 0,
+        name: parameter.name,
+        number: parameter.number,
+        prelude: false,
+        private: false,
+        value: values.join(" "),
+      });
+    }
+
+    Ok((evaluator.scope, positional))
+  }
+
+  pub(crate) fn new(
+    context: &ExecutionContext<'src, 'run>,
+    env: BTreeMap<String, String>,
+    is_dependency: bool,
+    scope: &'run Scope<'src, 'run>,
+  ) -> Self {
+    static OVERRIDES: LazyLock<HashMap<Number, String>> = LazyLock::new(HashMap::new);
+    Self {
+      assignments: None,
+      context: Some(*context),
+      env,
+      is_dependency,
+      non_const_assignments: Table::new(),
+      overrides: &OVERRIDES,
+      scope: scope.child(),
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  run_error! {
+    name: backtick_code,
+    src: "
+      a:
+       echo {{`f() { return 100; }; f`}}
+    ",
+    args: ["a"],
+    error: Error::Backtick {
+      token,
+      output_error: OutputError::Code(code),
+    },
+    check: {
+      assert_eq!(code, 100);
+      assert_eq!(token.lexeme(), "`f() { return 100; }; f`");
+    }
+  }
+
+  run_error! {
+    name: export_assignment_backtick,
+    src: "
+      export exported_variable := 'A'
+      b := `echo $exported_variable`
+
+      recipe:
+        echo {{b}}
+    ",
+    args: ["--quiet", "recipe"],
+    error: Error::Backtick {
+        token,
+        output_error: OutputError::Code(_),
+    },
+    check: {
+      assert_eq!(token.lexeme(), "`echo $exported_variable`");
+    }
+  }
+}
+use super::*;
+
+#[test]
+fn unstable() {
+  Test::new()
+    .justfile("foo() := 'bar'")
+    .stderr_regex(r"error: User-defined functions are currently unstable\..*")
+    .failure();
+}
+
+#[test]
+fn redefinition() {
+  Test::new()
+    .justfile(
+      "
+        foo() := 'bar'
+        foo() := 'baz'
+      ",
+    )
+    .stderr(
+      "
+        error: Function `foo` first defined on line 1 is redefined on line 2
+         ——▶ justfile:2:1
+          │
+        2 │ foo() := 'baz'
+          │ ^^^
+      ",
+    )
+    .env("JUST_UNSTABLE", "1")
+    .failure();
+}
+
+#[test]
+fn wrong_argument_count() {
+  Test::new()
+    .justfile(
+      "
+        foo(x) := x
+        a := foo('bar', 'baz')
+      ",
+    )
+    .stderr(
+      "
+        error: Function `foo` called with 2 arguments but takes 1
+         ——▶ justfile:2:6
+          │
+        2 │ a := foo('bar', 'baz')
+          │      ^^^
+      ",
+    )
+    .env("JUST_UNSTABLE", "1")
+    .failure();
+}
+
+#[test]
+fn undefined_variable_in_body() {
+  Test::new()
+    .justfile(
+      "
+        foo() := bar
+        a := foo()
+      ",
+    )
+    .stderr(
+      "
+        error: Variable `bar` not defined
+         ——▶ justfile:1:10
+          │
+        1 │ foo() := bar
+          │          ^^^
+      ",
+    )
+    .env("JUST_UNSTABLE", "1")
+    .failure();
+}
+
+#[test]
+fn undefined_in_assignment() {
+  Test::new()
+    .justfile("a := foo()")
+    .stderr(
+      "
+        error: Call to undefined function `foo`
+         ——▶ justfile:1:6
+          │
+        1 │ a := foo()
+          │      ^^^
+      ",
+    )
+    .env("JUST_UNSTABLE", "1")
+    .failure();
+}
+
+#[test]
+fn undefined_in_setting() {
+  Test::new()
+    .justfile("set tempdir := foo()")
+    .stderr(
+      "
+        error: Call to undefined function `foo`
+         ——▶ justfile:1:16
+          │
+        1 │ set tempdir := foo()
+          │                ^^^
+      ",
+    )
+    .env("JUST_UNSTABLE", "1")
+    .failure();
+}
+
+#[test]
+fn undefined_in_recipe_parameter_default() {
+  Test::new()
+    .justfile("bar x=foo():")
+    .stderr(
+      "
+        error: Call to undefined function `foo`
+         ——▶ justfile:1:7
+          │
+        1 │ bar x=foo():
+          │       ^^^
+      ",
+    )
+    .env("JUST_UNSTABLE", "1")
+    .failure();
+}
+
+#[test]
+fn undefined_in_dependency_argument() {
+  Test::new()
+    .justfile(
+      "
+        bar x:
+        foo: (bar baz())
+      ",
+    )
+    .stderr(
+      "
+        error: Call to undefined function `baz`
+         ——▶ justfile:2:11
+          │
+        2 │ foo: (bar baz())
+          │           ^^^
+      ",
+    )
+    .env("JUST_UNSTABLE", "1")
+    .failure();
+}
+
+#[test]
+fn undefined_in_confirm_attribute() {
+  Test::new()
+    .justfile(
+      "
+        [confirm(foo())]
+        bar:
+      ",
+    )
+    .stderr(
+      "
+        error: Call to undefined function `foo`
+         ——▶ justfile:1:10
+          │
+        1 │ [confirm(foo())]
+          │          ^^^
+      ",
+    )
+    .env("JUST_UNSTABLE", "1")
+    .failure();
+}
+
+#[test]
+fn undefined_in_interpolation() {
+  Test::new()
+    .justfile(
+      "
+        bar:
+          echo {{foo()}}
+      ",
+    )
+    .stderr(
+      "
+        error: Call to undefined function `foo`
+         ——▶ justfile:2:10
+          │
+        2 │   echo {{foo()}}
+          │          ^^^
+      ",
+    )
+    .env("JUST_UNSTABLE", "1")
+    .failure();
+}
+
+#[test]
+fn uses_parameter() {
+  Test::new()
+    .justfile(
+      "
+        foo(x) := x
+        a := foo('bar')
+      ",
+    )
+    .args(["--evaluate", "a"])
+    .stdout("bar")
+    .env("JUST_UNSTABLE", "1")
+    .success();
+}
+
+#[test]
+fn uses_outer_variable() {
+  Test::new()
+    .justfile(
+      "
+        x := 'bar'
+        foo() := x
+        a := foo()
+      ",
+    )
+    .args(["--evaluate", "a"])
+    .stdout("bar")
+    .env("JUST_UNSTABLE", "1")
+    .success();
+}
+
+#[test]
+fn parameter_shadows_variable() {
+  Test::new()
+    .justfile(
+      "
+        x := 'bar'
+        foo(x) := x
+        a := foo('baz')
+      ",
+    )
+    .args(["--evaluate", "a"])
+    .stdout("baz")
+    .env("JUST_UNSTABLE", "1")
+    .success();
+}
+
+#[test]
+fn format_no_args() {
+  Test::new()
+    .justfile(
+      "
+        foo() := 'bar'
+
+        a := foo()
+      ",
+    )
+    .arg("--dump")
+    .stdout(
+      "
+        foo() := 'bar'
+
+        a := foo()
+      ",
+    )
+    .env("JUST_UNSTABLE", "1")
+    .success();
+}
+
+#[test]
+fn format_one_arg() {
+  Test::new()
+    .justfile(
+      "
+        foo(x) := x
+
+        a := foo('bar')
+      ",
+    )
+    .arg("--dump")
+    .stdout(
+      "
+        foo(x) := x
+
+        a := foo('bar')
+      ",
+    )
+    .env("JUST_UNSTABLE", "1")
+    .success();
+}
+
+#[test]
+fn format_two_args() {
+  Test::new()
+    .justfile(
+      "
+        foo(x, y) := x + y
+
+        a := foo('bar', 'baz')
+      ",
+    )
+    .arg("--dump")
+    .stdout(
+      "
+        foo(x, y) := x + y
+
+        a := foo('bar', 'baz')
+      ",
+    )
+    .env("JUST_UNSTABLE", "1")
+    .success();
+}
+
+#[test]
+fn trailing_comma() {
+  Test::new()
+    .justfile(
+      "
+        foo(x,) := x
+        a := foo('bar')
+      ",
+    )
+    .args(["--evaluate", "a"])
+    .stdout("bar")
+    .env("JUST_UNSTABLE", "1")
+    .success();
+}
+
+#[test]
+fn has_access_to_env_file() {
+  Test::new()
+    .justfile(
+      "
+        set dotenv-required
+
+        foo() := env('VAR')
+
+        a := foo()
+      ",
+    )
+    .write(".env", "VAR=VAL")
+    .args(["--evaluate", "a"])
+    .stdout("VAL")
+    .env("JUST_UNSTABLE", "1")
+    .success();
+}
+
+#[test]
+fn may_reference_non_const_assignment() {
+  Test::new()
+    .justfile(
+      "
+        foo() := bar
+
+        bar := `echo baz`
+
+        a := foo()
+      ",
+    )
+    .args(["--evaluate", "a"])
+    .stdout("baz")
+    .env("JUST_UNSTABLE", "1")
+    .success();
+}
+}
+```
+
+### User-defined functions
+
+New functions may be defined<sup>1.49.0</sup>:
+
+```just
+set unstable
+
+hello(name) := f"Hello, {{ name }}!"
+
+foo:
+  echo '{{ hello("World") }}'
+```
+
+User-defined functions are currently unstable.
+
+Functions may reference assignments in the same module:
+
+```just
+set unstable
+
+base := "foo"
+
+join(extension) := base + "." + extension
+
+create:
+  touch {{ join("c") }}
+  touch {{ join("html") }}
+  touch {{ join("txt") }}
+```
+
+### Constants
+
+A number of constants are predefined:
+use {super::*, CompileErrorKind::*};
+
+#[derive(Default)]
+pub(crate) struct Analyzer<'run, 'src> {
+  aliases: Table<'src, Alias<'src, Namepath<'src>>>,
+  assignments: Vec<&'run Binding<'src, Expression<'src>>>,
+  functions: Vec<&'run FunctionDefinition<'src>>,
+  modules: Table<'src, Justfile<'src>>,
+  recipes: Vec<&'run Recipe<'src, UnresolvedDependency<'src>>>,
+  sets: Table<'src, Set<'src>>,
+  unexports: HashSet<String>,
+  warnings: Vec<Warning>,
+}
+
+impl<'run, 'src> Analyzer<'run, 'src> {
+  pub(crate) fn analyze(
+    asts: &'run HashMap<PathBuf, Ast<'src>>,
+    config: &Config,
+    doc: Option<String>,
+    groups: &[StringLiteral<'src>],
+    loaded: &[PathBuf],
+    name: Option<Name<'src>>,
+    overrides: &mut HashMap<Number, String>,
+    paths: &HashMap<PathBuf, PathBuf>,
+    private: bool,
+    root: &Path,
+  ) -> RunResult<'src, Justfile<'src>> {
+    Self::default().justfile(
+      asts, config, doc, groups, loaded, name, overrides, paths, private, root,
+    )
+  }
+
+  fn justfile(
+    mut self,
+    asts: &'run HashMap<PathBuf, Ast<'src>>,
+    config: &Config,
+    doc: Option<String>,
+    groups: &[StringLiteral<'src>],
+    loaded: &[PathBuf],
+    name: Option<Name<'src>>,
+    overrides: &mut HashMap<Number, String>,
+    paths: &HashMap<PathBuf, PathBuf>,
+    private: bool,
+    root: &Path,
+  ) -> RunResult<'src, Justfile<'src>> {
+    let mut definitions = HashMap::new();
+    let mut imports = HashSet::new();
+    let mut unstable_features = BTreeSet::new();
+
+    let mut stack = Vec::new();
+    let ast = asts.get(root).unwrap();
+    stack.push(ast);
+
+    while let Some(ast) = stack.pop() {
+      unstable_features.extend(&ast.unstable_features);
+
+      for item in &ast.items {
+        match item {
+          Item::Alias(alias) => {
+            Self::define(&mut definitions, alias.name, "alias", false)?;
+            self.aliases.insert(alias.clone());
+          }
+          Item::Assignment(assignment) => {
+            self.assignments.push(assignment);
+          }
+          Item::Comment(_) => (),
+          Item::Function(function) => {
+            self.functions.push(function);
+          }
+          Item::Import { absolute, .. } => {
+            if let Some(absolute) = absolute {
+              if imports.insert(absolute) {
+                stack.push(asts.get(absolute).unwrap());
+              }
+            }
+          }
+          Item::Module {
+            absolute,
+            doc,
+            groups,
+            name,
+            private,
+            ..
+          } => {
+            if let Some(absolute) = absolute {
+              Self::define(&mut definitions, *name, "module", false)?;
+              self.modules.insert(Self::analyze(
+                asts,
+                config,
+                doc.clone(),
+                groups.as_slice(),
+                loaded,
+                Some(*name),
+                overrides,
+                paths,
+                *private,
+                absolute,
+              )?);
+            }
+          }
+          Item::Newline => {}
+          Item::Recipe(recipe) => {
+            if recipe.enabled() {
+              Self::analyze_recipe(recipe)?;
+              self.recipes.push(recipe);
+            }
+          }
+          Item::Set(set) => {
+            self.analyze_set(set)?;
+            self.sets.insert(set.clone());
+          }
+          Item::Unexport { name } => {
+            if !self.unexports.insert(name.lexeme().to_string()) {
+              return Err(
+                name
+                  .error(DuplicateUnexport {
+                    variable: name.lexeme(),
+                  })
+                  .into(),
+              );
+            }
+          }
+        }
+      }
+
+      self.warnings.extend(ast.warnings.iter().cloned());
+    }
+
+    let mut allow_duplicate_variables = false;
+
+    for (_name, set) in &self.sets {
+      if let Setting::AllowDuplicateVariables(value) = set.value {
+        allow_duplicate_variables = value;
+      }
+    }
+
+    let mut assignments: Table<'src, Assignment<'src>> = Table::default();
+    for assignment in self.assignments {
+      let variable = assignment.name.lexeme();
+
+      if !allow_duplicate_variables && assignments.contains_key(variable) {
+        return Err(assignment.name.error(DuplicateVariable { variable }).into());
+      }
+
+      if assignments
+        .get(variable)
+        .is_none_or(|original| assignment.file_depth <= original.file_depth)
+      {
+        assignments.insert(assignment.clone());
+      }
+
+      if self.unexports.contains(variable) {
+        return Err(assignment.name.error(ExportUnexported { variable }).into());
+      }
+    }
+
+    let mut functions = Table::<FunctionDefinition>::default();
+    for function in self.functions {
+      let name = function.name.lexeme();
+      if let Some(first) = functions.get(name) {
+        return Err(
+          function
+            .name
+            .error(Redefinition {
+              first_type: "function",
+              second_type: "function",
+              name,
+              first: first.name.line,
+            })
+            .into(),
+        );
+      }
+      functions.insert(function.clone());
+    }
+
+    AssignmentResolver::resolve_assignments(&assignments, &functions)?;
+
+    for set in self.sets.values() {
+      for expression in set.value.expressions() {
+        for reference in expression.references() {
+          match reference {
+            Reference::Call { name, arguments } => {
+              Analyzer::resolve_call(&functions, name, arguments)?;
+            }
+            Reference::Variable(variable) => {
+              let name = variable.lexeme();
+              if !assignments.contains_key(name) && !constants().contains_key(name) {
+                return Err(variable.error(UndefinedVariable { variable: name }).into());
+              }
+            }
+          }
+        }
+      }
+    }
+
+    let mut unknown_overrides = Vec::new();
+
+    for ((path, name), value) in &config.overrides {
+      if *path == ast.module_path {
+        if let Some(assignment) = assignments.get(name) {
+          overrides.insert(assignment.number, value.clone());
+        } else {
+          unknown_overrides.push(path.join(name));
+        }
+      } else if path.starts_with(&ast.module_path)
+        && !self
+          .modules
+          .contains_key(&path.components[ast.module_path.components.len()])
+      {
+        unknown_overrides.push(format!("{path}::{name}"));
+      }
+    }
+
+    if !unknown_overrides.is_empty() {
+      return Err(Error::UnknownOverrides {
+        overrides: unknown_overrides,
+      });
+    }
+
+    let settings =
+      Evaluator::evaluate_settings(&assignments, overrides, &Scope::root(), self.sets)?;
+
+    let mut deduplicated_recipes = Table::<'src, UnresolvedRecipe<'src>>::default();
+    for recipe in self.recipes {
+      Self::define(
+        &mut definitions,
+        recipe.name,
+        "recipe",
+        settings.allow_duplicate_recipes,
+      )?;
+
+      if deduplicated_recipes
+        .get(recipe.name.lexeme())
+        .is_none_or(|original| recipe.file_depth <= original.file_depth)
+      {
+        deduplicated_recipes.insert(recipe.clone());
+      }
+
+      if !recipe.is_script() {
+        for line in &recipe.body {
+          let sigils = line.sigils(&settings);
+
+          if sigils.contains(&Sigil::Guard) && sigils.contains(&Sigil::Infallible) {
+            let Fragment::Text { token } = line.fragments.first().unwrap() else {
+              unreachable!();
+            };
+            return Err(
+              token
+                .error(CompileErrorKind::GuardAndInfallibleSigil)
+                .into(),
+            );
+          }
+        }
+      }
+    }
+
+    let recipes = RecipeResolver::resolve_recipes(
+      &assignments,
+      &functions,
+      &ast.module_path,

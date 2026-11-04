@@ -1,0 +1,872 @@
+use {super::*, serde::Serialize};
+
+type Scopes<'src, 'run> = BTreeMap<
+  Modulepath,
+  (
+    &'run Justfile<'src>,
+    &'run Scope<'src, 'run>,
+    &'run BTreeMap<String, String>,
+  ),
+>;
+
+#[derive(Debug, PartialEq, Serialize)]
+pub(crate) struct Justfile<'src> {
+  pub(crate) aliases: Table<'src, Alias<'src>>,
+  pub(crate) assignments: Table<'src, Assignment<'src>>,
+  #[serde(rename = "first", serialize_with = "keyed::serialize_option")]
+  pub(crate) default: Option<Arc<Recipe<'src>>>,
+  pub(crate) doc: Option<String>,
+  #[serde(skip)]
+  pub(crate) functions: Table<'src, FunctionDefinition<'src>>,
+  pub(crate) groups: Vec<StringLiteral<'src>>,
+  #[serde(skip)]
+  pub(crate) loaded: Vec<PathBuf>,
+  pub(crate) module_path: Modulepath,
+  pub(crate) modules: Table<'src, Self>,
+  #[serde(skip)]
+  pub(crate) name: Option<Name<'src>>,
+  #[serde(skip)]
+  pub(crate) private: bool,
+  pub(crate) recipes: Table<'src, Arc<Recipe<'src>>>,
+  pub(crate) settings: Settings,
+  pub(crate) source: PathBuf,
+  pub(crate) unexports: HashSet<String>,
+  #[serde(skip)]
+  pub(crate) unstable_features: BTreeSet<UnstableFeature>,
+  pub(crate) warnings: Vec<Warning>,
+  #[serde(skip)]
+  pub(crate) working_directory: PathBuf,
+}
+
+impl<'src> Justfile<'src> {
+  fn find_suggestion(
+    input: &str,
+    candidates: impl Iterator<Item = Suggestion<'src>>,
+  ) -> Option<Suggestion<'src>> {
+    candidates
+      .map(|suggestion| (edit_distance(input, suggestion.name), suggestion))
+      .filter(|(distance, _suggestion)| *distance < 3)
+      .min_by_key(|(distance, _suggestion)| *distance)
+      .map(|(_distance, suggestion)| suggestion)
+  }
+
+  pub(crate) fn suggest_recipe(&self, input: &str) -> Option<Suggestion<'src>> {
+    Self::find_suggestion(
+      input,
+      self
+        .recipes
+        .values()
+        .filter(|recipe| recipe.is_public())
+        .map(|recipe| Suggestion {
+          name: recipe.name(),
+          target: None,
+        })
+        .chain(
+          self
+            .aliases
+            .values()
+            .filter(|alias| alias.is_public())
+            .map(|alias| Suggestion {
+              name: alias.name.lexeme(),
+              target: Some(alias.target.name.lexeme()),
+            }),
+        ),
+    )
+  }
+
+  pub(crate) fn suggest_submodule(&self, input: &str) -> Option<Suggestion<'src>> {
+    Self::find_suggestion(
+      input,
+      self
+        .modules
+        .keys()
+        .map(|name| Suggestion { name, target: None }),
+    )
+  }
+
+  pub(crate) fn suggest_variable_or_submodule(&self, input: &str) -> Option<Suggestion<'src>> {
+    Self::find_suggestion(
+      input,
+      self
+        .assignments
+        .keys()
+        .chain(self.modules.keys())
+        .map(|name| Suggestion { name, target: None }),
+    )
+  }
+
+  fn evaluate_scopes<'run>(
+    &'run self,
+    config: &'run Config,
+    dotenv_arena: &'run Arena<BTreeMap<String, String>>,
+    overrides: &'run HashMap<Number, String>,
+    parent_dotenv: Option<&'run BTreeMap<String, String>>,
+    root: &'run Scope<'src, 'run>,
+    scope_arena: &'run Arena<Scope<'src, 'run>>,
+    scopes: &mut Scopes<'src, 'run>,
+    search: &'run Search,
+    variable_references: Option<&HashSet<Number>>,
+  ) -> RunResult<'src> {
+    let dotenv = if config.load_dotenv {
+      let working_directory = if self.is_submodule() {
+        &self.working_directory
+      } else {
+        &search.working_directory
+      };
+      load_dotenv(config, &self.settings, working_directory)?
+    } else {
+      BTreeMap::new()
+    };
+
+    let dotenv = if let Some(parent_dotenv) = parent_dotenv {
+      parent_dotenv
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .chain(dotenv)
+        .collect()
+    } else {
+      dotenv
+    };
+
+    let dotenv = dotenv_arena.alloc(dotenv);
+
+    let scope = Evaluator::evaluate_assignments(
+      config,
+      dotenv,
+      self,
+      overrides,
+      root,
+      search,
+      variable_references,
+    )?;
+
+    let scope = scope_arena.alloc(scope);
+    scopes.insert(self.module_path.clone(), (self, scope, dotenv));
+
+    for module in self.modules.values() {
+      module.evaluate_scopes(
+        config,
+        dotenv_arena,
+        overrides,
+        Some(dotenv),
+        scope,
+        scope_arena,
+        scopes,
+        search,
+        variable_references,
+      )?;
+    }
+
+    Ok(())
+  }
+
+  pub(crate) fn run(
+    &self,
+    config: &Config,
+    search: &Search,
+    arguments: &[String],
+    overrides: &HashMap<Number, String>,
+  ) -> RunResult<'src> {
+    let root = Scope::root();
+    let dotenv_arena = Arena::new();
+    let scope_arena = Arena::new();
+    let mut scopes = BTreeMap::new();
+
+    match &config.subcommand {
+      Subcommand::Choose { .. } | Subcommand::Run { .. } => {
+        let arguments = arguments.iter().map(String::as_str).collect::<Vec<&str>>();
+
+        let invocations = InvocationParser::parse_invocations(self, &arguments)?;
+
+        if config.one && invocations.len() > 1 {
+          return Err(Error::ExcessInvocations {
+            invocations: invocations.len(),
+          });
+        }
+
+        let variable_references = if self.settings.lazy {
+          let mut variable_references = HashSet::new();
+
+          let mut stack = Vec::new();
+
+          for invocation in &invocations {
+            stack.push(invocation.recipe);
+          }
+
+          while let Some(recipe) = stack.pop() {
+            variable_references.extend(&recipe.variable_references);
+            for dependency in &recipe.dependencies {
+              stack.push(&dependency.recipe);
+            }
+          }
+
+          Some(variable_references)
+        } else {
+          None
+        };
+
+        self.evaluate_scopes(
+          config,
+          &dotenv_arena,
+          overrides,
+          None,
+          &root,
+          &scope_arena,
+          &mut scopes,
+          search,
+          variable_references.as_ref(),
+        )?;
+
+        let ran = Ran::default();
+        for invocation in invocations {
+          Self::run_recipe(
+            &invocation.arguments,
+            config,
+            false,
+            &ran,
+            invocation.recipe,
+            &scopes,
+            search,
+          )?;
+        }
+
+        Ok(())
+      }
+      Subcommand::Command {
+        binary, arguments, ..
+      } => {
+        let mut command = if config.shell_command {
+          let mut command = self.settings.shell_command(config);
+          command.arg(binary);
+          command
+        } else {
+          Command::resolve(binary)
+        };
+
+        command
+          .args(arguments)
+          .current_dir(&search.working_directory);
+
+        self.evaluate_scopes(
+          config,
+          &dotenv_arena,
+          overrides,
+          None,
+          &root,
+          &scope_arena,
+          &mut scopes,
+          search,
+          Some(HashSet::new()).as_ref(),
+        )?;
+
+        let (_module, scope, dotenv) = scopes.get(&self.module_path).unwrap();
+        let scope = scope.child();
+
+        command.export(&self.settings, dotenv, &scope, &self.unexports);
+
+        let (result, caught) = command.status_guard();
+
+        let status = result.map_err(|io_error| Error::CommandInvoke {
+          binary: binary.clone(),
+use super::*;
+
+#[derive(Debug, Clone)]
+pub(crate) struct Pattern<'src> {
+  pub(crate) regex: Regex,
+  pub(crate) token: Token<'src>,
+}
+
+impl<'src> Pattern<'src> {
+  pub(crate) fn is_match(&self, haystack: &str) -> bool {
+    self.regex.is_match(haystack)
+  }
+
+  pub(crate) fn new(literal: &StringLiteral<'src>) -> Result<Self, CompileError<'src>> {
+    literal.cooked.parse::<Regex>().map_err(|source| {
+      literal
+        .token
+        .error(CompileErrorKind::ArgumentPatternRegex { source })
+    })?;
+
+    Ok(Self {
+      regex: format!("^(?:{})$", literal.cooked)
+        .parse::<Regex>()
+        .map_err(|source| {
+          literal
+            .token
+            .error(CompileErrorKind::ArgumentPatternRegex { source })
+        })?,
+      token: literal.token,
+    })
+  }
+
+  pub(crate) fn original(&self) -> &str {
+    &self.regex.as_str()[4..self.regex.as_str().len() - 2]
+  }
+}
+
+impl Eq for Pattern<'_> {}
+
+impl Ord for Pattern<'_> {
+  fn cmp(&self, other: &pattern::Pattern) -> Ordering {
+    self.regex.as_str().cmp(other.regex.as_str())
+  }
+}
+
+impl PartialEq for Pattern<'_> {
+  fn eq(&self, other: &pattern::Pattern) -> bool {
+    self.regex.as_str() == other.regex.as_str()
+  }
+}
+
+impl PartialOrd for Pattern<'_> {
+  fn partial_cmp(&self, other: &pattern::Pattern) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+impl Serialize for Pattern<'_> {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: Serializer,
+  {
+    serializer.serialize_str(self.original())
+  }
+}
+use {super::*, CompileErrorKind::*};
+
+pub(crate) struct RecipeResolver<'src: 'run, 'run> {
+  assignments: &'run Table<'src, Assignment<'src>>,
+  functions: &'run Table<'src, FunctionDefinition<'src>>,
+  modulepath: &'run Modulepath,
+  modules: &'run Table<'src, Justfile<'src>>,
+  resolved_recipes: Table<'src, Arc<Recipe<'src>>>,
+  settings: &'run Settings,
+  unresolved_recipes: Table<'src, UnresolvedRecipe<'src>>,
+}
+
+impl<'src: 'run, 'run> RecipeResolver<'src, 'run> {
+  pub(crate) fn resolve_recipes(
+    assignments: &'run Table<'src, Assignment<'src>>,
+    functions: &'run Table<'src, FunctionDefinition<'src>>,
+    modulepath: &'run Modulepath,
+    modules: &'run Table<'src, Justfile<'src>>,
+    settings: &'run Settings,
+    unresolved_recipes: Table<'src, UnresolvedRecipe<'src>>,
+  ) -> CompileResult<'src, Table<'src, Arc<Recipe<'src>>>> {
+    let mut resolver = Self {
+      assignments,
+      functions,
+      modulepath,
+      modules,
+      resolved_recipes: Table::new(),
+      settings,
+      unresolved_recipes,
+    };
+
+    while let Some(unresolved) = resolver.unresolved_recipes.pop() {
+      resolver.resolve_recipe(&mut Vec::new(), unresolved)?;
+    }
+
+    Ok(resolver.resolved_recipes)
+  }
+
+  fn resolve_recipe(
+    &mut self,
+    stack: &mut Vec<&'src str>,
+    recipe: UnresolvedRecipe<'src>,
+  ) -> CompileResult<'src, Arc<Recipe<'src>>> {
+    if let Some(resolved) = self.resolved_recipes.get(recipe.name()) {
+      return Ok(Arc::clone(resolved));
+    }
+
+    stack.push(recipe.name());
+
+    let dependencies = recipe
+      .dependencies
+      .iter()
+      .map(|dependency| {
+        self
+          .resolve_dependency(dependency, &recipe, stack)?
+          .ok_or_else(|| {
+            dependency.recipe.last().error(UnknownDependency {
+              recipe: recipe.name(),
+              unknown: dependency.recipe.clone(),
+            })
+          })
+      })
+      .collect::<CompileResult<Vec<Arc<Recipe>>>>()?;
+
+    stack.pop();
+
+    let resolved = Arc::new(recipe.resolve(
+      self.assignments,
+      self.functions,
+      self.modulepath,
+      dependencies,
+      self.settings,
+    )?);
+    self.resolved_recipes.insert(Arc::clone(&resolved));
+    Ok(resolved)
+  }
+
+  fn resolve_dependency(
+    &mut self,
+    dependency: &UnresolvedDependency<'src>,
+    recipe: &UnresolvedRecipe<'src>,
+    stack: &mut Vec<&'src str>,
+  ) -> CompileResult<'src, Option<Arc<Recipe<'src>>>> {
+    let name = dependency.recipe.last().lexeme();
+
+    if dependency.recipe.components() > 1 {
+      // recipe is in a submodule and is thus already resolved
+      Ok(Analyzer::resolve_recipe(
+        &dependency.recipe,
+        self.modules,
+        &self.resolved_recipes,
+      ))
+    } else if let Some(resolved) = self.resolved_recipes.get(name) {
+      // recipe is the current module and has already been resolved
+      Ok(Some(Arc::clone(resolved)))
+    } else if stack.contains(&name) {
+      // recipe depends on itself
+      let first = stack[0];
+      stack.push(first);
+      Err(
+        dependency.recipe.last().error(CircularRecipeDependency {
+          recipe: recipe.name(),
+          circle: stack
+            .iter()
+            .skip_while(|name| **name != dependency.recipe.last().lexeme())
+            .copied()
+            .collect(),
+        }),
+      )
+    } else if let Some(unresolved) = self.unresolved_recipes.remove(name) {
+      // recipe is as of yet unresolved
+      Ok(Some(self.resolve_recipe(stack, unresolved)?))
+    } else {
+      // recipe is unknown
+      Ok(None)
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  analysis_error! {
+    name:   circular_recipe_dependency,
+    input:  "a: b\nb: a",
+    offset: 8,
+    line:   1,
+    column: 3,
+    width:  1,
+    kind:   CircularRecipeDependency{recipe: "b", circle: vec!["a", "b", "a"]},
+  }
+
+  analysis_error! {
+    name:   self_recipe_dependency,
+    input:  "a: a",
+    offset: 3,
+    line:   0,
+    column: 3,
+    width:  1,
+    kind:   CircularRecipeDependency{recipe: "a", circle: vec!["a", "a"]},
+  }
+
+  analysis_error! {
+    name:   unknown_dependency,
+    input:  "a: b",
+    offset: 3,
+    line:   0,
+    column: 3,
+    width:  1,
+    kind:   UnknownDependency{
+      recipe: "a",
+      unknown: Namepath::from(Name::from_identifier(
+        Token{
+          column: 3,
+          kind: TokenKind::Identifier,
+          length: 1,
+          line: 0,
+          offset: 3,
+          path: Path::new("justfile"),
+          src: "a: b" }))
+    },
+  }
+
+  analysis_error! {
+    name:   unknown_interpolation_variable,
+    input:  "x:\n {{   hello}}",
+    offset: 9,
+    line:   1,
+    column: 6,
+    width:  5,
+    kind:   UndefinedVariable{variable: "hello"},
+  }
+
+  analysis_error! {
+    name:   unknown_second_interpolation_variable,
+    input:  "wtf:=\"x\"\nx:\n echo\n foo {{wtf}} {{ lol }}",
+    offset: 34,
+    line:   3,
+    column: 16,
+    width:  3,
+    kind:   UndefinedVariable{variable: "lol"},
+  }
+
+  analysis_error! {
+    name:   unknown_variable_in_default,
+    input:  "a f=foo:",
+    offset: 4,
+    line:   0,
+    column: 4,
+    width:  3,
+    kind:   UndefinedVariable{variable: "foo"},
+  }
+
+  analysis_error! {
+    name:   unknown_variable_in_dependency_argument,
+    input:  "bar x:\nfoo: (bar baz)",
+    offset: 17,
+    line:   1,
+    column: 10,
+    width:  3,
+    kind:   UndefinedVariable{variable: "baz"},
+  }
+}
+use super::*;
+
+pub(crate) struct Usage<'a, D> {
+  pub(crate) long: bool,
+  pub(crate) path: &'a Modulepath,
+  pub(crate) recipe: &'a Recipe<'a, D>,
+}
+
+impl<D> ColorDisplay for Usage<'_, D> {
+  fn fmt(&self, f: &mut Formatter, color: Color) -> fmt::Result {
+    write!(
+      f,
+      "{}{}{} {}",
+      color
+        .heading()
+        .paint(if self.long { "Usage:" } else { "usage:" }),
+      if self.long { " " } else { "\n    " },
+      color.argument().paint("just"),
+      color.argument().paint(&self.path.to_string()),
+    )?;
+
+    let options = self.recipe.parameters.iter().any(Parameter::is_option);
+
+    let arguments = self.recipe.parameters.iter().any(|p| !p.is_option());
+
+    if options {
+      write!(f, " {}", color.argument().paint("[OPTIONS]"))?;
+    }
+
+    for parameter in &self.recipe.parameters {
+      if parameter.is_option() {
+        continue;
+      }
+
+      write!(f, " ")?;
+
+      write!(
+        f,
+        "{}",
+        UsageParameter {
+          parameter,
+          long: false,
+        }
+        .color_display(color),
+      )?;
+    }
+
+    if !self.long {
+      return Ok(());
+    }
+
+    if arguments {
+      writeln!(f)?;
+      writeln!(f)?;
+      writeln!(f, "{}", color.heading().paint("Arguments:"))?;
+
+      for (i, parameter) in self
+        .recipe
+        .parameters
+        .iter()
+        .filter(|p| !p.is_option())
+        .enumerate()
+      {
+        if i > 0 {
+          writeln!(f)?;
+        }
+
+        write!(f, "  ")?;
+
+        write!(
+          f,
+          "{}",
+          UsageParameter {
+            parameter,
+            long: true,
+          }
+          .color_display(color),
+        )?;
+      }
+    }
+
+    if options {
+      if arguments {
+        writeln!(f)?;
+      }
+
+      writeln!(f)?;
+      writeln!(f, "{}", color.heading().paint("Options:"))?;
+      for (i, parameter) in self
+        .recipe
+        .parameters
+        .iter()
+        .filter(|p| p.is_option())
+        .enumerate()
+      {
+        if i > 0 {
+          writeln!(f)?;
+        }
+
+        write!(f, "  ")?;
+
+        write!(
+          f,
+          "{}",
+          UsageParameter {
+            parameter,
+            long: true,
+          }
+          .color_display(color),
+        )?;
+      }
+    }
+
+    Ok(())
+  }
+}
+
+struct UsageParameter<'a> {
+  long: bool,
+  parameter: &'a Parameter<'a>,
+}
+
+impl ColorDisplay for UsageParameter<'_> {
+  fn fmt(&self, f: &mut Formatter, color: Color) -> fmt::Result {
+    if self.parameter.is_option() {
+      if let Some(short) = self.parameter.short {
+        write!(f, "{}", color.option().paint(&format!("-{short}")))?;
+      } else {
+        write!(f, "  ")?;
+      }
+
+      if let Some(long) = &self.parameter.long {
+        if self.parameter.short.is_some() {
+          write!(f, ", ")?;
+        } else {
+          write!(f, "  ")?;
+        }
+
+        write!(f, "{}", color.option().paint(&format!("--{long}")))?;
+      }
+
+      if self.parameter.value.is_none() {
+        write!(
+          f,
+          " {}",
+          color.argument().paint(self.parameter.name.lexeme()),
+        )?;
+      }
+    } else {
+      if !self.parameter.is_required() {
+        write!(f, "{}", color.argument().paint("["))?;
+      }
+
+      write!(
+        f,
+        "{}",
+        color.argument().paint(self.parameter.name.lexeme()),
+      )?;
+
+      if self.parameter.kind.is_variadic() {
+        write!(f, "{}", color.argument().paint("..."))?;
+      }
+
+      if !self.parameter.is_required() {
+        write!(f, "{}", color.argument().paint("]"))?;
+      }
+    }
+
+    if !self.long {
+      return Ok(());
+    }
+
+    if let Some(help) = &self.parameter.help {
+      write!(f, " {help}")?;
+    }
+
+    if let Some(default) = &self.parameter.default {
+      if self.parameter.value.is_none() {
+        write!(f, " [default: {default}]")?;
+      }
+    }
+
+    if let Some(pattern) = &self.parameter.pattern {
+      write!(f, " [pattern: '{}']", pattern.original())?;
+    }
+
+    Ok(())
+  }
+}
+use {
+  super::*,
+  nix::{
+    errno::Errno,
+    fcntl::{FcntlArg, FdFlag},
+    sys::signal::{SaFlags, SigAction, SigHandler, SigSet},
+  },
+  std::{
+    fs::File,
+    io::Read,
+    os::fd::{BorrowedFd, IntoRawFd, OwnedFd},
+    sync::atomic::{self, AtomicI32},
+  },
+};
+
+const INVALID_FILENO: i32 = -1;
+
+static WRITE: AtomicI32 = AtomicI32::new(INVALID_FILENO);
+
+fn die(message: &str) -> ! {
+  // SAFETY:
+  //
+  // Standard error is open for the duration of the program.
+  const STDERR: BorrowedFd = unsafe { BorrowedFd::borrow_raw(libc::STDERR_FILENO) };
+
+  let mut i = 0;
+  let mut buffer = [0; 512];
+
+  let mut append = |s: &str| {
+    let remaining = buffer.len() - i;
+    let n = s.len().min(remaining);
+    let end = i + n;
+    buffer[i..end].copy_from_slice(&s.as_bytes()[0..n]);
+    i = end;
+  };
+
+  append("error: ");
+  append(message);
+  append("\n");
+
+  nix::unistd::write(STDERR, &buffer[0..i]).ok();
+
+  process::abort();
+}
+
+extern "C" fn handler(signal: libc::c_int) {
+  let errno = Errno::last();
+
+  let Ok(signal) = u8::try_from(signal) else {
+    die("unexpected signal");
+  };
+
+  // SAFETY:
+  //
+  // `WRITE` is initialized before the signal handler can run and remains open
+  // for the duration of the program.
+  let fd = unsafe { BorrowedFd::borrow_raw(WRITE.load(atomic::Ordering::Relaxed)) };
+
+  if let Err(err) = nix::unistd::write(fd, &[signal]) {
+    die(err.desc());
+  }
+
+  errno.set();
+}
+
+fn fcntl(fd: &OwnedFd, arg: FcntlArg) -> RunResult<'static, libc::c_int> {
+  nix::fcntl::fcntl(fd, arg).map_err(|errno| Error::SignalHandlerPipeCloexec {
+    io_error: errno.into(),
+  })
+}
+
+fn set_cloexec(fd: &OwnedFd) -> RunResult<'static> {
+  // It would be better to use pipe2(O_CLOEXEC) rather than pipe-then-fcntl,
+  // but it isn't supported on all platforms (most notably, not macos) and in
+  // the atomicity guarantees that pipe2 provides aren't needed.
+  let existing_flags = fcntl(fd, FcntlArg::F_GETFD)?;
+  let combined_flags = FdFlag::from_bits_retain(existing_flags) | FdFlag::FD_CLOEXEC;
+  fcntl(fd, FcntlArg::F_SETFD(combined_flags))?;
+  Ok(())
+}
+
+pub(crate) struct Signals(File);
+
+impl Signals {
+  pub(crate) fn new() -> RunResult<'static, Self> {
+    let (read, write) = nix::unistd::pipe().map_err(|errno| Error::SignalHandlerPipeOpen {
+      io_error: errno.into(),
+    })?;
+
+    set_cloexec(&read)?;
+    set_cloexec(&write)?;
+
+    if WRITE
+      .compare_exchange(
+        INVALID_FILENO,
+        write.into_raw_fd(),
+        atomic::Ordering::Relaxed,
+        atomic::Ordering::Relaxed,
+      )
+      .is_err()
+    {
+      panic!("signal iterator cannot be initialized twice");
+    }
+
+    let sa = SigAction::new(
+      SigHandler::Handler(handler),
+      SaFlags::SA_RESTART,
+      SigSet::empty(),
+    );
+
+    for &signal in Signal::ALL {
+      // SAFETY:
+      //
+      // This is the only place we modify signal handlers, and
+      // `nix::sys::signal::sigaction` is unsafe only if an invalid signal
+      // handler has already been installed.
+      unsafe {
+        nix::sys::signal::sigaction(signal.into(), &sa).map_err(|errno| {
+          Error::SignalHandlerSigaction {
+            signal,
+            io_error: errno.into(),
+          }
+        })?;
+      }
+    }
+
+    Ok(Self(File::from(read)))
+  }
+}
+
+impl Iterator for Signals {
+  type Item = io::Result<Signal>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    let mut signal = [0];
+    Some(
+      self
+        .0
+        .read_exact(&mut signal)
+        .and_then(|()| Signal::try_from(signal[0])),
+    )
+  }
+}
+1.7451166666666666 minutes used of 15.0

@@ -1,0 +1,513 @@
+use super::*;
+
+#[derive(Debug)]
+pub(crate) struct Scope<'src: 'run, 'run> {
+  bindings: Table<'src, Binding<'src, String>>,
+  parent: Option<&'run Self>,
+}
+
+impl<'src, 'run> Scope<'src, 'run> {
+  pub(crate) fn child(&'run self) -> Self {
+    Self {
+      parent: Some(self),
+      bindings: Table::new(),
+    }
+  }
+
+  pub(crate) fn root() -> Self {
+    let mut root = Self {
+      parent: None,
+      bindings: Table::new(),
+    };
+
+    for (i, (key, value)) in constants().iter().enumerate() {
+      root.bind(Binding {
+        eager: false,
+        export: false,
+        file_depth: 0,
+        name: Name {
+          token: Token {
+            column: 0,
+            kind: TokenKind::Identifier,
+            length: key.len(),
+            line: 0,
+            offset: 0,
+            path: Path::new("PRELUDE"),
+            src: key,
+          },
+        },
+        number: Numerator::constant(i),
+        prelude: true,
+        private: false,
+        value: (*value).into(),
+      });
+    }
+
+    root
+  }
+
+  pub(crate) fn bind(&mut self, binding: Binding<'src>) {
+    self.bindings.insert(binding);
+  }
+
+  pub(crate) fn bound(&self, name: &str) -> bool {
+    self.bindings.contains_key(name)
+  }
+
+  pub(crate) fn value(&self, name: &str) -> Option<&str> {
+    if let Some(binding) = self.bindings.get(name) {
+      Some(binding.value.as_ref())
+    } else {
+      self.parent?.value(name)
+    }
+  }
+
+  pub(crate) fn bindings(&self) -> impl Iterator<Item = &Binding<String>> {
+    self.bindings.values()
+  }
+
+  pub(crate) fn names(&self) -> impl Iterator<Item = &str> {
+    self.bindings.keys().copied()
+  }
+
+  pub(crate) fn parent(&self) -> Option<&'run Self> {
+    self.parent
+  }
+}
+use super::*;
+
+#[derive(Debug)]
+pub(crate) struct Compilation<'src> {
+  pub(crate) asts: HashMap<PathBuf, Ast<'src>>,
+  pub(crate) justfile: Justfile<'src>,
+  pub(crate) overrides: HashMap<Number, String>,
+  pub(crate) root: PathBuf,
+}
+
+impl<'src> Compilation<'src> {
+  pub(crate) fn root_ast(&self) -> &Ast<'src> {
+    self.asts.get(&self.root).unwrap()
+  }
+}
+use super::*;
+
+pub(crate) trait CommandExt {
+  fn export(
+    &mut self,
+    settings: &Settings,
+    dotenv: &BTreeMap<String, String>,
+    scope: &Scope,
+    unexports: &HashSet<String>,
+  ) -> &mut Command;
+
+  fn export_scope(&mut self, settings: &Settings, scope: &Scope, unexports: &HashSet<String>);
+
+  fn output_guard(self) -> (io::Result<process::Output>, Option<Signal>);
+
+  fn output_guard_stdout(self) -> Result<String, OutputError>;
+
+  fn resolve(program: impl AsRef<OsStr>) -> Command;
+
+  fn status_guard(self) -> (io::Result<ExitStatus>, Option<Signal>);
+}
+
+impl CommandExt for Command {
+  fn export(
+    &mut self,
+    settings: &Settings,
+    dotenv: &BTreeMap<String, String>,
+    scope: &Scope,
+    unexports: &HashSet<String>,
+  ) -> &mut Command {
+    for (name, value) in dotenv {
+      self.env(name, value);
+    }
+
+    if let Some(parent) = scope.parent() {
+      self.export_scope(settings, parent, unexports);
+    }
+
+    self
+  }
+
+  fn export_scope(&mut self, settings: &Settings, scope: &Scope, unexports: &HashSet<String>) {
+    if let Some(parent) = scope.parent() {
+      self.export_scope(settings, parent, unexports);
+    }
+
+    for unexport in unexports {
+      self.env_remove(unexport);
+    }
+
+    for binding in scope.bindings() {
+      if binding.export || (settings.export && !binding.prelude) {
+        self.env(binding.name.lexeme(), &binding.value);
+      }
+    }
+  }
+
+  fn output_guard(self) -> (io::Result<process::Output>, Option<Signal>) {
+    SignalHandler::spawn(self, process::Child::wait_with_output)
+  }
+
+  fn output_guard_stdout(self) -> Result<String, OutputError> {
+    let (result, caught) = self.output_guard();
+
+    let output = result.map_err(OutputError::Io)?;
+
+    OutputError::result_from_exit_status(output.status)?;
+
+    let output = str::from_utf8(&output.stdout).map_err(OutputError::Utf8)?;
+
+    if let Some(signal) = caught {
+      return Err(OutputError::Interrupted(signal));
+    }
+
+    Ok(
+      output
+        .strip_suffix("\r\n")
+        .or_else(|| output.strip_suffix("\n"))
+        .unwrap_or(output)
+        .into(),
+    )
+  }
+
+  fn resolve(program: impl AsRef<OsStr>) -> Self {
+    let program = Path::new(program.as_ref());
+
+    if !cfg!(windows) {
+      return Self::new(program);
+    }
+
+    let mut candidates = vec![program.into()];
+
+    let mut components = program.components();
+    if matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none() {
+      if let Some(path) = env::var_os("PATH") {
+        for path in env::split_paths(&path) {
+          candidates.push(path.join(program));
+        }
+      }
+    }
+
+    let extensions = if program.extension().is_none() {
+      let pathext = env::var_os("PATHEXT")
+        .unwrap_or(".COM;.EXE;.BAT;.CMD".into())
+        .to_string_lossy()
+        .into_owned();
+      let mut extensions = Vec::new();
+      for extension in pathext.split(';') {
+        if let Some(extension) = extension.strip_prefix('.') {
+          extensions.push(extension.to_owned());
+        }
+      }
+      Some(extensions)
+    } else {
+      None
+    };
+
+    for candidate in candidates {
+      if let Some(extensions) = &extensions {
+        for extension in extensions {
+          let path = candidate.with_extension(extension);
+          if path.is_file() {
+            return Self::new(path);
+          }
+        }
+      } else if candidate.is_file() {
+        return Self::new(candidate);
+      }
+    }
+
+    Self::new(program)
+  }
+
+  fn status_guard(self) -> (io::Result<ExitStatus>, Option<Signal>) {
+    SignalHandler::spawn(self, |mut child| child.wait())
+  }
+}
+use {super::*, CompileErrorKind::*};
+
+#[derive(Default)]
+pub(crate) struct Analyzer<'run, 'src> {
+  aliases: Table<'src, Alias<'src, Namepath<'src>>>,
+  assignments: Vec<&'run Binding<'src, Expression<'src>>>,
+  functions: Vec<&'run FunctionDefinition<'src>>,
+  modules: Table<'src, Justfile<'src>>,
+  recipes: Vec<&'run Recipe<'src, UnresolvedDependency<'src>>>,
+  sets: Table<'src, Set<'src>>,
+  unexports: HashSet<String>,
+  warnings: Vec<Warning>,
+}
+
+impl<'run, 'src> Analyzer<'run, 'src> {
+  pub(crate) fn analyze(
+    asts: &'run HashMap<PathBuf, Ast<'src>>,
+    config: &Config,
+    doc: Option<String>,
+    groups: &[StringLiteral<'src>],
+    loaded: &[PathBuf],
+    name: Option<Name<'src>>,
+    overrides: &mut HashMap<Number, String>,
+    paths: &HashMap<PathBuf, PathBuf>,
+    private: bool,
+    root: &Path,
+  ) -> RunResult<'src, Justfile<'src>> {
+    Self::default().justfile(
+      asts, config, doc, groups, loaded, name, overrides, paths, private, root,
+    )
+  }
+
+  fn justfile(
+    mut self,
+    asts: &'run HashMap<PathBuf, Ast<'src>>,
+    config: &Config,
+    doc: Option<String>,
+    groups: &[StringLiteral<'src>],
+    loaded: &[PathBuf],
+    name: Option<Name<'src>>,
+    overrides: &mut HashMap<Number, String>,
+    paths: &HashMap<PathBuf, PathBuf>,
+    private: bool,
+    root: &Path,
+  ) -> RunResult<'src, Justfile<'src>> {
+    let mut definitions = HashMap::new();
+    let mut imports = HashSet::new();
+    let mut unstable_features = BTreeSet::new();
+
+    let mut stack = Vec::new();
+    let ast = asts.get(root).unwrap();
+    stack.push(ast);
+
+    while let Some(ast) = stack.pop() {
+      unstable_features.extend(&ast.unstable_features);
+
+      for item in &ast.items {
+        match item {
+          Item::Alias(alias) => {
+            Self::define(&mut definitions, alias.name, "alias", false)?;
+            self.aliases.insert(alias.clone());
+          }
+          Item::Assignment(assignment) => {
+            self.assignments.push(assignment);
+          }
+          Item::Comment(_) => (),
+          Item::Function(function) => {
+            self.functions.push(function);
+          }
+          Item::Import { absolute, .. } => {
+            if let Some(absolute) = absolute {
+              if imports.insert(absolute) {
+                stack.push(asts.get(absolute).unwrap());
+              }
+            }
+          }
+          Item::Module {
+            absolute,
+            doc,
+            groups,
+            name,
+            private,
+            ..
+          } => {
+            if let Some(absolute) = absolute {
+              Self::define(&mut definitions, *name, "module", false)?;
+              self.modules.insert(Self::analyze(
+                asts,
+                config,
+                doc.clone(),
+                groups.as_slice(),
+                loaded,
+                Some(*name),
+                overrides,
+                paths,
+                *private,
+                absolute,
+              )?);
+            }
+          }
+          Item::Newline => {}
+          Item::Recipe(recipe) => {
+            if recipe.enabled() {
+              Self::analyze_recipe(recipe)?;
+              self.recipes.push(recipe);
+            }
+          }
+          Item::Set(set) => {
+            self.analyze_set(set)?;
+            self.sets.insert(set.clone());
+          }
+          Item::Unexport { name } => {
+            if !self.unexports.insert(name.lexeme().to_string()) {
+              return Err(
+                name
+                  .error(DuplicateUnexport {
+                    variable: name.lexeme(),
+                  })
+                  .into(),
+              );
+            }
+          }
+        }
+      }
+
+      self.warnings.extend(ast.warnings.iter().cloned());
+    }
+
+    let mut allow_duplicate_variables = false;
+
+    for (_name, set) in &self.sets {
+      if let Setting::AllowDuplicateVariables(value) = set.value {
+        allow_duplicate_variables = value;
+      }
+    }
+
+    let mut assignments: Table<'src, Assignment<'src>> = Table::default();
+    for assignment in self.assignments {
+      let variable = assignment.name.lexeme();
+
+      if !allow_duplicate_variables && assignments.contains_key(variable) {
+        return Err(assignment.name.error(DuplicateVariable { variable }).into());
+      }
+
+      if assignments
+        .get(variable)
+        .is_none_or(|original| assignment.file_depth <= original.file_depth)
+      {
+        assignments.insert(assignment.clone());
+      }
+
+      if self.unexports.contains(variable) {
+        return Err(assignment.name.error(ExportUnexported { variable }).into());
+      }
+    }
+
+    let mut functions = Table::<FunctionDefinition>::default();
+    for function in self.functions {
+      let name = function.name.lexeme();
+      if let Some(first) = functions.get(name) {
+        return Err(
+          function
+            .name
+            .error(Redefinition {
+              first_type: "function",
+              second_type: "function",
+              name,
+              first: first.name.line,
+            })
+            .into(),
+        );
+      }
+      functions.insert(function.clone());
+    }
+
+    AssignmentResolver::resolve_assignments(&assignments, &functions)?;
+
+    for set in self.sets.values() {
+      for expression in set.value.expressions() {
+        for reference in expression.references() {
+          match reference {
+            Reference::Call { name, arguments } => {
+              Analyzer::resolve_call(&functions, name, arguments)?;
+            }
+            Reference::Variable(variable) => {
+              let name = variable.lexeme();
+              if !assignments.contains_key(name) && !constants().contains_key(name) {
+                return Err(variable.error(UndefinedVariable { variable: name }).into());
+              }
+            }
+          }
+        }
+      }
+    }
+
+    let mut unknown_overrides = Vec::new();
+
+    for ((path, name), value) in &config.overrides {
+      if *path == ast.module_path {
+        if let Some(assignment) = assignments.get(name) {
+          overrides.insert(assignment.number, value.clone());
+        } else {
+          unknown_overrides.push(path.join(name));
+        }
+      } else if path.starts_with(&ast.module_path)
+        && !self
+          .modules
+          .contains_key(&path.components[ast.module_path.components.len()])
+      {
+        unknown_overrides.push(format!("{path}::{name}"));
+      }
+    }
+
+    if !unknown_overrides.is_empty() {
+      return Err(Error::UnknownOverrides {
+        overrides: unknown_overrides,
+      });
+    }
+
+    let settings =
+      Evaluator::evaluate_settings(&assignments, overrides, &Scope::root(), self.sets)?;
+
+    let mut deduplicated_recipes = Table::<'src, UnresolvedRecipe<'src>>::default();
+    for recipe in self.recipes {
+      Self::define(
+        &mut definitions,
+        recipe.name,
+        "recipe",
+        settings.allow_duplicate_recipes,
+      )?;
+
+      if deduplicated_recipes
+        .get(recipe.name.lexeme())
+        .is_none_or(|original| recipe.file_depth <= original.file_depth)
+      {
+        deduplicated_recipes.insert(recipe.clone());
+      }
+
+      if !recipe.is_script() {
+        for line in &recipe.body {
+          let sigils = line.sigils(&settings);
+
+          if sigils.contains(&Sigil::Guard) && sigils.contains(&Sigil::Infallible) {
+            let Fragment::Text { token } = line.fragments.first().unwrap() else {
+              unreachable!();
+            };
+            return Err(
+              token
+                .error(CompileErrorKind::GuardAndInfallibleSigil)
+                .into(),
+            );
+          }
+        }
+      }
+    }
+
+    let recipes = RecipeResolver::resolve_recipes(
+      &assignments,
+      &functions,
+      &ast.module_path,
+datetime-invalid exit 101 stdout '' stderr 
+thread 'main' (14) panicked at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/string.rs:2953:14:
+a Display implementation returned an error unexpectedly: Error
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+datetime-utc-invalid exit 101 stdout '' stderr 
+thread 'main' (16) panicked at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/string.rs:2953:14:
+a Display implementation returned an error unexpectedly: Error
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+timestamp-invalid exit 101 stdout '' stderr 
+thread 'main' (18) panicked at /rustc/58cf8f9c35b355199727627d07ae34a4e2846d67/library/alloc/src/string.rs:2953:14:
+a Display implementation returned an error unexpectedly: Error
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+function-override exit 0 stdout 'a := "original"\nx := "override"\n' stderr 
+function-dependency exit 0 stdout 'false\nfalse\n' stderr 
+function-export exit 2 stdout '' stderr sh: 1: x: parameter not set
+error: Backtick failed with exit code 2
+ ——▶ function-export.just:3:8
+  │
+3 │ f() := `printf '%s' "$x"`
+  │        ^^^^^^^^^^^^^^^^^^
+
+function-constant exit 0 stdout 'a := "0123456789abcdef"\n' stderr 

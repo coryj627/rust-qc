@@ -1,0 +1,345 @@
+        let b = self.evaluate_expression(&arguments[1])?;
+        let c = self.evaluate_expression(&arguments[2])?;
+        f(self.function_context(name).unwrap(), &a, &b, &c)
+      }
+    }
+    .map_err(|message| Error::FunctionCall {
+      function: name,
+      message,
+    })
+  }
+
+  pub(crate) fn evaluate_expression(
+    &mut self,
+    expression: &Expression<'src>,
+  ) -> RunResult<'src, String> {
+    match expression {
+      Expression::And { lhs, rhs } => {
+        let lhs = self.evaluate_expression(lhs)?;
+        if lhs.is_empty() {
+          return Ok(String::new());
+        }
+        self.evaluate_expression(rhs)
+      }
+      Expression::Assert {
+        condition,
+        error,
+        name,
+      } => {
+        if self.evaluate_condition(condition)? {
+          Ok(String::new())
+        } else {
+          Err(Error::Assert {
+            message: self.evaluate_expression(error)?,
+            name: *name,
+          })
+        }
+      }
+      Expression::Backtick { contents, token } => {
+        let context = self.context(ConstError::Backtick(*token))?;
+
+        if context.config.dry_run {
+          return Ok(format!("`{contents}`"));
+        }
+
+        Self::run_command(context, &self.env, &self.scope, contents, None).map_err(|output_error| {
+          Error::Backtick {
+            token: *token,
+            output_error,
+          }
+        })
+      }
+      Expression::Call { name, arguments } => {
+        let module = self.context(ConstError::FunctionCall(*name))?.module;
+        if let Some(function) = module.functions.get(name.lexeme()) {
+          self.evaluate_defined_function(function, arguments)
+        } else if let Some(builtin) = function::get(name.lexeme()) {
+          self.evaluate_builtin_function(*name, builtin, arguments)
+        } else {
+          unreachable!();
+        }
+      }
+      Expression::Concatenation { lhs, rhs } => {
+        let lhs = self.evaluate_expression(lhs)?;
+        let rhs = self.evaluate_expression(rhs)?;
+        Ok(lhs + &rhs)
+      }
+      Expression::Conditional {
+        condition,
+        then,
+        otherwise,
+      } => {
+        if self.evaluate_condition(condition)? {
+          self.evaluate_expression(then)
+        } else {
+          self.evaluate_expression(otherwise)
+        }
+      }
+      Expression::FormatString { start, expressions } => {
+        let mut value = start.cooked.clone();
+
+        for (expression, string) in expressions {
+          value.push_str(&self.evaluate_expression(expression)?);
+          value.push_str(&string.cooked);
+        }
+
+        if start.kind.indented {
+          Ok(unindent(&value))
+        } else {
+          Ok(value)
+        }
+      }
+      Expression::Group { contents } => self.evaluate_expression(contents),
+      Expression::Join { lhs: None, rhs } => Ok("/".to_string() + &self.evaluate_expression(rhs)?),
+      Expression::Join {
+        lhs: Some(lhs),
+        rhs,
+      } => {
+        let lhs = self.evaluate_expression(lhs)?;
+        let rhs = self.evaluate_expression(rhs)?;
+        Ok(lhs + "/" + &rhs)
+      }
+      Expression::Or { lhs, rhs } => {
+        let lhs = self.evaluate_expression(lhs)?;
+        if !lhs.is_empty() {
+          return Ok(lhs);
+        }
+        self.evaluate_expression(rhs)
+      }
+      Expression::StringLiteral { string_literal } => Ok(string_literal.cooked.clone()),
+      Expression::Variable { name, .. } => {
+        let variable = name.lexeme();
+        if let Some(value) = self.scope.value(variable) {
+          Ok(value.to_owned())
+        } else if self.non_const_assignments.contains_key(name.lexeme()) {
+          Err(ConstError::Variable(*name).into())
+        } else if let Some(assignment) = self
+          .assignments
+          .and_then(|assignments| assignments.get(variable))
+        {
+          Ok(self.evaluate_assignment(assignment)?.to_owned())
+        } else {
+          Err(Error::internal(format!(
+            "attempted to evaluate undefined variable `{variable}`"
+          )))
+        }
+      }
+    }
+  }
+
+  fn evaluate_condition(&mut self, condition: &Condition<'src>) -> RunResult<'src, bool> {
+    let lhs_value = self.evaluate_expression(&condition.lhs)?;
+    let rhs_value = self.evaluate_expression(&condition.rhs)?;
+    let condition = match condition.operator {
+      ConditionalOperator::Equality => lhs_value == rhs_value,
+      ConditionalOperator::Inequality => lhs_value != rhs_value,
+      ConditionalOperator::RegexMatch => Regex::new(&rhs_value)
+        .map_err(|source| Error::RegexCompile { source })?
+        .is_match(&lhs_value),
+      ConditionalOperator::RegexMismatch => !Regex::new(&rhs_value)
+        .map_err(|source| Error::RegexCompile { source })?
+        .is_match(&lhs_value),
+    };
+    Ok(condition)
+  }
+
+  pub(crate) fn run_command(
+    context: &ExecutionContext,
+    env: &BTreeMap<String, String>,
+    scope: &Scope,
+    command: &str,
+    args: Option<&[String]>,
+  ) -> Result<String, OutputError> {
+    let mut cmd = context.module.settings.shell_command(context.config);
+
+    cmd.arg(command);
+
+    if let Some(args) = args {
+      if ShellKind::from(&cmd).takes_shell_name() {
+        cmd.arg(command);
+      }
+
+      cmd.args(args);
+    }
+
+    cmd
+      .current_dir(context.working_directory())
+      .export(
+        &context.module.settings,
+        context.dotenv,
+        scope,
+        &context.module.unexports,
+      )
+      .stdin(Stdio::inherit())
+      .stderr(if context.config.verbosity.quiet() {
+        Stdio::null()
+      } else {
+        Stdio::inherit()
+      })
+      .stdout(Stdio::piped());
+
+    for (key, value) in env {
+      cmd.env(key, value);
+    }
+
+    cmd.output_guard_stdout()
+  }
+
+  pub(crate) fn evaluate_line(
+    &mut self,
+    line: &Line<'src>,
+    continued: bool,
+  ) -> RunResult<'src, String> {
+    let mut evaluated = String::new();
+    for (i, fragment) in line.fragments.iter().enumerate() {
+      match fragment {
+        Fragment::Text { token } => {
+          let lexeme = token
+            .lexeme()
+            .replace(Lexer::INTERPOLATION_ESCAPE, Lexer::INTERPOLATION_START);
+
+          if i == 0 && continued {
+            evaluated += lexeme.trim_start();
+          } else {
+            evaluated += &lexeme;
+          }
+        }
+        Fragment::Interpolation { expression } => {
+          evaluated += &self.evaluate_expression(expression)?;
+        }
+      }
+    }
+    Ok(evaluated)
+  }
+
+  pub(crate) fn evaluate_parameters(
+    arguments: &[Vec<String>],
+    context: &ExecutionContext<'src, 'run>,
+    is_dependency: bool,
+    parameters: &[Parameter<'src>],
+    recipe: &Recipe<'src>,
+    scope: &'run Scope<'src, 'run>,
+  ) -> RunResult<'src, (Scope<'src, 'run>, Vec<String>)> {
+    let env = recipe
+      .attributes
+      .iter()
+      .filter_map(|attribute| {
+        if let Attribute::Env(key, value) = attribute {
+          Some((key.cooked.clone(), value.cooked.clone()))
+        } else {
+          None
+        }
+      })
+      .collect();
+
+    let mut evaluator = Self::new(context, env, is_dependency, scope);
+
+    let mut positional = Vec::new();
+
+    if arguments.len() != parameters.len() {
+      return Err(Error::internal("arguments do not match parameter count"));
+    }
+
+    for (parameter, group) in parameters.iter().zip(arguments) {
+      let values = if group.is_empty() {
+        if let Some(ref default) = parameter.default {
+          let value = evaluator.evaluate_expression(default)?;
+          positional.push(value.clone());
+          vec![value]
+        } else if parameter.kind == ParameterKind::Star {
+          Vec::new()
+        } else {
+          return Err(Error::internal("missing parameter without default"));
+        }
+      } else if parameter.kind.is_variadic() {
+        positional.extend_from_slice(group);
+        group.clone()
+      } else {
+        if group.len() != 1 {
+          return Err(Error::internal(
+            "multiple values for non-variadic parameter",
+          ));
+        }
+        let value = group[0].clone();
+        positional.push(value.clone());
+        vec![value]
+      };
+
+      for value in &values {
+        parameter.check_pattern_match(recipe, value)?;
+      }
+
+      evaluator.scope.bind(Binding {
+        eager: false,
+        export: parameter.export,
+        file_depth: 0,
+        name: parameter.name,
+        number: parameter.number,
+        prelude: false,
+        private: false,
+        value: values.join(" "),
+      });
+    }
+
+    Ok((evaluator.scope, positional))
+  }
+
+  pub(crate) fn new(
+    context: &ExecutionContext<'src, 'run>,
+    env: BTreeMap<String, String>,
+    is_dependency: bool,
+    scope: &'run Scope<'src, 'run>,
+  ) -> Self {
+    static OVERRIDES: LazyLock<HashMap<Number, String>> = LazyLock::new(HashMap::new);
+    Self {
+      assignments: None,
+      context: Some(*context),
+      env,
+      is_dependency,
+      non_const_assignments: Table::new(),
+      overrides: &OVERRIDES,
+      scope: scope.child(),
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  run_error! {
+    name: backtick_code,
+    src: "
+      a:
+       echo {{`f() { return 100; }; f`}}
+    ",
+    args: ["a"],
+    error: Error::Backtick {
+      token,
+      output_error: OutputError::Code(code),
+    },
+    check: {
+      assert_eq!(code, 100);
+      assert_eq!(token.lexeme(), "`f() { return 100; }; f`");
+    }
+  }
+
+  run_error! {
+    name: export_assignment_backtick,
+    src: "
+      export exported_variable := 'A'
+      b := `echo $exported_variable`
+
+      recipe:
+        echo {{b}}
+    ",
+    args: ["--quiet", "recipe"],
+    error: Error::Backtick {
+        token,
+        output_error: OutputError::Code(_),
+    },
+    check: {
+      assert_eq!(token.lexeme(), "`echo $exported_variable`");
+    }
+  }
+}

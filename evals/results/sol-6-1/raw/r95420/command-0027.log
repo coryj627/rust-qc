@@ -1,0 +1,261 @@
+//! Lock-free hash tables.
+//!
+//! The hash tables in this crate are, at their core, open addressing hash
+//! tables implemented using open addressing and boxed buckets. The core of
+//! these hash tables are bucket arrays, which consist of a vector of atomic
+//! pointers to buckets, an atomic pointer to the next bucket array, and an
+//! epoch number. In the context of this crate, an atomic pointer is a nullable
+//! pointer that is accessed and manipulated using atomic memory operations.
+//! Each bucket consists of a key and a possibly-uninitialized value.
+//!
+//! The key insight into making the hash table resizable is to incrementally
+//! copy buckets from the old bucket array to the new bucket array. As buckets
+//! are copied between bucket arrays, their pointers in the old bucket array are
+//! CAS'd with a null pointer that has a sentinel bit set. If the CAS fails,
+//! that thread must read the bucket pointer again and retry copying it into the
+//! new bucket array. If at any time a thread reads a bucket pointer with the
+//! sentinel bit set, that thread knows that a new (larger) bucket array has
+//! been allocated. That thread will then immediately attempt to copy all
+//! buckets to the new bucket array. It is possible to implement an algorithm in
+//! which a subset of buckets are relocated per-thread; such an algorithm has
+//! not been implemented for the sake of simplicity.
+//!
+//! Bucket pointers that have been copied from an old bucket array into a new
+//! bucket array are marked with a borrowed bit. If a thread copies a bucket
+//! from an old bucket array into a new bucket array, fails to CAS the bucket
+//! pointer in the old bucket array, it attempts to CAS the bucket pointer in
+//! the new bucket array that it previously inserted to. If the bucket pointer
+//! in the new bucket array does *not* have the borrowed tag bit set, that
+//! thread knows that the value in the new bucket array was modified more
+//! recently than the value in the old bucket array. To avoid discarding updates
+//! to the new bucket array, a thread will never replace a bucket pointer that
+//! has the borrowed tag bit set with one that does not. To see why this is
+//! necessary, consider the case where a bucket pointer is copied into the new
+//! array, removed from the new array by a second thread, then copied into the
+//! new array again by a third thread.
+//!
+//! Mutating operations are, at their core, an atomic compare-and-swap (CAS) on
+//! a bucket pointer. Insertions CAS null pointers and bucket pointers with
+//! matching keys, modifications CAS bucket pointers with matching keys, and
+//! removals CAS non-tombstone bucket pointers. Tombstone bucket pointers are
+//! bucket pointers with a tombstone bit set as part of a removal; this
+//! indicates that the bucket's value has been moved from and will be destroyed
+//! if it has not been already.
+//!
+//! As previously mentioned, removing an entry from the hash table results in
+//! that bucket pointer having a tombstone bit set. Insertions cannot
+//! displace a tombstone bucket unless their key compares equal, so once an
+//! entry is inserted into the hash table, the specific index it is assigned to
+//! will only ever hold entries whose keys compare equal. Without this
+//! restriction, resizing operations could result in the old and new bucket
+//! arrays being temporarily inconsistent. Consider the case where one thread,
+//! as part of a resizing operation, copies a bucket into a new bucket array
+//! while another thread removes and replaces that bucket from the old bucket
+//! array. If the new bucket has a non-matching key, what happens to the bucket
+//! that was just copied into the new bucket array?
+//!
+//! Tombstone bucket pointers are typically not copied into new bucket arrays.
+//! The exception is the case where a bucket pointer was copied to the new
+//! bucket array, then CAS on the old bucket array fails because that bucket has
+//! been replaced with a tombstone. In this case, the tombstone bucket pointer
+//! will be copied over to reflect the update without displacing a key from its
+//! bucket.
+//!
+//! This hash table algorithm was inspired by [a blog post by Jeff Phreshing]
+//! that describes the implementation of the Linear hash table in [Junction], a
+//! C++ library of concurrent data structures. Additional inspiration was drawn
+//! from the lock-free hash table described by Cliff Click in [a tech talk] given
+//! at Google in 2007.
+//!
+//! [a blog post by Jeff Phreshing]: https://preshing.com/20160222/a-resizable-concurrent-map/
+//! [Junction]: https://github.com/preshing/junction
+//! [a tech talk]: https://youtu.be/HJ-719EGIts
+
+pub(crate) mod iter;
+pub(crate) mod map;
+pub(crate) mod segment;
+
+#[cfg(test)]
+#[macro_use]
+pub(crate) mod test_util;
+
+pub(crate) use segment::HashMap as SegmentedHashMap;
+//! A lock-free hash map implemented with bucket pointer arrays, open addressing,
+//! and linear probing.
+
+pub(crate) mod bucket;
+pub(crate) mod bucket_array_ref;
+
+use std::collections::hash_map::RandomState;
+
+/// Default hasher for `HashMap`.
+pub type DefaultHashBuilder = RandomState;
+use std::{
+    borrow::{Borrow, BorrowMut},
+    hash::{Hash, Hasher},
+    ops::{Deref, DerefMut},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
+
+use crossbeam_epoch::Owned;
+
+#[derive(Clone, Debug)]
+pub(crate) struct NoisyDropper<T: ?Sized> {
+    parent: Arc<DropNotifier>,
+    pub elem: T,
+}
+
+impl<T> NoisyDropper<T> {
+    pub(crate) fn new(parent: Arc<DropNotifier>, elem: T) -> Self {
+        Self { parent, elem }
+    }
+}
+
+impl<T: ?Sized> Drop for NoisyDropper<T> {
+    fn drop(&mut self) {
+        assert!(!self.parent.dropped.swap(true, Ordering::Relaxed));
+    }
+}
+
+impl<T: ?Sized + PartialEq> PartialEq for NoisyDropper<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.elem == other.elem
+    }
+}
+
+impl<T: ?Sized + PartialEq> PartialEq<T> for NoisyDropper<T> {
+    fn eq(&self, other: &T) -> bool {
+        &self.elem == other
+    }
+}
+
+impl<T: ?Sized + Eq> Eq for NoisyDropper<T> {}
+
+impl<T: ?Sized + Hash> Hash for NoisyDropper<T> {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        self.elem.hash(hasher);
+    }
+}
+
+impl<T: ?Sized> AsRef<T> for NoisyDropper<T> {
+    fn as_ref(&self) -> &T {
+        &self.elem
+    }
+}
+
+impl<T: ?Sized> AsMut<T> for NoisyDropper<T> {
+    fn as_mut(&mut self) -> &mut T {
+        &mut self.elem
+    }
+}
+
+impl<T: ?Sized> Borrow<T> for NoisyDropper<T> {
+    fn borrow(&self) -> &T {
+        &self.elem
+    }
+}
+
+impl<T: ?Sized> BorrowMut<T> for NoisyDropper<T> {
+    fn borrow_mut(&mut self) -> &mut T {
+        &mut self.elem
+    }
+}
+
+impl<T: ?Sized> Deref for NoisyDropper<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.elem
+    }
+}
+
+impl<T: ?Sized> DerefMut for NoisyDropper<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.elem
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DropNotifier {
+    dropped: AtomicBool,
+}
+
+impl DropNotifier {
+    pub(crate) fn new() -> Self {
+        Self {
+            dropped: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn was_dropped(&self) -> bool {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+pub(crate) fn run_deferred() {
+    for _ in 0..65536 {
+        let guard = crossbeam_epoch::pin();
+
+        unsafe { guard.defer_destroy(Owned::new(0).into_shared(&guard)) };
+
+        guard.flush();
+    }
+}
+crate/src/cht/segment.rs:32:use crate::cht::map::{
+crate/src/cht/segment.rs:607:    crate::common::available_parallelism() * 2
+crate/src/cht/segment.rs:619:    use crate::cht::test_util::{run_deferred, DropNotifier, NoisyDropper};
+crate/src/cht/map/bucket.rs:12:use crate::common::concurrent::debug_counters;
+455:    pub(crate) fn insert_if_not_present(&self, key: K, hash: u64, value: V) -> Option<V>
+456-    where
+457-        V: Clone,
+458-    {
+459-        let result = self.bucket_array_ref(hash).insert_if_not_present_and(
+460-            key,
+461-            hash,
+462-            || value,
+463-            |_, v| v.clone(),
+464-        );
+465-
+466-        if result.is_none() {
+467-            self.len.fetch_add(1, Ordering::Relaxed);
+468-        }
+469-
+470-        result
+471-    }
+472-
+473-    pub(crate) fn keys<T>(&self, segment: usize, with_key: impl FnMut(&K) -> T) -> Option<Vec<T>> {
+474-        if segment >= self.segments.len() {
+475-            return None;
+476-        }
+477-
+478-        let Segment {
+479-            ref bucket_array,
+480-            ref len,
+481-        } = self.segments[segment];
+482-
+483-        let bucket_array_ref = BucketArrayRef {
+484-            bucket_array,
+485-            build_hasher: &self.build_hasher,
+486-            len,
+487-        };
+488-
+489-        Some(bucket_array_ref.keys(with_key))
+490-    }
+491-
+492-    pub(crate) fn iter(&self) -> Iter<'_, K, V>
+493-    where
+494-        K: Clone,
+495-        V: Clone,
+496-    {
+497-        Iter::with_single_cache_segment(self, self.actual_num_segments())
+498-    }
+499-
+500-    #[inline]
+501-    pub(crate) fn hash<Q>(&self, key: &Q) -> u64
+502-    where
+503-        Q: Equivalent<K> + Hash + ?Sized,
+504-    {
+505-        bucket::hash(&self.build_hasher, key)

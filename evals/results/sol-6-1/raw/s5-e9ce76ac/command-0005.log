@@ -1,0 +1,450 @@
+
+    #[inline]
+    fn resize(&mut self, num_cols: usize, num_lines: usize) {
+        // Reset point, so old cursor won't end up outside of the viewport.
+        self.last_cursor = Default::default();
+        self.full = true;
+
+        self.lines.clear();
+        self.lines.reserve(num_lines);
+        for line in 0..num_lines {
+            self.lines.push(LineDamageBounds::undamaged(line, num_cols));
+        }
+    }
+
+    /// Damage point inside of the viewport.
+    #[inline]
+    fn damage_point(&mut self, point: Point<usize>) {
+        self.damage_line(point.line, point.column.0, point.column.0);
+    }
+
+    /// Expand `line`'s damage to span at least `left` to `right` column.
+    #[inline]
+    fn damage_line(&mut self, line: usize, left: usize, right: usize) {
+        self.lines[line].expand(left, right);
+    }
+
+    /// Reset information about terminal damage.
+    fn reset(&mut self, num_cols: usize) {
+        self.full = false;
+        self.lines.iter_mut().for_each(|line| line.reset(num_cols));
+    }
+}
+
+pub struct Term<T> {
+    /// Terminal focus controlling the cursor shape.
+    pub is_focused: bool,
+
+    /// Cursor for keyboard selection.
+    pub vi_mode_cursor: ViModeCursor,
+
+    pub selection: Option<Selection>,
+
+    /// Currently active grid.
+    ///
+    /// Tracks the screen buffer currently in use. While the alternate screen buffer is active,
+    /// this will be the alternate grid. Otherwise it is the primary screen buffer.
+    grid: Grid<Cell>,
+
+    /// Currently inactive grid.
+    ///
+    /// Opposite of the active grid. While the alternate screen buffer is active, this will be the
+    /// primary grid. Otherwise it is the alternate screen buffer.
+    inactive_grid: Grid<Cell>,
+
+    /// Index into `charsets`, pointing to what ASCII is currently being mapped to.
+    active_charset: CharsetIndex,
+
+    /// Tabstops.
+    tabs: TabStops,
+
+    /// Mode flags.
+    mode: TermMode,
+
+    /// Scroll region.
+    ///
+    /// Range going from top to bottom of the terminal, indexed from the top of the viewport.
+    scroll_region: Range<Line>,
+
+    /// Modified terminal colors.
+    colors: Colors,
+
+    /// Current style of the cursor.
+    cursor_style: Option<CursorStyle>,
+
+    /// Proxy for sending events to the event loop.
+    event_proxy: T,
+
+    /// Current title of the window.
+    title: Option<String>,
+
+    /// Stack of saved window titles. When a title is popped from this stack, the `title` for the
+    /// term is set.
+    title_stack: Vec<Option<String>>,
+
+    /// The stack for the keyboard modes.
+    keyboard_mode_stack: Vec<KeyboardModes>,
+
+    /// Currently inactive keyboard mode stack.
+    inactive_keyboard_mode_stack: Vec<KeyboardModes>,
+
+    /// Information about damaged cells.
+    damage: TermDamageState,
+
+    /// Config directly for the terminal.
+    config: Config,
+}
+
+/// Configuration options for the [`Term`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    /// The maximum amount of scrolling history.
+    pub scrolling_history: usize,
+
+    /// Default cursor style to reset the cursor to.
+    pub default_cursor_style: CursorStyle,
+
+    /// Cursor style for Vi mode.
+    pub vi_mode_cursor_style: Option<CursorStyle>,
+
+    /// The characters which terminate semantic selection.
+    ///
+    /// The default value is [`SEMANTIC_ESCAPE_CHARS`].
+    pub semantic_escape_chars: String,
+
+    /// Whether to enable kitty keyboard protocol.
+    pub kitty_keyboard: bool,
+
+    /// OSC52 support mode.
+    pub osc52: Osc52,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            scrolling_history: 10000,
+            semantic_escape_chars: SEMANTIC_ESCAPE_CHARS.to_owned(),
+            default_cursor_style: Default::default(),
+            vi_mode_cursor_style: Default::default(),
+            kitty_keyboard: Default::default(),
+            osc52: Default::default(),
+        }
+    }
+}
+
+/// OSC 52 behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(rename_all = "lowercase"))]
+pub enum Osc52 {
+    /// The handling of the escape sequence is disabled.
+    Disabled,
+    /// Only copy sequence is accepted.
+    ///
+    /// This option is the default as a compromise between entirely
+    /// disabling it (the most secure) and allowing `paste` (the less secure).
+    #[default]
+    OnlyCopy,
+    /// Only paste sequence is accepted.
+    OnlyPaste,
+    /// Both are accepted.
+    CopyPaste,
+}
+
+impl<T> Term<T> {
+    #[inline]
+    pub fn scroll_display(&mut self, scroll: Scroll)
+    where
+        T: EventListener,
+    {
+        let old_display_offset = self.grid.display_offset();
+        self.grid.scroll_display(scroll);
+        self.event_proxy.send_event(Event::MouseCursorDirty);
+
+        // Clamp vi mode cursor to the viewport.
+        let viewport_start = -(self.grid.display_offset() as i32);
+        let viewport_end = viewport_start + self.bottommost_line().0;
+        let vi_cursor_line = &mut self.vi_mode_cursor.point.line.0;
+        *vi_cursor_line = cmp::min(viewport_end, cmp::max(viewport_start, *vi_cursor_line));
+        self.vi_mode_recompute_selection();
+
+        // Damage everything if display offset changed.
+        if old_display_offset != self.grid().display_offset() {
+            self.mark_fully_damaged();
+        }
+    }
+
+    pub fn new<D: Dimensions>(config: Config, dimensions: &D, event_proxy: T) -> Term<T> {
+        let num_cols = dimensions.columns();
+        let num_lines = dimensions.screen_lines();
+
+        let history_size = config.scrolling_history;
+        let grid = Grid::new(num_lines, num_cols, history_size);
+        let inactive_grid = Grid::new(num_lines, num_cols, 0);
+
+        let tabs = TabStops::new(grid.columns());
+
+        let scroll_region = Line(0)..Line(grid.screen_lines() as i32);
+
+        // Initialize terminal damage, covering the entire terminal upon launch.
+        let damage = TermDamageState::new(num_cols, num_lines);
+
+        Term {
+            inactive_grid,
+            scroll_region,
+            event_proxy,
+            damage,
+            config,
+            grid,
+            tabs,
+            inactive_keyboard_mode_stack: Default::default(),
+            keyboard_mode_stack: Default::default(),
+            active_charset: Default::default(),
+            vi_mode_cursor: Default::default(),
+            cursor_style: Default::default(),
+            colors: color::Colors::default(),
+            title_stack: Default::default(),
+            is_focused: Default::default(),
+            selection: Default::default(),
+            title: Default::default(),
+            mode: Default::default(),
+        }
+    }
+
+    /// Collect the information about the changes in the lines, which
+    /// could be used to minimize the amount of drawing operations.
+    ///
+    /// The user controlled elements, like `Vi` mode cursor and `Selection` are **not** part of the
+    /// collected damage state. Those could easily be tracked by comparing their old and new
+    /// value between adjacent frames.
+    ///
+    /// After reading damage [`reset_damage`] should be called.
+    ///
+    /// [`reset_damage`]: Self::reset_damage
+    #[must_use]
+    pub fn damage(&mut self) -> TermDamage<'_> {
+        // Ensure the entire terminal is damaged after entering insert mode.
+        // Leaving is handled in the ansi handler.
+        if self.mode.contains(TermMode::INSERT) {
+            self.mark_fully_damaged();
+        }
+
+        let previous_cursor = mem::replace(&mut self.damage.last_cursor, self.grid.cursor.point);
+
+        if self.damage.full {
+            return TermDamage::Full;
+        }
+
+        // Add information about old cursor position and new one if they are not the same, so we
+        // cover everything that was produced by `Term::input`.
+        if self.damage.last_cursor != previous_cursor {
+            // Cursor coordinates are always inside viewport even if you have `display_offset`.
+            let point = Point::new(previous_cursor.line.0 as usize, previous_cursor.column);
+
+        let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
+        self.grid.resize(!is_alt, num_lines, num_cols);
+        self.inactive_grid.resize(is_alt, num_lines, num_cols);
+
+        // Invalidate selection and tabs only when necessary.
+        if old_cols != num_cols {
+            self.selection = None;
+
+            // Recreate tabs list.
+            self.tabs.resize(num_cols);
+        } else if let Some(selection) = self.selection.take() {
+            let max_lines = cmp::max(num_lines, old_lines) as i32;
+            let range = Line(0)..Line(max_lines);
+            self.selection = selection.rotate(self, &range, -delta);
+        }
+
+        // Clamp vi cursor to viewport.
+        let vi_point = self.vi_mode_cursor.point;
+        let viewport_top = Line(-(self.grid.display_offset() as i32));
+        let viewport_bottom = viewport_top + self.bottommost_line();
+        self.vi_mode_cursor.point.line =
+            cmp::max(cmp::min(vi_point.line, viewport_bottom), viewport_top);
+        self.vi_mode_cursor.point.column = cmp::min(vi_point.column, self.last_column());
+
+        // Reset scrolling region.
+        self.scroll_region = Line(0)..Line(self.screen_lines() as i32);
+
+        // Resize damage information.
+        self.damage.resize(num_cols, num_lines);
+    }
+
+    /// Active terminal modes.
+    #[inline]
+    pub fn mode(&self) -> &TermMode {
+        &self.mode
+    }
+
+    /// Swap primary and alternate screen buffer.
+    pub fn swap_alt(&mut self) {
+        if !self.mode.contains(TermMode::ALT_SCREEN) {
+            // Set alt screen cursor to the current primary screen cursor.
+            self.inactive_grid.cursor = self.grid.cursor.clone();
+
+            // Drop information about the primary screens saved cursor.
+            self.grid.saved_cursor = self.grid.cursor.clone();
+
+            // Reset alternate screen contents.
+            self.inactive_grid.reset_region(..);
+        }
+
+        mem::swap(&mut self.keyboard_mode_stack, &mut self.inactive_keyboard_mode_stack);
+        let keyboard_mode =
+            self.keyboard_mode_stack.last().copied().unwrap_or(KeyboardModes::NO_MODE).into();
+        self.set_keyboard_mode(keyboard_mode, KeyboardModesApplyBehavior::Replace);
+
+        mem::swap(&mut self.grid, &mut self.inactive_grid);
+        self.mode ^= TermMode::ALT_SCREEN;
+        self.selection = None;
+        self.mark_fully_damaged();
+    }
+
+    /// Scroll screen down.
+    ///
+    /// Text moves down; clear at bottom
+    /// Expects origin to be in scroll range.
+    #[inline]
+    fn scroll_down_relative(&mut self, origin: Line, mut lines: usize) {
+
+                if (cursor.line.0 as usize) < screen_lines - 1 {
+                    self.grid.reset_region((cursor.line + 1)..);
+                }
+
+                let range = cursor.line..Line(screen_lines as i32);
+                self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
+            },
+            ansi::ClearMode::All => {
+                if self.mode.contains(TermMode::ALT_SCREEN) {
+                    self.grid.reset_region(..);
+                } else {
+                    let old_offset = self.grid.display_offset();
+
+                    self.grid.clear_viewport();
+
+                    // Compute number of lines scrolled by clearing the viewport.
+                    let lines = self.grid.display_offset().saturating_sub(old_offset);
+
+                    self.vi_mode_cursor.point.line =
+                        (self.vi_mode_cursor.point.line - lines).grid_clamp(self, Boundary::Grid);
+                }
+
+                self.selection = None;
+            },
+            ansi::ClearMode::Saved if self.history_size() > 0 => {
+                self.grid.clear_history();
+
+                self.vi_mode_cursor.point.line =
+                    self.vi_mode_cursor.point.line.grid_clamp(self, Boundary::Cursor);
+
+                self.selection = self.selection.take().filter(|s| !s.intersects_range(..Line(0)));
+            },
+            // We have no history to clear.
+            ansi::ClearMode::Saved => (),
+        }
+
+        self.mark_fully_damaged();
+    }
+
+    #[inline]
+    fn clear_tabs(&mut self, mode: ansi::TabulationClearMode) {
+        trace!("Clearing tabs: {:?}", mode);
+        match mode {
+            ansi::TabulationClearMode::Current => {
+                self.tabs[self.grid.cursor.point.column] = false;
+            },
+            ansi::TabulationClearMode::All => {
+                self.tabs.clear_all();
+            },
+        }
+    }
+
+    /// Reset all important fields in the term struct.
+    #[inline]
+    fn reset_state(&mut self) {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            mem::swap(&mut self.grid, &mut self.inactive_grid);
+        }
+        self.active_charset = Default::default();
+        self.cursor_style = None;
+        self.grid.reset();
+        self.inactive_grid.reset();
+        self.scroll_region = Line(0)..Line(self.screen_lines() as i32);
+        self.tabs = TabStops::new(self.columns());
+        self.title_stack = Vec::new();
+        self.title = None;
+        self.selection = None;
+        self.vi_mode_cursor = Default::default();
+        self.keyboard_mode_stack = Default::default();
+        self.inactive_keyboard_mode_stack = Default::default();
+
+        // Preserve vi mode across resets.
+        self.mode &= TermMode::VI;
+        self.mode.insert(TermMode::default());
+
+        self.event_proxy.send_event(Event::CursorBlinkingChange);
+        self.mark_fully_damaged();
+    }
+
+    #[inline]
+    fn reverse_index(&mut self) {
+        trace!("Reversing index");
+        // If cursor is at the top.
+        if self.grid.cursor.point.line == self.scroll_region.start {
+            self.scroll_down(1);
+        } else {
+            self.damage_cursor();
+            self.grid.cursor.point.line = cmp::max(self.grid.cursor.point.line - 1, Line(0));
+            self.damage_cursor();
+        }
+alacritty_terminal/src/term/mod.rs:2367:pub struct RenderableCursor {
+alacritty_terminal/src/term/mod.rs:2372:impl RenderableCursor {
+alacritty_terminal/src/vi_mode.rs:59:pub struct ViModeCursor {
+alacritty_terminal/src/vi_mode.rs:63:impl ViModeCursor {
+alacritty_terminal/src/vi_mode.rs:277:    let mut next_point = advance(term, point, direction);
+alacritty_terminal/src/vi_mode.rs:280:        next_point = advance(term, point, direction);
+alacritty_terminal/src/vi_mode.rs:285:        point = advance(term, point, direction);
+alacritty_terminal/src/vi_mode.rs:313:        let mut next_point = advance(term, point, direction);
+alacritty_terminal/src/vi_mode.rs:316:            next_point = advance(term, point, direction);
+alacritty_terminal/src/vi_mode.rs:320:        let mut next_point = advance(term, point, direction);
+alacritty_terminal/src/vi_mode.rs:323:            next_point = advance(term, point, direction);
+alacritty_terminal/src/vi_mode.rs:330:            point = advance(term, point, direction);
+alacritty_terminal/src/vi_mode.rs:335:            point = advance(term, point, direction);
+alacritty_terminal/src/event_loop.rs:155:                state.parser.advance(&mut **terminal, *byte);
+alacritty_terminal/src/event_loop.rs:187:                        current.advance(n);
+alacritty_terminal/src/event_loop.rs:405:    parser: ansi::Processor,
+alacritty_terminal/src/event_loop.rs:444:    fn advance(&mut self, n: usize) {
+alacritty_terminal/tests/ref.rs:113:    let mut parser: ansi::Processor = ansi::Processor::new();
+alacritty_terminal/tests/ref.rs:116:        parser.advance(&mut terminal, byte);
+format_code_in_doc_comments = true
+match_block_trailing_comma = true
+condense_wildcard_suffixes = true
+use_field_init_shorthand = true
+normalize_doc_attributes = true
+overflow_delimited_expr = true
+imports_granularity = "Module"
+use_small_heuristics = "Max"
+normalize_comments = true
+reorder_impl_items = true
+use_try_shorthand = true
+newline_style = "Unix"
+format_strings = true
+wrap_comments = true
+comment_width = 100
+clock
+crate
+tmp
+[workspace]
+members = [
+    "alacritty",
+    "alacritty_terminal",
+    "alacritty_config",
+    "alacritty_config_derive",
+]
+resolver = "2"
+
+[profile.release]
+lto = "thin"
+debug = 1
+incremental = false

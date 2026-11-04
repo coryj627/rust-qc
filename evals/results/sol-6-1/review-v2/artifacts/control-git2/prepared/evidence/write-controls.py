@@ -1,0 +1,66 @@
+from pathlib import Path
+import json
+out = Path('/work/prepared')
+command = '/work/prepared/evidence/run-probes.sh'
+native = 'libgit2-sys/libgit2/src/libgit2/'
+def ref(test, evidence, refs):
+    return {'method': 'ran', 'evidence': f'Public-API regression {test} passed in the unmodified-source scratch copy of git2 0.20.2 with no default features and vendored libgit2. {evidence} Probe source: /work/prepared/evidence/controls_regression.rs; successful output: /work/prepared/evidence/probes.log; numbered source evidence: /work/prepared/evidence/source-excerpts.txt.', 'commands': [command], 'source_refs': refs}
+controls = {
+    'project': 'git2',
+    'decoys': [
+        {
+            'id': 'decoy-1',
+            'kind': 'wrong-behavior',
+            'summary': 'Config::get_i32 silently narrows out-of-range configuration integers instead of returning an error: 2147483648 is returned as -2147483648 and -2147483649 as 2147483647, allowing invalid numeric settings to be accepted with the wrong value.',
+            'location': ['src/config.rs:216'],
+            'match_rule': 'Identify Config::get_i32 as accepting and wrapping signed integers outside the i32 range instead of reporting a conversion error, with a concrete value just above i32::MAX or below i32::MIN. Generic config parsing complaints do not match.',
+            'refutation': ref('decoy_1_config_i32_rejects_out_of_range_without_wrapping', 'Both 2147483648 and -2147483649 returned Err from get_i32, while get_i64 returned their exact values; i32::MIN and i32::MAX succeeded. The native get_int32 calls parse_int32, whose truncate != tmp check rejects values that cannot be represented before assigning the output. try_call! propagates that negative result rather than returning the initialized output.', ['src/config.rs:212', 'src/config.rs:216', 'src/call.rs:11', 'src/call.rs:39', native+'config.c:878', native+'config.c:1497', native+'config.c:1506'])
+        },
+        {
+            'id': 'decoy-2',
+            'kind': 'wrong-behavior',
+            'summary': 'Tree::walk treats TreeWalkResult::Skip as an abort in PreOrder mode. Skipping an early directory stops traversal of subsequent siblings as well as its descendants, so callers pruning one subtree receive an incomplete walk of the remaining tree.',
+            'location': ['src/tree.rs:130', 'src/tree.rs:226'],
+            'match_rule': 'Identify positive TreeWalkResult::Skip from a preorder callback as prematurely stopping the entire Tree::walk, specifically omitting siblings outside the skipped subtree. Claims about Abort or postorder traversal do not match.',
+            'refutation': ref('decoy_2_tree_skip_prunes_only_the_selected_subtree', 'A tree containing a_skip/child.txt followed by z_keep.txt was walked in PreOrder mode. Returning Skip for a_skip produced Ok(()) and exactly [a_skip, z_keep.txt], excluding only the skipped child. Skip is 1 and the callback bridge preserves it; native tree_walk treats negative results as aborts, and explicitly resets a positive result to zero and continues to the next entry.', ['src/tree.rs:49', 'src/tree.rs:130', 'src/tree.rs:226', native+'tree.c:989', native+'tree.c:991', native+'tree.c:995'])
+        }
+    ],
+    'false_findings': [
+        {
+            'id': 'false-1',
+            'title': 'Revision ranges include the excluded left endpoint',
+            'location': 'src/revwalk.rs:132',
+            'body': 'Revwalk::push_range does not establish the exclusion side of a two-dot revision range. On a linear history A <- B <- C, pushing B..C also yields B and A instead of yielding only C, because the left endpoint is traversed as another root. Consumers using two-dot ranges to select newly introduced commits consequently process commits outside the requested range.',
+            'refutation': ref('false_1_revwalk_range_excludes_left_endpoint_and_ancestors', 'For a three-commit linear history, B..C yielded exactly C, excluding both B and its ancestor A; B..B yielded nothing. The wrapper delegates to git_revwalk_push_range, which pushes revspec.from with opts.uninteresting = 1, then pushes revspec.to with opts.uninteresting = 0. The exclusion is already performed inside this delegated operation.', ['src/revwalk.rs:124', 'src/revwalk.rs:132', native+'revwalk.c:238', native+'revwalk.c:260', native+'revwalk.c:264'])
+        },
+        {
+            'id': 'false-2',
+            'title': 'Raw commit message accessors strip leading blank lines',
+            'location': 'src/commit.rs:98',
+            'body': 'Commit::message_raw_bytes and Commit::message_raw use the prettified commit-message path, so a stored message beginning with two newline bytes is returned without those bytes. A caller reading a commit whose message is "\\n\\nsubject\\n\\nbody\\n" receives "subject\\n\\nbody\\n" even through the raw accessors, breaking lossless message round trips.',
+            'refutation': ref('false_2_raw_commit_message_preserves_leading_newlines', 'A commit created with the exact message "\\n\\nsubject\\n\\nbody\\n" returned all original bytes from message_raw_bytes and the identical string from message_raw. Only message() removed the two leading newlines. The raw wrapper calls git_commit_message_raw, whose getter returns commit->raw_message directly; the newline-skipping loop exists in the separate git_commit_message function.', ['src/commit.rs:76', 'src/commit.rs:92', 'src/commit.rs:97', native+'commit.c:578', native+'commit.c:586', native+'commit.c:594'])
+        },
+        {
+            'id': 'false-3',
+            'title': 'Staging a buffer retains the input entry object ID and size',
+            'location': 'src/index.rs:225',
+            'body': 'Index::add_frombuffer copies entry.id and entry.file_size into the native index entry without replacing them from the supplied data. Reusing an entry with an older blob ID and file_size = 1 to stage a 20-byte replacement therefore leaves the stored index pointing to the older blob with the stale size. Writing a tree from that index records the old content instead of the replacement buffer.',
+            'refutation': ref('false_3_index_buffer_replaces_stale_object_id_and_size', 'The probe supplied an existing old blob ID and file_size = 1 with a 20-byte new buffer. After writing and reopening the index, its stored entry had the independently hashed new blob ID, size 20, and all new bytes; write_tree also recorded the new ID. Although the wrapper initializes the temporary entry from the input, git_index_add_frombuffer forwards to git_index_add_from_buffer, which creates the new blob and overwrites the duplicated entry ID and size before insertion. This concerns the stored index entry, not mutation of the caller-owned immutable IndexEntry.', ['src/index.rs:204', 'src/index.rs:225', 'src/index.rs:242', native+'index.c:3944', native+'index.c:1515', native+'index.c:1518', native+'index.c:1524', native+'index.c:1527'])
+        },
+        {
+            'id': 'false-4',
+            'title': 'Forced conditional reference updates ignore the expected target',
+            'location': 'src/repo.rs:1564',
+            'body': 'Repository::reference_matching bypasses the current_id comparison when force is true. If a branch currently points to commit B but the caller supplies stale expected commit A and requests commit C with force = true, the update succeeds and replaces B with C instead of returning ErrorCode::Modified. Callers must enable force to replace an existing reference, so this makes the conditional-update contract ineffective for ordinary branch updates.',
+            'refutation': ref('false_4_force_does_not_bypass_reference_expected_target', 'With an existing branch at B, reference_matching(new=C, force=true, current_id=A) returned ErrorCode::Modified and a fresh lookup still pointed to B. Repeating with expected B succeeded and moved the reference to C. The wrapper passes current_id independently of force. In the filesystem backend, force affects reference-path availability; the subsequent write tail unconditionally compares the expected old value and returns GIT_EMODIFIED on mismatch before writing.', ['src/repo.rs:1549', 'src/repo.rs:1564', 'src/repo.rs:1569', 'src/repo.rs:1570', native+'refs.c:480', native+'refdb_fs.c:1609', native+'refdb_fs.c:1616', native+'refdb_fs.c:1634', native+'refdb_fs.c:1637'])
+        },
+        {
+            'id': 'false-5',
+            'title': 'Untracked status inclusion cannot be disabled on reused options',
+            'location': 'src/status.rs:122',
+            'body': 'StatusOptions::include_untracked(false) does not clear a previously enabled include-untracked flag: the setter accumulates the flag in the options bitmask. Reusing one StatusOptions object for an initial query with include_untracked(true) and a later query with include_untracked(false) still reports untracked working-tree files in the second result, despite the caller disabling them.',
+            'refutation': ref('false_5_reused_status_options_can_disable_untracked', 'For a repository with one untracked file, using the same options object with include_untracked(true), then false, then true produced respectively 1, 0, and 1 status entries. The initial entry had the expected filename and WT_NEW status. include_untracked delegates to flag; its false branch applies self.raw.flags &= !(flag as c_uint), explicitly clearing the bit. The later query therefore honors the disabled setting.', ['src/status.rs:108', 'src/status.rs:112', 'src/status.rs:121', 'src/status.rs:122'])
+        }
+    ]
+}
+(out/'controls.json').write_text(json.dumps(controls, indent=2)+'\n')

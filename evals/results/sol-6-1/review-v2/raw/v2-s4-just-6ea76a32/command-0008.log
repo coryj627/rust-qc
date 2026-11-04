@@ -1,0 +1,632 @@
+use super::*;
+
+#[allow(clippy::doc_markdown)]
+/// The invocation parser is responsible for grouping command-line positional
+/// arguments into invocations, which consist of a recipe and its arguments.
+///
+/// Invocation parsing is substantially complicated by the fact that recipe
+/// paths can be given on the command line as multiple arguments, i.e., "foo"
+/// "bar" baz", or as a single "::"-separated argument.
+///
+/// Error messages produced by the invocation parser should use the format of
+/// the recipe path as passed on the command line.
+///
+/// Additionally, if a recipe is specified with a "::"-separated path, extra
+/// components of that path after a valid recipe must not be used as arguments,
+/// whereas arguments after multiple argument path may be used as arguments. As
+/// an example, `foo bar baz` may refer to recipe `foo::bar` with argument
+/// `baz`, but `foo::bar::baz` is an error, since `bar` is a recipe, not a
+/// module.
+pub(crate) struct InvocationParser<'src: 'run, 'run> {
+  arguments: &'run [&'run str],
+  next: usize,
+  root: &'run Justfile<'src>,
+}
+
+impl<'src: 'run, 'run> InvocationParser<'src, 'run> {
+  pub(crate) fn parse_invocations(
+    root: &'run Justfile<'src>,
+    arguments: &'run [&'run str],
+  ) -> RunResult<'src, Vec<Invocation<'src, 'run>>> {
+    let mut invocations = Vec::new();
+
+    let mut invocation_parser = Self {
+      arguments,
+      next: 0,
+      root,
+    };
+
+    loop {
+      invocations.push(invocation_parser.parse_invocation()?);
+
+      if invocation_parser.next == arguments.len() {
+        break;
+      }
+    }
+
+    Ok(invocations)
+  }
+
+  fn parse_invocation(&mut self) -> RunResult<'src, Invocation<'src, 'run>> {
+    let recipe = if let Some(next) = self.next() {
+      if next.contains(':') {
+        let path = if self.next + 1 == self.arguments.len() {
+          next.strip_suffix("::").unwrap_or(next)
+        } else {
+          next
+        };
+        let modulepath =
+          Modulepath::try_from([path].as_slice()).map_err(|()| Error::UnknownRecipe {
+            recipe: next.into(),
+            suggestion: None,
+          })?;
+        let (recipe, _) = self.resolve_recipe(true, &modulepath.components)?;
+        self.next += 1;
+        recipe
+      } else {
+        let (recipe, consumed) = self.resolve_recipe(false, self.rest())?;
+        self.next += consumed;
+        recipe
+      }
+    } else {
+      let (recipe, consumed) = self.resolve_recipe(false, self.rest())?;
+      assert_eq!(consumed, 0);
+      recipe
+    };
+
+    let mut arguments = vec![Vec::<String>::new(); recipe.parameters.len()];
+
+    let long = recipe
+      .parameters
+      .iter()
+      .enumerate()
+      .filter_map(|(i, parameter)| parameter.long.as_ref().map(|name| (name.as_str(), i)))
+      .collect::<BTreeMap<&str, usize>>();
+
+    let short = recipe
+      .parameters
+      .iter()
+      .enumerate()
+      .filter_map(|(i, parameter)| parameter.short.map(|name| (name, i)))
+      .collect::<BTreeMap<char, usize>>();
+
+    let positional = recipe
+      .parameters
+      .iter()
+      .enumerate()
+      .filter_map(|(i, parameter)| (!parameter.is_option()).then_some(i))
+      .collect::<Vec<usize>>();
+
+    let mut end_of_options = long.is_empty() && short.is_empty();
+
+    let rest = self.rest();
+
+    let mut i = 0;
+    let mut positional_index = 0;
+    let mut positional_accepted = 0;
+    while let Some(argument) = rest.get(i) {
+      if !end_of_options && *argument == "--" {
+        end_of_options = true;
+        i += 1;
+      } else if !end_of_options && argument.starts_with('-') && *argument != "-" {
+        let mut name = argument
+          .strip_prefix("--")
+          .or_else(|| argument.strip_prefix('-'))
+          .unwrap();
+
+        let value = if let Some((left, right)) = name.split_once('=') {
+          name = left;
+          Some(right)
+        } else {
+          None
+        };
+
+        let switch = if argument.starts_with("--") {
+          Switch::Long(name.into())
+        } else {
+          if name.chars().count() != 1 {
+            return Err(Error::MultipleShortOptions {
+              options: name.into(),
+            });
+          }
+          Switch::Short(name.chars().next().unwrap())
+        };
+
+        let index = match &switch {
+          Switch::Long(name) => long.get(name.as_str()),
+          Switch::Short(name) => short.get(name),
+        };
+
+        let Some(&index) = index else {
+          return Err(Error::UnknownOption {
+            recipe: recipe.name(),
+            option: switch,
+          });
+        };
+
+        let value = if let Some(flag_value) = &recipe.parameters[index].value {
+          if value.is_some() {
+            return Err(Error::FlagWithValue {
+              recipe: recipe.name(),
+              option: switch,
+            });
+          }
+          i += 1;
+          flag_value
+        } else if let Some(value) = value {
+          i += 1;
+          value
+        } else {
+          let Some(&value) = rest.get(i + 1) else {
+            return Err(Error::OptionMissingValue {
+              recipe: recipe.name(),
+              option: switch,
+            });
+          };
+          i += 2;
+          value
+        };
+
+        let group = &mut arguments[index];
+
+        if !group.is_empty() {
+          return Err(Error::DuplicateOption {
+            recipe: recipe.name(),
+            option: switch,
+          });
+        }
+
+        group.push((*value).into());
+      } else {
+        let Some(&index) = positional.get(positional_index) else {
+          break;
+        };
+        let group = &mut arguments[index];
+        group.push((*argument).into());
+        if !recipe.parameters[index].kind.is_variadic() {
+          positional_index += 1;
+        }
+        positional_accepted += 1;
+        i += 1;
+      }
+    }
+
+    let mut missing_positional = 0;
+
+    for (parameter, group) in recipe.parameters.iter().zip(&arguments) {
+      if !group.is_empty() {
+        continue;
+      }
+
+      if parameter.default.is_some() || parameter.kind == ParameterKind::Star {
+        continue;
+      }
+
+      if let Some(name) = &parameter.long {
+        return Err(Error::MissingOption {
+          recipe: recipe.name(),
+          option: Switch::Long(name.into()),
+        });
+      }
+
+      if let Some(name) = &parameter.short {
+        return Err(Error::MissingOption {
+          recipe: recipe.name(),
+          option: Switch::Short(*name),
+        });
+      }
+
+      missing_positional += 1;
+    }
+
+    if missing_positional > 0 {
+      return Err(Error::PositionalArgumentCountMismatch {
+        recipe: Box::new(recipe.clone()),
+        found: positional_accepted,
+        min: recipe
+          .parameters
+          .iter()
+          .filter(|p| p.is_required() && !p.is_option())
+          .count(),
+        max: if recipe.parameters.iter().any(|p| p.kind.is_variadic()) {
+          usize::MAX - 1
+        } else {
+          recipe.parameters.iter().filter(|p| !p.is_option()).count()
+        },
+      });
+    }
+
+    for (group, parameter) in arguments.iter().zip(&recipe.parameters) {
+      for argument in group {
+        parameter.check_pattern_match(recipe, argument)?;
+      }
+    }
+
+    self.next += i;
+
+    Ok(Invocation { arguments, recipe })
+  }
+
+  fn resolve_recipe(
+    &self,
+    modulepath: bool,
+    args: &[impl AsRef<str>],
+  ) -> RunResult<'src, (&'run Recipe<'src>, usize)> {
+    let mut current = self.root;
+    let mut path = Vec::new();
+
+    for (i, arg) in args.iter().enumerate() {
+      let arg = arg.as_ref();
+
+      path.push(arg.to_string());
+
+      if let Some(module) = current.modules.get(arg) {
+        current = module;
+      } else if let Some(recipe) = current.get_recipe(arg) {
+        if modulepath && i + 1 < args.len() {
+          return Err(Error::ExpectedSubmoduleButFoundRecipe {
+            path: path.join("::"),
+          });
+        }
+        return Ok((recipe, i + 1));
+      } else {
+        if modulepath && i + 1 < args.len() {
+          return Err(Error::UnknownSubmodule {
+            path: path.join("::"),
+          });
+        }
+
+        return Err(Error::UnknownRecipe {
+          recipe: if modulepath {
+            path.join("::")
+          } else {
+            path.join(" ")
+          },
+          suggestion: current.suggest_recipe(arg),
+        });
+      }
+    }
+
+    if let Some(recipe) = &current.default {
+      recipe.check_can_be_default_recipe()?;
+      Ok((recipe, args.len()))
+    } else if current.recipes.is_empty() {
+      Err(Error::NoRecipes)
+    } else {
+      Err(Error::NoDefaultRecipe)
+    }
+  }
+
+  fn next(&self) -> Option<&'run str> {
+    self.arguments.get(self.next).copied()
+  }
+
+  fn rest(&self) -> &[&'run str] {
+    &self.arguments[self.next..]
+  }
+}
+
+#[cfg(test)]
+mod tests {
+use super::*;
+
+pub(crate) struct ArgAttribute<'src> {
+  pub(crate) help: Option<String>,
+  pub(crate) long: Option<String>,
+  pub(crate) name: Token<'src>,
+  pub(crate) pattern: Option<Pattern<'src>>,
+  pub(crate) short: Option<char>,
+  pub(crate) value: Option<String>,
+}
+use super::*;
+
+#[derive(PartialEq, Debug, Clone, Serialize)]
+pub(crate) struct Parameter<'src> {
+  pub(crate) default: Option<Expression<'src>>,
+  pub(crate) export: bool,
+  pub(crate) help: Option<String>,
+  pub(crate) kind: ParameterKind,
+  pub(crate) long: Option<String>,
+  pub(crate) name: Name<'src>,
+  #[serde(skip)]
+  pub(crate) number: Number,
+  pub(crate) pattern: Option<Pattern<'src>>,
+  pub(crate) short: Option<char>,
+  pub(crate) value: Option<String>,
+}
+
+impl<'src> Parameter<'src> {
+  pub(crate) fn is_option(&self) -> bool {
+    self.long.is_some() || self.short.is_some()
+  }
+
+  pub(crate) fn is_required(&self) -> bool {
+    self.default.is_none() && self.kind != ParameterKind::Star
+  }
+
+  pub(crate) fn check_pattern_match(
+    &self,
+    recipe: &Recipe<'src>,
+    value: &str,
+  ) -> Result<(), Error<'src>> {
+    let Some(pattern) = &self.pattern else {
+      return Ok(());
+    };
+
+    if pattern.is_match(value) {
+      return Ok(());
+    }
+
+    Err(Error::ArgumentPatternMismatch {
+      argument: value.into(),
+      parameter: self.name.lexeme(),
+      pattern: Box::new(pattern.clone()),
+      recipe: recipe.name(),
+    })
+  }
+}
+
+impl ColorDisplay for Parameter<'_> {
+  fn fmt(&self, f: &mut Formatter, color: Color) -> fmt::Result {
+    if let Some(prefix) = self.kind.prefix() {
+      write!(f, "{}", color.annotation().paint(prefix))?;
+    }
+    if self.export {
+      write!(f, "$")?;
+    }
+    write!(f, "{}", color.parameter().paint(self.name.lexeme()))?;
+    if let Some(ref default) = self.default {
+      write!(f, "={}", color.string().paint(&default.to_string()))?;
+    }
+    Ok(())
+  }
+}
+use super::*;
+
+pub(crate) enum Executor<'a> {
+  Command(Interpreter<String>),
+  Shebang(Shebang<'a>),
+}
+
+impl Executor<'_> {
+  pub(crate) fn command<'src>(
+    &self,
+    config: &Config,
+    path: &Path,
+    recipe: &'src str,
+    working_directory: Option<&Path>,
+  ) -> RunResult<'src, Command> {
+    match self {
+      Self::Command(interpreter) => {
+        let mut command = Command::resolve(&interpreter.command);
+
+        if let Some(working_directory) = working_directory {
+          command.current_dir(working_directory);
+        }
+
+        for arg in &interpreter.arguments {
+          command.arg(arg);
+        }
+
+        command.arg(path);
+
+        Ok(command)
+      }
+      Self::Shebang(shebang) => {
+        // make script executable
+        Platform::set_execute_permission(path).map_err(|error| Error::TempdirIo {
+          recipe,
+          io_error: error,
+        })?;
+
+        // create command to run script
+        Platform::make_shebang_command(config, path, *shebang, working_directory).map_err(
+          |output_error| Error::Cygpath {
+            recipe,
+            output_error,
+          },
+        )
+      }
+    }
+  }
+
+  fn shell_kind(&self) -> ShellKind {
+    match self {
+      Self::Command(interpreter) => &interpreter.command,
+      Self::Shebang(shebang) => shebang.interpreter_filename(),
+    }
+    .into()
+  }
+
+  pub(crate) fn script_filename(&self, recipe: &str, extension: Option<&str>) -> String {
+    format!(
+      "{recipe}{}",
+      extension.unwrap_or_else(|| self.shell_kind().extension()),
+    )
+  }
+
+  pub(crate) fn error<'src>(&self, io_error: io::Error, recipe: &'src str) -> Error<'src> {
+    match self {
+      Self::Command(Interpreter { command, arguments }) => {
+        let mut command = command.clone();
+
+        for arg in arguments {
+          command.push(' ');
+          command.push_str(arg);
+        }
+
+        Error::Script {
+          command,
+          io_error,
+          recipe,
+        }
+      }
+      Self::Shebang(shebang) => Error::Shebang {
+        argument: shebang.argument.map(String::from),
+        command: shebang.interpreter.to_owned(),
+        io_error,
+        recipe,
+      },
+    }
+  }
+
+  // Script text for `recipe` given evaluated `lines` including blanks so line
+  // numbers in errors from generated script match justfile source lines.
+  pub(crate) fn script<D>(&self, recipe: &Recipe<D>, lines: &[String]) -> String {
+    let mut script = String::new();
+    let mut n = 0;
+    let shebangs = recipe
+      .body
+      .iter()
+      .take_while(|line| line.is_shebang())
+      .count();
+
+    if let Self::Shebang(shebang) = self {
+      for shebang_line in &lines[..shebangs] {
+        if shebang.include_shebang_line() {
+          script.push_str(shebang_line);
+        }
+        script.push('\n');
+        n += 1;
+      }
+    }
+
+    for (line, text) in recipe.body.iter().zip(lines).skip(n) {
+      while n < line.number {
+        script.push('\n');
+        n += 1;
+      }
+
+      script.push_str(text);
+      script.push('\n');
+      n += 1;
+    }
+
+    script
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn shebang_script_filename() {
+    #[track_caller]
+    fn case(interpreter: &str, recipe: &str, extension: Option<&str>, expected: &str) {
+      assert_eq!(
+        Executor::Shebang(Shebang::new(&format!("#!{interpreter}")).unwrap())
+          .script_filename(recipe, extension),
+        expected
+      );
+      assert_eq!(
+        Executor::Command(Interpreter {
+          command: interpreter.into(),
+          arguments: Vec::new()
+        })
+        .script_filename(recipe, extension),
+        expected
+      );
+    }
+
+    case("bar", "foo", Some(".sh"), "foo.sh");
+    case("pwsh.exe", "foo", Some(".sh"), "foo.sh");
+    case("cmd.exe", "foo", Some(".sh"), "foo.sh");
+    case("powershell", "foo", None, "foo.ps1");
+    case("pwsh", "foo", None, "foo.ps1");
+    case("powershell.exe", "foo", None, "foo.ps1");
+    case("pwsh.exe", "foo", None, "foo.ps1");
+    case("cmd", "foo", None, "foo.bat");
+    case("cmd.exe", "foo", None, "foo.bat");
+    case("bar", "foo", None, "foo");
+  }
+}
+use super::*;
+
+pub(crate) fn load_dotenv(
+  config: &Config,
+  settings: &Settings,
+  working_directory: &Path,
+) -> RunResult<'static, BTreeMap<String, String>> {
+  let dotenv_filename = config
+    .dotenv_filename
+    .as_ref()
+    .or(settings.dotenv_filename.as_ref());
+
+  let dotenv_path = config
+    .dotenv_path
+    .as_ref()
+    .or(settings.dotenv_path.as_ref());
+
+  if !settings.dotenv_load
+    && !settings.dotenv_override
+    && !settings.dotenv_required
+    && dotenv_filename.is_none()
+    && dotenv_path.is_none()
+  {
+    return Ok(BTreeMap::new());
+  }
+
+  if let Some(path) = dotenv_path {
+    let path = working_directory.join(path);
+    if let Some(map) = load_from_file(&path, settings)? {
+      return Ok(map);
+    }
+  }
+
+  let filename = dotenv_filename.map_or(".env", |s| s.as_str());
+
+  for directory in working_directory.ancestors() {
+    let path = directory.join(filename);
+    if let Some(map) = load_from_file(&path, settings)? {
+      return Ok(map);
+    }
+  }
+
+  if settings.dotenv_required {
+    Err(Error::DotenvRequired)
+  } else {
+    Ok(BTreeMap::new())
+  }
+}
+
+fn load_from_file(
+  path: &Path,
+  settings: &Settings,
+) -> RunResult<'static, Option<BTreeMap<String, String>>> {
+  if path.is_dir() {
+    return Ok(None);
+  }
+
+  let file = match File::open(path) {
+    Ok(file) => file,
+    Err(source) => {
+      if source.kind() == io::ErrorKind::NotFound {
+        return Ok(None);
+      }
+      return Err(Error::FilesystemIo {
+        path: path.into(),
+        source,
+      });
+    }
+  };
+
+  let mut dotenv = BTreeMap::new();
+
+  for result in dotenvy::from_read_iter(file) {
+    let (key, value) = result.map_err(|dotenv_error| Error::Dotenv {
+      dotenv_error,
+      path: path.into(),
+    })?;
+
+    if settings.dotenv_override || env::var_os(&key).is_none() {
+      dotenv.insert(key, value);
+    }
+  }
+
+  Ok(Some(dotenv))
+}
+find: 'book/src': No such file or directory
+.github/workflows/ci.yaml
+.github/workflows/release.yaml
+cat: /work/crate/.cargo/config.toml: No such file or directory

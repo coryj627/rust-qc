@@ -1,0 +1,771 @@
+     1	#![allow(dead_code)]
+     2	use crate::charutils::is_not_structural_or_whitespace;
+     3	use crate::macros::unlikely;
+     4	use crate::safer_unchecked::GetSaferUnchecked;
+     5	use crate::value::tape::Node;
+     6	use crate::{Deserializer, Error, ErrorType, InternalError, Result};
+     7	use value_trait::StaticNode;
+     8	
+     9	#[cfg_attr(not(feature = "no-inline"), inline)]
+    10	pub fn is_valid_true_atom(loc: &[u8]) -> bool {
+    11	    debug_assert!(loc.len() >= 8, "loc too short for a u64 read");
+    12	
+    13	    // TODO is this expensive?
+    14	    let mut error: u64;
+    15	    unsafe {
+    16	        //let tv: u64 = *(b"true    ".as_ptr() as *const u64);
+    17	        // this is the same:
+    18	        const TV: u64 = 0x00_00_00_00_65_75_72_74;
+    19	        const MASK4: u64 = 0x00_00_00_00_ff_ff_ff_ff;
+    20	
+    21	        let locval: u64 = loc.as_ptr().cast::<u64>().read_unaligned();
+    22	
+    23	        error = (locval & MASK4) ^ TV;
+    24	        error |= u64::from(is_not_structural_or_whitespace(*loc.get_kinda_unchecked(4)));
+    25	    }
+    26	    error == 0
+    27	}
+    28	
+    29	macro_rules! get {
+    30	    ($a:expr_2021, $i:expr_2021) => {{ unsafe { $a.get_kinda_unchecked($i) } }};
+    31	}
+    32	
+    33	#[cfg_attr(not(feature = "no-inline"), inline)]
+    34	pub fn is_valid_false_atom(loc: &[u8]) -> bool {
+    35	    const FV: u64 = 0x00_00_00_65_73_6c_61_66;
+    36	    const MASK5: u64 = 0x00_00_00_ff_ff_ff_ff_ff;
+    37	
+    38	    debug_assert!(loc.len() >= 8, "loc too short for a u64 read");
+    39	
+    40	    // TODO: this is ugly and probably copies data every time
+    41	    let mut error: u64;
+    42	    //let fv: u64 = *(b"false   ".as_ptr() as *const u64);
+    43	    // this is the same:
+    44	
+    45	    let locval: u64 = unsafe { loc.as_ptr().cast::<u64>().read_unaligned() };
+    46	
+    47	    // FIXME the original code looks like this:
+    48	    // error = ((locval & mask5) ^ fv) as u32;
+    49	    // but that fails on falsy as the u32 conversion
+    50	    // will mask the error on the y so we re-write it
+    51	    // it would be interesting what the consequences are
+    52	    error = (locval & MASK5) ^ FV;
+    53	    error |= u64::from(is_not_structural_or_whitespace(*get!(loc, 5)));
+    54	
+    55	    error == 0
+    56	}
+    57	
+    58	#[cfg_attr(not(feature = "no-inline"), inline)]
+    59	pub fn is_valid_null_atom(loc: &[u8]) -> bool {
+    60	    //let nv: u64 = *(b"null   ".as_ptr() as *const u64);
+    61	    // this is the same:
+    62	    const NV: u64 = 0x00_00_00_00_6c_6c_75_6e;
+    63	    const MASK4: u64 = 0x00_00_00_00_ff_ff_ff_ff;
+    64	
+    65	    debug_assert!(loc.len() >= 8, "loc too short for a u64 read");
+    66	
+    67	    // TODO is this expensive?
+    68	    let mut error: u64;
+    69	
+    70	    let locval: u64 = unsafe { loc.as_ptr().cast::<u64>().read_unaligned() };
+    71	
+    72	    error = (locval & MASK4) ^ NV;
+    73	    error |= u64::from(is_not_structural_or_whitespace(*get!(loc, 4)));
+    74	
+    75	    error == 0
+    76	}
+    77	
+    78	#[derive(Debug)]
+    79	enum State {
+    80	    ObjectKey,
+    81	    ScopeEnd,
+    82	    MainArraySwitch,
+    83	}
+    84	#[derive(Debug)]
+    85	pub(crate) enum StackState {
+    86	    Start,
+    87	    Object { last_start: usize, cnt: usize },
+    88	    Array { last_start: usize, cnt: usize },
+    89	}
+    90	
+    91	impl<'de> Deserializer<'de> {
+    92	    #[cfg_attr(not(feature = "no-inline"), inline)]
+    93	    #[allow(
+    94	        clippy::cognitive_complexity,
+    95	        clippy::too_many_lines,
+    96	        unused_unsafe,
+    97	        clippy::needless_continue
+    98	    )]
+    99	    pub(crate) fn build_tape(
+   100	        input: &'de mut [u8],
+   101	        input2: &[u8],
+   102	        buffer: &mut [u8],
+   103	        structural_indexes: &[u32],
+   104	        stack: &mut Vec<StackState>,
+   105	        res: &mut Vec<Node<'de>>,
+   106	    ) -> Result<()> {
+   107	        res.clear();
+   108	        res.reserve(structural_indexes.len());
+   109	        // While a valid json can have at max len/2 (`[[[]]]`)elements that are relevant
+   110	        // a invalid json might exceed this `[[[[[[` and we need to protect against that.
+   111	        stack.clear();
+   112	        stack.reserve(structural_indexes.len());
+   113	
+   114	        let res_ptr = res.as_mut_ptr();
+   115	        let stack_ptr = stack.as_mut_ptr();
+   116	
+   117	        let mut depth: usize = 0;
+   118	        let mut last_start;
+   119	        let mut cnt: usize;
+   120	        let mut r_i = 0;
+   121	
+   122	        // let mut i: usize = 0; // index of the structural character (0,1,2,3...)
+   123	        // location of the structural character in the input (buf)
+   124	        let mut idx: usize = 0;
+   125	        // used to track the (structural) character we are looking at, updated
+   126	        // by UPDATE_CHAR macro
+   127	        let mut c: u8 = 0;
+   128	        // skip the zero index
+   129	        let mut i: usize = 0;
+   130	        let mut state;
+   131	
+   132	        macro_rules! s2try {
+   133	            ($e:expr_2021) => {
+   134	                match $e {
+   135	                    ::std::result::Result::Ok(val) => val,
+   136	                    ::std::result::Result::Err(err) => {
+   137	                        // We need to ensure that rust doesn't
+   138	                        // try to free strings that we never
+   139	                        // allocated
+   140	                        unsafe {
+   141	                            res.set_len(r_i);
+   142	                        };
+   143	                        return ::std::result::Result::Err(err);
+   144	                    }
+   145	                }
+   146	            };
+   147	        }
+   148	
+   149	        macro_rules! insert_res {
+   150	            ($t:expr_2021) => {
+   151	                unsafe {
+   152	                    res_ptr.add(r_i).write($t);
+   153	                    r_i += 1;
+   154	                }
+   155	            };
+   156	        }
+   157	        macro_rules! success {
+   158	            () => {
+   159	                unsafe {
+   160	                    res.set_len(r_i);
+   161	                }
+   162	                return Ok(());
+   163	            };
+   164	        }
+   165	        macro_rules! update_char {
+   166	            () => {
+   167	                if i < structural_indexes.len() {
+   168	                    idx = *get!(structural_indexes, i) as usize;
+   169	                    i += 1;
+   170	                    c = *get!(input2, idx);
+   171	                } else {
+   172	                    fail!(ErrorType::Syntax);
+   173	                }
+   174	            };
+   175	        }
+   176	
+   177	        macro_rules! goto {
+   178	            ($state:expr_2021) => {{
+   179	                state = $state;
+   180	                #[allow(clippy::needless_continue)]
+   181	                continue;
+   182	            }};
+   183	        }
+   184	
+   185	        macro_rules! insert_str {
+   186	            () => {
+   187	                insert_res!(Node::String(s2try!(Self::parse_str_(
+   188	                    input.as_mut_ptr(),
+   189	                    &input2,
+   190	                    buffer,
+   191	                    idx
+   192	                ))));
+   193	            };
+   194	        }
+   195	
+   196	        // The continue cases are the most frequently called onces it's
+   197	        // worth pulling them out into a macro (aka inlining them)
+   198	        // Since we don't have a 'gogo' in rust.
+   199	        macro_rules! array_continue {
+   200	            () => {{
+   201	                update_char!();
+   202	                match c {
+   203	                    b',' => {
+   204	                        cnt += 1;
+   205	                        update_char!();
+   206	                        goto!(MainArraySwitch);
+   207	                    }
+   208	                    b']' => {
+   209	                        goto!(ScopeEnd);
+   210	                    }
+   211	                    _c => {
+   212	                        fail!(ErrorType::ExpectedArrayContent);
+   213	                    }
+   214	                }
+   215	            }};
+   216	        }
+   217	
+   218	        macro_rules! object_continue {
+   219	            () => {{
+   220	                update_char!();
+   221	                match c {
+   222	                    b',' => {
+   223	                        cnt += 1;
+   224	                        update_char!();
+   225	                        if c == b'"' {
+   226	                            insert_str!();
+   227	                            goto!(ObjectKey);
+   228	                        }
+   229	                        fail!(ErrorType::ExpectedObjectKey);
+   230	                    }
+   231	                    b'}' => {
+   232	                        goto!(ScopeEnd);
+   233	                    }
+   234	                    _ => {
+   235	                        fail!(ErrorType::ExpectedObjectContent);
+   236	                    }
+   237	                }
+   238	            }};
+   239	        }
+   240	
+   241	        macro_rules! array_begin {
+   242	            () => {
+   243	                update_char!();
+   244	                if c == b']' {
+   245	                    cnt = 0;
+   246	                    goto!(ScopeEnd);
+   247	                }
+   248	                goto!(MainArraySwitch);
+   249	            };
+   250	        }
+   251	
+   252	        macro_rules! object_begin {
+   253	            () => {{
+   254	                update_char!();
+   255	                match c {
+   256	                    b'"' => {
+   257	                        insert_str!();
+   258	                        goto!(ObjectKey)
+   259	                    }
+   260	                    b'}' => {
+   261	                        cnt = 0;
+   262	                        goto!(ScopeEnd);
+   263	                    }
+   264	                    _c => {
+   265	                        fail!(ErrorType::ExpectedObjectContent);
+   266	                    }
+   267	                }
+   268	            }};
+   269	        }
+   270	
+   271	        macro_rules! fail {
+   272	            () => {
+   273	                // We need to ensure that rust doesn't
+   274	                // try to free strings that we never
+   275	                // allocated
+   276	                unsafe {
+   277	                    res.set_len(r_i);
+   278	                };
+   279	                return Err(Error::new_c(
+   280	                    idx,
+   281	                    c as char,
+   282	                    ErrorType::InternalError(InternalError::TapeError),
+   283	                ));
+   284	            };
+   285	            ($t:expr_2021) => {
+   286	                // We need to ensure that rust doesn't
+   287	                // try to free strings that we never
+   288	                // allocated
+   289	                unsafe {
+   290	                    res.set_len(r_i);
+   291	                };
+   292	                return Err(Error::new_c(idx, c as char, $t));
+   293	            };
+   294	        }
+   295	        // State start, we pull this outside of the
+   296	        // loop to reduce the number of required checks
+   297	        update_char!();
+   298	        match c {
+   299	            b'{' => {
+   300	                unsafe {
+   330	    &'invoke mut [u8],
+   331	    usize,
+   332	) -> std::result::Result<&'de str, error::Error>;
+   333	#[cfg(all(
+   334	    feature = "runtime-detection",
+   335	    any(target_arch = "x86_64", target_arch = "x86"),
+   336	))]
+   337	type FindStructuralBitsFn = unsafe fn(
+   338	    input: &[u8],
+   339	    structural_indexes: &mut Vec<u32>,
+   340	) -> std::result::Result<(), ErrorType>;
+   341	
+   342	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+   343	/// Supported implementations
+   344	pub enum Implementation {
+   345	    /// Rust native implementation
+   346	    Native,
+   347	    /// Rust native implementation with using [`std::simd`]
+   348	    StdSimd,
+   349	    /// SSE4.2 implementation
+   350	    SSE42,
+   351	    /// AVX2 implementation
+   352	    AVX2,
+   353	    /// ARM NEON implementation
+   354	    NEON,
+   355	    /// WEBASM SIMD128 implementation
+   356	    SIMD128,
+   357	}
+   358	
+   359	impl std::fmt::Display for Implementation {
+   360	    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+   361	        match self {
+   362	            Implementation::Native => write!(f, "Rust Native"),
+   363	            Implementation::StdSimd => write!(f, "std::simd"),
+   364	            Implementation::SSE42 => write!(f, "SSE42"),
+   365	            Implementation::AVX2 => write!(f, "AVX2"),
+   366	            Implementation::NEON => write!(f, "NEON"),
+   367	            Implementation::SIMD128 => write!(f, "SIMD128"),
+   368	        }
+   369	    }
+   370	}
+   371	
+   372	impl Deserializer<'_> {
+   373	    /// returns the algorithm / architecture used by the deserializer
+   374	    #[cfg(all(
+   375	        feature = "runtime-detection",
+   376	        any(target_arch = "x86_64", target_arch = "x86"),
+   377	    ))]
+   378	    #[must_use]
+   379	    pub fn algorithm() -> Implementation {
+   380	        if std::is_x86_feature_detected!("avx2") {
+   381	            Implementation::AVX2
+   382	        } else if std::is_x86_feature_detected!("sse4.2") {
+   383	            Implementation::SSE42
+   384	        } else {
+   385	            #[cfg(feature = "portable")]
+   386	            let r = Implementation::StdSimd;
+   387	            #[cfg(not(feature = "portable"))]
+   388	            let r = Implementation::Native;
+   389	            r
+   390	        }
+   391	    }
+   392	    #[cfg(not(any(
+   393	        all(
+   394	            feature = "runtime-detection",
+   395	            any(target_arch = "x86_64", target_arch = "x86")
+   396	        ),
+   397	        feature = "portable",
+   398	        target_feature = "avx2",
+   399	        target_feature = "sse4.2",
+   400	        target_feature = "simd128",
+   401	        target_arch = "aarch64",
+   402	    )))]
+   403	    /// returns the algorithm / architecture used by the deserializer
+   404	    #[must_use]
+   405	    pub fn algorithm() -> Implementation {
+   406	        Implementation::Native
+   407	    }
+   408	    #[cfg(all(feature = "portable", not(feature = "runtime-detection")))]
+   409	    /// returns the algorithm / architecture used by the deserializer
+   410	    #[must_use]
+   411	    pub fn algorithm() -> Implementation {
+   412	        Implementation::StdSimd
+   413	    }
+   414	
+   415	    #[cfg(all(
+   416	        target_feature = "avx2",
+   417	        not(feature = "portable"),
+   418	        not(feature = "runtime-detection"),
+   419	    ))]
+   420	    /// returns the algorithm / architecture used by the deserializer
+   421	    #[must_use]
+   422	    pub fn algorithm() -> Implementation {
+   423	        Implementation::AVX2
+   424	    }
+   425	
+   426	    #[cfg(all(
+   427	        target_feature = "sse4.2",
+   428	        not(target_feature = "avx2"),
+   429	        not(feature = "runtime-detection"),
+   430	        not(feature = "portable"),
+   431	    ))]
+   432	    /// returns the algorithm / architecture used by the deserializer
+   433	    #[must_use]
+   434	    pub fn algorithm() -> Implementation {
+   435	        Implementation::SSE42
+   436	    }
+   437	
+   438	    #[cfg(all(target_arch = "aarch64", not(feature = "portable")))]
+   439	    /// returns the algorithm / architecture used by the deserializer
+   440	    #[must_use]
+   441	    pub fn algorithm() -> Implementation {
+   442	        Implementation::NEON
+   443	    }
+   444	
+   445	    #[cfg(all(target_feature = "simd128", not(feature = "portable")))]
+   446	    /// returns the algorithm / architecture used by the deserializer
+   447	    #[must_use]
+   448	    pub fn algorithm() -> Implementation {
+   449	        Implementation::SIMD128
+   450	    }
+   451	}
+   452	
+   453	impl<'de> Deserializer<'de> {
+   454	    #[cfg_attr(not(feature = "no-inline"), inline)]
+   455	    #[cfg(all(
+   456	        feature = "runtime-detection",
+   457	        any(target_arch = "x86_64", target_arch = "x86"),
+   458	    ))]
+   459	    pub(crate) unsafe fn parse_str_<'invoke>(
+   460	        input: *mut u8,
+   461	        data: &'invoke [u8],
+   462	        buffer: &'invoke mut [u8],
+   463	        idx: usize,
+   464	    ) -> Result<&'de str>
+   465	    where
+   466	        'de: 'invoke,
+   467	    {
+   468	        unsafe {
+   469	            use std::sync::atomic::{AtomicPtr, Ordering};
+   470	
+   471	            static FN: AtomicPtr<()> = AtomicPtr::new(get_fastest as FnRaw);
+   472	
+   473	            #[cfg_attr(not(feature = "no-inline"), inline)]
+   474	            fn get_fastest_available_implementation() -> ParseStrFn {
+   475	                if std::is_x86_feature_detected!("avx2") {
+   476	                    impls::avx2::parse_str
+   477	                } else if std::is_x86_feature_detected!("sse4.2") {
+   478	                    impls::sse42::parse_str
+   479	                } else {
+   480	                    #[cfg(feature = "portable")]
+   481	                    let r = impls::portable::parse_str;
+   482	                    #[cfg(not(feature = "portable"))]
+   483	                    let r = impls::native::parse_str;
+   484	                    r
+   485	                }
+   486	            }
+   487	
+   488	            #[cfg_attr(not(feature = "no-inline"), inline)]
+   489	            unsafe fn get_fastest<'invoke, 'de>(
+   490	                input: SillyWrapper<'de>,
+   491	                data: &'invoke [u8],
+   492	                buffer: &'invoke mut [u8],
+   493	                idx: usize,
+   494	            ) -> core::result::Result<&'de str, error::Error>
+   495	            where
+   496	                'de: 'invoke,
+   497	            {
+   498	                unsafe {
+   499	                    let fun = get_fastest_available_implementation();
+   500	                    FN.store(fun as FnRaw, Ordering::Relaxed);
+   501	                    (fun)(input, data, buffer, idx)
+   502	                }
+   503	            }
+   504	
+   505	            let input: SillyWrapper<'de> = SillyWrapper::from(input);
+   506	            let fun = FN.load(Ordering::Relaxed);
+   507	            mem::transmute::<FnRaw, ParseStrFn>(fun)(input, data, buffer, idx)
+   508	        }
+   509	    }
+   510	    #[cfg_attr(not(feature = "no-inline"), inline)]
+   511	    #[cfg(not(any(
+   512	        all(
+   513	            feature = "runtime-detection",
+   514	            any(target_arch = "x86_64", target_arch = "x86")
+   515	        ),
+   516	        feature = "portable",
+   517	        target_feature = "avx2",
+   518	        target_feature = "sse4.2",
+   519	        target_feature = "simd128",
+   520	        target_arch = "aarch64",
+     1	use crate::serde_ext::de::IntoDeserializer;
+     2	use crate::{Deserializer, Error, ErrorType, Node, Result, StaticNode, macros::stry};
+     3	use serde_ext::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+     4	use serde_ext::forward_to_deserialize_any;
+     5	use std::str;
+     6	
+     7	impl<'a, 'de> de::Deserializer<'de> for &'a mut Deserializer<'de>
+     8	where
+     9	    'de: 'a,
+    10	{
+    11	    type Error = Error;
+    12	
+    13	    // Look at the input data to decide what Serde data model type to
+    14	    // deserialize as. Not all data formats are able to support this operation.
+    15	    // Formats that support `deserialize_any` are known as self-describing.
+    16	    #[cfg_attr(not(feature = "no-inline"), inline)]
+    17	    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value>
+    18	    where
+    19	        V: Visitor<'de>,
+    20	    {
+    21	        match stry!(self.next()) {
+    22	            Node::String(s) => visitor.visit_borrowed_str(s),
+    23	            Node::Static(StaticNode::Null) => visitor.visit_unit(),
+    24	            Node::Static(StaticNode::Bool(b)) => visitor.visit_bool(b),
+    25	            #[allow(clippy::useless_conversion)] // .into() required by ordered-float
+    26	            Node::Static(StaticNode::F64(n)) => visitor.visit_f64(n.into()),
+    27	            Node::Static(StaticNode::I64(n)) => visitor.visit_i64(n),
+    28	            #[cfg(feature = "128bit")]
+    29	            Node::Static(StaticNode::I128(n)) => visitor.visit_i128(n),
+    30	            Node::Static(StaticNode::U64(n)) => visitor.visit_u64(n),
+    31	            #[cfg(feature = "128bit")]
+    32	            Node::Static(StaticNode::U128(n)) => visitor.visit_u128(n),
+    33	            Node::Array { len, count: _ } => visitor.visit_seq(CommaSeparated::new(self, len)),
+    34	            Node::Object { len, count: _ } => visitor.visit_map(CommaSeparated::new(self, len)),
+    35	        }
+    36	    }
+    37	
+    38	    // Uses the `parse_bool` parsing function defined above to read the JSON
+    39	    // identifier `true` or `false` from the input.
+    40	    //
+    41	    // Parsing refers to looking at the input and deciding that it contains the
+    42	    // JSON value `true` or `false`.
+    43	    //
+    44	    // Deserialization refers to mapping that JSON value into Serde's data
+    45	    // model by invoking one of the `Visitor` methods. In the case of JSON and
+    46	    // bool that mapping is straightforward so the distinction may seem silly,
+    47	    // but in other cases Deserializers sometimes perform non-obvious mappings.
+    48	    // For example the TOML format has a Datetime type and Serde's data model
+    49	    // does not. In the `toml` crate, a Datetime in the input is deserialized by
+    50	    // mapping it to a Serde data model "struct" type with a special name and a
+    51	    // single field containing the Datetime represented as a string.
+    52	    #[cfg_attr(not(feature = "no-inline"), inline)]
+    53	    fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value>
+    54	    where
+    55	        V: Visitor<'de>,
+    56	    {
+    57	        match stry!(self.next()) {
+    58	            Node::Static(StaticNode::Bool(b)) => visitor.visit_bool(b),
+    59	            _c => Err(Deserializer::error(ErrorType::ExpectedBoolean)),
+    60	        }
+    61	    }
+    62	
+    63	    // Refer to the "Understanding deserializer lifetimes" page for information
+    64	    // about the three deserialization flavors of strings in Serde.
+    65	    #[cfg_attr(not(feature = "no-inline"), inline)]
+    66	    fn deserialize_str<V>(self, visitor: V) -> Result<V::Value>
+    67	    where
+    68	        V: Visitor<'de>,
+    69	    {
+    70	        if let Ok(Node::String(s)) = self.next() {
+    71	            visitor.visit_borrowed_str(s)
+    72	        } else {
+    73	            Err(Deserializer::error(ErrorType::ExpectedString))
+    74	        }
+    75	    }
+    76	
+    77	    #[cfg_attr(not(feature = "no-inline"), inline)]
+    78	    fn deserialize_string<V>(self, visitor: V) -> Result<V::Value>
+    79	    where
+    80	        V: Visitor<'de>,
+    81	    {
+    82	        if let Ok(Node::String(s)) = self.next() {
+    83	            visitor.visit_str(s)
+    84	        } else {
+    85	            Err(Deserializer::error(ErrorType::ExpectedString))
+    86	        }
+    87	    }
+    88	
+    89	    // The `parse_signed` function is generic over the integer type `T` so here
+    90	    // it is invoked with `T=i8`. The next 8 methods are similar.
+    91	    #[cfg_attr(not(feature = "no-inline"), inline)]
+    92	    #[allow(clippy::cast_possible_truncation)]
+    93	    fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value>
+    94	    where
+    95	        V: Visitor<'de>,
+    96	    {
+    97	        visitor.visit_i8(stry!(self.parse_i8()))
+    98	    }
+    99	
+   100	    #[cfg_attr(not(feature = "no-inline"), inline)]
+   101	    #[allow(clippy::cast_possible_truncation)]
+   102	    fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value>
+   103	    where
+   104	        V: Visitor<'de>,
+   105	    {
+   106	        visitor.visit_i16(stry!(self.parse_i16()))
+   107	    }
+   108	
+   109	    #[cfg_attr(not(feature = "no-inline"), inline)]
+   110	    #[allow(clippy::cast_possible_truncation)]
+   111	    fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value>
+   112	    where
+   113	        V: Visitor<'de>,
+   114	    {
+   115	        visitor.visit_i32(stry!(self.parse_i32()))
+   116	    }
+   117	
+   118	    #[cfg_attr(not(feature = "no-inline"), inline)]
+   119	    fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value>
+   120	    where
+   121	        V: Visitor<'de>,
+   122	    {
+   123	        visitor.visit_i64(stry!(self.parse_i64()))
+   124	    }
+   125	
+   126	    #[cfg_attr(not(feature = "no-inline"), inline)]
+   127	    fn deserialize_i128<V>(self, visitor: V) -> Result<V::Value>
+   128	    where
+   129	        V: Visitor<'de>,
+   130	    {
+   131	        visitor.visit_i128(stry!(self.parse_i128()))
+   132	    }
+   133	
+   134	    #[cfg_attr(not(feature = "no-inline"), inline)]
+   135	    #[allow(clippy::cast_possible_truncation)]
+   136	    fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value>
+   137	    where
+   138	        V: Visitor<'de>,
+   139	    {
+   140	        visitor.visit_u8(stry!(self.parse_u8()))
+   141	    }
+   142	
+   143	    #[cfg_attr(not(feature = "no-inline"), inline)]
+   144	    #[allow(clippy::cast_possible_truncation)]
+   145	    fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value>
+   146	    where
+   147	        V: Visitor<'de>,
+   148	    {
+   149	        visitor.visit_u16(stry!(self.parse_u16()))
+   150	    }
+   151	
+   152	    #[cfg_attr(not(feature = "no-inline"), inline)]
+   153	    #[allow(clippy::cast_possible_truncation)]
+   154	    fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value>
+   155	    where
+   156	        V: Visitor<'de>,
+   157	    {
+   158	        visitor.visit_u32(stry!(self.parse_u32()))
+   159	    }
+   160	
+   161	    #[cfg_attr(not(feature = "no-inline"), inline)]
+   162	    fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value>
+   163	    where
+   164	        V: Visitor<'de>,
+   165	    {
+   166	        visitor.visit_u64(stry!(self.parse_u64()))
+   167	    }
+   168	
+   169	    #[cfg_attr(not(feature = "no-inline"), inline)]
+   170	    fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value>
+   171	    where
+   172	        V: Visitor<'de>,
+   173	    {
+   174	        visitor.visit_u128(stry!(self.parse_u128()))
+   175	    }
+   176	
+   177	    #[cfg_attr(not(feature = "no-inline"), inline)]
+   178	    #[allow(clippy::cast_possible_truncation)]
+   179	    fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value>
+   180	    where
+   181	        V: Visitor<'de>,
+   182	    {
+   183	        let v: f64 = stry!(self.parse_double());
+   184	        visitor.visit_f32(v as f32)
+   185	    }
+   186	
+   187	    #[cfg_attr(not(feature = "no-inline"), inline)]
+   188	    fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value>
+   189	    where
+   190	        V: Visitor<'de>,
+   191	    {
+   192	        visitor.visit_f64(stry!(self.parse_double()))
+   193	    }
+   194	
+   195	    // An absent optional is represented as the JSON `null` and a present
+   196	    // optional is represented as just the contained value.
+   197	    //
+   198	    // As commented in `Serializer` implementation, this is a lossy
+   199	    // representation. For example the values `Some(())` and `None` both
+   200	    // serialize as just `null`. Unfortunately this is typically what people
+   201	    // expect when working with JSON. Other formats are encouraged to behave
+   202	    // more intelligently if possible.
+   203	
+   204	    #[cfg_attr(not(feature = "no-inline"), inline)]
+   205	    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value>
+   206	    where
+   207	        V: Visitor<'de>,
+   208	    {
+   209	        if stry!(self.peek()) == Node::Static(StaticNode::Null) {
+   210	            self.skip();
+   211	            visitor.visit_unit()
+   212	        } else {
+   213	            visitor.visit_some(self)
+   214	        }
+   215	    }
+   216	
+   217	    // In Serde, unit means an anonymous value containing no data.
+   218	    #[cfg_attr(not(feature = "no-inline"), inline)]
+   219	    fn deserialize_unit<V>(self, visitor: V) -> Result<V::Value>
+   220	    where
+   221	        V: Visitor<'de>,
+   222	    {
+   223	        if stry!(self.next()) != Node::Static(StaticNode::Null) {
+   224	            return Err(Deserializer::error(ErrorType::ExpectedNull));
+   225	        }
+   226	        visitor.visit_unit()
+   227	    }
+   228	
+   229	    // Deserialization of compound types like sequences and maps happens by
+   230	    // passing the visitor an "Access" object that gives it the ability to
+   231	    // iterate through the data contained in the sequence.
+   232	    #[cfg_attr(not(feature = "no-inline"), inline)]
+   233	    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value>
+   234	    where
+   235	        V: Visitor<'de>,
+   236	    {
+   237	        // Parse the opening bracket of the sequence.
+   238	        if let Ok(Node::Array { len, count: _ }) = self.next() {
+   239	            // Give the visitor access to each element of the sequence.
+   240	            visitor.visit_seq(CommaSeparated::new(self, len))
+   241	        } else {
+   242	            Err(Deserializer::error(ErrorType::ExpectedArray))
+   243	        }
+   244	    }
+   245	
+   246	    // Tuples look just like sequences in JSON. Some formats may be able to
+   247	    // represent tuples more efficiently.
+   248	    //
+   249	    // As indicated by the length parameter, the `Deserialize` implementation
+   250	    // for a tuple in the Serde data model is required to know the length of the
+   251	    // tuple before even looking at the input data.
+   252	
+   253	    #[cfg_attr(not(feature = "no-inline"), inline)]
+   254	    fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value>
+   255	    where
+   256	        V: Visitor<'de>,
+   257	    {
+   258	        self.deserialize_seq(visitor)
+   259	        // tuples have a known length damn you serde ...
+   260	        //self.skip();
+   261	        // r
+   262	    }
+   263	
+   264	    // Tuple structs look just like sequences in JSON.
+   265	    fn deserialize_tuple_struct<V>(
+   266	        self,
+   267	        _name: &'static str,
+   268	        _len: usize,
+   269	        visitor: V,
+   270	    ) -> Result<V::Value>
+   271	    where
+   272	        V: Visitor<'de>,
+   273	    {
+   274	        self.deserialize_seq(visitor)
+   275	    }
+   276	
+   277	    // Unit struct means a named value containing no data.
+   278	    fn deserialize_unit_struct<V>(self, _name: &'static str, visitor: V) -> Result<V::Value>
+   279	    where
+   280	        V: Visitor<'de>,

@@ -1,0 +1,1228 @@
+use super::{util, StreamDependency, StreamId};
+use crate::ext::Protocol;
+use crate::frame::{Error, Frame, Head, Kind};
+use crate::hpack::{self, BytesStr};
+
+use http::header::{self, HeaderName, HeaderValue};
+use http::{uri, HeaderMap, Method, Request, StatusCode, Uri};
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+use std::fmt;
+use std::io::Cursor;
+
+type EncodeBuf<'a> = bytes::buf::Limit<&'a mut BytesMut>;
+
+/// Header frame
+///
+/// This could be either a request or a response.
+#[derive(Eq, PartialEq)]
+pub struct Headers {
+    /// The ID of the stream with which this frame is associated.
+    stream_id: StreamId,
+
+    /// The stream dependency information, if any.
+    stream_dep: Option<StreamDependency>,
+
+    /// The header block fragment
+    header_block: HeaderBlock,
+
+    /// The associated flags
+    flags: HeadersFlag,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub struct HeadersFlag(u8);
+
+#[derive(Eq, PartialEq)]
+pub struct PushPromise {
+    /// The ID of the stream with which this frame is associated.
+    stream_id: StreamId,
+
+    /// The ID of the stream being reserved by this PushPromise.
+    promised_id: StreamId,
+
+    /// The header block fragment
+    header_block: HeaderBlock,
+
+    /// The associated flags
+    flags: PushPromiseFlag,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub struct PushPromiseFlag(u8);
+
+#[derive(Debug)]
+pub struct Continuation {
+    /// Stream ID of continuation frame
+    stream_id: StreamId,
+
+    header_block: EncodingHeaderBlock,
+}
+
+// TODO: These fields shouldn't be `pub`
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct Pseudo {
+    // Request
+    pub method: Option<Method>,
+    pub scheme: Option<BytesStr>,
+    pub authority: Option<BytesStr>,
+    pub path: Option<BytesStr>,
+    pub protocol: Option<Protocol>,
+
+    // Response
+    pub status: Option<StatusCode>,
+}
+
+#[derive(Debug)]
+pub struct Iter {
+    /// Pseudo headers
+    pseudo: Option<Pseudo>,
+
+    /// Header fields
+    fields: header::IntoIter<HeaderValue>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HeaderBlock {
+    /// The decoded header fields
+    fields: HeaderMap,
+
+    /// Precomputed size of all of our header fields, for perf reasons
+    field_size: usize,
+
+    /// Set to true if decoding went over the max header list size.
+    is_over_size: bool,
+
+    /// Pseudo headers, these are broken out as they must be sent as part of the
+    /// headers frame.
+    pseudo: Pseudo,
+}
+
+#[derive(Debug)]
+struct EncodingHeaderBlock {
+    hpack: Bytes,
+}
+
+const END_STREAM: u8 = 0x1;
+const END_HEADERS: u8 = 0x4;
+const PADDED: u8 = 0x8;
+const PRIORITY: u8 = 0x20;
+const ALL: u8 = END_STREAM | END_HEADERS | PADDED | PRIORITY;
+
+// ===== impl Headers =====
+
+impl Headers {
+    /// Create a new HEADERS frame
+    pub fn new(stream_id: StreamId, pseudo: Pseudo, fields: HeaderMap) -> Self {
+        Headers {
+            stream_id,
+            stream_dep: None,
+            header_block: HeaderBlock {
+                field_size: calculate_headermap_size(&fields),
+                fields,
+                is_over_size: false,
+                pseudo,
+            },
+            flags: HeadersFlag::default(),
+        }
+    }
+
+    pub fn trailers(stream_id: StreamId, fields: HeaderMap) -> Self {
+        let mut flags = HeadersFlag::default();
+        flags.set_end_stream();
+
+        Headers {
+            stream_id,
+            stream_dep: None,
+            header_block: HeaderBlock {
+                field_size: calculate_headermap_size(&fields),
+                fields,
+                is_over_size: false,
+                pseudo: Pseudo::default(),
+            },
+            flags,
+        }
+    }
+
+    /// Loads the header frame but doesn't actually do HPACK decoding.
+    ///
+    /// HPACK decoding is done in the `load_hpack` step.
+    pub fn load(head: Head, mut src: BytesMut) -> Result<(Self, BytesMut), Error> {
+        let flags = HeadersFlag(head.flag());
+        let mut pad = 0;
+
+        tracing::trace!("loading headers; flags={:?}", flags);
+
+        if head.stream_id().is_zero() {
+            return Err(Error::InvalidStreamId);
+        }
+
+        // Read the padding length
+        if flags.is_padded() {
+            if src.is_empty() {
+                return Err(Error::MalformedMessage);
+            }
+            pad = src[0] as usize;
+
+            // Drop the padding
+            src.advance(1);
+        }
+
+        // Read the stream dependency
+        let stream_dep = if flags.is_priority() {
+            if src.len() < 5 {
+                return Err(Error::MalformedMessage);
+            }
+            let stream_dep = StreamDependency::load(&src[..5])?;
+
+            if stream_dep.dependency_id() == head.stream_id() {
+                return Err(Error::InvalidDependencyId);
+            }
+
+            // Drop the next 5 bytes
+            src.advance(5);
+
+            Some(stream_dep)
+        } else {
+            None
+        };
+
+        if pad > 0 {
+            if pad > src.len() {
+                return Err(Error::TooMuchPadding);
+            }
+
+            let len = src.len() - pad;
+            src.truncate(len);
+        }
+
+        let headers = Headers {
+            stream_id: head.stream_id(),
+            stream_dep,
+            header_block: HeaderBlock {
+                fields: HeaderMap::new(),
+                field_size: 0,
+                is_over_size: false,
+                pseudo: Pseudo::default(),
+            },
+            flags,
+        };
+
+        Ok((headers, src))
+    }
+
+    pub fn load_hpack(
+        &mut self,
+        src: &mut BytesMut,
+        max_header_list_size: usize,
+        decoder: &mut hpack::Decoder,
+    ) -> Result<(), Error> {
+        self.header_block.load(src, max_header_list_size, decoder)
+    }
+
+    pub fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub fn is_end_headers(&self) -> bool {
+        self.flags.is_end_headers()
+    }
+
+    pub fn set_end_headers(&mut self) {
+        self.flags.set_end_headers();
+    }
+
+    pub fn is_end_stream(&self) -> bool {
+        self.flags.is_end_stream()
+    }
+
+    pub fn set_end_stream(&mut self) {
+    }
+
+    pub fn fields(&self) -> &HeaderMap {
+        &self.header_block.fields
+    }
+
+    #[cfg(feature = "unstable")]
+    pub fn into_fields(self) -> HeaderMap {
+        self.header_block.fields
+    }
+
+    /// Loads the push promise frame but doesn't actually do HPACK decoding.
+    ///
+    /// HPACK decoding is done in the `load_hpack` step.
+    pub fn load(head: Head, mut src: BytesMut) -> Result<(Self, BytesMut), Error> {
+        let flags = PushPromiseFlag(head.flag());
+        let mut pad = 0;
+
+        if head.stream_id().is_zero() {
+            return Err(Error::InvalidStreamId);
+        }
+
+        // Read the padding length
+        if flags.is_padded() {
+            if src.is_empty() {
+                return Err(Error::MalformedMessage);
+            }
+
+            // TODO: Ensure payload is sized correctly
+            pad = src[0] as usize;
+
+            // Drop the padding
+            src.advance(1);
+        }
+
+        if src.len() < 5 {
+            return Err(Error::MalformedMessage);
+        }
+
+        let (promised_id, _) = StreamId::parse(&src[..4]);
+        // Drop promised_id bytes
+        src.advance(4);
+
+        if pad > 0 {
+            if pad > src.len() {
+                return Err(Error::TooMuchPadding);
+            }
+
+            let len = src.len() - pad;
+            src.truncate(len);
+        }
+
+        let frame = PushPromise {
+            flags,
+            header_block: HeaderBlock {
+                fields: HeaderMap::new(),
+                field_size: 0,
+                is_over_size: false,
+                pseudo: Pseudo::default(),
+            },
+            promised_id,
+            stream_id: head.stream_id(),
+        };
+        Ok((frame, src))
+    }
+
+    pub fn load_hpack(
+        &mut self,
+        src: &mut BytesMut,
+        max_header_list_size: usize,
+        decoder: &mut hpack::Decoder,
+    ) -> Result<(), Error> {
+        self.header_block.load(src, max_header_list_size, decoder)
+    }
+
+    pub fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub fn promised_id(&self) -> StreamId {
+        self.promised_id
+    }
+
+    pub fn is_end_headers(&self) -> bool {
+        self.flags.is_end_headers()
+    }
+
+    pub fn set_end_headers(&mut self) {
+        self.flags.set_end_headers();
+    }
+
+    pub fn is_over_size(&self) -> bool {
+        self.header_block.is_over_size
+    }
+
+    pub fn encode(
+        self,
+        encoder: &mut hpack::Encoder,
+        dst: &mut EncodeBuf<'_>,
+    ) -> Option<Continuation> {
+        // At this point, the `is_end_headers` flag should always be set
+        debug_assert!(self.flags.is_end_headers());
+
+        let head = self.head();
+        let promised_id = self.promised_id;
+
+        self.header_block
+            .into_encoding(encoder)
+            .encode(&head, dst, |dst| {
+                dst.put_u32(promised_id.into());
+            })
+    }
+
+    fn head(&self) -> Head {
+        Head::new(Kind::PushPromise, self.flags.into(), self.stream_id)
+    }
+
+    /// Consume `self`, returning the parts of the frame
+    pub fn into_parts(self) -> (Pseudo, HeaderMap) {
+        (self.header_block.pseudo, self.header_block.fields)
+    }
+}
+
+impl<T> From<PushPromise> for Frame<T> {
+    fn from(src: PushPromise) -> Self {
+        Frame::PushPromise(src)
+    }
+}
+
+impl fmt::Debug for PushPromise {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("PushPromise")
+            .field("stream_id", &self.stream_id)
+            .field("promised_id", &self.promised_id)
+            .field("flags", &self.flags)
+            // `fields` and `pseudo` purposefully not included
+            .finish()
+    }
+}
+
+// ===== impl Continuation =====
+
+impl Continuation {
+    fn head(&self) -> Head {
+        Head::new(Kind::Continuation, END_HEADERS, self.stream_id)
+    }
+
+    pub fn encode(self, dst: &mut EncodeBuf<'_>) -> Option<Continuation> {
+        // Get the CONTINUATION frame head
+        let head = self.head();
+
+        self.header_block.encode(&head, dst, |_| {})
+    }
+}
+
+// ===== impl Pseudo =====
+
+impl Pseudo {
+    pub fn request(method: Method, uri: Uri, protocol: Option<Protocol>) -> Self {
+        let parts = uri::Parts::from(uri);
+
+        let (scheme, path) = if method == Method::CONNECT && protocol.is_none() {
+            (None, None)
+        } else {
+            let path = parts
+                .path_and_query
+                .map(|v| BytesStr::from(v.as_str()))
+                .unwrap_or(BytesStr::from_static(""));
+
+            let path = if !path.is_empty() {
+                path
+            } else if method == Method::OPTIONS {
+                BytesStr::from_static("*")
+            } else {
+                BytesStr::from_static("/")
+            };
+
+            (parts.scheme, Some(path))
+        };
+
+        let mut pseudo = Pseudo {
+            method: Some(method),
+            scheme: None,
+            authority: None,
+            path,
+            protocol,
+            status: None,
+        };
+
+        // If the URI includes a scheme component, add it to the pseudo headers
+        if let Some(scheme) = scheme {
+            pseudo.set_scheme(scheme);
+        }
+
+        // If the URI includes an authority component, add it to the pseudo
+        // headers
+        if let Some(authority) = parts.authority {
+            pseudo.set_authority(BytesStr::from(authority.as_str()));
+        }
+
+        pseudo
+    }
+
+    pub fn response(status: StatusCode) -> Self {
+        Pseudo {
+            method: None,
+            scheme: None,
+            authority: None,
+            path: None,
+            protocol: None,
+            status: Some(status),
+        }
+    }
+
+    #[cfg(feature = "unstable")]
+    pub fn set_status(&mut self, value: StatusCode) {
+        self.status = Some(value);
+    }
+
+    pub fn set_scheme(&mut self, scheme: uri::Scheme) {
+        let bytes_str = match scheme.as_str() {
+            "http" => BytesStr::from_static("http"),
+            "https" => BytesStr::from_static("https"),
+            s => BytesStr::from(s),
+        };
+        self.scheme = Some(bytes_str);
+    }
+
+    #[cfg(feature = "unstable")]
+    pub fn set_protocol(&mut self, protocol: Protocol) {
+        self.protocol = Some(protocol);
+    }
+
+    pub fn set_authority(&mut self, authority: BytesStr) {
+        self.authority = Some(authority);
+    }
+
+    /// Whether it has status 1xx
+    pub(crate) fn is_informational(&self) -> bool {
+        self.status
+            .map_or(false, |status| status.is_informational())
+    }
+}
+
+// ===== impl EncodingHeaderBlock =====
+
+impl EncodingHeaderBlock {
+    fn encode<F>(mut self, head: &Head, dst: &mut EncodeBuf<'_>, f: F) -> Option<Continuation>
+    where
+        F: FnOnce(&mut EncodeBuf<'_>),
+    {
+        let head_pos = dst.get_ref().len();
+
+        // At this point, we don't know how big the h2 frame will be.
+        // So, we write the head with length 0, then write the body, and
+        // finally write the length once we know the size.
+        head.encode(0, dst);
+
+        let payload_pos = dst.get_ref().len();
+
+        f(dst);
+
+        // Now, encode the header payload
+        let continuation = if self.hpack.len() > dst.remaining_mut() {
+            dst.put((&mut self.hpack).take(dst.remaining_mut()));
+
+            Some(Continuation {
+                stream_id: head.stream_id(),
+                header_block: self,
+            })
+        } else {
+            dst.put_slice(&self.hpack);
+
+            None
+        };
+
+        // Compute the header block length
+        let payload_len = (dst.get_ref().len() - payload_pos) as u64;
+
+        // Write the frame length
+        let payload_len_be = payload_len.to_be_bytes();
+        assert!(payload_len_be[0..5].iter().all(|b| *b == 0));
+        (dst.get_mut()[head_pos..head_pos + 3]).copy_from_slice(&payload_len_be[5..]);
+
+        if continuation.is_some() {
+            // There will be continuation frames, so the `is_end_headers` flag
+            // must be unset
+            debug_assert!(dst.get_ref()[head_pos + 4] & END_HEADERS == END_HEADERS);
+
+            dst.get_mut()[head_pos + 4] -= END_HEADERS;
+        }
+
+        continuation
+    }
+}
+
+// ===== impl Iter =====
+
+impl Iterator for Iter {
+    type Item = hpack::Header<Option<HeaderName>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use crate::hpack::Header::*;
+
+        if let Some(ref mut pseudo) = self.pseudo {
+            if let Some(method) = pseudo.method.take() {
+                return Some(Method(method));
+            }
+
+            if let Some(scheme) = pseudo.scheme.take() {
+                return Some(Scheme(scheme));
+
+    const NAME: &'static str = "Server";
+
+    /*
+    fn is_server() -> bool {
+        true
+    }
+    */
+
+    fn r#dyn() -> proto::DynPeer {
+        proto::DynPeer::Server
+    }
+
+    fn convert_poll_message(
+        pseudo: Pseudo,
+        fields: HeaderMap,
+        stream_id: StreamId,
+    ) -> Result<Self::Poll, Error> {
+        use http::{uri, Version};
+
+        let mut b = Request::builder();
+
+        macro_rules! malformed {
+            ($($arg:tt)*) => {{
+                tracing::debug!($($arg)*);
+                return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
+            }}
+        }
+
+        b = b.version(Version::HTTP_2);
+
+        let is_connect;
+        if let Some(method) = pseudo.method {
+            is_connect = method == Method::CONNECT;
+            b = b.method(method);
+        } else {
+            malformed!("malformed headers: missing method");
+        }
+
+        let has_protocol = pseudo.protocol.is_some();
+        if has_protocol {
+            if is_connect {
+                // Assert that we have the right type.
+                b = b.extension::<crate::ext::Protocol>(pseudo.protocol.unwrap());
+            } else {
+                malformed!("malformed headers: :protocol on non-CONNECT request");
+            }
+        }
+
+        if pseudo.status.is_some() {
+            malformed!("malformed headers: :status field on request");
+        }
+
+        // Convert the URI
+        let mut parts = uri::Parts::default();
+
+        // A request translated from HTTP/1 must not include the :authority
+        // header
+        if let Some(authority) = pseudo.authority {
+            let maybe_authority = uri::Authority::from_maybe_shared(authority.clone().into_inner());
+            parts.authority = Some(maybe_authority.or_else(|why| {
+                malformed!(
+                    "malformed headers: malformed authority ({:?}): {}",
+                    authority,
+                    why,
+                )
+            })?);
+        }
+
+        // A :scheme is required, except CONNECT.
+        if let Some(scheme) = pseudo.scheme {
+            if is_connect && !has_protocol {
+                malformed!("malformed headers: :scheme in CONNECT");
+            }
+            let maybe_scheme = scheme.parse();
+            let scheme = maybe_scheme.or_else(|why| {
+                malformed!(
+                    "malformed headers: malformed scheme ({:?}): {}",
+                    scheme,
+                    why,
+                )
+            })?;
+
+            // It's not possible to build an `Uri` from a scheme and path. So,
+            // after validating is was a valid scheme, we just have to drop it
+            // if there isn't an :authority.
+            if parts.authority.is_some() {
+                parts.scheme = Some(scheme);
+            }
+        } else if !is_connect || has_protocol {
+            malformed!("malformed headers: missing scheme");
+        }
+
+        if let Some(path) = pseudo.path {
+            if is_connect && !has_protocol {
+                malformed!("malformed headers: :path in CONNECT");
+            }
+
+            // This cannot be empty
+            if path.is_empty() {
+                malformed!("malformed headers: missing path");
+            }
+
+            let maybe_path = uri::PathAndQuery::from_maybe_shared(path.clone().into_inner());
+            parts.path_and_query = Some(maybe_path.or_else(|why| {
+                malformed!("malformed headers: malformed path ({:?}): {}", path, why,)
+            })?);
+        } else if is_connect && has_protocol {
+            malformed!("malformed headers: missing path in extended CONNECT");
+        }
+
+        b = b.uri(parts);
+
+        let mut request = match b.body(()) {
+            Ok(request) => request,
+            Err(e) => {
+                // TODO: Should there be more specialized handling for different
+                // kinds of errors
+                proto_err!(stream: "error building request: {}; stream={:?}", e, stream_id);
+                return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
+            }
+        };
+
+        *request.headers_mut() = fields;
+
+        Ok(request)
+    }
+}
+
+// ===== impl Handshaking =====
+
+use super::{
+    store, Buffer, Codec, Config, Counts, Frame, Prioritize, Prioritized, Store, Stream, StreamId,
+    StreamIdOverflow, WindowSize,
+};
+use crate::codec::UserError;
+use crate::frame::{self, Reason};
+use crate::proto::{self, Error, Initiator};
+
+use bytes::Buf;
+use tokio::io::AsyncWrite;
+
+use std::cmp::Ordering;
+use std::io;
+use std::task::{Context, Poll, Waker};
+
+/// Manages state transitions related to outbound frames.
+#[derive(Debug)]
+pub(super) struct Send {
+    /// Stream identifier to use for next initialized stream.
+    next_stream_id: Result<StreamId, StreamIdOverflow>,
+
+    /// Any streams with a higher ID are ignored.
+    ///
+    /// This starts as MAX, but is lowered when a GOAWAY is received.
+    ///
+    /// > After sending a GOAWAY frame, the sender can discard frames for
+    /// > streams initiated by the receiver with identifiers higher than
+    /// > the identified last stream.
+    max_stream_id: StreamId,
+
+    /// Initial window size of locally initiated streams
+    init_window_sz: WindowSize,
+
+    /// Prioritization layer
+    prioritize: Prioritize,
+
+    is_push_enabled: bool,
+
+    /// If extended connect protocol is enabled.
+    is_extended_connect_protocol_enabled: bool,
+}
+
+/// A value to detect which public API has called `poll_reset`.
+#[derive(Debug)]
+pub(crate) enum PollReset {
+    AwaitingHeaders,
+    Streaming,
+}
+
+impl Send {
+    /// Create a new `Send`
+    pub fn new(config: &Config) -> Self {
+        Send {
+            init_window_sz: config.remote_init_window_sz,
+            max_stream_id: StreamId::MAX,
+            next_stream_id: Ok(config.local_next_stream_id),
+            prioritize: Prioritize::new(config),
+            is_push_enabled: true,
+            is_extended_connect_protocol_enabled: false,
+        }
+    }
+
+    /// Returns the initial send window size
+    pub fn init_window_sz(&self) -> WindowSize {
+        self.init_window_sz
+    }
+
+    pub fn open(&mut self) -> Result<StreamId, UserError> {
+        let stream_id = self.ensure_next_stream_id()?;
+        self.next_stream_id = stream_id.next_id();
+        Ok(stream_id)
+    }
+
+    pub fn reserve_local(&mut self) -> Result<StreamId, UserError> {
+        let stream_id = self.ensure_next_stream_id()?;
+        self.next_stream_id = stream_id.next_id();
+        Ok(stream_id)
+    }
+
+    fn check_headers(fields: &http::HeaderMap) -> Result<(), UserError> {
+        // 8.1.2.2. Connection-Specific Header Fields
+        if fields.contains_key(http::header::CONNECTION)
+            || fields.contains_key(http::header::TRANSFER_ENCODING)
+            || fields.contains_key(http::header::UPGRADE)
+            || fields.contains_key("keep-alive")
+            || fields.contains_key("proxy-connection")
+        {
+            tracing::debug!("illegal connection-specific headers found");
+            return Err(UserError::MalformedHeaders);
+        } else if let Some(te) = fields.get(http::header::TE) {
+            if te != "trailers" {
+                tracing::debug!("illegal connection-specific headers found");
+                return Err(UserError::MalformedHeaders);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn send_push_promise<B>(
+        &mut self,
+        frame: frame::PushPromise,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError> {
+        if !self.is_push_enabled {
+            return Err(UserError::PeerDisabledServerPush);
+        }
+
+        tracing::trace!(
+            "send_push_promise; frame={:?}; init_window={:?}",
+            frame,
+            self.init_window_sz
+        );
+
+        Self::check_headers(frame.fields())?;
+
+        // Queue the frame for sending
+        self.prioritize
+            .queue_frame(frame.into(), buffer, stream, task);
+
+        Ok(())
+    }
+
+    pub fn send_headers<B>(
+        &mut self,
+        frame: frame::Headers,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError> {
+        tracing::trace!(
+            "send_headers; frame={:?}; init_window={:?}",
+            frame,
+            self.init_window_sz
+        );
+
+        Self::check_headers(frame.fields())?;
+
+        let end_stream = frame.is_end_stream();
+
+        // Update the state
+        stream.state.send_open(end_stream)?;
+
+        let mut pending_open = false;
+        if counts.peer().is_local_init(frame.stream_id()) && !stream.is_pending_push {
+            self.prioritize.queue_open(stream);
+            pending_open = true;
+        }
+
+        // Queue the frame for sending
+        //
+        // This call expects that, since new streams are in the open queue, new
+        // streams won't be pushed on pending_send.
+        self.prioritize
+            .queue_frame(frame.into(), buffer, stream, task);
+
+        // Need to notify the connection when pushing onto pending_open since
+        // queue_frame only notifies for pending_send.
+        if pending_open {
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Send an explicit RST_STREAM frame
+    }
+
+    pub fn ensure_next_stream_id(&self) -> Result<StreamId, UserError> {
+        self.next_stream_id
+            .map_err(|_| UserError::OverflowedStreamId)
+    }
+
+    pub fn may_have_created_stream(&self, id: StreamId) -> bool {
+        if let Ok(next_id) = self.next_stream_id {
+            // Peer::is_local_init should have been called beforehand
+            debug_assert_eq!(id.is_server_initiated(), next_id.is_server_initiated(),);
+            id < next_id
+        } else {
+            true
+        }
+    }
+
+    pub(super) fn maybe_reset_next_stream_id(&mut self, id: StreamId) {
+        if let Ok(next_id) = self.next_stream_id {
+            // Peer::is_local_init should have been called beforehand
+            debug_assert_eq!(id.is_server_initiated(), next_id.is_server_initiated());
+            if id >= next_id {
+                self.next_stream_id = id.next_id();
+            }
+        }
+    }
+
+    pub(crate) fn is_extended_connect_protocol_enabled(&self) -> bool {
+        self.is_extended_connect_protocol_enabled
+    }
+}
+use futures::StreamExt;
+use h2_support::prelude::*;
+
+#[tokio::test]
+async fn recv_trailers_only() {
+    h2_support::trace_init!();
+
+    let mock = mock_io::Builder::new()
+        .handshake()
+        // Write GET /
+        .write(&[
+            0, 0, 0x10, 1, 5, 0, 0, 0, 1, 0x82, 0x87, 0x41, 0x8B, 0x9D, 0x29, 0xAC, 0x4B, 0x8F,
+            0xA8, 0xE9, 0x19, 0x97, 0x21, 0xE9, 0x84,
+        ])
+        .write(frames::SETTINGS_ACK)
+        // Read response
+        .read(&[
+            0, 0, 1, 1, 4, 0, 0, 0, 1, 0x88, 0, 0, 9, 1, 5, 0, 0, 0, 1, 0x40, 0x84, 0x42, 0x46,
+            0x9B, 0x51, 0x82, 0x3F, 0x5F,
+        ])
+        .build();
+
+    let (mut client, mut h2) = client::handshake(mock).await.unwrap();
+
+    // Send the request
+    let request = Request::builder()
+        .uri("https://http2.akamai.com/")
+        .body(())
+        .unwrap();
+
+    tracing::info!("sending request");
+    let (response, _) = client.send_request(request, true).unwrap();
+
+    let response = h2.run(response).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (_, mut body) = response.into_parts();
+
+    // Make sure there is no body
+    let chunk = h2.run(Box::pin(body.next())).await;
+    assert!(chunk.is_none());
+
+    let trailers = h2
+        .run(poll_fn(|cx| body.poll_trailers(cx)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(1, trailers.len());
+    assert_eq!(trailers["status"], "ok");
+
+    h2.await.unwrap();
+}
+
+#[tokio::test]
+async fn send_trailers_immediately() {
+    h2_support::trace_init!();
+
+    let mock = mock_io::Builder::new()
+        .handshake()
+        // Write GET /
+        .write(&[
+            0, 0, 0x10, 1, 4, 0, 0, 0, 1, 0x82, 0x87, 0x41, 0x8B, 0x9D, 0x29, 0xAC, 0x4B, 0x8F,
+            0xA8, 0xE9, 0x19, 0x97, 0x21, 0xE9, 0x84, 0, 0, 0x0A, 1, 5, 0, 0, 0, 1, 0x40, 0x83,
+            0xF6, 0x7A, 0x66, 0x84, 0x9C, 0xB4, 0x50, 0x7F,
+        ])
+        .write(frames::SETTINGS_ACK)
+        // Read response
+        .read(&[
+            0, 0, 1, 1, 4, 0, 0, 0, 1, 0x88, 0, 0, 0x0B, 0, 1, 0, 0, 0, 1, 0x68, 0x65, 0x6C, 0x6C,
+            0x6F, 0x20, 0x77, 0x6F, 0x72, 0x6C, 0x64,
+        ])
+        .build();
+
+    let (mut client, mut h2) = client::handshake(mock).await.unwrap();
+
+    // Send the request
+    let request = Request::builder()
+        .uri("https://http2.akamai.com/")
+        .body(())
+        .unwrap();
+
+    tracing::info!("sending request");
+    let (response, mut stream) = client.send_request(request, false).unwrap();
+
+    let mut trailers = HeaderMap::new();
+    trailers.insert("zomg", "hello".parse().unwrap());
+
+    stream.send_trailers(trailers).unwrap();
+
+    let response = h2.run(response).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (_, mut body) = response.into_parts();
+
+    // There is a data chunk
+    let _ = h2.run(body.next()).await.unwrap().unwrap();
+
+    let chunk = h2.run(body.next()).await;
+    assert!(chunk.is_none());
+
+    let trailers = h2.run(poll_fn(|cx| body.poll_trailers(cx))).await.unwrap();
+    assert!(trailers.is_none());
+
+    h2.await.unwrap();
+}
+
+#[test]
+#[ignore]
+fn recv_trailers_without_eos() {
+    // This should be a protocol error?
+}
+use futures::future::{ready, Either};
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
+use h2_support::prelude::*;
+use std::pin::Pin;
+use std::task::Context;
+use std::{io, panic};
+
+#[tokio::test]
+async fn handshake() {
+    h2_support::trace_init!();
+
+    let mock = mock_io::Builder::new()
+        .handshake()
+        .write(SETTINGS_ACK)
+        .build();
+
+    let (_client, h2) = client::handshake(mock).await.unwrap();
+
+    tracing::trace!("hands have been shook");
+
+    // At this point, the connection should be closed
+    h2.await.unwrap();
+}
+
+#[tokio::test]
+async fn client_other_thread() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::handshake(io).await.unwrap();
+        tokio::spawn(async move {
+            let request = Request::builder()
+                .uri("https://http2.akamai.com/")
+                .body(())
+                .unwrap();
+            let _res = client
+                .send_request(request, true)
+                .unwrap()
+                .0
+                .await
+                .expect("request");
+        });
+        h2.await.expect("h2");
+    };
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn recv_invalid_server_stream_id() {
+    h2_support::trace_init!();
+
+    let mock = mock_io::Builder::new()
+        .handshake()
+        // Write GET /
+        .write(&[
+            0, 0, 0x10, 1, 5, 0, 0, 0, 1, 0x82, 0x87, 0x41, 0x8B, 0x9D, 0x29, 0xAC, 0x4B, 0x8F,
+            0xA8, 0xE9, 0x19, 0x97, 0x21, 0xE9, 0x84,
+        ])
+        .write(SETTINGS_ACK)
+        // Read response
+        .read(&[0, 0, 1, 1, 5, 0, 0, 0, 2, 137])
+        // Write GO_AWAY
+        .write(&[0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+        .build();
+
+    let (mut client, h2) = client::handshake(mock).await.unwrap();
+
+    // Send the request
+    let request = Request::builder()
+        .uri("https://http2.akamai.com/")
+        .body(())
+        .unwrap();
+
+    tracing::info!("sending request");
+    let (response, _) = client.send_request(request, true).unwrap();
+
+    // The connection errors
+    assert!(h2.await.is_err());
+
+    // The stream errors
+    assert!(response.await.is_err());
+}
+
+#[tokio::test]
+async fn request_stream_id_overflows() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::Builder::new()
+            .initial_stream_id(::std::u32::MAX >> 1)
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+
+        // first request is allowed
+        let (response, _) = client.send_request(request, true).unwrap();
+        let _x = h2.drive(response).await.unwrap();
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+        // second cannot use the next stream id, it's over
+        let poll_err = poll_fn(|cx| client.poll_ready(cx)).await.unwrap_err();
+        assert_eq!(poll_err.to_string(), "user error: stream ID overflowed");
+
+        let err = client.send_request(request, true).unwrap_err();
+        assert_eq!(err.to_string(), "user error: stream ID overflowed");
+
+        h2.await.unwrap();
+    };
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(::std::u32::MAX >> 1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(::std::u32::MAX >> 1).response(200).eos())
+            .await;
+        idle_ms(10).await;
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn client_builder_max_concurrent_streams() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let mut settings = frame::Settings::default();
+    settings.set_max_concurrent_streams(Some(1));
+
+    let srv = async move {
+        let rcvd_settings = srv.assert_client_handshake().await;
+        assert_frame_eq(settings, rcvd_settings);
+
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+    };
+
+    let mut builder = client::Builder::new();
+    builder.max_concurrent_streams(1);
+
+    let h2 = async move {
+        let (mut client, mut h2) = builder.handshake::<_, Bytes>(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        h2.drive(response).await.unwrap();
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn request_over_max_concurrent_streams_errors() {
+//! Utilities to support tests.
+
+#[macro_use]
+pub mod assert;
+
+pub mod raw;
+
+pub mod frames;
+pub mod mock;
+pub mod prelude;
+pub mod trace;
+pub mod util;
+
+mod client_ext;
+mod future_ext;
+
+pub use crate::client_ext::SendRequestExt;
+pub use crate::future_ext::TestFuture;
+
+pub type WindowSize = usize;
+pub const DEFAULT_WINDOW_SIZE: WindowSize = (1 << 16) - 1;
+
+// This is our test Codec type
+pub type Codec<T> = h2::Codec<T, bytes::Bytes>;
+
+// This is the frame type that is sent
+pub type SendFrame = h2::frame::Frame<bytes::Bytes>;
+
+#[macro_export]
+macro_rules! trace_init {
+    () => {
+        let _guard = $crate::trace::init();
+        let span = $crate::prelude::tracing::info_span!(
+            "test",
+            "{}",
+            // get the name of the test thread to generate a unique span for the test
+            std::thread::current()
+                .name()
+                .expect("test threads must be named")
+        );
+        let _e = span.enter();
+    };
+}
+4.785183333333333 minutes used of 15.0

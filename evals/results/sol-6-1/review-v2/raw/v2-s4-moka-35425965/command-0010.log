@@ -1,0 +1,412 @@
+163:    /// This method guarantees that concurrent calls on the same key are executed
+164:    /// serially. That is, `and_compute_with` calls on the same key never run
+165:    /// concurrently. The calls are serialized by the order of their invocation. It
+226:    /// This method guarantees that concurrent calls on the same key are executed
+227:    /// serially. That is, `and_try_compute_with` calls on the same key never run
+228:    /// concurrently. The calls are serialized by the order of their invocation. It
+335:    /// This method guarantees that concurrent calls on the same key are executed
+336:    /// serially. That is, `and_upsert_with` calls on the same key never run
+337:    /// concurrently. The calls are serialized by the order of their invocation. It
+474:    /// This method guarantees that concurrent calls on the same not-existing entry
+566:    /// This method guarantees that concurrent calls on the same not-existing entry
+641:    /// This method guarantees that concurrent calls on the same not-existing entry
+818:    /// This method guarantees that concurrent calls on the same key are executed
+819:    /// serially. That is, `and_compute_with` calls on the same key never run
+820:    /// concurrently. The calls are serialized by the order of their invocation. It
+881:    /// This method guarantees that concurrent calls on the same key are executed
+882:    /// serially. That is, `and_try_compute_with` calls on the same key never run
+883:    /// concurrently. The calls are serialized by the order of their invocation. It
+990:    /// This method guarantees that concurrent calls on the same key are executed
+991:    /// serially. That is, `and_upsert_with` calls on the same key never run
+992:    /// concurrently. The calls are serialized by the order of their invocation. It
+1128:    /// This method guarantees that concurrent calls on the same not-existing entry
+1223:    /// This method guarantees that concurrent calls on the same not-existing entry
+1298:    /// This method guarantees that concurrent calls on the same not-existing entry
+        // record a serial number on a WriteOp, and consider the WriteOp with the
+        // largest serial number is the one made by the last call of the closures.
+        self.inner.cache.insert_with_or_modify(
+            Arc::clone(&key),
+            hash,
+            // on_insert
+            || {
+                let (entry, gen) = self.new_value_entry(&key, hash, value.clone(), ts, weight);
+                let ins_op = WriteOp::new_upsert(&key, hash, &entry, gen, 0, weight);
+                let cnt = op_cnt1.fetch_add(1, Ordering::Relaxed);
+                op1 = Some((cnt, ins_op));
+                entry
+            },
+            // on_modify
+            |_k, old_entry| {
+                let old_weight = old_entry.policy_weight();
+
+                // Create this OldEntryInfo _before_ creating a new ValueEntry, so
+                // that the OldEntryInfo can preserve the old EntryInfo's
+                // last_accessed and last_modified timestamps.
+                let old_info = OldEntryInfo::new(old_entry);
+                let (entry, gen) = self.new_value_entry_from(value.clone(), ts, weight, old_entry);
+                let upd_op = WriteOp::new_upsert(&key, hash, &entry, gen, old_weight, weight);
+                let cnt = op_cnt2.fetch_add(1, Ordering::Relaxed);
+                op2 = Some((cnt, old_info, upd_op));
+                entry
+            },
+        );
+
+        match (op1, op2) {
+            (Some((_cnt, ins_op)), None) => self.do_post_insert_steps(ts, &key, ins_op),
+            (Some((cnt1, ins_op)), Some((cnt2, ..))) if cnt1 > cnt2 => {
+                self.do_post_insert_steps(ts, &key, ins_op)
+            }
+            (_, Some((_cnt, old_entry, upd_op))) => {
+                self.do_post_update_steps(ts, key, old_entry, upd_op, &self.interrupted_op_ch_snd)
+                    .await
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+
+    fn do_post_insert_steps(
+        &self,
+        ts: Instant,
+        key: &Arc<K>,
+        ins_op: WriteOp<K, V>,
+    ) -> (WriteOp<K, V>, Instant) {
+        if let (Some(expiry), WriteOp::Upsert { value_entry, .. }) =
+            (&self.inner.expiration_policy.expiry(), &ins_op)
+        {
+            Self::expire_after_create(expiry, key, value_entry, ts, self.inner.clock());
+        }
+        (ins_op, ts)
+    }
+
+    async fn do_post_update_steps(
+        &self,
+        ts: Instant,
+        key: Arc<K>,
+        old_info: OldEntryInfo<K, V>,
+        upd_op: WriteOp<K, V>,
+        interrupted_op_ch: &Sender<InterruptedOp<K, V>>,
+    ) -> (WriteOp<K, V>, Instant) {
+        use futures_util::FutureExt;
+
+        if let (Some(expiry), WriteOp::Upsert { value_entry, .. }) =
+            (&self.inner.expiration_policy.expiry(), &upd_op)
+        {
+            Self::expire_after_read_or_update(
+                |k, v, t, d| expiry.expire_after_update(k, v, t, d),
+                &key,
+                value_entry,
+                self.inner.expiration_policy.time_to_live(),
+                self.inner.expiration_policy.time_to_idle(),
+                ts,
+                self.inner.clock(),
+            );
+        }
+
+        if self.is_removal_notifier_enabled() {
+            let future = self
+                .inner
+                .notify_upsert(
+                    key,
+                    &old_info.entry,
+                    old_info.last_accessed,
+                    old_info.last_modified,
+                )
+                .shared();
+            // Async Cancellation Safety: To ensure the above future should be
+            // executed even if our caller async task is cancelled, we create a
+            // cancel guard for the future (and the upd_op). If our caller is
+            // cancelled while we are awaiting for the future, the cancel guard will
+            // save the future and the upd_op to the interrupted_op_ch channel, so
+            // that we can resume/retry later.
+            let mut cancel_guard = CancelGuard::new(interrupted_op_ch, ts);
+            cancel_guard.set_future_and_op(future.clone(), upd_op.clone());
+
+            // Notify the eviction listener.
+            future.await;
+            cancel_guard.clear();
+        }
+
+        crossbeam_epoch::pin().flush();
+        (upd_op, ts)
+    }
+
+    #[inline]
+    pub(crate) async fn schedule_write_op(
+        inner: &Arc<Inner<K, V, S>>,
+        ch: &Sender<WriteOp<K, V>>,
+        ch_ready_event: &event_listener::Event<()>,
+        op: WriteOp<K, V>,
+        ts: Instant,
+        housekeeper: Option<&HouseKeeperArc>,
+        // Used only for testing.
+        _should_block: bool,
+    ) -> Result<(), TrySendError<WriteOp<K, V>>> {
+        // Testing stuff.
+        #[cfg(test)]
+        if _should_block {
+            // We are going to do a dead-lock here to simulate a full channel.
+            let mutex = Mutex::new(());
+            let _guard = mutex.lock().await;
+            // This should dead-lock.
+            mutex.lock().await;
+        }
+
+        let mut op = op;
+        let mut spin_loop_attempts = 0u8;
+        loop {
+            // Run the `Inner::do_run_pending_tasks` method if needed.
+            BaseCache::<K, V, S>::apply_reads_writes_if_needed(inner, ch, ts, housekeeper).await;
+
+            // Try to send our op to the write op channel.
+            match ch.try_send(op) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(op1)) => {
+                    op = op1;
+                }
+                Err(e @ TrySendError::Disconnected(_)) => return Err(e),
+            }
+
+            // We have got a `TrySendError::Full` above. Wait a moment and try again.
+
+            if spin_loop_attempts < 4 {
+                spin_loop_attempts += 1;
+                // Wastes some CPU time with a hint to indicate to the CPU that we
+                // are spinning. Adjust the SPIN_COUNT because the `PAUSE`
+                // instruction of recent x86_64 CPUs may have longer latency than the
+                // alternatives in other CPU architectures.
+                const SPIN_COUNT: usize = if cfg!(target_arch = "x86_64") { 8 } else { 32 };
+                for _ in 0..SPIN_COUNT {
+                    std::hint::spin_loop();
+                }
+            } else {
+                spin_loop_attempts = 0;
+
+                // Yield the async runtime scheduler to other async tasks and wait
+                // for a channel ready event. This event will be sent when one of the
+                // following conditions is met:
+                //
+                // - The `Inner::do_run_pending_tasks` method has removed some ops
+                //   from the write op channel.
+                // - The `Housekeeper`'s `run_pending_tasks` or `
+                //   try_run_pending_tasks` methods has freed the lock on the
+                //   `current_task`.
+                //
+                ch_ready_event.listen().await;
+
+                // We are going to retry. Now the channel may have some space and/or
+                // one of us is allowed to run `do_run_pending_tasks` method.
+            }
+        }
+    }
+
+    pub(crate) async fn retry_interrupted_ops(&self) {
+        while let Ok(op) = self.interrupted_op_ch_rcv.try_recv() {
+            // Async Cancellation Safety: Remember that we are in an async task here.
+            // If our caller is cancelled while we are awaiting for the future, we
+            // will be cancelled too at the await point. In that case, the cancel
+            // guard below will save the future and the op to the interrupted_op_ch
+            // channel, so that we can resume/retry later.
+            let mut cancel_guard;
+
+            // Resume an interrupted future if there is one.
+            match op {
+                InterruptedOp::CallEvictionListener { ts, future, op } => {
+                    cancel_guard = CancelGuard::new(&self.interrupted_op_ch_snd, ts);
+                    cancel_guard.set_future_and_op(future.clone(), op);
+    hash: u64,
+    cache: &'a Cache<K, V, S>,
+}
+
+impl<'a, K, V, S> OwnedKeyEntrySelector<'a, K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn new(owned_key: K, hash: u64, cache: &'a Cache<K, V, S>) -> Self {
+        Self {
+            owned_key,
+            hash,
+            cache,
+        }
+    }
+
+    /// Performs a compute operation on a cached entry by using the given closure
+    /// `f`. A compute operation is either put, remove or no-operation (nop).
+    ///
+    /// The closure `f` should take the current entry of `Option<Entry<K, V>>` for
+    /// the key, and return a `Future` that resolves to an `ops::compute::Op<V>`
+    /// enum.
+    ///
+    /// This method works as the followings:
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+use futures_util::FutureExt;
+
+use crate::notification::{AsyncEvictionListener, RemovalCause};
+
+pub(crate) struct RemovalNotifier<K, V> {
+    listener: AsyncEvictionListener<K, V>,
+    is_enabled: AtomicBool,
+    #[cfg(feature = "logging")]
+    cache_name: Option<String>,
+}
+
+impl<K, V> RemovalNotifier<K, V> {
+    pub(crate) fn new(listener: AsyncEvictionListener<K, V>, _cache_name: Option<String>) -> Self {
+        Self {
+            listener,
+            is_enabled: AtomicBool::new(true),
+            #[cfg(feature = "logging")]
+            cache_name: _cache_name,
+        }
+    }
+
+    pub(crate) async fn notify(&self, key: Arc<K>, value: V, cause: RemovalCause) {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        if !self.is_enabled.load(Ordering::Acquire) {
+            return;
+        }
+
+        // This macro unwraps the result of the catch_unwind call if it is Ok. And
+        // disable the notifier and do early return if the listener panicked.
+        macro_rules! try_or_disable {
+            ($match_expr:expr) => {
+                match $match_expr {
+                    Ok(v) => v,
+                    Err(_payload) => {
+                        self.is_enabled.store(false, Ordering::Release);
+                        #[cfg(feature = "logging")]
+                        log_panic(&*_payload, self.cache_name.as_deref());
+                        return;
+                    }
+                }
+            };
+        }
+
+        let listener_clo = || (self.listener)(key, value, cause);
+
+        // Safety: It is safe to assert unwind safety here because we will not
+        // call the listener again if it has been panicked.
+        let fut = try_or_disable!(catch_unwind(AssertUnwindSafe(listener_clo)));
+        try_or_disable!(AssertUnwindSafe(fut).catch_unwind().await);
+    }
+}
+
+#[cfg(feature = "logging")]
+fn log_panic(payload: &(dyn std::any::Any + Send + 'static), cache_name: Option<&str>) {
+    // Try to downcast the payload into &str or String.
+    //
+    // NOTE: Clippy will complain if we use `if let Some(_)` here.
+    // https://rust-lang.github.io/rust-clippy/master/index.html#manual_map
+    let message: Option<std::borrow::Cow<'_, str>> =
+        (payload.downcast_ref::<&str>().map(|s| (*s).into()))
+            .or_else(|| payload.downcast_ref::<String>().map(Into::into));
+
+    let cn = cache_name
+        .map(|name| format!("[{name}] "))
+        .unwrap_or_default();
+
+    if let Some(m) = message {
+        log::error!("{cn}Disabled the eviction listener because it panicked at '{m}'");
+    } else {
+        log::error!("{cn}Disabled the eviction listener because it panicked");
+    }
+}
+use std::{fmt::Debug, sync::Arc};
+
+/// A snapshot of a single entry in the cache.
+///
+/// `Entry` is constructed from the methods like `or_insert` on the struct returned
+/// by cache's `entry` or `entry_by_ref` methods. `Entry` holds the cached key and
+/// value at the time it was constructed. It also carries extra information about the
+/// entry; [`is_fresh`](#method.is_fresh) method returns `true` if the value was not
+/// cached and was freshly computed.
+///
+/// See the followings for more information about `entry` and `entry_by_ref` methods:
+///
+/// - `sync::Cache`:
+///     - [`entry`](./sync/struct.Cache.html#method.entry)
+///     - [`entry_by_ref`](./sync/struct.Cache.html#method.entry_by_ref)
+/// - `future::Cache`:
+///     - [`entry`](./future/struct.Cache.html#method.entry)
+///     - [`entry_by_ref`](./future/struct.Cache.html#method.entry_by_ref)
+///
+pub struct Entry<K, V> {
+    key: Option<Arc<K>>,
+    value: V,
+    is_fresh: bool,
+    is_old_value_replaced: bool,
+}
+
+impl<K, V> Debug for Entry<K, V>
+where
+    K: Debug,
+    V: Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("key", self.key())
+            .field("value", &self.value)
+            .field("is_fresh", &self.is_fresh)
+            .field("is_old_value_replaced", &self.is_old_value_replaced)
+            .finish()
+    }
+}
+
+impl<K, V> Entry<K, V> {
+    pub(crate) fn new(
+        key: Option<Arc<K>>,
+        value: V,
+        is_fresh: bool,
+        is_old_value_replaced: bool,
+    ) -> Self {
+        Self {
+            key,
+            value,
+            is_fresh,
+            is_old_value_replaced,
+        }
+    }
+
+    /// Returns a reference to the wrapped key.
+    pub fn key(&self) -> &K {
+        self.key.as_ref().expect("Bug: Key is None")
+    }
+
+    /// Returns a reference to the wrapped value.
+    ///
+    /// Note that the returned reference is _not_ pointing to the original value in
+    /// the cache. Instead, it is pointing to the cloned value in this `Entry`.
+    pub fn value(&self) -> &V {
+        &self.value
+    }
+
+    /// Consumes this `Entry`, returning the wrapped value.
+    ///
+    /// Note that the returned value is a clone of the original value in the cache.
+    /// It was cloned when this `Entry` was constructed.
+    pub fn into_value(self) -> V {
+        self.value
+    }
+
+    /// Returns `true` if the value in this `Entry` was not cached and was freshly
+    /// computed.
+    pub fn is_fresh(&self) -> bool {
+        self.is_fresh
+    }
+
+    /// Returns `true` if an old value existed in the cache and was replaced by the
+    /// value in this `Entry`.
+    ///
+    /// Note that the new value can be the same as the old value. This method still
+    /// returns `true` in that case.
+    pub fn is_old_value_replaced(&self) -> bool {
+        self.is_old_value_replaced
+    }
+}
+3.3010666666666664 minutes used of 15.0

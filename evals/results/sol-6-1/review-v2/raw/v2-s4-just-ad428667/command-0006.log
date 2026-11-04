@@ -1,0 +1,1256 @@
+use {super::*, CompileErrorKind::*};
+
+#[derive(Default)]
+pub(crate) struct Analyzer<'run, 'src> {
+  aliases: Table<'src, Alias<'src, Namepath<'src>>>,
+  assignments: Vec<&'run Binding<'src, Expression<'src>>>,
+  functions: Vec<&'run FunctionDefinition<'src>>,
+  modules: Table<'src, Justfile<'src>>,
+  recipes: Vec<&'run Recipe<'src, UnresolvedDependency<'src>>>,
+  sets: Table<'src, Set<'src>>,
+  unexports: HashSet<String>,
+  warnings: Vec<Warning>,
+}
+
+impl<'run, 'src> Analyzer<'run, 'src> {
+  pub(crate) fn analyze(
+    asts: &'run HashMap<PathBuf, Ast<'src>>,
+    config: &Config,
+    doc: Option<String>,
+    groups: &[StringLiteral<'src>],
+    loaded: &[PathBuf],
+    name: Option<Name<'src>>,
+    overrides: &mut HashMap<Number, String>,
+    paths: &HashMap<PathBuf, PathBuf>,
+    private: bool,
+    root: &Path,
+  ) -> RunResult<'src, Justfile<'src>> {
+    Self::default().justfile(
+      asts, config, doc, groups, loaded, name, overrides, paths, private, root,
+    )
+  }
+
+  fn justfile(
+    mut self,
+    asts: &'run HashMap<PathBuf, Ast<'src>>,
+    config: &Config,
+    doc: Option<String>,
+    groups: &[StringLiteral<'src>],
+    loaded: &[PathBuf],
+    name: Option<Name<'src>>,
+    overrides: &mut HashMap<Number, String>,
+    paths: &HashMap<PathBuf, PathBuf>,
+    private: bool,
+    root: &Path,
+  ) -> RunResult<'src, Justfile<'src>> {
+    let mut definitions = HashMap::new();
+    let mut imports = HashSet::new();
+    let mut unstable_features = BTreeSet::new();
+
+    let mut stack = Vec::new();
+    let ast = asts.get(root).unwrap();
+    stack.push(ast);
+
+    while let Some(ast) = stack.pop() {
+      unstable_features.extend(&ast.unstable_features);
+
+      for item in &ast.items {
+        match item {
+          Item::Alias(alias) => {
+            Self::define(&mut definitions, alias.name, "alias", false)?;
+            self.aliases.insert(alias.clone());
+          }
+          Item::Assignment(assignment) => {
+            self.assignments.push(assignment);
+          }
+          Item::Comment(_) => (),
+          Item::Function(function) => {
+            self.functions.push(function);
+          }
+          Item::Import { absolute, .. } => {
+            if let Some(absolute) = absolute {
+              if imports.insert(absolute) {
+                stack.push(asts.get(absolute).unwrap());
+              }
+            }
+          }
+          Item::Module {
+            absolute,
+            doc,
+            groups,
+            name,
+            private,
+            ..
+          } => {
+            if let Some(absolute) = absolute {
+              Self::define(&mut definitions, *name, "module", false)?;
+              self.modules.insert(Self::analyze(
+                asts,
+                config,
+                doc.clone(),
+                groups.as_slice(),
+                loaded,
+                Some(*name),
+                overrides,
+                paths,
+                *private,
+                absolute,
+              )?);
+            }
+          }
+          Item::Newline => {}
+          Item::Recipe(recipe) => {
+            if recipe.enabled() {
+              Self::analyze_recipe(recipe)?;
+              self.recipes.push(recipe);
+            }
+          }
+          Item::Set(set) => {
+            self.analyze_set(set)?;
+            self.sets.insert(set.clone());
+          }
+          Item::Unexport { name } => {
+            if !self.unexports.insert(name.lexeme().to_string()) {
+              return Err(
+                name
+                  .error(DuplicateUnexport {
+                    variable: name.lexeme(),
+                  })
+                  .into(),
+              );
+            }
+          }
+        }
+      }
+
+      self.warnings.extend(ast.warnings.iter().cloned());
+    }
+
+    let mut allow_duplicate_variables = false;
+
+    for (_name, set) in &self.sets {
+      if let Setting::AllowDuplicateVariables(value) = set.value {
+        allow_duplicate_variables = value;
+      }
+    }
+
+    let mut assignments: Table<'src, Assignment<'src>> = Table::default();
+    for assignment in self.assignments {
+      let variable = assignment.name.lexeme();
+
+      if !allow_duplicate_variables && assignments.contains_key(variable) {
+        return Err(assignment.name.error(DuplicateVariable { variable }).into());
+      }
+
+      if assignments
+        .get(variable)
+        .is_none_or(|original| assignment.file_depth <= original.file_depth)
+      {
+        assignments.insert(assignment.clone());
+      }
+
+      if self.unexports.contains(variable) {
+        return Err(assignment.name.error(ExportUnexported { variable }).into());
+      }
+    }
+
+    let mut functions = Table::<FunctionDefinition>::default();
+    for function in self.functions {
+      let name = function.name.lexeme();
+      if let Some(first) = functions.get(name) {
+        return Err(
+          function
+            .name
+            .error(Redefinition {
+              first_type: "function",
+              second_type: "function",
+              name,
+              first: first.name.line,
+            })
+            .into(),
+        );
+      }
+      functions.insert(function.clone());
+    }
+
+    AssignmentResolver::resolve_assignments(&assignments, &functions)?;
+
+    for set in self.sets.values() {
+      for expression in set.value.expressions() {
+        for reference in expression.references() {
+          match reference {
+            Reference::Call { name, arguments } => {
+              Analyzer::resolve_call(&functions, name, arguments)?;
+            }
+            Reference::Variable(variable) => {
+              let name = variable.lexeme();
+              if !assignments.contains_key(name) && !constants().contains_key(name) {
+                return Err(variable.error(UndefinedVariable { variable: name }).into());
+              }
+            }
+          }
+        }
+      }
+    }
+
+    let mut unknown_overrides = Vec::new();
+
+    for ((path, name), value) in &config.overrides {
+      if *path == ast.module_path {
+        if let Some(assignment) = assignments.get(name) {
+          overrides.insert(assignment.number, value.clone());
+        } else {
+          unknown_overrides.push(path.join(name));
+        }
+      } else if path.starts_with(&ast.module_path)
+        && !self
+          .modules
+          .contains_key(&path.components[ast.module_path.components.len()])
+      {
+        unknown_overrides.push(format!("{path}::{name}"));
+      }
+    }
+
+    if !unknown_overrides.is_empty() {
+      return Err(Error::UnknownOverrides {
+        overrides: unknown_overrides,
+      });
+    }
+
+    let settings =
+      Evaluator::evaluate_settings(&assignments, overrides, &Scope::root(), self.sets)?;
+
+    let mut deduplicated_recipes = Table::<'src, UnresolvedRecipe<'src>>::default();
+    for recipe in self.recipes {
+      Self::define(
+        &mut definitions,
+        recipe.name,
+        "recipe",
+        settings.allow_duplicate_recipes,
+      )?;
+
+      if deduplicated_recipes
+        .get(recipe.name.lexeme())
+        .is_none_or(|original| recipe.file_depth <= original.file_depth)
+      {
+        deduplicated_recipes.insert(recipe.clone());
+      }
+
+      if !recipe.is_script() {
+        for line in &recipe.body {
+          let sigils = line.sigils(&settings);
+
+          if sigils.contains(&Sigil::Guard) && sigils.contains(&Sigil::Infallible) {
+            let Fragment::Text { token } = line.fragments.first().unwrap() else {
+              unreachable!();
+            };
+            return Err(
+              token
+                .error(CompileErrorKind::GuardAndInfallibleSigil)
+                .into(),
+            );
+          }
+        }
+      }
+    }
+
+    let recipes = RecipeResolver::resolve_recipes(
+      &assignments,
+      &functions,
+      &ast.module_path,
+      &self.modules,
+      &settings,
+      deduplicated_recipes,
+    )?;
+
+    let mut aliases = Table::new();
+    while let Some(alias) = self.aliases.pop() {
+      aliases.insert(Self::resolve_alias(&self.modules, &recipes, alias)?);
+    }
+
+    let source = root.to_owned();
+    let root = paths.get(root).unwrap();
+
+    let mut default = None;
+    for recipe in recipes.values() {
+      if recipe.attributes.contains(AttributeDiscriminant::Default) {
+        if default.is_some() {
+          return Err(
+            recipe
+              .name
+              .error(CompileErrorKind::DuplicateDefault {
+                recipe: recipe.name.lexeme(),
+              })
+              .into(),
+          );
+        }
+
+        default = Some(Arc::clone(recipe));
+      }
+    }
+
+    let default = default.or_else(|| {
+      recipes
+        .values()
+        .filter(|recipe| recipe.name.path == root)
+        .fold(None, |accumulator, next| match accumulator {
+          None => Some(Arc::clone(next)),
+          Some(previous) => Some(if previous.line_number() < next.line_number() {
+            previous
+          } else {
+            Arc::clone(next)
+          }),
+        })
+    });
+
+    Ok(Justfile {
+      aliases,
+      assignments,
+      default,
+      doc: doc.filter(|doc| !doc.is_empty()),
+      functions,
+      groups: groups.into(),
+      loaded: loaded.into(),
+      module_path: ast.module_path.clone(),
+      modules: self.modules,
+      name,
+      private,
+      recipes,
+      settings,
+      source,
+      unexports: self.unexports,
+      unstable_features,
+      warnings: self.warnings,
+      working_directory: ast.working_directory.clone(),
+    })
+  }
+
+  fn define(
+    definitions: &mut HashMap<&'src str, (&'static str, Name<'src>)>,
+    name: Name<'src>,
+    second_type: &'static str,
+    duplicates_allowed: bool,
+  ) -> CompileResult<'src> {
+    if let Some((first_type, original)) = definitions.get(name.lexeme()) {
+      if !(*first_type == second_type && duplicates_allowed) {
+        let ((first_type, second_type), (original, redefinition)) = if name.line < original.line {
+          ((second_type, *first_type), (name, *original))
+        } else {
+          ((*first_type, second_type), (*original, name))
+        };
+
+        return Err(redefinition.token.error(Redefinition {
+          first_type,
+          second_type,
+          name: name.lexeme(),
+          first: original.line,
+        }));
+      }
+    }
+
+    definitions.insert(name.lexeme(), (second_type, name));
+
+    Ok(())
+  }
+
+  fn analyze_recipe(recipe: &UnresolvedRecipe<'src>) -> CompileResult<'src> {
+    let mut parameters = BTreeSet::new();
+    let mut passed_default = false;
+
+    for parameter in &recipe.parameters {
+      if parameters.contains(parameter.name.lexeme()) {
+        return Err(parameter.name.error(DuplicateParameter {
+          recipe: recipe.name.lexeme(),
+          parameter: parameter.name.lexeme(),
+        }));
+      }
+
+      parameters.insert(parameter.name.lexeme());
+
+      if parameter.default.is_some() {
+        passed_default = true;
+      } else if passed_default && parameter.is_required() && !parameter.is_option() {
+        return Err(
+          parameter
+            .name
+            .token
+            .error(RequiredParameterFollowsDefaultParameter {
+              parameter: parameter.name.lexeme(),
+            }),
+        );
+      }
+    }
+
+    let mut continued = false;
+    for line in &recipe.body {
+      if !recipe.is_script() && !continued {
+        if let Some(Fragment::Text { token }) = line.fragments.first() {
+          let text = token.lexeme();
+
+          if text.starts_with(' ') || text.starts_with('\t') {
+use {super::*, CompileErrorKind::*};
+
+pub(crate) struct AssignmentResolver<'src: 'run, 'run> {
+  assignments: &'run Table<'src, Assignment<'src>>,
+  evaluated: BTreeSet<&'src str>,
+  functions: &'run Table<'src, FunctionDefinition<'src>>,
+  stack: Vec<&'src str>,
+}
+
+impl<'src: 'run, 'run> AssignmentResolver<'src, 'run> {
+  pub(crate) fn resolve_assignments(
+    assignments: &'run Table<'src, Assignment<'src>>,
+    functions: &'run Table<'src, FunctionDefinition<'src>>,
+  ) -> CompileResult<'src> {
+    let mut resolver = Self {
+      assignments,
+      evaluated: BTreeSet::new(),
+      functions,
+      stack: Vec::new(),
+    };
+
+    for assignment in assignments.values() {
+      resolver.resolve_assignment(assignment)?;
+    }
+
+    for function in functions.values() {
+      for reference in function.body.references() {
+        resolver.resolve_reference(Some(&function.parameters), reference)?;
+      }
+    }
+
+    Ok(())
+  }
+
+  fn resolve_assignment(&mut self, assignment: &Assignment<'src>) -> CompileResult<'src> {
+    let name = assignment.name.lexeme();
+
+    if self.evaluated.contains(name) {
+      return Ok(());
+    }
+
+    self.stack.push(name);
+
+    for reference in assignment.value.references() {
+      self.resolve_reference(None, reference)?;
+    }
+
+    self.evaluated.insert(name);
+
+    self.stack.pop();
+
+    Ok(())
+  }
+
+  fn resolve_reference(
+    &mut self,
+    parameters: Option<&[(Name<'src>, Number)]>,
+    reference: Reference<'src>,
+  ) -> CompileResult<'src> {
+    match reference {
+      Reference::Call { name, arguments } => {
+        Analyzer::resolve_call(self.functions, name, arguments)
+      }
+      Reference::Variable(name) => self.resolve_variable(parameters, name),
+    }
+  }
+
+  fn resolve_variable(
+    &mut self,
+    parameters: Option<&[(Name<'src>, Number)]>,
+    variable: Name<'src>,
+  ) -> CompileResult<'src> {
+    let name = variable.lexeme();
+
+    if let Some(parameters) = parameters {
+      if parameters
+        .iter()
+        .any(|(parameter, _number)| parameter.lexeme() == name)
+      {
+        return Ok(());
+      }
+    }
+
+    if self.evaluated.contains(name) || constants().contains_key(name) {
+      return Ok(());
+    }
+
+    if self.stack.contains(&name) {
+      self.stack.push(name);
+      return Err(
+        self.assignments[name]
+          .name
+          .error(CircularVariableDependency {
+            variable: name,
+            circle: self.stack.clone(),
+          }),
+      );
+    } else if let Some(assignment) = self.assignments.get(name) {
+      self.resolve_assignment(assignment)?;
+    } else {
+      return Err(variable.error(UndefinedVariable { variable: name }));
+    }
+
+    Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+use super::*;
+
+pub(crate) struct References<'expression, 'src> {
+  stack: Vec<&'expression Expression<'src>>,
+}
+
+impl<'expression, 'src> References<'expression, 'src> {
+  pub(crate) fn new(root: &'expression Expression<'src>) -> Self {
+    Self { stack: vec![root] }
+  }
+}
+
+impl<'src> Iterator for References<'_, 'src> {
+  type Item = Reference<'src>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    loop {
+      match self.stack.pop()? {
+        Expression::And { lhs, rhs } | Expression::Or { lhs, rhs } => {
+          self.stack.push(lhs);
+          self.stack.push(rhs);
+        }
+        Expression::Assert {
+          condition:
+            Condition {
+              lhs,
+              rhs,
+              operator: _,
+            },
+          error,
+          ..
+        } => {
+          self.stack.push(error);
+          self.stack.push(rhs);
+          self.stack.push(lhs);
+        }
+        Expression::Backtick { .. } | Expression::StringLiteral { .. } => {}
+        Expression::Call { name, arguments } => {
+          for arg in arguments.iter().rev() {
+            self.stack.push(arg);
+          }
+          return Some(Reference::Call {
+            name: *name,
+            arguments: arguments.len(),
+          });
+        }
+        Expression::Concatenation { lhs, rhs } => {
+          self.stack.push(rhs);
+          self.stack.push(lhs);
+        }
+        Expression::Conditional {
+          condition:
+            Condition {
+              lhs,
+              rhs,
+              operator: _,
+            },
+          then,
+          otherwise,
+        } => {
+          self.stack.push(otherwise);
+          self.stack.push(then);
+          self.stack.push(rhs);
+          self.stack.push(lhs);
+        }
+        Expression::FormatString { expressions, .. } => {
+          for (expression, _string) in expressions {
+            self.stack.push(expression);
+          }
+        }
+        Expression::Group { contents } => {
+          self.stack.push(contents);
+        }
+        Expression::Join { lhs, rhs } => {
+          self.stack.push(rhs);
+          if let Some(lhs) = lhs {
+            self.stack.push(lhs);
+          }
+        }
+        Expression::Variable { name, .. } => return Some(Reference::Variable(*name)),
+      }
+    }
+  }
+}
+use {super::*, CompileErrorKind::*};
+
+pub(crate) struct RecipeResolver<'src: 'run, 'run> {
+  assignments: &'run Table<'src, Assignment<'src>>,
+  functions: &'run Table<'src, FunctionDefinition<'src>>,
+  modulepath: &'run Modulepath,
+  modules: &'run Table<'src, Justfile<'src>>,
+  resolved_recipes: Table<'src, Arc<Recipe<'src>>>,
+  settings: &'run Settings,
+  unresolved_recipes: Table<'src, UnresolvedRecipe<'src>>,
+}
+
+impl<'src: 'run, 'run> RecipeResolver<'src, 'run> {
+  pub(crate) fn resolve_recipes(
+    assignments: &'run Table<'src, Assignment<'src>>,
+    functions: &'run Table<'src, FunctionDefinition<'src>>,
+    modulepath: &'run Modulepath,
+    modules: &'run Table<'src, Justfile<'src>>,
+    settings: &'run Settings,
+    unresolved_recipes: Table<'src, UnresolvedRecipe<'src>>,
+  ) -> CompileResult<'src, Table<'src, Arc<Recipe<'src>>>> {
+    let mut resolver = Self {
+      assignments,
+      functions,
+      modulepath,
+      modules,
+      resolved_recipes: Table::new(),
+      settings,
+      unresolved_recipes,
+    };
+
+    while let Some(unresolved) = resolver.unresolved_recipes.pop() {
+      resolver.resolve_recipe(&mut Vec::new(), unresolved)?;
+    }
+
+    Ok(resolver.resolved_recipes)
+  }
+
+  fn resolve_recipe(
+    &mut self,
+    stack: &mut Vec<&'src str>,
+    recipe: UnresolvedRecipe<'src>,
+  ) -> CompileResult<'src, Arc<Recipe<'src>>> {
+    if let Some(resolved) = self.resolved_recipes.get(recipe.name()) {
+      return Ok(Arc::clone(resolved));
+    }
+
+    stack.push(recipe.name());
+
+    let dependencies = recipe
+      .dependencies
+      .iter()
+      .map(|dependency| {
+        self
+          .resolve_dependency(dependency, &recipe, stack)?
+          .ok_or_else(|| {
+            dependency.recipe.last().error(UnknownDependency {
+              recipe: recipe.name(),
+              unknown: dependency.recipe.clone(),
+            })
+          })
+      })
+      .collect::<CompileResult<Vec<Arc<Recipe>>>>()?;
+
+    stack.pop();
+
+    let resolved = Arc::new(recipe.resolve(
+      self.assignments,
+      self.functions,
+      self.modulepath,
+      dependencies,
+      self.settings,
+    )?);
+    self.resolved_recipes.insert(Arc::clone(&resolved));
+    Ok(resolved)
+  }
+
+  fn resolve_dependency(
+    &mut self,
+    dependency: &UnresolvedDependency<'src>,
+    recipe: &UnresolvedRecipe<'src>,
+    stack: &mut Vec<&'src str>,
+  ) -> CompileResult<'src, Option<Arc<Recipe<'src>>>> {
+    let name = dependency.recipe.last().lexeme();
+
+    if dependency.recipe.components() > 1 {
+      // recipe is in a submodule and is thus already resolved
+      Ok(Analyzer::resolve_recipe(
+        &dependency.recipe,
+        self.modules,
+        &self.resolved_recipes,
+      ))
+    } else if let Some(resolved) = self.resolved_recipes.get(name) {
+      // recipe is the current module and has already been resolved
+      Ok(Some(Arc::clone(resolved)))
+    } else if stack.contains(&name) {
+      // recipe depends on itself
+      let first = stack[0];
+      stack.push(first);
+      Err(
+        dependency.recipe.last().error(CircularRecipeDependency {
+          recipe: recipe.name(),
+          circle: stack
+            .iter()
+            .skip_while(|name| **name != dependency.recipe.last().lexeme())
+            .copied()
+            .collect(),
+        }),
+      )
+    } else if let Some(unresolved) = self.unresolved_recipes.remove(name) {
+      // recipe is as of yet unresolved
+      Ok(Some(self.resolve_recipe(stack, unresolved)?))
+    } else {
+      // recipe is unknown
+      Ok(None)
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  analysis_error! {
+    name:   circular_recipe_dependency,
+    input:  "a: b\nb: a",
+    offset: 8,
+    line:   1,
+    column: 3,
+    width:  1,
+    kind:   CircularRecipeDependency{recipe: "b", circle: vec!["a", "b", "a"]},
+  }
+
+  analysis_error! {
+    name:   self_recipe_dependency,
+    input:  "a: a",
+    offset: 3,
+    line:   0,
+    column: 3,
+    width:  1,
+    kind:   CircularRecipeDependency{recipe: "a", circle: vec!["a", "a"]},
+  }
+
+  analysis_error! {
+    name:   unknown_dependency,
+    input:  "a: b",
+    offset: 3,
+    line:   0,
+    column: 3,
+    width:  1,
+    kind:   UnknownDependency{
+      recipe: "a",
+      unknown: Namepath::from(Name::from_identifier(
+        Token{
+          column: 3,
+          kind: TokenKind::Identifier,
+          length: 1,
+          line: 0,
+          offset: 3,
+          path: Path::new("justfile"),
+          src: "a: b" }))
+    },
+  }
+
+  analysis_error! {
+    name:   unknown_interpolation_variable,
+    input:  "x:\n {{   hello}}",
+    offset: 9,
+    line:   1,
+    column: 6,
+    width:  5,
+    kind:   UndefinedVariable{variable: "hello"},
+  }
+
+  analysis_error! {
+    name:   unknown_second_interpolation_variable,
+    input:  "wtf:=\"x\"\nx:\n echo\n foo {{wtf}} {{ lol }}",
+    offset: 34,
+    line:   3,
+    column: 16,
+    width:  3,
+    kind:   UndefinedVariable{variable: "lol"},
+  }
+
+  analysis_error! {
+    name:   unknown_variable_in_default,
+    input:  "a f=foo:",
+    offset: 4,
+    line:   0,
+    column: 4,
+    width:  3,
+    kind:   UndefinedVariable{variable: "foo"},
+  }
+
+  analysis_error! {
+    name:   unknown_variable_in_dependency_argument,
+    input:  "bar x:\nfoo: (bar baz)",
+    offset: 17,
+    line:   1,
+    column: 10,
+    width:  3,
+    kind:   UndefinedVariable{variable: "baz"},
+  }
+}
+//! Justfile summary creation, for testing purposes only.
+//!
+//! The contents of this module are not bound by any stability guarantees.
+//! Breaking changes may be introduced at any time.
+//!
+//! The main entry point into this module is the `summary` function, which
+//! parses a justfile at a given path and produces a `Summary` object, which
+//! broadly captures the functionality of the parsed justfile, or an error
+//! message.
+//!
+//! This functionality is intended to be used with `janus`, a tool for ensuring
+//! that changes to just do not inadvertently break or change the interpretation
+//! of existing justfiles.
+
+use {
+  crate::{compiler::Compiler, config::Config, error::Error, loader::Loader},
+  std::{collections::BTreeMap, io, path::Path},
+};
+
+mod full {
+  pub(crate) use crate::{
+    assignment::Assignment, condition::Condition, conditional_operator::ConditionalOperator,
+    dependency::Dependency, expression::Expression, fragment::Fragment, justfile::Justfile,
+    line::Line, parameter::Parameter, parameter_kind::ParameterKind, recipe::Recipe,
+  };
+}
+
+pub fn summary(path: &Path) -> io::Result<Result<Summary, String>> {
+  let loader = Loader::new();
+
+  match Compiler::compile(&Config::new().unwrap(), &loader, path) {
+    Ok(compilation) => Ok(Ok(Summary::new(&compilation.justfile))),
+    Err(error) => Ok(Err(if let Error::Compile { compile_error } = error {
+      compile_error.to_string()
+    } else {
+      format!("{error:?}")
+    })),
+  }
+}
+
+#[derive(Eq, PartialEq, Hash, Ord, PartialOrd, Debug, Clone)]
+pub struct Summary {
+  pub assignments: BTreeMap<String, Assignment>,
+  pub recipes: BTreeMap<String, Recipe>,
+}
+
+impl Summary {
+  fn new(justfile: &full::Justfile) -> Self {
+    let mut aliases = BTreeMap::new();
+
+    for alias in justfile.aliases.values() {
+      aliases
+        .entry(alias.target.name())
+        .or_insert_with(Vec::new)
+        .push(alias.name.to_string());
+    }
+
+    Self {
+      recipes: justfile
+        .recipes
+        .iter()
+        .map(|(name, recipe)| {
+          (
+            (*name).to_string(),
+            Recipe::new(recipe, aliases.remove(name).unwrap_or_default()),
+          )
+        })
+        .collect(),
+      assignments: justfile
+        .assignments
+        .iter()
+        .map(|(name, assignment)| ((*name).to_owned(), Assignment::new(assignment)))
+        .collect(),
+    }
+  }
+}
+
+#[derive(Eq, PartialEq, Hash, Ord, PartialOrd, Debug, Clone)]
+pub struct Recipe {
+  pub aliases: Vec<String>,
+  pub dependencies: Vec<Dependency>,
+  pub lines: Vec<Line>,
+  pub parameters: Vec<Parameter>,
+  pub private: bool,
+  pub quiet: bool,
+  pub shebang: bool,
+}
+
+impl Recipe {
+  fn new(recipe: &full::Recipe, aliases: Vec<String>) -> Self {
+    Self {
+      aliases,
+      dependencies: recipe.dependencies.iter().map(Dependency::new).collect(),
+      lines: recipe.body.iter().map(Line::new).collect(),
+      parameters: recipe.parameters.iter().map(Parameter::new).collect(),
+      private: recipe.private,
+      quiet: recipe.quiet,
+      shebang: recipe.shebang,
+    }
+  }
+}
+
+#[derive(Eq, PartialEq, Hash, Ord, PartialOrd, Debug, Clone)]
+pub struct Parameter {
+  pub default: Option<Expression>,
+  pub kind: ParameterKind,
+  pub name: String,
+}
+
+impl Parameter {
+  fn new(parameter: &full::Parameter) -> Self {
+    Self {
+      kind: ParameterKind::new(parameter.kind),
+      name: parameter.name.lexeme().to_owned(),
+      default: parameter.default.as_ref().map(Expression::new),
+    }
+  }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub enum ParameterKind {
+  Plus,
+  Singular,
+  Star,
+}
+
+impl ParameterKind {
+  fn new(parameter_kind: full::ParameterKind) -> Self {
+    match parameter_kind {
+      full::ParameterKind::Singular => Self::Singular,
+      full::ParameterKind::Plus => Self::Plus,
+      full::ParameterKind::Star => Self::Star,
+    }
+  }
+}
+
+#[derive(Eq, PartialEq, Hash, Ord, PartialOrd, Debug, Clone)]
+pub struct Line {
+  pub fragments: Vec<Fragment>,
+}
+
+impl Line {
+  fn new(line: &full::Line) -> Self {
+    Self {
+      fragments: line.fragments.iter().map(Fragment::new).collect(),
+    }
+  }
+}
+
+#[derive(Eq, PartialEq, Hash, Ord, PartialOrd, Debug, Clone)]
+pub enum Fragment {
+  Expression { expression: Expression },
+  Text { text: String },
+}
+
+impl Fragment {
+  fn new(fragment: &full::Fragment) -> Self {
+    match fragment {
+      full::Fragment::Text { token } => Self::Text {
+        text: token.lexeme().to_owned(),
+use {
+  super::*,
+  clap::{
+    ArgAction, Args, Parser,
+    builder::{
+      FalseyValueParser, Styles,
+      styling::{AnsiColor, Effects},
+    },
+  },
+};
+
+#[derive(Debug, Parser)]
+#[command(
+  about = concat!(env!("CARGO_PKG_DESCRIPTION"), " - ", env!("CARGO_PKG_HOMEPAGE")),
+  author = env!("CARGO_PKG_AUTHORS"),
+  bin_name = env!("CARGO_PKG_NAME"),
+  name = env!("CARGO_PKG_NAME"),
+  styles = Styles::styled()
+    .error(AnsiColor::Red.on_default() | Effects::BOLD)
+    .header(AnsiColor::Yellow.on_default() | Effects::BOLD)
+    .invalid(AnsiColor::Red.on_default())
+    .literal(AnsiColor::Green.on_default())
+    .placeholder(AnsiColor::Cyan.on_default())
+    .usage(AnsiColor::Yellow.on_default() | Effects::BOLD)
+    .valid(AnsiColor::Green.on_default()),
+  trailing_var_arg = true,
+  version = env!("CARGO_PKG_VERSION"),
+)]
+pub struct Arguments {
+  #[arg(
+    conflicts_with = "no_aliases",
+    default_value = "right",
+    env = "JUST_ALIAS_STYLE",
+    help = "Set list command alias display style",
+    long,
+    value_enum
+  )]
+  pub(crate) alias_style: AliasStyle,
+  #[arg(
+    env = "JUST_ALLOW_MISSING",
+    help = "Ignore missing recipe and module errors",
+    long
+  )]
+  pub(crate) allow_missing: bool,
+  #[arg(
+    add = ArgValueCompleter::new(Completer::complete_argument),
+    help = "Overrides and recipe(s) to run, defaulting to the first recipe in the justfile",
+    num_args = 1..,
+  )]
+  pub(crate) arguments: Vec<String>,
+  #[arg(
+    add = ArgValueCompleter::new(PathCompleter::dir()),
+    env = "JUST_CEILING",
+    help = "Do not ascend above <CEILING> directory when searching for a justfile.",
+    long,
+    value_name = "CEILING"
+  )]
+  pub(crate) ceiling: Option<PathBuf>,
+  #[arg(
+    help = "Run `--fmt` in 'check' mode. Exits with 0 if justfile is formatted correctly. \
+            Exits with 1 and prints a diff if formatting is required.",
+    long,
+    requires = "fmt"
+  )]
+  pub(crate) check: bool,
+  #[arg(
+    add = ArgValueCompleter::new(PathCompleter::file()),
+    env = "JUST_CHOOSER",
+    help = "Override binary invoked by `--choose`",
+    long
+  )]
+  pub(crate) chooser: Option<PathBuf>,
+  #[arg(help = "Clear shell arguments", long, overrides_with = "shell_arg")]
+  pub(crate) clear_shell_args: bool,
+  #[arg(
+    default_value = "auto",
+    env = "JUST_COLOR",
+    help = "Print colorful output",
+    long,
+    value_enum
+  )]
+  pub(crate) color: UseColor,
+  #[arg(
+    env = "JUST_COMMAND_COLOR",
+    help = "Echo recipe lines in <COMMAND-COLOR>",
+    long,
+    value_enum
+  )]
+  pub(crate) command_color: Option<CommandColor>,
+  #[arg(
+    env = "JUST_COMPLETE_ALIASES",
+    help = "Auto-complete recipe aliases",
+    long
+  )]
+  pub(crate) complete_aliases: bool,
+  #[arg(
+    add = ArgValueCompleter::new(PathCompleter::file()),
+    default_value = Self::DEFAULT_CYGPATH,
+    env = "JUST_CYGPATH",
+    help = "Use binary at <CYGPATH> to convert between unix and Windows paths.",
+name: CI
+
+on:
+  pull_request:
+    branches:
+    - '*'
+  push:
+    branches:
+    - master
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  RUSTFLAGS: --deny warnings
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Clippy
+      run: cargo clippy --all --all-targets
+
+    - name: Format
+      run: cargo fmt --all -- --check
+
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install ripgrep shellcheck
+
+    - name: Check for Forbidden Words
+      run: ./bin/forbid
+
+    - name: Check Install Script
+      run: shellcheck www/install.sh
+
+  msrv:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - uses: actions-rust-lang/setup-rust-toolchain@v1
+      with:
+        toolchain: 1.85.0
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Check
+      run: cargo check
+
+  pages:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Install `mdbook`
+      run: cargo install --locked mdbook@0.4.52
+
+    - name: Install `mdbook-linkcheck`
+      run: cargo install --locked mdbook-linkcheck@0.7.7
+
+    - name: Build book
+      run: |
+        cargo run --package generate-book
+        mdbook build book/en
+        mdbook build book/zh
+
+  test:
+    strategy:
+      matrix:
+        os:
+        - ubuntu-latest
+        - macos-latest
+        - windows-latest
+
+    runs-on: ${{matrix.os}}
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Remove Broken WSL bash executable
+      if: ${{ matrix.os == 'windows-latest' }}
+      shell: cmd
+      run: |
+        takeown /F C:\Windows\System32\bash.exe
+        icacls C:\Windows\System32\bash.exe /grant administrators:F
+        del C:\Windows\System32\bash.exe
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Test
+      run: cargo test --all
+
+    - name: Test install.sh
+      run: |
+        bash www/install.sh --to /tmp --tag 1.25.0
+        /tmp/just --version
+#!/usr/bin/env -S just --justfile
+# ^ A shebang isn't required, but allows a justfile to be executed
+#   like a script, with `./justfile test`, for example.
+
+alias t := test
+
+log := "warn"
+
+export JUST_LOG := log
+
+[group: 'dev']
+watch +args='test':
+  cargo watch --clear --exec '{{ args }}'
+
+[group: 'test']
+test:
+  cargo test --all
+
+[group: 'check']
+ci: test clippy build-book forbid
+  cargo fmt --all -- --check
+  cargo update --locked --package just
+
+[group: 'check']
+fuzz:
+  cargo +nightly fuzz run fuzz-compiler
+
+[group: 'misc']
+run:
+  cargo run
+
+# only run tests matching `PATTERN`
+[group: 'test']
+filter PATTERN:
+  cargo test {{PATTERN}}
+
+[group: 'misc']
+build:
+  cargo build
+
+[group: 'misc']
+fmt:
+  cargo fmt --all
+
+[group: 'check']
+shellcheck:
+  shellcheck www/install.sh
+
+[group: 'doc']
+man:
+  mkdir -p man
+  cargo run -- --man > man/just.1
+
+[group: 'doc']
+view-man: man
+  man man/just.1
+
+# add git log messages to changelog
+[group: 'release']
+update-changelog:
+  echo >> CHANGELOG.md
+  git log --pretty='format:- %s' >> CHANGELOG.md
+
+[group: 'release']
+update-contributors:
+  cargo run --release --package update-contributors
+
+[group: 'check']
+action-versions:
+  cargo run --package action-versions
+
+[group: 'check']
+outdated:
+  cargo outdated -R
+
+[group: 'check']
+unused:
+  cargo +nightly udeps --workspace
+
+# publish current GitHub master branch
+[group: 'release']
+publish:
+  #!/usr/bin/env bash
+  set -euxo pipefail
+  rm -rf tmp/release
+  git clone --depth 1 <email>:casey/just.git tmp/release
+  cd tmp/release
+  ! grep '<sup>master</sup>' README.md
+  VERSION=`sed -En 's/version[[:space:]]*=[[:space:]]*"([^"]+)"/\1/p' Cargo.toml | head -1`
+  git tag -a $VERSION -m "Release $VERSION"
+  git push origin $VERSION
+  cargo publish
+  cd ../..
+  rm -rf tmp/release
+
+[group: 'release']
+readme-version-notes:
+  grep '<sup>master</sup>' README.md
+
+# clean up feature branch BRANCH

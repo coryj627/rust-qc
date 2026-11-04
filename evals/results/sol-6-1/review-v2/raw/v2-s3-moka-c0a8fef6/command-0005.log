@@ -1,0 +1,974 @@
+use equivalent::Equivalent;
+
+use super::{cache::Cache, CacheBuilder, OwnedKeyEntrySelector, RefKeyEntrySelector};
+use crate::common::concurrent::Weigher;
+use crate::common::time::Clock;
+use crate::{
+    common::{
+        iter::{Iter, ScanningGet},
+        HousekeeperConfig,
+    },
+    notification::EvictionListener,
+    policy::{EvictionPolicy, ExpirationPolicy},
+    Entry, Policy, PredicateError,
+};
+
+use std::{
+    collections::hash_map::RandomState,
+    fmt,
+    hash::{BuildHasher, Hash, Hasher},
+    sync::Arc,
+};
+
+/// A thread-safe concurrent in-memory cache, with multiple internal segments.
+///
+/// `SegmentedCache` has multiple internal [`Cache`][cache-struct] instances for
+/// increased concurrent update performance. However, it has little overheads on
+/// retrievals and updates for managing these segments.
+///
+/// For usage examples, see the document of the [`Cache`][cache-struct].
+///
+/// [cache-struct]: ./struct.Cache.html
+///
+pub struct SegmentedCache<K, V, S = RandomState> {
+    inner: Arc<Inner<K, V, S>>,
+}
+
+unsafe impl<K, V, S> Send for SegmentedCache<K, V, S>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+    S: Send,
+{
+}
+
+unsafe impl<K, V, S> Sync for SegmentedCache<K, V, S>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+    S: Sync,
+{
+}
+
+impl<K, V, S> Clone for SegmentedCache<K, V, S> {
+    /// Makes a clone of this shared cache.
+    ///
+    /// This operation is cheap as it only creates thread-safe reference counted
+    /// pointers to the shared internal data structures.
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<K, V, S> fmt::Debug for SegmentedCache<K, V, S>
+where
+    K: fmt::Debug + Eq + Hash + Send + Sync + 'static,
+    V: fmt::Debug + Clone + Send + Sync + 'static,
+    // TODO: Remove these bounds from S.
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut d_map = f.debug_map();
+
+        for (k, v) in self {
+            d_map.entry(&k, &v);
+        }
+
+        d_map.finish()
+    }
+}
+
+impl<K, V> SegmentedCache<K, V, RandomState>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    /// Constructs a new `SegmentedCache<K, V>` that has multiple internal
+    /// segments and will store up to the `max_capacity`.
+    ///
+    /// To adjust various configuration knobs such as `initial_capacity` or
+    /// `time_to_live`, use the [`CacheBuilder`][builder-struct].
+    ///
+    /// [builder-struct]: ./struct.CacheBuilder.html
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is 0.
+    pub fn new(max_capacity: u64, num_segments: usize) -> Self {
+        let build_hasher = RandomState::default();
+        Self::with_everything(
+            None,
+            Some(max_capacity),
+            None,
+            num_segments,
+            build_hasher,
+            None,
+            EvictionPolicy::default(),
+            None,
+            ExpirationPolicy::default(),
+            HousekeeperConfig::default(),
+            false,
+            Clock::default(),
+        )
+    }
+
+    /// Returns a [`CacheBuilder`][builder-struct], which can builds a
+    /// `SegmentedCache` with various configuration knobs.
+    ///
+    /// [builder-struct]: ./struct.CacheBuilder.html
+    pub fn builder(num_segments: usize) -> CacheBuilder<K, V, SegmentedCache<K, V, RandomState>> {
+        CacheBuilder::default().segments(num_segments)
+    }
+}
+
+impl<K, V, S> SegmentedCache<K, V, S> {
+    /// Returns cache’s name.
+    pub fn name(&self) -> Option<&str> {
+        self.inner.segments[0].name()
+    }
+
+    /// Returns a read-only cache policy of this cache.
+    ///
+    /// At this time, cache policy cannot be modified after cache creation.
+    /// A future version may support to modify it.
+    pub fn policy(&self) -> Policy {
+        let mut policy = self.inner.segments[0].policy();
+        policy.set_max_capacity(self.inner.desired_capacity);
+        policy.set_num_segments(self.inner.segments.len());
+        policy
+    }
+
+    /// Returns an approximate number of entries in this cache.
+    ///
+    /// The value returned is _an estimate_; the actual count may differ if there are
+    /// concurrent insertions or removals, or if some entries are pending removal due
+    /// to expiration. This inaccuracy can be mitigated by performing a
+    /// `run_pending_tasks` first.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use moka::sync::SegmentedCache;
+    ///
+    /// let cache = SegmentedCache::new(10, 4);
+    /// cache.insert('n', "Netherland Dwarf");
+    /// cache.insert('l', "Lop Eared");
+    /// cache.insert('d', "Dutch");
+    ///
+    /// // Ensure an entry exists.
+    /// assert!(cache.contains_key(&'n'));
+    ///
+    /// // However, followings may print stale number zeros instead of threes.
+    /// println!("{}", cache.entry_count());   // -> 0
+    /// println!("{}", cache.weighted_size()); // -> 0
+    ///
+    /// // To mitigate the inaccuracy, call `run_pending_tasks` method to run
+    /// // pending internal tasks.
+    /// cache.run_pending_tasks();
+    ///
+    /// // Followings will print the actual numbers.
+    /// println!("{}", cache.entry_count());   // -> 3
+    /// println!("{}", cache.weighted_size()); // -> 3
+    /// ```
+    ///
+    pub fn entry_count(&self) -> u64 {
+        self.inner
+            .segments
+            .iter()
+            .map(|seg| seg.entry_count())
+            .sum()
+    }
+
+    /// Returns an approximate total weighted size of entries in this cache.
+    ///
+    /// The value returned is _an estimate_; the actual size may differ if there are
+    /// concurrent insertions or removals, or if some entries are pending removal due
+    /// to expiration. This inaccuracy can be mitigated by performing a
+    /// `run_pending_tasks` first. See [`entry_count`](#method.entry_count) for a
+    /// sample code.
+    pub fn weighted_size(&self) -> u64 {
+        self.inner
+            .segments
+            .iter()
+            .map(|seg| seg.weighted_size())
+            .sum()
+    }
+}
+
+impl<K, V, S> SegmentedCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is 0.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_everything(
+        name: Option<String>,
+        max_capacity: Option<u64>,
+        initial_capacity: Option<usize>,
+        num_segments: usize,
+        build_hasher: S,
+        weigher: Option<Weigher<K, V>>,
+        eviction_policy: EvictionPolicy,
+        eviction_listener: Option<EvictionListener<K, V>>,
+        expiration_policy: ExpirationPolicy<K, V>,
+        housekeeper_config: HousekeeperConfig,
+        invalidator_enabled: bool,
+        clock: Clock,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Inner::new(
+                name,
+                max_capacity,
+                initial_capacity,
+                num_segments,
+                build_hasher,
+                weigher,
+                eviction_policy,
+                eviction_listener,
+                expiration_policy,
+                housekeeper_config,
+                invalidator_enabled,
+                clock,
+            )),
+        }
+    }
+
+    /// Returns `true` if the cache contains a value for the key.
+    ///
+    /// Unlike the `get` method, this method is not considered a cache read operation,
+    /// so it does not update the historic popularity estimator or reset the idle
+    /// timer for the key.
+    ///
+    /// The key may be any borrowed form of the cache's key type, but `Hash` and `Eq`
+    /// on the borrowed form _must_ match those for the key type.
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+        Q: Equivalent<K> + ToOwned<Owned = K> + Hash + ?Sized,
+    {
+        let hash = self.inner.hash(key);
+        self.inner
+            .select(hash)
+            .get_or_try_insert_with_hash_by_ref_and_fun(key, hash, init, false)
+            .map(Entry::into_value)
+    }
+
+    /// Inserts a key-value pair into the cache.
+    ///
+    /// If the cache has this key present, the value is updated.
+    pub fn insert(&self, key: K, value: V) {
+        let hash = self.inner.hash(&key);
+        let key = Arc::new(key);
+        self.inner.select(hash).insert_with_hash(key, hash, value);
+    }
+
+    /// Discards any cached value for the key.
+    ///
+    /// If you need to get a the value that has been discarded, use the
+    /// [`remove`](#method.remove) method instead.
+    ///
+    /// The key may be any borrowed form of the cache's key type, but `Hash` and `Eq`
+    /// on the borrowed form _must_ match those for the key type.
+    pub fn invalidate<Q>(&self, key: &Q)
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        let hash = self.inner.hash(key);
+        self.inner
+            .select(hash)
+            .invalidate_with_hash(key, hash, false);
+    }
+
+    /// Discards any cached value for the key and returns a clone of the value.
+    ///
+    /// If you do not need to get the value that has been discarded, use the
+    /// [`invalidate`](#method.invalidate) method instead.
+    ///
+    /// The key may be any borrowed form of the cache's key type, but `Hash` and `Eq`
+    /// on the borrowed form _must_ match those for the key type.
+    pub fn remove<Q>(&self, key: &Q) -> Option<V>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        let hash = self.inner.hash(key);
+        self.inner
+            .select(hash)
+            .invalidate_with_hash(key, hash, true)
+    }
+
+    /// Discards all cached values.
+    ///
+    /// This method returns immediately by just setting the current time as the
+    /// invalidation time. `get` and other retrieval methods are guaranteed not to
+    /// return the entries inserted before or at the invalidation time.
+    ///
+    /// The actual removal of the invalidated entries is done as a maintenance task
+    /// driven by a user thread. For more details, see
+    /// [the Maintenance Tasks section](../index.html#maintenance-tasks) in the crate
+    /// level documentation.
+    ///
+    /// Like the `invalidate` method, this method does not clear the historic
+    /// popularity estimator of keys so that it retains the client activities of
+    /// trying to retrieve an item.
+    pub fn invalidate_all(&self) {
+        for segment in self.inner.segments.iter() {
+            segment.invalidate_all();
+        }
+    }
+
+    /// Discards cached values that satisfy a predicate.
+    ///
+    /// `invalidate_entries_if` takes a closure that returns `true` or `false`. The
+    /// closure is called against each cached entry inserted before or at the time
+    /// when this method was called. If the closure returns `true` that entry will be
+    /// evicted from the cache.
+    ///
+    /// This method returns immediately by not actually removing the invalidated
+    /// entries. Instead, it just sets the predicate to the cache with the time when
+    /// this method was called. The actual removal of the invalidated entries is done
+    /// as a maintenance task driven by a user thread. For more details, see
+    /// [the Maintenance Tasks section](../index.html#maintenance-tasks) in the crate
+    /// level documentation.
+    ///
+    /// Also the `get` and other retrieval methods will apply the closure to a cached
+    /// entry to determine if it should have been invalidated. Therefore, it is
+    /// guaranteed that these methods must not return invalidated values.
+    ///
+    /// Note that you must call
+    /// [`CacheBuilder::support_invalidation_closures`][support-invalidation-closures]
+    /// at the cache creation time as the cache needs to maintain additional internal
+    /// data structures to support this method. Otherwise, calling this method will
+    /// fail with a
+    /// [`PredicateError::InvalidationClosuresDisabled`][invalidation-disabled-error].
+    ///
+    /// Like the `invalidate` method, this method does not clear the historic
+    /// popularity estimator of keys so that it retains the client activities of
+    /// trying to retrieve an item.
+    ///
+    /// [support-invalidation-closures]:
+    ///     ./struct.CacheBuilder.html#method.support_invalidation_closures
+    /// [invalidation-disabled-error]:
+    ///     ../enum.PredicateError.html#variant.InvalidationClosuresDisabled
+    pub fn invalidate_entries_if<F>(&self, predicate: F) -> Result<(), PredicateError>
+    where
+        F: Fn(&K, &V) -> bool + Send + Sync + 'static,
+    {
+        let pred = Arc::new(predicate);
+        for segment in self.inner.segments.iter() {
+            segment.invalidate_entries_with_arc_fun(Arc::clone(&pred))?;
+        }
+        Ok(())
+    }
+
+    /// Creates an iterator visiting all key-value pairs in arbitrary order. The
+    /// iterator element type is `(Arc<K>, V)`, where `V` is a clone of a stored
+    /// value.
+    ///
+    /// Iterators do not block concurrent reads and writes on the cache. An entry can
+    /// be inserted to, invalidated or evicted from a cache while iterators are alive
+    /// on the same cache.
+    ///
+    /// Unlike the `get` method, visiting entries via an iterator do not update the
+    /// historic popularity estimator or reset idle timers for keys.
+    ///
+    /// # Guarantees
+    ///
+    /// In order to allow concurrent access to the cache, iterator's `next` method
+    /// does _not_ guarantee the following:
+    ///
+    /// - It does not guarantee to return a key-value pair (an entry) if its key has
+    ///   been inserted to the cache _after_ the iterator was created.
+    ///   - Such an entry may or may not be returned depending on key's hash and
+    ///     timing.
+    ///
+    /// and the `next` method guarantees the followings:
+    ///
+    /// - It guarantees not to return the same entry more than once.
+    /// - It guarantees not to return an entry if it has been removed from the cache
+    ///   after the iterator was created.
+    ///     - Note: An entry can be removed by following reasons:
+    ///         - Manually invalidated.
+    ///         - Expired (e.g. time-to-live).
+    ///         - Evicted as the cache capacity exceeded.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use moka::sync::SegmentedCache;
+    ///
+    /// let cache = SegmentedCache::new(100, 4);
+    /// cache.insert("Julia", 14);
+    ///
+    /// let mut iter = cache.iter();
+    /// let (k, v) = iter.next().unwrap(); // (Arc<K>, V)
+    /// assert_eq!(*k, "Julia");
+    /// assert_eq!(v, 14);
+    ///
+    /// assert!(iter.next().is_none());
+    /// ```
+    ///
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        let num_cht_segments = self.inner.segments[0].num_cht_segments();
+        let segments = self
+            .inner
+            .segments
+            .iter()
+            .map(|c| c as &dyn ScanningGet<_, _>)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Iter::with_multiple_cache_segments(segments, num_cht_segments)
+    }
+
+    /// Performs any pending maintenance operations needed by the cache.
+    pub fn run_pending_tasks(&self) {
+        for segment in self.inner.segments.iter() {
+            segment.run_pending_tasks();
+        }
+    }
+}
+
+impl<'a, K, V, S> IntoIterator for &'a SegmentedCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    type Item = (Arc<K>, V);
+
+    type IntoIter = Iter<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+// For unit tests.
+#[cfg(test)]
+impl<K, V, S> SegmentedCache<K, V, S> {
+    fn is_waiter_map_empty(&self) -> bool {
+        self.inner.segments.iter().all(Cache::is_waiter_map_empty)
+    }
+}
+
+#[cfg(test)]
+impl<K, V, S> SegmentedCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn invalidation_predicate_count(&self) -> usize {
+        self.inner
+            .segments
+            .iter()
+            .map(|seg| seg.invalidation_predicate_count())
+            .sum()
+    }
+
+    fn reconfigure_for_testing(&mut self) {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("There are other strong reference to self.inner Arc");
+
+        for segment in inner.segments.iter_mut() {
+            segment.reconfigure_for_testing();
+        }
+    }
+
+    fn key_locks_map_is_empty(&self) -> bool {
+        self.inner
+            .segments
+            .iter()
+            .all(|seg| seg.key_locks_map_is_empty())
+    }
+}
+
+struct Inner<K, V, S> {
+    desired_capacity: Option<u64>,
+    segments: Box<[Cache<K, V, S>]>,
+    build_hasher: S,
+    segment_shift: u32,
+}
+
+impl<K, V, S> Inner<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+use parking_lot::RwLock;
+use std::{
+    any::{Any, TypeId},
+    fmt,
+    hash::{BuildHasher, Hash},
+    sync::Arc,
+};
+
+use crate::{
+    common::concurrent::arc::MiniArc,
+    ops::compute::{CompResult, Op},
+    Entry,
+};
+
+use super::{Cache, ComputeNone, OptionallyNone};
+
+const WAITER_MAP_NUM_SEGMENTS: usize = 64;
+
+type ErrorObject = Arc<dyn Any + Send + Sync + 'static>;
+
+// type WaiterValue<V> = Option<Result<V, ErrorObject>>;
+enum WaiterValue<V> {
+    Computing,
+    Ready(Result<V, ErrorObject>),
+    ReadyNone,
+    // https://github.com/moka-rs/moka/issues/43
+    InitClosurePanicked,
+}
+
+impl<V> fmt::Debug for WaiterValue<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WaiterValue::Computing => write!(f, "Computing"),
+            WaiterValue::Ready(_) => write!(f, "Ready"),
+            WaiterValue::ReadyNone => write!(f, "ReadyNone"),
+            WaiterValue::InitClosurePanicked => write!(f, "InitFuturePanicked"),
+        }
+    }
+}
+
+type Waiter<V> = MiniArc<RwLock<WaiterValue<V>>>;
+
+pub(crate) enum InitResult<V, E> {
+    Initialized(V),
+    ReadExisting(V),
+    InitErr(Arc<E>),
+}
+
+pub(crate) struct ValueInitializer<K, V, S> {
+    // TypeId is the type ID of the concrete error type of generic type E in the
+    // try_get_with method. We use the type ID as a part of the key to ensure that
+    // we can always downcast the trait object ErrorObject (in Waiter<V>) into
+    // its concrete type.
+    waiters: crate::cht::SegmentedHashMap<(Arc<K>, TypeId), Waiter<V>, S>,
+}
+
+impl<K, V, S> ValueInitializer<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn with_hasher(hasher: S) -> Self {
+        Self {
+            waiters: crate::cht::SegmentedHashMap::with_num_segments_and_hasher(
+                WAITER_MAP_NUM_SEGMENTS,
+                hasher,
+            ),
+        }
+    }
+
+    /// # Panics
+    /// Panics if the `init` closure has been panicked.
+    pub(crate) fn try_init_or_read<O, E>(
+        &self,
+        key: &Arc<K>,
+        type_id: TypeId,
+        // Closure to get an existing value from cache.
+        mut get: impl FnMut() -> Option<V>,
+        // Closure to initialize a new value.
+        init: impl FnOnce() -> O,
+        // Closure to insert a new value into cache.
+        mut insert: impl FnMut(V),
+        // Function to convert a value O, returned from the init future, into
+        // Result<V, E>.
+        post_init: fn(O) -> Result<V, E>,
+    ) -> InitResult<V, E>
+    where
+        E: Send + Sync + 'static,
+    {
+        use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+        use InitResult::{InitErr, ReadExisting};
+
+        const MAX_RETRIES: usize = 200;
+        let mut retries = 0;
+
+        let (w_key, w_hash) = self.waiter_key_hash(key, type_id);
+
+        let waiter = MiniArc::new(RwLock::new(WaiterValue::Computing));
+        let mut lock = waiter.write();
+
+        loop {
+            let Some(existing_waiter) = self.try_insert_waiter(w_key.clone(), w_hash, &waiter)
+            else {
+                // Inserted.
+                break;
+            };
+
+            // Somebody else's waiter already exists, so wait for its result to become available.
+            let waiter_result = existing_waiter.read();
+            match &*waiter_result {
+                WaiterValue::Ready(Ok(value)) => return ReadExisting(value.clone()),
+                WaiterValue::Ready(Err(e)) => return InitErr(Arc::clone(e).downcast().unwrap()),
+                // Somebody else's init closure has been panicked.
+                WaiterValue::InitClosurePanicked => {
+                    retries += 1;
+                    assert!(
+                        retries < MAX_RETRIES,
+                        "Too many retries. Tried to read the return value from the `init` \
+                        closure but failed {retries} times. Maybe the `init` kept panicking?"
+                    );
+
+                    // Retry from the beginning.
+                    continue;
+                }
+                // Unexpected state.
+                s @ (WaiterValue::Computing | WaiterValue::ReadyNone) => panic!(
+                    "Got unexpected state `{s:?}` after resolving `init` future. \
+                    This might be a bug in Moka"
+                ),
+            }
+        }
+
+        // Our waiter was inserted.
+
+        // Check if the value has already been inserted by other thread.
+        if let Some(value) = get() {
+            // Yes. Set the waiter value, remove our waiter, and return
+            // the existing value.
+            *lock = WaiterValue::Ready(Ok(value.clone()));
+            self.remove_waiter(w_key, w_hash);
+            return InitResult::ReadExisting(value);
+        }
+
+        // The value still does note exist. Let's evaluate the init
+        // closure. Catching panic is safe here as we do not try to
+        // evaluate the closure again.
+        match catch_unwind(AssertUnwindSafe(init)) {
+            // Evaluated.
+            Ok(value) => {
+                let init_res = match post_init(value) {
+                    Ok(value) => {
+                        insert(value.clone());
+                        *lock = WaiterValue::Ready(Ok(value.clone()));
+                        InitResult::Initialized(value)
+                    }
+                    Err(e) => {
+                        let err: ErrorObject = Arc::new(e);
+                        *lock = WaiterValue::Ready(Err(Arc::clone(&err)));
+                        InitResult::InitErr(err.downcast().unwrap())
+                    }
+                };
+                self.remove_waiter(w_key, w_hash);
+                init_res
+            }
+            // Panicked.
+            Err(payload) => {
+                *lock = WaiterValue::InitClosurePanicked;
+                // Remove the waiter so that others can retry.
+                self.remove_waiter(w_key, w_hash);
+                resume_unwind(payload);
+            }
+        }
+        // The write lock will be unlocked here.
+    }
+
+    /// # Panics
+    /// Panics if the `init` closure has been panicked.
+    pub(crate) fn try_compute<F, O, E>(
+        &self,
+        c_key: Arc<K>,
+        c_hash: u64,
+        cache: &Cache<K, V, S>,
+        f: F,
+        post_init: fn(O) -> Result<Op<V>, E>,
+        allow_nop: bool,
+    ) -> Result<CompResult<K, V>, E>
+    where
+        V: 'static,
+        F: FnOnce(Option<Entry<K, V>>) -> O,
+        E: Send + Sync + 'static,
+    {
+        use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+
+        let type_id = TypeId::of::<ComputeNone>();
+        let (w_key, w_hash) = self.waiter_key_hash(&c_key, type_id);
+        let waiter = MiniArc::new(RwLock::new(WaiterValue::Computing));
+        // NOTE: We have to acquire a write lock before `try_insert_waiter`,
+        // so that any concurrent attempt will get our lock and wait on it.
+        let mut lock = waiter.write();
+
+        loop {
+            let Some(existing_waiter) = self.try_insert_waiter(w_key.clone(), w_hash, &waiter)
+            else {
+                // Inserted.
+                break;
+            };
+
+            // Somebody else's waiter already exists, so wait for it to finish
+            // (wait for it to release the write lock).
+            let waiter_result = existing_waiter.read();
+            match &*waiter_result {
+                // Unexpected state.
+                WaiterValue::Computing => panic!(
+                    "Got unexpected state `Computing` after resolving `init` future. \
+                    This might be a bug in Moka"
+                ),
+                _ => {
+                    // Try to insert our waiter again.
+                    continue;
+                }
+            }
+        }
+
+        // Our waiter was inserted.
+
+        // Get the current value.
+        let ignore_if = None as Option<&mut fn(&V) -> bool>;
+        let maybe_entry = cache
+            .base
+            .get_with_hash_and_ignore_if(&*c_key, c_hash, ignore_if, true);
+        let maybe_value = if allow_nop {
+            maybe_entry.as_ref().map(|ent| ent.value().clone())
+        } else {
+            None
+        };
+        let entry_existed = maybe_entry.is_some();
+
+        // Evaluate the `f` closure. Catching panic is safe here as we will not
+        // evaluate the closure again.
+        let output = match catch_unwind(AssertUnwindSafe(|| f(maybe_entry))) {
+            // Evaluated.
+            Ok(output) => {
+                *lock = WaiterValue::ReadyNone;
+                output
+            }
+            // Panicked.
+            Err(payload) => {
+                *lock = WaiterValue::InitClosurePanicked;
+                // Remove the waiter so that others can retry.
+                self.remove_waiter(w_key, w_hash);
+                resume_unwind(payload);
+            }
+        };
+
+        let op = match post_init(output) {
+            Ok(op) => op,
+            Err(e) => {
+                self.remove_waiter(w_key, w_hash);
+                return Err(e);
+use std::{hash::Hash, sync::Arc};
+
+// This trait is implemented by `sync::BaseCache` and `sync::Cache`.
+pub(crate) trait ScanningGet<K, V> {
+    /// Returns the number of segments in the concurrent hash table.
+    fn num_cht_segments(&self) -> usize;
+
+    /// Returns a _clone_ of the value corresponding to the key.
+    ///
+    /// Unlike the `get` method of cache, this method is not considered a cache read
+    /// operation, so it does not update the historic popularity estimator or reset
+    /// the idle timer for the key.
+    fn scanning_get(&self, key: &Arc<K>) -> Option<V>;
+
+    /// Returns a vec of keys in a specified segment of the concurrent hash table.
+    fn keys(&self, cht_segment: usize) -> Option<Vec<Arc<K>>>;
+}
+
+/// Iterator visiting all key-value pairs in a cache in arbitrary order.
+///
+/// Call [`Cache::iter`](./struct.Cache.html#method.iter) method to obtain an `Iter`.
+pub struct Iter<'i, K, V> {
+    keys: Option<Vec<Arc<K>>>,
+    cache_segments: Box<[&'i dyn ScanningGet<K, V>]>,
+    num_cht_segments: usize,
+    cache_seg_index: usize,
+    cht_seg_index: usize,
+    is_done: bool,
+}
+
+impl<'i, K, V> Iter<'i, K, V> {
+    pub(crate) fn with_single_cache_segment(
+        cache: &'i dyn ScanningGet<K, V>,
+        num_cht_segments: usize,
+    ) -> Self {
+        Self {
+            keys: None,
+            cache_segments: Box::new([cache]),
+            num_cht_segments,
+            cache_seg_index: 0,
+            cht_seg_index: 0,
+            is_done: false,
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    pub(crate) fn with_multiple_cache_segments(
+        cache_segments: Box<[&'i dyn ScanningGet<K, V>]>,
+        num_cht_segments: usize,
+    ) -> Self {
+        Self {
+            keys: None,
+            cache_segments,
+            num_cht_segments,
+            cache_seg_index: 0,
+            cht_seg_index: 0,
+            is_done: false,
+        }
+    }
+}
+
+impl<K, V> Iterator for Iter<'_, K, V>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    type Item = (Arc<K>, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.is_done {
+            return None;
+        }
+
+        while let Some(key) = self.next_key() {
+            if let Some(v) = self.cache().scanning_get(&key) {
+                return Some((key, v));
+            }
+        }
+
+        self.is_done = true;
+        None
+    }
+}
+
+impl<'i, K, V> Iter<'i, K, V>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    fn cache(&self) -> &'i dyn ScanningGet<K, V> {
+        self.cache_segments[self.cache_seg_index]
+    }
+
+    fn next_key(&mut self) -> Option<Arc<K>> {
+        while let Some(keys) = self.current_keys() {
+            if let key @ Some(_) = keys.pop() {
+                return key;
+            }
+        }
+        None
+    }
+
+    fn current_keys(&mut self) -> Option<&mut Vec<Arc<K>>> {
+        // If keys is none or some but empty, try to get next keys.
+        while self.keys.as_ref().map_or(true, Vec::is_empty) {
+            // Adjust indices.
+            if self.cht_seg_index >= self.num_cht_segments {
+                self.cache_seg_index += 1;
+                self.cht_seg_index = 0;
+                if self.cache_seg_index >= self.cache_segments.len() {
+                    // No more cache segments left.
+                    return None;
+                }
+            }
+
+            let cache_segment = self.cache_segments[self.cache_seg_index];
+            self.keys = cache_segment.keys(self.cht_seg_index);
+            self.num_cht_segments = cache_segment.num_cht_segments();
+
+            self.cht_seg_index += 1;
+        }
+
+        self.keys.as_mut()
+    }
+}
+
+// Clippy beta 0.1.83 (f41c7ed9889 2024-10-31) warns about unused lifetimes on 'a.
+// This seems a false positive. The lifetimes are used in the Send and Sync impls.
+// Let's suppress the warning.
+// https://rust-lang.github.io/rust-clippy/master/index.html#extra_unused_lifetimes
+#[allow(clippy::extra_unused_lifetimes)]
+unsafe impl<'a, K, V> Send for Iter<'_, K, V>
+where
+    K: 'a + Eq + Hash + Send,
+    V: 'a + Send,
+{
+}
+
+// Clippy beta 0.1.83 (f41c7ed9889 2024-10-31) warns about unused lifetimes on 'a.
+// This seems a false positive. The lifetimes are used in the Send and Sync impls.
+// Let's suppress the warning.
+// https://rust-lang.github.io/rust-clippy/master/index.html#extra_unused_lifetimes
+#[allow(clippy::extra_unused_lifetimes)]
+unsafe impl<'a, K, V> Sync for Iter<'_, K, V>
+where
+    K: 'a + Eq + Hash + Sync,
+    V: 'a + Sync,
+{
+}
+name: Clippy lints and Rustfmt
+
+on:
+  push:
+    paths-ignore:
+    - '.devcontainer/**'
+    - '.gitpod.yml'
+    - '.vscode/**'
+  schedule:
+    # Run against the last commit on the default branch on Friday at 7pm (UTC?)
+    - cron:  '0 19 * * 5'
+
+jobs:
+  pre_job:
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+    steps:
+      - id: skip_check
+        # https://github.com/marketplace/actions/skip-duplicate-actions
+        uses: fkirc/skip-duplicate-actions@v5
+        with:
+          concurrent_skipping: 'same_content'
+          do_not_skip: '["pull_request", "workflow_dispatch", "schedule"]'
+
+  test:
+    needs: pre_job
+    if: needs.pre_job.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      # Continue running other jobs in the matrix even if one fails.
+      fail-fast: false
+      matrix:
+        rust:
+          - toolchain: stable
+          - toolchain: beta
+            rustflags: '--cfg beta_clippy'
+
+    steps:
+      - name: Checkout Moka
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust.toolchain }}
+          components: rustfmt, clippy
+
+      - name: Run Clippy
+        run: cargo clippy --lib --tests --all-features --all-targets -- -D warnings
+        env:
+          RUSTFLAGS: ${{ matrix.rust.rustflags }}
+
+      - name: Run Rustfmt
+        if: ${{ matrix.rust.toolchain == 'stable' }}
+        run: cargo fmt --all -- --check
+[target.armv5te-unknown-linux-musleabi]
+rustflags = ["--cfg", "armv5te", "--cfg", "rustver"]
+
+[target.mips-unknown-linux-musl]
+rustflags = ["--cfg", "mips", "--cfg", "rustver"]
+
+[target.mipsel-unknown-linux-musl]
+rustflags = ["--cfg", "mips", "--cfg", "rustver"]

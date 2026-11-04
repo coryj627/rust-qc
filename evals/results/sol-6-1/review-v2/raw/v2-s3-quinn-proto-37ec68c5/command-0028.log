@@ -1,0 +1,555 @@
+quinn-proto/src/connection/streams/mod.rs:189:        self.state.queue_max_stream_id(self.pending);
+quinn-proto/src/connection/streams/state.rs:810:    pub(crate) fn queue_max_stream_id(&mut self, pending: &mut Retransmits) -> bool {
+quinn-proto/src/connection/streams/recv.rs:359:        let mut should_transmit = self.streams.queue_max_stream_id(self.pending);
+quinn-proto/src/connection/mod.rs:1412:        self.streams.queue_max_stream_id(pending);
+quinn-proto/src/connection/mod.rs:3023:        self.streams.queue_max_stream_id(pending);
+                f => {
+                    trace!("got frame {:?}", f);
+                }
+            }
+
+            let _guard = span.as_ref().map(|x| x.enter());
+            if packet.header.is_0rtt() {
+                match frame {
+                    Frame::Crypto(_) | Frame::Close(Close::Application(_)) => {
+                        return Err(TransportError::PROTOCOL_VIOLATION(
+                            "illegal frame type in 0-RTT",
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            ack_eliciting |= frame.is_ack_eliciting();
+
+            // Check whether this could be a probing packet
+            match frame {
+                Frame::Padding
+                | Frame::PathChallenge(_)
+                | Frame::PathResponse(_)
+                | Frame::NewConnectionId(_) => {}
+                _ => {
+                    is_probing_packet = false;
+                }
+            }
+            match frame {
+                Frame::Crypto(frame) => {
+                    self.read_crypto(SpaceId::Data, &frame, payload_len)?;
+                }
+                Frame::Stream(frame) => {
+                    if self.streams.received(frame, payload_len)?.should_transmit() {
+                        self.spaces[SpaceId::Data].pending.max_data = true;
+                    }
+                }
+                Frame::Ack(ack) => {
+                    self.on_ack_received(now, SpaceId::Data, ack)?;
+                }
+                Frame::Padding | Frame::Ping => {}
+                Frame::Close(reason) => {
+                    close = Some(reason);
+                }
+                Frame::PathChallenge(token) => {
+                    self.path_responses.push(number, token, remote);
+                    if remote == self.path.remote {
+                        // PATH_CHALLENGE on active path, possible off-path packet forwarding
+                        // attack. Send a non-probing packet to recover the active path.
+                        match self.peer_supports_ack_frequency() {
+                            true => self.immediate_ack(),
+                            false => self.ping(),
+                        }
+                    }
+                }
+                Frame::PathResponse(token) => {
+                    if self.path.challenge == Some(token) && remote == self.path.remote {
+                        trace!("new path validated");
+                        self.timers.stop(Timer::PathValidation);
+                        self.path.challenge = None;
+                        self.path.validated = true;
+                        if let Some((_, ref mut prev_path)) = self.prev_path {
+                            prev_path.challenge = None;
+                            prev_path.challenge_pending = false;
+                        }
+                    } else {
+                        debug!(token, "ignoring invalid PATH_RESPONSE");
+                    }
+                }
+                Frame::MaxData(bytes) => {
+                    self.streams.received_max_data(bytes);
+                }
+                Frame::MaxStreamData { id, offset } => {
+                    self.streams.received_max_stream_data(id, offset)?;
+                }
+                Frame::MaxStreams { dir, count } => {
+                    self.streams.received_max_streams(dir, count)?;
+                }
+                Frame::ResetStream(frame) => {
+                    if self.streams.received_reset(frame)?.should_transmit() {
+                        self.spaces[SpaceId::Data].pending.max_data = true;
+                    }
+                }
+                Frame::DataBlocked { offset } => {
+                    debug!(offset, "peer claims to be blocked at connection level");
+                }
+                Frame::StreamDataBlocked { id, offset } => {
+                    if id.initiator() == self.side.side() && id.dir() == Dir::Uni {
+                        debug!("got STREAM_DATA_BLOCKED on send-only {}", id);
+                        return Err(TransportError::STREAM_STATE_ERROR(
+                            "STREAM_DATA_BLOCKED on send-only stream",
+                        ));
+                    }
+                    debug!(
+                        stream = %id,
+                        offset, "peer claims to be blocked at stream level"
+                    );
+                }
+                Frame::StreamsBlocked { dir, limit } => {
+                    if limit > MAX_STREAM_COUNT {
+                        return Err(TransportError::FRAME_ENCODING_ERROR(
+                            "unrepresentable stream limit",
+                        ));
+                    }
+                    debug!(
+                        "peer claims to be blocked opening more than {} {} streams",
+                        limit, dir
+                    );
+                }
+                Frame::StopSending(frame::StopSending { id, error_code }) => {
+                    if id.initiator() != self.side.side() {
+                        if id.dir() == Dir::Uni {
+                            debug!("got STOP_SENDING on recv-only {}", id);
+                            return Err(TransportError::STREAM_STATE_ERROR(
+                                "STOP_SENDING on recv-only stream",
+                            ));
+                        }
+                    } else if self.streams.is_local_unopened(id) {
+                        return Err(TransportError::STREAM_STATE_ERROR(
+                            "STOP_SENDING on unopened stream",
+                        ));
+                    }
+                    self.streams.received_stop_sending(id, error_code);
+                }
+                Frame::RetireConnectionId { sequence } => {
+                    let allow_more_cids = self
+                        .local_cid_state
+                        .on_cid_retirement(sequence, self.peer_params.issue_cids_limit())?;
+                    self.endpoint_events
+                        .push_back(EndpointEventInner::RetireConnectionId(
+                            now,
+                            sequence,
+                            allow_more_cids,
+                        ));
+                }
+                Frame::NewConnectionId(frame) => {
+                    trace!(
+                        sequence = frame.sequence,
+                        id = %frame.id,
+                        retire_prior_to = frame.retire_prior_to,
+                    );
+                    if self.rem_cids.active().is_empty() {
+                        return Err(TransportError::PROTOCOL_VIOLATION(
+                            "NEW_CONNECTION_ID when CIDs aren't in use",
+                        ));
+                    }
+                    if frame.retire_prior_to > frame.sequence {
+                        return Err(TransportError::PROTOCOL_VIOLATION(
+                            "NEW_CONNECTION_ID retiring unissued CIDs",
+                        ));
+                    }
+
+                    use crate::cid_queue::InsertError;
+                    match self.rem_cids.insert(frame) {
+                        Ok(None) => {}
+                        Ok(Some((retired, reset_token))) => {
+                            let pending_retired =
+                                &mut self.spaces[SpaceId::Data].pending.retire_cids;
+                            /// Ensure `pending_retired` cannot grow without bound. Limit is
+                            /// somewhat arbitrary but very permissive.
+                            const MAX_PENDING_RETIRED_CIDS: u64 = CidQueue::LEN as u64 * 10;
+                            // We don't bother counting in-flight frames because those are bounded
+                            // by congestion control.
+                            if (pending_retired.len() as u64)
+                                .saturating_add(retired.end.saturating_sub(retired.start))
+                                > MAX_PENDING_RETIRED_CIDS
+                            {
+                                return Err(TransportError::CONNECTION_ID_LIMIT_ERROR(
+                                    "queued too many retired CIDs",
+                                ));
+                            }
+                            pending_retired.extend(retired);
+                            self.set_reset_token(reset_token);
+                        }
+                        Err(InsertError::ExceedsLimit) => {
+                            return Err(TransportError::CONNECTION_ID_LIMIT_ERROR(""));
+                        }
+                        Err(InsertError::Retired) => {
+                            trace!("discarding already-retired");
+                            // RETIRE_CONNECTION_ID might not have been previously sent if e.g. a
+                            // range of connection IDs larger than the active connection ID limit
+                            // was retired all at once via retire_prior_to.
+                            self.spaces[SpaceId::Data]
+                                .pending
+                                .retire_cids
+                                .push(frame.sequence);
+                            continue;
+                        }
+                    };
+
+                    if self.side.is_server() && self.rem_cids.active_seq() == 0 {
+                        // We're a server still using the initial remote CID for the client, so
+                        // let's switch immediately to enable clientside stateless resets.
+                        self.update_rem_cid();
+                    }
+                }
+                Frame::NewToken(NewToken { token }) => {
+                    let ConnectionSide::Client {
+                        token_store,
+                        server_name,
+                        ..
+                    } = &self.side
+                    else {
+                        return Err(TransportError::PROTOCOL_VIOLATION("client sent NEW_TOKEN"));
+                    };
+                    if token.is_empty() {
+                        return Err(TransportError::FRAME_ENCODING_ERROR("empty token"));
+                    }
+                    trace!("got new token");
+                    token_store.insert(server_name, token);
+                }
+                // order, allowing us to compute an increase in ECN counts to compare against the number
+                // of newly acked packets that remains well-defined in the presence of arbitrary packet
+                // reordering.
+                if new_largest {
+                    let sent = self.spaces[space].largest_acked_packet_sent;
+                    self.process_ecn(now, space, newly_acked.len() as u64, ecn, sent);
+                }
+            } else {
+                // We always start out sending ECN, so any ack that doesn't acknowledge it disables it.
+                debug!("ECN not acknowledged by peer");
+                self.path.sending_ecn = false;
+            }
+        }
+
+        self.set_loss_detection_timer(now);
+        Ok(())
+    }
+
+    /// Process a new ECN block from an in-order ACK
+    fn process_ecn(
+        &mut self,
+        now: Instant,
+        space: SpaceId,
+        newly_acked: u64,
+        ecn: frame::EcnCounts,
+        largest_sent_time: Instant,
+    ) {
+        match self.spaces[space].detect_ecn(newly_acked, ecn) {
+            Err(e) => {
+                debug!("halting ECN due to verification failure: {}", e);
+                self.path.sending_ecn = false;
+                // Wipe out the existing value because it might be garbage and could interfere with
+                // future attempts to use ECN on new paths.
+                self.spaces[space].ecn_feedback = frame::EcnCounts::ZERO;
+            }
+            Ok(false) => {}
+            Ok(true) => {
+                self.stats.path.congestion_events += 1;
+                self.path
+                    .congestion
+                    .on_congestion_event(now, largest_sent_time, false, 0);
+            }
+        }
+    }
+
+    // Not timing-aware, so it's safe to call this for inferred acks, such as arise from
+    // high-latency handshakes
+    fn on_packet_acked(&mut self, now: Instant, info: SentPacket) {
+        self.remove_in_flight(&info);
+        if info.ack_eliciting && self.path.challenge.is_none() {
+            // Only pass ACKs to the congestion controller if we are not validating the current
+            // path, so as to ignore any ACKs from older paths still coming in.
+            self.path.congestion.on_ack(
+                now,
+                info.time_sent,
+                info.size.into(),
+                self.app_limited,
+                &self.path.rtt,
+            );
+        }
+
+        // Update state for confirmed delivery of frames
+        if let Some(retransmits) = info.retransmits.get() {
+            for (id, _) in retransmits.reset_stream.iter() {
+                self.streams.reset_acked(*id);
+            }
+        }
+
+        for frame in info.stream_frames {
+            self.streams.received_ack_of(frame);
+        }
+    }
+
+    fn set_key_discard_timer(&mut self, now: Instant, space: SpaceId) {
+        let start = if self.zero_rtt_crypto.is_some() {
+            now
+        } else {
+            self.prev_crypto
+                .as_ref()
+                .expect("no previous keys")
+                .end_packet
+                .as_ref()
+                .expect("update not acknowledged yet")
+                .1
+        };
+        self.timers
+            .set(Timer::KeyDiscard, start + self.pto(space) * 3);
+    }
+
+    fn on_loss_detection_timeout(&mut self, now: Instant) {
+        if let Some((_, pn_space)) = self.loss_time_and_space() {
+            // Time threshold loss Detection
+            self.detect_lost_packets(now, pn_space, false);
+            self.set_loss_detection_timer(now);
+            return;
+        }
+
+        let (_, space) = match self.pto_time_and_space(now) {
+            Some(x) => x,
+            None => {
+                error!("PTO expired while unset");
+                return;
+            }
+        };
+        trace!(
+            in_flight = self.path.in_flight.bytes,
+            count = self.pto_count,
+            ?space,
+            "PTO fired"
+        );
+
+        let count = match self.path.in_flight.ack_eliciting {
+            // A PTO when we're not expecting any ACKs must be due to handshake anti-amplification
+            // deadlock preventions
+            0 => {
+                debug_assert!(!self.peer_completed_address_validation());
+                1
+            }
+            // Conventional loss probe
+            _ => 2,
+        };
+        self.spaces[space].loss_probes = self.spaces[space].loss_probes.saturating_add(count);
+        self.pto_count = self.pto_count.saturating_add(1);
+        self.set_loss_detection_timer(now);
+    }
+
+    fn detect_lost_packets(&mut self, now: Instant, pn_space: SpaceId, due_to_ack: bool) {
+        let mut lost_packets = Vec::<u64>::new();
+        let mut lost_mtu_probe = None;
+        let in_flight_mtu_probe = self.path.mtud.in_flight_mtu_probe();
+        let rtt = self.path.rtt.conservative();
+        let loss_delay = cmp::max(rtt.mul_f32(self.config.time_threshold), TIMER_GRANULARITY);
+
+        // Packets sent before this time are deemed lost.
+        let lost_send_time = now.checked_sub(loss_delay).unwrap();
+        let largest_acked_packet = self.spaces[pn_space].largest_acked_packet.unwrap();
+                remaining,
+            }) => {
+                // If this packet could initiate a migration and we're a client or a server that
+                // forbids migration, drop the datagram. This could be relaxed to heuristically
+                // permit NAT-rebinding-like migration.
+                if remote != self.path.remote && !self.side.remote_may_migrate() {
+                    trace!("discarding packet from unrecognized peer {}", remote);
+                    return;
+                }
+
+                let was_anti_amplification_blocked = self.path.anti_amplification_blocked(1);
+
+                self.stats.udp_rx.datagrams += 1;
+                self.stats.udp_rx.bytes += first_decode.len() as u64;
+                let data_len = first_decode.len();
+
+                self.handle_decode(now, remote, ecn, first_decode);
+                // The current `path` might have changed inside `handle_decode`,
+                // since the packet could have triggered a migration. Make sure
+                // the data received is accounted for the most recent path by accessing
+                // `path` after `handle_decode`.
+                self.path.total_recvd = self.path.total_recvd.saturating_add(data_len as u64);
+
+                if let Some(data) = remaining {
+                    self.stats.udp_rx.bytes += data.len() as u64;
+                    self.handle_coalesced(now, remote, ecn, data);
+                }
+
+                self.config.qlog_sink.emit_recovery_metrics(
+                    self.pto_count,
+                    &mut self.path,
+                    now,
+                    self.orig_rem_cid,
+                );
+
+                if was_anti_amplification_blocked {
+                    // A prior attempt to set the loss detection timer may have failed due to
+                    // anti-amplification, so ensure it's set now. Prevents a handshake deadlock if
+                    // the server's first flight is lost.
+                    self.set_loss_detection_timer(now);
+                }
+            }
+            NewIdentifiers(ids, now) => {
+                self.local_cid_state.new_cids(&ids, now);
+                ids.into_iter().rev().for_each(|frame| {
+                    self.spaces[SpaceId::Data].pending.new_cids.push(frame);
+                });
+                // Update Timer::PushNewCid
+                if self
+                    .timers
+                    .get(Timer::PushNewCid)
+                    .map_or(true, |x| x <= now)
+                {
+                    self.reset_cid_retirement();
+                }
+            }
+        }
+    }
+
+    /// Process timer expirations
+    ///
+    /// Executes protocol logic, potentially preparing signals (including application `Event`s,
+    /// `EndpointEvent`s and outgoing datagrams) that should be extracted through the relevant
+    /// methods.
+    ///
+    /// It is most efficient to call this immediately after the system clock reaches the latest
+    /// `Instant` that was output by `poll_timeout`; however spurious extra calls will simply
+    /// no-op and therefore are safe.
+    pub fn handle_timeout(&mut self, now: Instant) {
+        for &timer in &Timer::VALUES {
+            if !self.timers.is_expired(timer, now) {
+use std::fmt;
+
+use bytes::{Buf, BufMut};
+
+use crate::{
+    coding::{self, BufExt, BufMutExt},
+    frame,
+};
+
+/// Transport-level errors occur when a peer violates the protocol specification
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct Error {
+    /// Type of error
+    pub code: Code,
+    /// Frame type that triggered the error
+    pub frame: Option<frame::FrameType>,
+    /// Human-readable explanation of the reason
+    pub reason: String,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.code.fmt(f)?;
+        if let Some(frame) = self.frame {
+            write!(f, " in {frame}")?;
+        }
+        if !self.reason.is_empty() {
+            write!(f, ": {}", self.reason)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<Code> for Error {
+    fn from(x: Code) -> Self {
+        Self {
+            code: x,
+            frame: None,
+            reason: "".to_string(),
+        }
+    }
+}
+
+/// Transport-level error code
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub struct Code(u64);
+
+impl Code {
+    /// Create QUIC error code from TLS alert code
+    pub fn crypto(code: u8) -> Self {
+        Self(0x100 | u64::from(code))
+    }
+}
+
+impl coding::Codec for Code {
+    fn decode<B: Buf>(buf: &mut B) -> coding::Result<Self> {
+        Ok(Self(buf.get_var()?))
+    }
+    fn encode<B: BufMut>(&self, buf: &mut B) {
+        buf.write_var(self.0)
+    }
+}
+
+impl From<Code> for u64 {
+    fn from(x: Code) -> Self {
+        x.0
+    }
+}
+
+macro_rules! errors {
+    {$($name:ident($val:expr) $desc:expr;)*} => {
+        #[allow(non_snake_case, unused)]
+        impl Error {
+            $(
+            pub(crate) fn $name<T>(reason: T) -> Self where T: Into<String> {
+                Self {
+                    code: Code::$name,
+                    frame: None,
+                    reason: reason.into(),
+                }
+            }
+            )*
+        }
+
+        impl Code {
+            $(#[doc = $desc] pub const $name: Self = Code($val);)*
+        }
+
+        impl fmt::Debug for Code {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self.0 {
+                    $($val => f.write_str(stringify!($name)),)*
+                    x if (0x100..0x200).contains(&x) => write!(f, "Code::crypto({:02x})", self.0 as u8),
+                    _ => write!(f, "Code({:x})", self.0),
+                }
+            }
+        }
+
+        impl fmt::Display for Code {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                match self.0 {
+                    $($val => f.write_str($desc),)*
+                    // We're trying to be abstract over the crypto protocol, so human-readable descriptions here is tricky.
+                    _ if self.0 >= 0x100 && self.0 < 0x200 => write!(f, "the cryptographic handshake failed: error {}", self.0 & 0xFF),
+                    _ => f.write_str("unknown error"),
+                }
+            }
+        }
+    }
+}
+
+errors! {
+    NO_ERROR(0x0) "the connection is being closed abruptly in the absence of any error";
+    INTERNAL_ERROR(0x1) "the endpoint encountered an internal error and cannot continue with the connection";
+    CONNECTION_REFUSED(0x2) "the server refused to accept a new connection";
+    FLOW_CONTROL_ERROR(0x3) "received more data than permitted in advertised data limits";
+    STREAM_LIMIT_ERROR(0x4) "received a frame for a stream identifier that exceeded advertised the stream limit for the corresponding stream type";
+    STREAM_STATE_ERROR(0x5) "received a frame for a stream that was not in a state that permitted that frame";
+    FINAL_SIZE_ERROR(0x6) "received a STREAM frame or a RESET_STREAM frame containing a different final size to the one already established";
+    FRAME_ENCODING_ERROR(0x7) "received a frame that was badly formatted";
+    TRANSPORT_PARAMETER_ERROR(0x8) "received transport parameters that were badly formatted, included an invalid value, was absent even though it is mandatory, was present though it is forbidden, or is otherwise in error";
+    CONNECTION_ID_LIMIT_ERROR(0x9) "the number of connection IDs provided by the peer exceeds the advertised active_connection_id_limit";
+    PROTOCOL_VIOLATION(0xA) "detected an error with protocol compliance that was not covered by more specific error codes";
+    INVALID_TOKEN(0xB) "received an invalid Retry Token in a client Initial";
+    APPLICATION_ERROR(0xC) "the application or application protocol caused the connection to be closed during the handshake";
+    CRYPTO_BUFFER_EXCEEDED(0xD) "received more data in CRYPTO frames than can be buffered";
+    KEY_UPDATE_ERROR(0xE) "key update error";
+    AEAD_LIMIT_REACHED(0xF) "the endpoint has reached the confidentiality or integrity limit for the AEAD algorithm";
+    NO_VIABLE_PATH(0x10) "no viable network path exists";
+}

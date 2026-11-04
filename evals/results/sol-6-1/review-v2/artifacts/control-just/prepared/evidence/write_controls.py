@@ -1,0 +1,99 @@
+import json
+from pathlib import Path
+
+ROOT = Path('/work/prepared')
+
+def ref(control, evidence, refs):
+    return {
+        'method': 'ran',
+        'evidence': evidence + f' Full commands, exit codes, exact stdout (also hex), stderr, and assertions are preserved in evidence/{control}/probe-log.json. The binary was built from an unmodified scratch copy; see evidence/build.log.',
+        'commands': [f'python3 /work/prepared/evidence/probe.py {control}'],
+        'source_refs': refs,
+    }
+
+controls = {
+    'project': 'just',
+    'decoys': [
+        {
+            'id': 'decoy-1',
+            'kind': 'wrong-behavior',
+            'summary': "The run-once dependency cache is keyed only by recipe path, so distinct argument lists are conflated. If default depends on (emit 'one') and (emit 'two'), emit only runs for 'one' and the work requested for 'two' is silently skipped.",
+            'location': ['src/ran.rs:12', 'src/justfile.rs:427'],
+            'match_rule': 'A report must identify run-once memoization conflating invocations of the same recipe with different argument values and consequently skipping a distinct dependency invocation.',
+            'refutation': ref('decoy-1',
+                "Ran::mutex first indexes by recipe path and then by the complete Vec<Vec<String>> argument groups at src/ran.rs:14. Justfile::run_recipe checks the resulting per-argument mutex. The default fixture depends on emit('one'), emit('two'), and emit('one') again: it exits 0 with exactly 'one\\ntwo\\ndone\\n'. Direct CLI invocations of the same three argument lists likewise print 'one\\ntwo\\n'. Both distinct argument lists execute and only the identical repeated invocation is skipped, as documented.",
+                ['src/ran.rs:7-16', 'src/justfile.rs:418-433', 'src/justfile.rs:508-518', 'src/justfile.rs:536-539', 'README.md:3198-3198']),
+        },
+        {
+            'id': 'decoy-2',
+            'kind': 'wrong-behavior',
+            'summary': "Backtick command capture trims all trailing whitespace from stdout. Capturing printf '  payload \\t\\n' produces '  payload', discarding the meaningful trailing space and tab along with the line ending and corrupting values later used in interpolation.",
+            'location': ['src/command_ext.rs:75'],
+            'match_rule': 'A report must allege that backtick stdout processing removes trailing spaces or tabs, rather than removing only a terminal line ending.',
+            'refutation': ref('decoy-2',
+                "output_guard_stdout uses strip_suffix(\"\\r\\n\") or strip_suffix(\"\\n\"), falling back to the unchanged output. It does not call trim or trim_end. Evaluating the backtick fixture produces exactly '  payload \\t' (hex 20207061796c6f61642009), retaining both the space and tab. A no-newline capture retains its trailing space/tab too. A two-newline capture returns 'payload\\n', demonstrating that only one terminal line ending is stripped. Evaluator::run_command delegates to this same helper.",
+                ['src/command_ext.rs:62-81', 'src/evaluator.rs:339-349', 'src/evaluator.rs:443-484']),
+        },
+    ],
+    'false_findings': [
+        {
+            'id': 'false-1',
+            'title': 'Explicit empty recipe option values are replaced by parameter defaults',
+            'location': 'src/evaluator.rs:543',
+            'body': "For a recipe declared with [arg('name', long='name')] and show name='fallback', invoking just show --name= loses the explicitly supplied empty string. The parameter default path treats an empty option value as a missing argument and binds 'fallback', so callers cannot intentionally clear a default through the documented --name=value syntax.",
+            'refutation': ref('false-1',
+                "The parser retains the empty right side of '=' as Some(\"\") and pushes it into the parameter's argument vector. Thus the group contains one string; group.is_empty() is false even when that string is empty. The default branch in evaluate_parameters only runs for a zero-element group. The defaulted show fixture prints '<>\\n' for --name= and '<fallback>\\n' when the option is omitted. A required option also accepts --name= and prints '<>\\n', while genuine omission exits 1 with 'Recipe `show` requires option `--name`'.",
+                ['src/invocation_parser.rs:117-122', 'src/invocation_parser.rs:147-179', 'src/invocation_parser.rs:196-209', 'src/evaluator.rs:542-564']),
+        },
+        {
+            'id': 'false-2',
+            'title': 'Conditional expressions evaluate errors in the unselected branch',
+            'location': 'src/evaluator.rs:371',
+            'body': "Conditional expression evaluation eagerly resolves both result expressions before choosing a value. As a result, value := if 'a' == 'a' { 'chosen-then' } else { error('UNSELECTED_ELSE') } fails instead of producing 'chosen-then'. This breaks justfiles that use a conditional to keep a failing computation out of the active branch.",
+            'refutation': ref('false-2',
+                "The conditional match arm first evaluates its condition, then calls evaluate_expression on exactly one branch through an ordinary Rust if/else. Both the true-condition fixture with error() in the else branch and the false-condition fixture with error() in the then branch exit 0 and yield the selected text. A separate fixture with error('SELECTED_ERROR') in the selected branch exits 1 with that diagnostic, confirming that errors are active when their branch is reached.",
+                ['src/evaluator.rs:366-376', 'src/function.rs:306-308']),
+        },
+        {
+            'id': 'false-3',
+            'title': 'env with a fallback overwrites present but empty environment values',
+            'location': 'src/function.rs:297',
+            'body': "env(key, default) treats a present environment variable whose value is the empty string as absent. With CONTROL_EMPTY set to an empty value, env('CONTROL_EMPTY', 'fallback') returns 'fallback', even though the documented contract only substitutes the default when the variable is not present. This prevents callers from preserving an intentionally empty process environment value.",
+            'refutation': ref('false-3',
+                "env(key, default) delegates to env_var_or_default. That function returns the default only for Err(NotPresent); Ok(value) is returned without an emptiness test. With dotenv loading disabled, the fixture brackets the result: an explicitly empty CONTROL_EMPTY yields '[]', an absent CONTROL_EMPTY yields '[fallback]', and a nonempty value yields '[present]', all with exit 0. README.md separately documents using || when fallback on an empty value is desired.",
+                ['src/function.rs:267-272', 'src/function.rs:290-303', 'README.md:1887-1898']),
+        },
+        {
+            'id': 'false-4',
+            'title': 'Required plus-variadic parameters allow zero arguments',
+            'location': 'src/invocation_parser.rs:201',
+            'body': "The invocation parser treats all variadic parameter groups as optional. For a recipe gather +items with no default, just gather is accepted and runs the recipe with items bound to an empty string. This violates the documented one-or-more requirement for + parameters and allows an incomplete invocation to execute the recipe body.",
+            'refutation': ref('false-4',
+                "An empty argument group is exempted from the missing-argument check only when it has a default or its kind is Star. A Plus parameter with no default increments missing_positional and causes PositionalArgumentCountMismatch before an invocation is returned. The +items fixture with no arguments exits 1, prints 'Recipe `gather` got 0 positional arguments but takes at least 1', and has empty stdout, so the body did not run. Supplying one and two succeeds and prints '<one two>\\n'. A separate *items fixture accepts omission and prints '<>\\n', confirming the intentional distinction.",
+                ['src/invocation_parser.rs:194-237', 'src/parameter.rs:23-25', 'README.md:2918-2929']),
+        },
+        {
+            'id': 'false-5',
+            'title': 'Recipe argument patterns accept partial matches of alternatives',
+            'location': 'src/pattern.rs:10',
+            'body': "Pattern::is_match delegates directly to Regex::is_match, so an argument pattern such as dev|prod accepts a substring instead of requiring the entire argument to match. For [arg('mode', pattern='dev|prod')] on build mode, invoking just build xdevx or just build xprod incorrectly passes validation and runs the dependencies and recipe body, despite neither value being a permitted mode.",
+            'refutation': ref('false-5',
+                "Pattern::new compiles the stored regex as ^(?:<pattern>)$, grouping the alternatives inside both anchors. Thus is_match operates on ^(?:dev|prod)$, not on the raw pattern. The CLI also checks each supplied argument before returning the parsed invocation. xdevx, xprod, and devx each exit 1 with a pattern-mismatch diagnostic and empty stdout; the dependency and body print markers, so neither ran on rejection. Exact dev and prod each exit 0 and print both markers. The documented contract expressly describes the added anchors.",
+                ['src/pattern.rs:9-30', 'src/invocation_parser.rs:239-247', 'src/parameter.rs:27-45', 'README.md:2986-2995']),
+        },
+    ],
+}
+(ROOT / 'controls.json').write_text(json.dumps(controls, indent=2) + '\n')
+
+# Freeze concise, line-numbered excerpts from the exact original baseline.
+references = sorted({r for entry in controls['decoys'] + controls['false_findings']
+                     for r in entry['refutation']['source_refs']})
+with (ROOT / 'evidence/source-excerpts.txt').open('w') as out:
+    for refname in references:
+        name, span = refname.rsplit(':', 1)
+        start, end = map(int, span.split('-'))
+        lines = (Path('/work/crate') / name).read_text().splitlines()
+        out.write(f'\n{refname}\n')
+        for n in range(start, end + 1):
+            out.write(f'{n:5}: {lines[n - 1]}\n')
+print('Wrote controls.json and source-excerpts.txt')

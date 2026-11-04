@@ -1,0 +1,1178 @@
+      current
+        .assignments
+        .values()
+        .filter(|assignment| !assignment.private)
+        .map(|assignment| assignment.number)
+        .collect()
+    };
+
+    Ok((current, variable, variable_references))
+  }
+
+  pub(crate) fn check_unstable(&self, config: &Config) -> RunResult<'src> {
+    if let Some(&unstable_feature) = self.unstable_features.iter().next() {
+      config.require_unstable(self, unstable_feature)?;
+    }
+
+    for module in self.modules.values() {
+      module.check_unstable(config)?;
+    }
+
+    Ok(())
+  }
+
+  pub(crate) fn get_alias(&self, name: &str) -> Option<&Alias<'src>> {
+    self.aliases.get(name)
+  }
+
+  pub(crate) fn get_recipe(&self, name: &str) -> Option<&Recipe<'src>> {
+    self
+      .recipes
+      .get(name)
+      .map(Arc::as_ref)
+      .or_else(|| self.aliases.get(name).map(|alias| alias.target.as_ref()))
+  }
+
+  pub(crate) fn is_submodule(&self) -> bool {
+    self.name.is_some()
+  }
+
+  pub(crate) fn name(&self) -> &'src str {
+    self.name.map(|name| name.lexeme()).unwrap_or_default()
+  }
+
+  fn run_recipe(
+    arguments: &[Vec<String>],
+    config: &Config,
+    is_dependency: bool,
+    ran: &Ran,
+    recipe: &Recipe<'src>,
+    scopes: &Scopes<'src, '_>,
+    search: &Search,
+  ) -> RunResult<'src> {
+    let mutex = ran.mutex(recipe, arguments);
+
+    let mut guard = mutex.lock().unwrap();
+
+    if *guard {
+      return Ok(());
+    }
+
+    let (module, scope, dotenv) = scopes
+      .get(recipe.module_path())
+      .expect("failed to retrieve scope for module");
+
+    let context = ExecutionContext {
+      config,
+      dotenv,
+      module,
+      search,
+    };
+
+    let (outer, positional) = Evaluator::evaluate_parameters(
+      arguments,
+      &context,
+      is_dependency,
+      &recipe.parameters,
+      recipe,
+      scope,
+    )?;
+
+    let scope = outer.child();
+
+    let mut evaluator = Evaluator::new(&context, BTreeMap::new(), true, &scope);
+
+    if !config.yes && !recipe.confirm(&mut evaluator)? {
+      return Err(Error::NotConfirmed {
+        recipe: recipe.name(),
+      });
+    }
+
+    Self::run_dependencies(
+      config,
+      &context,
+      recipe.priors(),
+      &mut evaluator,
+      ran,
+      recipe,
+      scopes,
+      search,
+    )?;
+
+    recipe.run(&context, &scope, &positional, is_dependency)?;
+
+    Self::run_dependencies(
+      config,
+      &context,
+      recipe.subsequents(),
+      &mut evaluator,
+      &Ran::default(),
+      recipe,
+      scopes,
+      search,
+    )?;
+
+    *guard = true;
+
+    Ok(())
+  }
+
+  fn run_dependencies<'run>(
+    config: &Config,
+    context: &ExecutionContext<'src, 'run>,
+    dependencies: &[Dependency<'src>],
+    evaluator: &mut Evaluator<'src, 'run>,
+    ran: &Ran,
+    recipe: &Recipe<'src>,
+    scopes: &Scopes<'src, 'run>,
+    search: &Search,
+  ) -> RunResult<'src> {
+    if context.config.no_dependencies {
+      return Ok(());
+    }
+
+    let mut evaluated = Vec::new();
+    for Dependency { recipe, arguments } in dependencies {
+      let mut grouped = Vec::new();
+      for group in arguments {
+        let evaluated_group = group
+          .iter()
+          .map(|argument| evaluator.evaluate_expression(argument))
+          .collect::<RunResult<Vec<String>>>()?;
+        grouped.push(evaluated_group);
+      }
+      evaluated.push((recipe, grouped));
+    }
+
+    if recipe.is_parallel() {
+      thread::scope::<_, RunResult>(|thread_scope| {
+        let mut handles = Vec::new();
+        for (recipe, arguments) in evaluated {
+          handles.push(thread_scope.spawn(move || {
+            Self::run_recipe(&arguments, config, true, ran, recipe, scopes, search)
+          }));
+        }
+        for handle in handles {
+          handle
+            .join()
+            .map_err(|_| Error::internal("parallel dependency thread panicked"))??;
+        }
+        Ok(())
+      })?;
+    } else {
+      for (recipe, arguments) in evaluated {
+        Self::run_recipe(&arguments, config, true, ran, recipe, scopes, search)?;
+      }
+    }
+
+    Ok(())
+  }
+
+  pub(crate) fn public_modules(&self, config: &Config) -> Vec<&Justfile> {
+    let mut modules = self
+      .modules
+      .values()
+      .filter(|module| !module.private)
+      .collect::<Vec<&Justfile>>();
+
+    if config.unsorted {
+      modules.sort_by_key(|module| {
+        module
+          .name
+          .map(|name| name.token.offset)
+          .unwrap_or_default()
+      });
+    }
+
+    modules
+  }
+
+  pub(crate) fn public_recipes(&self, config: &Config) -> Vec<&Recipe> {
+    let mut recipes = self
+      .recipes
+      .values()
+      .map(AsRef::as_ref)
+      .filter(|recipe| recipe.is_public())
+      .collect::<Vec<&Recipe>>();
+
+    if config.unsorted {
+      recipes.sort_by_key(|recipe| (&recipe.import_offsets, recipe.name.offset));
+    }
+
+    recipes
+  }
+
+  pub(crate) fn public_recipes_recursive(&self, config: &Config) -> Vec<&Recipe> {
+    let mut recipes = Vec::new();
+
+    let mut stack = vec![self];
+    while let Some(current) = stack.pop() {
+      for recipe in current.public_recipes(config) {
+        recipes.push(recipe);
+      }
+
+      for module in current.public_modules(config).into_iter().rev() {
+        stack.push(module);
+      }
+    }
+
+    recipes
+  }
+
+  pub(crate) fn public_aliases_recursive(&self, config: &Config) -> Vec<(&Alias, &Modulepath)> {
+    let mut aliases = Vec::new();
+
+    let mut stack = vec![self];
+    while let Some(current) = stack.pop() {
+      for alias in current.aliases.values() {
+        if alias.is_public() {
+          aliases.push((alias, &current.module_path));
+        }
+      }
+
+      for module in current.public_modules(config).into_iter().rev() {
+        stack.push(module);
+      }
+    }
+
+    aliases
+  }
+
+  pub(crate) fn groups(&self) -> Vec<&str> {
+    self
+      .groups
+      .iter()
+      .map(|group| group.cooked.as_str())
+      .collect()
+  }
+
+  pub(crate) fn public_groups(&self, config: &Config) -> Vec<String> {
+    let mut groups = Vec::new();
+
+    for recipe in self.recipes.values() {
+      if recipe.is_public() {
+        for group in recipe.groups() {
+          groups.push((recipe.import_offsets.as_slice(), recipe.name.offset, group));
+        }
+      }
+    }
+
+    for submodule in self.public_modules(config) {
+      for group in submodule.groups() {
+        groups.push((&[], submodule.name.unwrap().offset, group.to_string()));
+      }
+    }
+
+    if config.unsorted {
+      groups.sort();
+    } else {
+      groups.sort_by(|(_, _, a), (_, _, b)| a.cmp(b));
+    }
+
+    let mut seen = HashSet::new();
+
+    groups.retain(|(_, _, group)| seen.insert(group.clone()));
+
+    groups.into_iter().map(|(_, _, group)| group).collect()
+  }
+}
+
+impl ColorDisplay for Justfile<'_> {
+  fn fmt(&self, f: &mut Formatter, color: Color) -> fmt::Result {
+    let mut items = self.recipes.len() + self.assignments.len() + self.aliases.len();
+    for (name, assignment) in &self.assignments {
+      if assignment.export {
+        write!(f, "export ")?;
+      }
+      write!(f, "{name} := {}", assignment.value)?;
+      items -= 1;
+      if items != 0 {
+        write!(f, "\n\n")?;
+      }
+    }
+    for alias in self.aliases.values() {
+      write!(f, "{alias}")?;
+      items -= 1;
+      if items != 0 {
+        write!(f, "\n\n")?;
+      }
+    }
+    for recipe in self.recipes.values() {
+      write!(f, "{}", recipe.color_display(color))?;
+      items -= 1;
+      if items != 0 {
+        write!(f, "\n\n")?;
+      }
+    }
+    Ok(())
+  }
+}
+
+impl<'src> Keyed<'src> for Justfile<'src> {
+  fn key(&self) -> &'src str {
+    self.name()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use {super::*, Error::*, testing::compile};
+
+  run_error! {
+    name: unknown_recipe_no_suggestion,
+    src: "a:\nb:\nc:",
+    args: ["a", "xyz", "y", "z"],
+    error: UnknownRecipe {
+      recipe,
+      suggestion,
+    },
+    check: {
+      assert_eq!(recipe, "xyz");
+      assert_eq!(suggestion, None);
+    }
+  }
+
+  run_error! {
+    name: unknown_recipe_with_suggestion,
+    src: "a:\nb:\nc:",
+    args: ["a", "x", "y", "z"],
+    error: UnknownRecipe {
+      recipe,
+      suggestion,
+    },
+    check: {
+      assert_eq!(recipe, "x");
+      assert_eq!(suggestion, Some(Suggestion {
+        name: "a",
+      eprintln!(
+        "{prefix}===> Running recipe `{}`...{suffix}",
+        self.recipe_path(),
+      );
+    }
+
+    if context.config.explain {
+      if let Some(doc) = self.doc() {
+        eprintln!("{prefix}#### {doc}{suffix}");
+      }
+    }
+
+    let evaluator = Evaluator::new(context, BTreeMap::new(), is_dependency, scope);
+
+    let start = Instant::now();
+    let result = if self.is_script() {
+      self.run_script(context, scope, positional, evaluator)
+    } else {
+      self.run_linewise(context, scope, positional, evaluator)
+    };
+    let elapsed = start.elapsed();
+
+    if context.config.time {
+      let color = if context.config.highlight {
+        context.config.color.command(context.config.command_color)
+      } else {
+        context.config.color
+      }
+      .stderr();
+
+      let prefix = color.prefix();
+      let suffix = color.suffix();
+      let recipe_name = self.name.lexeme();
+
+      eprintln!(
+        "{prefix}---> {recipe_name} completed in {:.3}s{suffix}",
+        elapsed.as_secs_f64(),
+      );
+    }
+
+    result
+  }
+
+  fn run_linewise<'run>(
+    &self,
+    context: &ExecutionContext<'src, 'run>,
+    scope: &Scope<'src, 'run>,
+    positional: &[String],
+    mut evaluator: Evaluator<'src, 'run>,
+  ) -> RunResult<'src> {
+    let config = &context.config;
+    let settings = &context.module.settings;
+
+    let mut lines = self.body.iter().peekable();
+    let mut line_number = self.line_number() + 1;
+    loop {
+      let Some(line) = lines.peek() else {
+        return Ok(());
+      };
+
+      let mut evaluated = String::new();
+      let mut continued = false;
+
+      let comment_line = settings.ignore_comments && line.is_comment();
+      let sigils = line.sigils(settings);
+
+      loop {
+        if lines.peek().is_none() {
+          break;
+        }
+        let line = lines.next().unwrap();
+        line_number += 1;
+        if !comment_line {
+          evaluated += &evaluator.evaluate_line(line, continued)?;
+        }
+        if line.is_continuation() && !comment_line {
+          continued = true;
+          evaluated.pop();
+        } else {
+          break;
+        }
+      }
+
+      if comment_line {
+        continue;
+      }
+
+      let mut command = evaluated.as_str();
+
+      command = &command[sigils.len()..];
+
+      if command.is_empty() {
+        continue;
+      }
+
+      let guard = sigils.contains(&Sigil::Guard);
+      let infallible = sigils.contains(&Sigil::Infallible);
+      let quiet = sigils.contains(&Sigil::Quiet);
+
+      if config.dry_run
+        || config.verbosity.loquacious()
+        || config.timestamp
+        || !((quiet ^ self.quiet)
+          || (settings.quiet && !self.no_quiet())
+          || config.verbosity.quiet())
+      {
+        let color = if config.highlight {
+          config.color.command(config.command_color)
+        } else {
+          config.color
+        }
+        .stderr();
+
+        if let Some(timestamp) = config.timestamp() {
+          eprint!("[{}] ", color.paint(&timestamp));
+        }
+
+        eprintln!("{}", color.paint(command));
+      }
+
+      if config.dry_run {
+        continue;
+      }
+
+      let mut cmd = settings.shell_command(config);
+
+      if let Some(working_directory) = self.working_directory(context) {
+        cmd.current_dir(working_directory);
+      }
+
+      cmd.arg(command);
+
+      if self.takes_positional_arguments(settings) {
+        cmd.arg(self.name.lexeme());
+        cmd.args(positional);
+      }
+
+      if config.verbosity.quiet() {
+        cmd.stderr(Stdio::null());
+        cmd.stdout(Stdio::null());
+      }
+
+      for attribute in &self.attributes {
+        if let Attribute::Env(key, value) = attribute {
+          cmd.env(&key.cooked, &value.cooked);
+        }
+      }
+
+      cmd.export(settings, context.dotenv, scope, &context.module.unexports);
+
+      let (result, caught) = cmd.status_guard();
+
+      match result {
+        Ok(exit_status) => {
+          if let Some(code) = exit_status.code() {
+            if code != 0 {
+              if guard {
+                if code == 1 {
+                  return Ok(());
+                }
+
+                return Err(Error::GuardCode {
+                  recipe: self.name(),
+                  line_number,
+                  code,
+                });
+              } else if !infallible {
+                return Err(Error::Code {
+                  recipe: self.name(),
+                  line_number: Some(line_number),
+                  code,
+                  print_message: self.print_exit_message(settings),
+                });
+              }
+            }
+          } else if !infallible {
+            return Err(Error::from_signal(
+              exit_status,
+              Some(line_number),
+              self.print_exit_message(settings),
+              self.name(),
+            ));
+          }
+        }
+        Err(io_error) => {
+          return Err(Error::ShellIo {
+            io_error,
+            recipe: self.name(),
+            shell: settings.shell(config).0.into(),
+          });
+        }
+      }
+
+      if !infallible {
+        if let Some(signal) = caught {
+          return Err(Error::Interrupted { signal });
+        }
+      }
+    }
+  }
+
+  pub(crate) fn run_script<'run>(
+    &self,
+    context: &ExecutionContext<'src, 'run>,
+    scope: &Scope<'src, 'run>,
+    positional: &[String],
+    mut evaluator: Evaluator<'src, 'run>,
+  ) -> RunResult<'src> {
+    let config = &context.config;
+
+    if let Some(timestamp) = config.timestamp() {
+      let color = if config.highlight {
+        config.color.command(config.command_color)
+      } else {
+        config.color
+      }
+      .stderr();
+
+      eprintln!("[{}] {}", color.paint(&timestamp), self.name);
+    }
+
+    let mut evaluated_lines = Vec::new();
+    for line in &self.body {
+      evaluated_lines.push(evaluator.evaluate_line(line, false)?);
+    }
+
+    if config.verbosity.loud() && (config.dry_run || self.quiet) {
+      for line in &evaluated_lines {
+        eprintln!(
+          "{}",
+          config
+            .color
+            .command(config.command_color)
+            .stderr()
+            .paint(line)
+        );
+      }
+    }
+
+    if config.dry_run {
+      return Ok(());
+    }
+
+    let executor = if let Some(Attribute::Script(interpreter)) =
+      self.attributes.get(AttributeDiscriminant::Script)
+    {
+      Executor::Command(
+        interpreter
+          .as_ref()
+          .map(|interpreter| Interpreter {
+            command: interpreter.command.cooked.clone(),
+            arguments: interpreter
+              .arguments
+              .iter()
+              .map(|argument| argument.cooked.clone())
+              .collect(),
+          })
+          .or_else(|| context.module.settings.script_interpreter.clone())
+          .unwrap_or_else(|| Interpreter::default_script_interpreter().clone()),
+      )
+    } else {
+      let line = evaluated_lines
+        .first()
+        .ok_or_else(|| Error::internal("evaluated_lines was empty"))?;
+
+      let shebang =
+        Shebang::new(line).ok_or_else(|| Error::internal(format!("bad shebang line: {line}")))?;
+
+      Executor::Shebang(shebang)
+    };
+
+    let tempdir = context.tempdir(self)?;
+
+    let mut path = tempdir.path().to_path_buf();
+
+    let extension = self.attributes.iter().find_map(|attribute| {
+      if let Attribute::Extension(extension) = attribute {
+        Some(extension.cooked.as_str())
+      } else {
+        None
+      }
+    });
+
+    path.push(executor.script_filename(self.name(), extension));
+
+    let script = executor.script(self, &evaluated_lines);
+
+    if config.verbosity.grandiloquent() {
+      eprintln!("{}", config.color.doc().stderr().paint(&script));
+    }
+
+    fs::write(&path, script).map_err(|error| Error::TempdirIo {
+      recipe: self.name(),
+      io_error: error,
+    })?;
+
+    let mut command = executor.command(
+      config,
+      &path,
+      self.name(),
+      self.working_directory(context).as_deref(),
+    )?;
+
+    if self.takes_positional_arguments(&context.module.settings) {
+      command.args(positional);
+    }
+
+    for attribute in &self.attributes {
+      if let Attribute::Env(key, value) = attribute {
+        command.env(&key.cooked, &value.cooked);
+      }
+    }
+
+    command.export(
+      &context.module.settings,
+      context.dotenv,
+      scope,
+      &context.module.unexports,
+    );
+
+    // run it!
+    let (result, caught) = command.status_guard();
+
+    match result {
+      Ok(exit_status) => exit_status.code().map_or_else(
+        || {
+          Err(Error::from_signal(
+            exit_status,
+            None,
+            self.print_exit_message(&context.module.settings),
+            self.name(),
+          ))
+        },
+        |code| {
+          if code == 0 {
+            Ok(())
+          } else {
+            Err(Error::Code {
+              recipe: self.name(),
+              line_number: None,
+              code,
+              print_message: self.print_exit_message(&context.module.settings),
+            })
+          }
+        },
+      )?,
+      Err(io_error) => return Err(executor.error(io_error, self.name())),
+    }
+
+    if let Some(signal) = caught {
+      return Err(Error::Interrupted { signal });
+use {super::*, CompileErrorKind::*};
+
+pub(crate) struct RecipeResolver<'src: 'run, 'run> {
+  assignments: &'run Table<'src, Assignment<'src>>,
+  functions: &'run Table<'src, FunctionDefinition<'src>>,
+  modulepath: &'run Modulepath,
+  modules: &'run Table<'src, Justfile<'src>>,
+  resolved_recipes: Table<'src, Arc<Recipe<'src>>>,
+  settings: &'run Settings,
+  unresolved_recipes: Table<'src, UnresolvedRecipe<'src>>,
+}
+
+impl<'src: 'run, 'run> RecipeResolver<'src, 'run> {
+  pub(crate) fn resolve_recipes(
+    assignments: &'run Table<'src, Assignment<'src>>,
+    functions: &'run Table<'src, FunctionDefinition<'src>>,
+    modulepath: &'run Modulepath,
+    modules: &'run Table<'src, Justfile<'src>>,
+    settings: &'run Settings,
+    unresolved_recipes: Table<'src, UnresolvedRecipe<'src>>,
+  ) -> CompileResult<'src, Table<'src, Arc<Recipe<'src>>>> {
+    let mut resolver = Self {
+      assignments,
+      functions,
+      modulepath,
+      modules,
+      resolved_recipes: Table::new(),
+      settings,
+      unresolved_recipes,
+    };
+
+    while let Some(unresolved) = resolver.unresolved_recipes.pop() {
+      resolver.resolve_recipe(&mut Vec::new(), unresolved)?;
+    }
+
+    Ok(resolver.resolved_recipes)
+  }
+
+  fn resolve_recipe(
+    &mut self,
+    stack: &mut Vec<&'src str>,
+    recipe: UnresolvedRecipe<'src>,
+  ) -> CompileResult<'src, Arc<Recipe<'src>>> {
+    if let Some(resolved) = self.resolved_recipes.get(recipe.name()) {
+      return Ok(Arc::clone(resolved));
+    }
+
+    stack.push(recipe.name());
+
+    let dependencies = recipe
+      .dependencies
+      .iter()
+      .map(|dependency| {
+        self
+          .resolve_dependency(dependency, &recipe, stack)?
+          .ok_or_else(|| {
+            dependency.recipe.last().error(UnknownDependency {
+              recipe: recipe.name(),
+              unknown: dependency.recipe.clone(),
+            })
+          })
+      })
+      .collect::<CompileResult<Vec<Arc<Recipe>>>>()?;
+
+    stack.pop();
+
+    let resolved = Arc::new(recipe.resolve(
+      self.assignments,
+      self.functions,
+      self.modulepath,
+      dependencies,
+      self.settings,
+    )?);
+    self.resolved_recipes.insert(Arc::clone(&resolved));
+    Ok(resolved)
+  }
+
+  fn resolve_dependency(
+    &mut self,
+    dependency: &UnresolvedDependency<'src>,
+    recipe: &UnresolvedRecipe<'src>,
+    stack: &mut Vec<&'src str>,
+  ) -> CompileResult<'src, Option<Arc<Recipe<'src>>>> {
+    let name = dependency.recipe.last().lexeme();
+
+    if dependency.recipe.components() > 1 {
+      // recipe is in a submodule and is thus already resolved
+      Ok(Analyzer::resolve_recipe(
+        &dependency.recipe,
+        self.modules,
+        &self.resolved_recipes,
+      ))
+    } else if let Some(resolved) = self.resolved_recipes.get(name) {
+      // recipe is the current module and has already been resolved
+      Ok(Some(Arc::clone(resolved)))
+    } else if stack.contains(&name) {
+      // recipe depends on itself
+      let first = stack[0];
+      stack.push(first);
+      Err(
+        dependency.recipe.last().error(CircularRecipeDependency {
+          recipe: recipe.name(),
+          circle: stack
+            .iter()
+            .skip_while(|name| **name != dependency.recipe.last().lexeme())
+            .copied()
+            .collect(),
+        }),
+      )
+    } else if let Some(unresolved) = self.unresolved_recipes.remove(name) {
+      // recipe is as of yet unresolved
+      Ok(Some(self.resolve_recipe(stack, unresolved)?))
+    } else {
+      // recipe is unknown
+      Ok(None)
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  analysis_error! {
+    name:   circular_recipe_dependency,
+    input:  "a: b\nb: a",
+    offset: 8,
+    line:   1,
+    column: 3,
+    width:  1,
+    kind:   CircularRecipeDependency{recipe: "b", circle: vec!["a", "b", "a"]},
+  }
+
+  analysis_error! {
+    name:   self_recipe_dependency,
+    input:  "a: a",
+    offset: 3,
+    line:   0,
+    column: 3,
+    width:  1,
+    kind:   CircularRecipeDependency{recipe: "a", circle: vec!["a", "a"]},
+  }
+
+  analysis_error! {
+    name:   unknown_dependency,
+    input:  "a: b",
+    offset: 3,
+    line:   0,
+    column: 3,
+    width:  1,
+    kind:   UnknownDependency{
+      recipe: "a",
+      unknown: Namepath::from(Name::from_identifier(
+        Token{
+          column: 3,
+          kind: TokenKind::Identifier,
+          length: 1,
+          line: 0,
+          offset: 3,
+          path: Path::new("justfile"),
+          src: "a: b" }))
+    },
+  }
+
+  analysis_error! {
+    name:   unknown_interpolation_variable,
+    input:  "x:\n {{   hello}}",
+    offset: 9,
+    line:   1,
+    column: 6,
+    width:  5,
+    kind:   UndefinedVariable{variable: "hello"},
+  }
+
+  analysis_error! {
+    name:   unknown_second_interpolation_variable,
+    input:  "wtf:=\"x\"\nx:\n echo\n foo {{wtf}} {{ lol }}",
+    offset: 34,
+    line:   3,
+    column: 16,
+    width:  3,
+    kind:   UndefinedVariable{variable: "lol"},
+  }
+
+  analysis_error! {
+    name:   unknown_variable_in_default,
+    input:  "a f=foo:",
+    offset: 4,
+    line:   0,
+    column: 4,
+    width:  3,
+    kind:   UndefinedVariable{variable: "foo"},
+  }
+
+  analysis_error! {
+    name:   unknown_variable_in_dependency_argument,
+    input:  "bar x:\nfoo: (bar baz)",
+    offset: 17,
+    line:   1,
+    column: 10,
+    width:  3,
+    kind:   UndefinedVariable{variable: "baz"},
+  }
+}
+use super::*;
+
+pub(crate) trait CommandExt {
+  fn export(
+    &mut self,
+    settings: &Settings,
+    dotenv: &BTreeMap<String, String>,
+    scope: &Scope,
+    unexports: &HashSet<String>,
+  ) -> &mut Command;
+
+  fn export_scope(&mut self, settings: &Settings, scope: &Scope, unexports: &HashSet<String>);
+
+  fn output_guard(self) -> (io::Result<process::Output>, Option<Signal>);
+
+  fn output_guard_stdout(self) -> Result<String, OutputError>;
+
+  fn resolve(program: impl AsRef<OsStr>) -> Command;
+
+  fn status_guard(self) -> (io::Result<ExitStatus>, Option<Signal>);
+}
+
+impl CommandExt for Command {
+  fn export(
+    &mut self,
+    settings: &Settings,
+    dotenv: &BTreeMap<String, String>,
+    scope: &Scope,
+    unexports: &HashSet<String>,
+  ) -> &mut Command {
+    for (name, value) in dotenv {
+      self.env(name, value);
+    }
+
+    if let Some(parent) = scope.parent() {
+      self.export_scope(settings, parent, unexports);
+    }
+
+    self
+  }
+
+  fn export_scope(&mut self, settings: &Settings, scope: &Scope, unexports: &HashSet<String>) {
+    if let Some(parent) = scope.parent() {
+      self.export_scope(settings, parent, unexports);
+    }
+
+    for unexport in unexports {
+      self.env_remove(unexport);
+    }
+
+    for binding in scope.bindings() {
+      if binding.export || (settings.export && !binding.prelude) {
+        self.env(binding.name.lexeme(), &binding.value);
+      }
+    }
+  }
+
+  fn output_guard(self) -> (io::Result<process::Output>, Option<Signal>) {
+    SignalHandler::spawn(self, process::Child::wait_with_output)
+  }
+
+  fn output_guard_stdout(self) -> Result<String, OutputError> {
+    let (result, caught) = self.output_guard();
+
+    let output = result.map_err(OutputError::Io)?;
+
+    OutputError::result_from_exit_status(output.status)?;
+
+    let output = str::from_utf8(&output.stdout).map_err(OutputError::Utf8)?;
+
+    if let Some(signal) = caught {
+      return Err(OutputError::Interrupted(signal));
+    }
+
+    Ok(
+      output
+        .strip_suffix("\r\n")
+        .or_else(|| output.strip_suffix("\n"))
+        .unwrap_or(output)
+        .into(),
+    )
+  }
+
+  fn resolve(program: impl AsRef<OsStr>) -> Self {
+    let program = Path::new(program.as_ref());
+
+    if !cfg!(windows) {
+      return Self::new(program);
+    }
+
+    let mut candidates = vec![program.into()];
+
+    let mut components = program.components();
+    if matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none() {
+      if let Some(path) = env::var_os("PATH") {
+        for path in env::split_paths(&path) {
+          candidates.push(path.join(program));
+        }
+      }
+    }
+
+    let extensions = if program.extension().is_none() {
+      let pathext = env::var_os("PATHEXT")
+        .unwrap_or(".COM;.EXE;.BAT;.CMD".into())
+        .to_string_lossy()
+        .into_owned();
+      let mut extensions = Vec::new();
+      for extension in pathext.split(';') {
+        if let Some(extension) = extension.strip_prefix('.') {
+          extensions.push(extension.to_owned());
+        }
+      }
+      Some(extensions)
+    } else {
+      None
+    };
+
+    for candidate in candidates {
+      if let Some(extensions) = &extensions {
+        for extension in extensions {
+          let path = candidate.with_extension(extension);
+          if path.is_file() {
+            return Self::new(path);
+          }
+        }
+      } else if candidate.is_file() {
+        return Self::new(candidate);
+      }
+    }
+
+    Self::new(program)
+  }
+
+  fn status_guard(self) -> (io::Result<ExitStatus>, Option<Signal>) {
+    SignalHandler::spawn(self, |mut child| child.wait())
+  }
+}
+use super::*;
+
+#[test]
+#[ignore]
+fn prior_dependencies_run_in_parallel() {
+  let start = Instant::now();
+
+  Test::new()
+    .justfile(
+      "
+        [parallel]
+        foo: a b c d e
+
+        a:
+          sleep 1
+
+        b:
+          sleep 1
+
+        c:
+          sleep 1
+
+        d:
+          sleep 1
+
+        e:
+          sleep 1
+      ",
+    )
+    .stderr(
+      "
+        sleep 1
+        sleep 1
+        sleep 1
+        sleep 1
+        sleep 1
+      ",
+    )
+    .success();
+
+  assert!(start.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+#[ignore]
+fn subsequent_dependencies_run_in_parallel() {
+  let start = Instant::now();
+
+  Test::new()
+    .justfile(
+      "
+        [parallel]
+        foo: && a b c d e
+
+        a:
+          sleep 1
+
+        b:
+          sleep 1
+
+        c:
+          sleep 1
+
+        d:
+          sleep 1
+
+        e:
+          sleep 1
+      ",
+    )
+    .stderr(
+      "
+        sleep 1
+        sleep 1
+        sleep 1
+        sleep 1
+        sleep 1
+      ",
+    )
+    .success();
+
+  assert!(start.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn parallel_dependencies_report_errors() {
+  Test::new()
+    .justfile(
+      "
+        [parallel]
+        foo: bar
+
+        bar:
+          exit 1
+      ",
+    )
+    .stderr(
+      "
+        exit 1
+        error: Recipe `bar` failed on line 5 with exit code 1
+      ",
+    )
+    .failure();
+}
+
+#[test]
+#[ignore]
+fn dependents_block_on_running_dependencies() {
+  Test::new()
+    .justfile(
+      "
+        set quiet
+
+        [parallel]
+        a: b c
+          echo a
+
+        b: x
+          echo b
+
+        c: x
+          echo c
+
+        x:
+          sleep 1
+          echo x
+      ",
+    )
+    .stdout_regex(
+      r"(?x)
+      x\n
+      (
+        b\nc\n
+        |
+        c\nb\n
+      )
+      a\n",
+    )
+    .success();
+}

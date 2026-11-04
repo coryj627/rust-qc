@@ -1,0 +1,746 @@
+/// [HTTP/2 handshake]: http://httpwg.org/specs/rfc7540.html#ConnectionHeader
+/// [Handshake]: ../index.html#handshake
+/// [`Connection`]: struct.Connection.html
+/// [`SendRequest`]: struct.SendRequest.html
+///
+/// # Examples
+///
+/// ```
+/// # use tokio::io::{AsyncRead, AsyncWrite};
+/// # use h2::client;
+/// # use h2::client::*;
+/// #
+/// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T) -> Result<(), h2::Error>
+/// # {
+/// let (send_request, connection) = client::handshake(my_io).await?;
+/// // The HTTP/2 handshake has completed, now start polling
+/// // `connection` and use `send_request` to send requests to the
+/// // server.
+/// # Ok(())
+/// # }
+/// #
+/// # pub fn main() {}
+/// ```
+pub async fn handshake<T>(io: T) -> Result<(SendRequest<Bytes>, Connection<T, Bytes>), crate::Error>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let builder = Builder::new();
+    builder
+        .handshake(io)
+        .instrument(tracing::trace_span!("client_handshake"))
+        .await
+}
+
+// ===== impl Connection =====
+
+async fn bind_connection<T>(io: &mut T) -> Result<(), crate::Error>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    tracing::debug!("binding client connection");
+
+    let msg: &'static [u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    io.write_all(msg).await.map_err(crate::Error::from_io)?;
+
+    tracing::debug!("client connection bound");
+
+    Ok(())
+}
+
+impl<T, B> Connection<T, B>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+    B: Buf,
+{
+    async fn handshake2(
+        mut io: T,
+        builder: Builder,
+    ) -> Result<(SendRequest<B>, Connection<T, B>), crate::Error> {
+        bind_connection(&mut io).await?;
+
+        // Create the codec
+        let mut codec = Codec::new(io);
+
+        if let Some(max) = builder.settings.max_frame_size() {
+            codec.set_max_recv_frame_size(max as usize);
+        }
+
+        if let Some(max) = builder.settings.max_header_list_size() {
+            codec.set_max_recv_header_list_size(max as usize);
+        }
+
+        // Send initial settings frame
+        codec
+            .buffer(builder.settings.clone().into())
+            .expect("invalid SETTINGS frame");
+
+        let inner = proto::Connection::new(
+            codec,
+            proto::Config {
+                next_stream_id: builder.stream_id,
+                initial_max_send_streams: builder.initial_max_send_streams,
+                max_send_buffer_size: builder.max_send_buffer_size,
+                reset_stream_duration: builder.reset_stream_duration,
+                reset_stream_max: builder.reset_stream_max,
+                remote_reset_stream_max: builder.pending_accept_reset_stream_max,
+                local_error_reset_streams_max: builder.local_max_error_reset_streams,
+                settings: builder.settings.clone(),
+            },
+        );
+        let send_request = SendRequest {
+            inner: inner.streams().clone(),
+            pending: None,
+        };
+
+        let mut connection = Connection { inner };
+        if let Some(sz) = builder.initial_target_connection_window_size {
+            connection.set_target_window_size(sz);
+        }
+
+        Ok((send_request, connection))
+use crate::frame::{util, Error, Frame, Head, Kind, StreamId};
+use bytes::{Buf, BufMut, Bytes};
+
+use std::fmt;
+
+/// Data frame
+///
+/// Data frames convey arbitrary, variable-length sequences of octets associated
+/// with a stream. One or more DATA frames are used, for instance, to carry HTTP
+/// request or response payloads.
+#[derive(Eq, PartialEq)]
+pub struct Data<T = Bytes> {
+    stream_id: StreamId,
+    data: T,
+    flags: DataFlags,
+    pad_len: Option<u8>,
+}
+
+#[derive(Copy, Clone, Default, Eq, PartialEq)]
+struct DataFlags(u8);
+
+const END_STREAM: u8 = 0x1;
+const PADDED: u8 = 0x8;
+const ALL: u8 = END_STREAM | PADDED;
+
+impl<T> Data<T> {
+    /// Creates a new DATA frame.
+    pub fn new(stream_id: StreamId, payload: T) -> Self {
+        assert!(!stream_id.is_zero());
+
+        Data {
+            stream_id,
+            data: payload,
+            flags: DataFlags::default(),
+            pad_len: None,
+        }
+    }
+
+    /// Returns the stream identifier that this frame is associated with.
+    ///
+    /// This cannot be a zero stream identifier.
+    pub fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    /// Gets the value of the `END_STREAM` flag for this frame.
+    ///
+    /// If true, this frame is the last that the endpoint will send for the
+    /// identified stream.
+    ///
+    /// Setting this flag causes the stream to enter one of the "half-closed"
+    /// states or the "closed" state (Section 5.1).
+    pub fn is_end_stream(&self) -> bool {
+        self.flags.is_end_stream()
+    }
+
+    /// Sets the value for the `END_STREAM` flag on this frame.
+    pub fn set_end_stream(&mut self, val: bool) {
+        if val {
+            self.flags.set_end_stream();
+        } else {
+            self.flags.unset_end_stream();
+        }
+    }
+
+    /// Returns whether the `PADDED` flag is set on this frame.
+    #[cfg(feature = "unstable")]
+    pub fn is_padded(&self) -> bool {
+        self.flags.is_padded()
+    }
+
+    /// Sets the value for the `PADDED` flag on this frame.
+    #[cfg(feature = "unstable")]
+    pub fn set_padded(&mut self) {
+        self.flags.set_padded();
+    }
+
+    /// Returns a reference to this frame's payload.
+    ///
+    /// This does **not** include any padding that might have been originally
+    /// included.
+    pub fn payload(&self) -> &T {
+        &self.data
+    }
+
+    /// Returns a mutable reference to this frame's payload.
+    ///
+    /// This does **not** include any padding that might have been originally
+    /// included.
+    pub fn payload_mut(&mut self) -> &mut T {
+        &mut self.data
+    }
+
+    /// Consumes `self` and returns the frame's payload.
+    ///
+    /// This does **not** include any padding that might have been originally
+    /// included.
+    pub fn into_payload(self) -> T {
+        self.data
+    }
+
+    pub(crate) fn head(&self) -> Head {
+        Head::new(Kind::Data, self.flags.into(), self.stream_id)
+    }
+
+    pub(crate) fn map<F, U>(self, f: F) -> Data<U>
+    where
+        F: FnOnce(T) -> U,
+    {
+        Data {
+            stream_id: self.stream_id,
+            data: f(self.data),
+            flags: self.flags,
+            pad_len: self.pad_len,
+        }
+    }
+}
+
+impl Data<Bytes> {
+    pub(crate) fn load(head: Head, mut payload: Bytes) -> Result<Self, Error> {
+        let flags = DataFlags::load(head.flag());
+
+        // The stream identifier must not be zero
+        if head.stream_id().is_zero() {
+            return Err(Error::InvalidStreamId);
+        }
+
+        let pad_len = if flags.is_padded() {
+            let len = util::strip_padding(&mut payload)?;
+            Some(len)
+        } else {
+            None
+        };
+
+        Ok(Data {
+            stream_id: head.stream_id(),
+            data: payload,
+            flags,
+            pad_len,
+        })
+    }
+}
+
+impl<T: Buf> Data<T> {
+    /// Encode the data frame into the `dst` buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dst` cannot contain the data frame.
+    pub(crate) fn encode_chunk<U: BufMut>(&mut self, dst: &mut U) {
+        let len = self.data.remaining();
+
+        assert!(dst.remaining_mut() >= len);
+
+        self.head().encode(len, dst);
+        dst.put(&mut self.data);
+    }
+}
+
+impl<T> From<Data<T>> for Frame<T> {
+    fn from(src: Data<T>) -> Self {
+        Frame::Data(src)
+    }
+}
+
+impl<T> fmt::Debug for Data<T> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        let mut f = fmt.debug_struct("Data");
+        f.field("stream_id", &self.stream_id);
+        if !self.flags.is_empty() {
+            f.field("flags", &self.flags);
+        }
+        if let Some(ref pad_len) = self.pad_len {
+            f.field("pad_len", pad_len);
+        }
+        // `data` bytes purposefully excluded
+        f.finish()
+    }
+}
+
+// ===== impl DataFlags =====
+
+impl DataFlags {
+    fn load(bits: u8) -> DataFlags {
+        DataFlags(bits & ALL)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0 & END_STREAM == END_STREAM
+    }
+
+    fn set_end_stream(&mut self) {
+        self.0 |= END_STREAM
+    }
+
+    fn unset_end_stream(&mut self) {
+        self.0 &= !END_STREAM
+    }
+
+    fn is_padded(&self) -> bool {
+        self.0 & PADDED == PADDED
+    }
+
+    #[cfg(feature = "unstable")]
+    fn set_padded(&mut self) {
+        self.0 |= PADDED
+    }
+}
+
+impl From<DataFlags> for u8 {
+    fn from(src: DataFlags) -> u8 {
+        src.0
+    }
+}
+
+impl fmt::Debug for DataFlags {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        util::debug_flags(fmt, self.0)
+            .flag_if(self.is_end_stream(), "END_STREAM")
+            .flag_if(self.is_padded(), "PADDED")
+            .finish()
+    }
+}
+1515:async fn data_padding() {
+mod error;
+mod framed_read;
+mod framed_write;
+
+pub use self::error::{SendError, UserError};
+
+use self::framed_read::FramedRead;
+use self::framed_write::FramedWrite;
+
+use crate::frame::{self, Data, Frame};
+use crate::proto::Error;
+
+use bytes::Buf;
+use futures_core::Stream;
+use futures_sink::Sink;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::codec::length_delimited;
+
+use std::io;
+
+#[derive(Debug)]
+pub struct Codec<T, B> {
+    inner: FramedRead<FramedWrite<T, B>>,
+}
+
+impl<T, B> Codec<T, B>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+    B: Buf,
+{
+    /// Returns a new `Codec` with the default max frame size
+    #[inline]
+    pub fn new(io: T) -> Self {
+        Self::with_max_recv_frame_size(io, frame::DEFAULT_MAX_FRAME_SIZE as usize)
+    }
+
+    /// Returns a new `Codec` with the given maximum frame size
+    pub fn with_max_recv_frame_size(io: T, max_frame_size: usize) -> Self {
+        // Wrap with writer
+        let framed_write = FramedWrite::new(io);
+
+        // Delimit the frames
+        let delimited = length_delimited::Builder::new()
+            .big_endian()
+            .length_field_length(3)
+            .length_adjustment(9)
+            .num_skip(0) // Don't skip the header
+            .new_read(framed_write);
+
+        let mut inner = FramedRead::new(delimited);
+
+        // Use FramedRead's method since it checks the value is within range.
+        inner.set_max_frame_size(max_frame_size);
+
+        Codec { inner }
+    }
+}
+
+impl<T, B> Codec<T, B> {
+    /// Updates the max received frame size.
+    ///
+    /// The change takes effect the next time a frame is decoded. In other
+    /// words, if a frame is currently in process of being decoded with a frame
+    /// size greater than `val` but less than the max frame size in effect
+    /// before calling this function, then the frame will be allowed.
+    #[inline]
+    pub fn set_max_recv_frame_size(&mut self, val: usize) {
+        self.inner.set_max_frame_size(val)
+    }
+
+    /// Returns the current max received frame size setting.
+    ///
+    /// This is the largest size this codec will accept from the wire. Larger
+    /// frames will be rejected.
+    #[cfg(feature = "unstable")]
+    #[inline]
+    pub fn max_recv_frame_size(&self) -> usize {
+        self.inner.max_frame_size()
+    }
+
+    /// Returns the max frame size that can be sent to the peer.
+    pub fn max_send_frame_size(&self) -> usize {
+        self.inner.get_ref().max_frame_size()
+    }
+
+    /// Set the peer's max frame size.
+    pub fn set_max_send_frame_size(&mut self, val: usize) {
+        self.framed_write().set_max_frame_size(val)
+    }
+
+    /// Set the peer's header table size size.
+    pub fn set_send_header_table_size(&mut self, val: usize) {
+        self.framed_write().set_header_table_size(val)
+    }
+
+    /// Set the decoder header table size size.
+    pub fn set_recv_header_table_size(&mut self, val: usize) {
+        self.inner.set_header_table_size(val)
+    }
+
+    /// Set the max header list size that can be received.
+    pub fn set_max_recv_header_list_size(&mut self, val: usize) {
+        self.inner.set_max_header_list_size(val);
+    }
+
+    /// Get a reference to the inner stream.
+    #[cfg(feature = "unstable")]
+    pub fn get_ref(&self) -> &T {
+        self.inner.get_ref().get_ref()
+    }
+
+    /// Get a mutable reference to the inner stream.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.inner.get_mut().get_mut()
+    }
+
+    /// Takes the data payload value that was fully written to the socket
+    pub(crate) fn take_last_data_frame(&mut self) -> Option<Data<B>> {
+        self.framed_write().take_last_data_frame()
+    }
+
+    fn framed_write(&mut self) -> &mut FramedWrite<T, B> {
+        self.inner.get_mut()
+    }
+}
+
+impl<T, B> Codec<T, B>
+where
+    T: AsyncWrite + Unpin,
+    B: Buf,
+{
+    /// Returns `Ready` when the codec can buffer a frame
+    pub fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.framed_write().poll_ready(cx)
+    }
+
+    /// Buffer a frame.
+    ///
+    /// `poll_ready` must be called first to ensure that a frame may be
+    /// accepted.
+    ///
+    /// TODO: Rename this to avoid conflicts with Sink::buffer
+    pub fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
+        self.framed_write().buffer(item)
+    }
+
+    /// Flush buffered data to the wire
+    pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.framed_write().flush(cx)
+    }
+
+    /// Shutdown the send half
+    pub fn shutdown(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.framed_write().shutdown(cx)
+    }
+}
+
+impl<T, B> Stream for Codec<T, B>
+where
+    T: AsyncRead + Unpin,
+{
+    type Item = Result<Frame, Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl<T, B> Sink<Frame<B>> for Codec<T, B>
+where
+    T: AsyncWrite + Unpin,
+    B: Buf,
+{
+    type Error = SendError;
+
+    fn start_send(mut self: Pin<&mut Self>, item: Frame<B>) -> Result<(), Self::Error> {
+        Codec::buffer(&mut self, item)?;
+        Ok(())
+    }
+    /// Returns `Ready` when the codec can buffer a frame
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.framed_write().poll_ready(cx).map_err(Into::into)
+    }
+
+    /// Flush buffered data to the wire
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.framed_write().flush(cx).map_err(Into::into)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        ready!(self.shutdown(cx))?;
+        Poll::Ready(Ok(()))
+    }
+}
+
+// TODO: remove (or improve) this
+impl<T> From<T> for Codec<T, bytes::Bytes>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    fn from(src: T) -> Self {
+        Self::new(src)
+    }
+}
+use crate::codec::Codec;
+use crate::frame::Ping;
+use crate::proto::{self, PingPayload};
+
+use atomic_waker::AtomicWaker;
+use bytes::Buf;
+use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use tokio::io::AsyncWrite;
+
+/// Acknowledges ping requests from the remote.
+#[derive(Debug)]
+pub(crate) struct PingPong {
+    pending_ping: Option<PendingPing>,
+    pending_pong: Option<PingPayload>,
+    user_pings: Option<UserPingsRx>,
+}
+
+#[derive(Debug)]
+pub(crate) struct UserPings(Arc<UserPingsInner>);
+
+#[derive(Debug)]
+struct UserPingsRx(Arc<UserPingsInner>);
+
+#[derive(Debug)]
+struct UserPingsInner {
+    state: AtomicUsize,
+    /// Task to wake up the main `Connection`.
+    ping_task: AtomicWaker,
+    /// Task to wake up `share::PingPong::poll_pong`.
+    pong_task: AtomicWaker,
+}
+
+#[derive(Debug)]
+struct PendingPing {
+    payload: PingPayload,
+    sent: bool,
+}
+
+/// Status returned from `PingPong::recv_ping`.
+#[derive(Debug)]
+pub(crate) enum ReceivedPing {
+    MustAck,
+    Unknown,
+    Shutdown,
+}
+
+/// No user ping pending.
+const USER_STATE_EMPTY: usize = 0;
+/// User has called `send_ping`, but PING hasn't been written yet.
+const USER_STATE_PENDING_PING: usize = 1;
+/// User PING has been written, waiting for PONG.
+const USER_STATE_PENDING_PONG: usize = 2;
+/// We've received user PONG, waiting for user to `poll_pong`.
+const USER_STATE_RECEIVED_PONG: usize = 3;
+/// The connection is closed.
+const USER_STATE_CLOSED: usize = 4;
+
+// ===== impl PingPong =====
+
+impl PingPong {
+    pub(crate) fn new() -> Self {
+        PingPong {
+            pending_ping: None,
+            pending_pong: None,
+            user_pings: None,
+        }
+    }
+
+    /// Can only be called once. If called a second time, returns `None`.
+    pub(crate) fn take_user_pings(&mut self) -> Option<UserPings> {
+        if self.user_pings.is_some() {
+            return None;
+        }
+
+        let user_pings = Arc::new(UserPingsInner {
+            state: AtomicUsize::new(USER_STATE_EMPTY),
+            ping_task: AtomicWaker::new(),
+            pong_task: AtomicWaker::new(),
+        });
+        self.user_pings = Some(UserPingsRx(user_pings.clone()));
+        Some(UserPings(user_pings))
+    }
+
+    pub(crate) fn ping_shutdown(&mut self) {
+        assert!(self.pending_ping.is_none());
+
+        self.pending_ping = Some(PendingPing {
+            payload: Ping::SHUTDOWN,
+            sent: false,
+        });
+    }
+
+    /// Process a ping
+    pub(crate) fn recv_ping(&mut self, ping: Ping) -> ReceivedPing {
+        // The caller should always check that `send_pongs` returns ready before
+        // calling `recv_ping`.
+        assert!(self.pending_pong.is_none());
+
+        if ping.is_ack() {
+            if let Some(pending) = self.pending_ping.take() {
+                if &pending.payload == ping.payload() {
+                    assert_eq!(
+                        &pending.payload,
+                        &Ping::SHUTDOWN,
+                        "pending_ping should be for shutdown",
+                    );
+                    tracing::trace!("recv PING SHUTDOWN ack");
+                    return ReceivedPing::Shutdown;
+                }
+
+                // if not the payload we expected, put it back.
+                self.pending_ping = Some(pending);
+            }
+
+            if let Some(ref users) = self.user_pings {
+                if ping.payload() == &Ping::USER && users.receive_pong() {
+                    tracing::trace!("recv PING USER ack");
+                    return ReceivedPing::Unknown;
+                }
+            }
+
+            // else we were acked a ping we didn't send?
+            // The spec doesn't require us to do anything about this,
+            // so for resiliency, just ignore it for now.
+            tracing::warn!("recv PING ack that we never sent: {:?}", ping);
+            ReceivedPing::Unknown
+        } else {
+            // Save the ping's payload to be sent as an acknowledgement.
+            self.pending_pong = Some(ping.into_payload());
+            ReceivedPing::MustAck
+        }
+    }
+
+    /// Send any pending pongs.
+    pub(crate) fn send_pending_pong<T, B>(
+        &mut self,
+        cx: &mut Context,
+        dst: &mut Codec<T, B>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        if let Some(pong) = self.pending_pong.take() {
+            if !dst.poll_ready(cx)?.is_ready() {
+                self.pending_pong = Some(pong);
+                return Poll::Pending;
+            }
+
+            dst.buffer(Ping::pong(pong).into())
+                .expect("invalid pong frame");
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
+    /// Send any pending pings.
+    pub(crate) fn send_pending_ping<T, B>(
+        &mut self,
+        cx: &mut Context,
+        dst: &mut Codec<T, B>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        if let Some(ref mut ping) = self.pending_ping {
+            if !ping.sent {
+                if !dst.poll_ready(cx)?.is_ready() {
+                    return Poll::Pending;
+                }
+
+                dst.buffer(Ping::new(ping.payload).into())
+                    .expect("invalid ping frame");
+                ping.sent = true;
+            }
+        } else if let Some(ref users) = self.user_pings {
+            if users.0.state.load(Ordering::Acquire) == USER_STATE_PENDING_PING {
+                if !dst.poll_ready(cx)?.is_ready() {
+                    return Poll::Pending;
+                }
+
+                dst.buffer(Ping::new(Ping::USER).into())
+                    .expect("invalid ping frame");
+                users
+                    .0
+                    .state
+                    .store(USER_STATE_PENDING_PONG, Ordering::Release);
+            } else {
+                users.0.ping_task.register(cx.waker());
+            }
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl ReceivedPing {
+    pub(crate) fn is_shutdown(&self) -> bool {
+        matches!(*self, Self::Shutdown)
+    }
+}
+
+// ===== impl UserPings =====
+
+impl UserPings {
+    pub(crate) fn send_ping(&self) -> Result<(), Option<proto::Error>> {
+6.267133333333334 minutes used of 15.0

@@ -1,0 +1,278 @@
+        {
+            InitResult::Initialized(v) => {
+                crossbeam_epoch::pin().flush();
+                Ok(Entry::new(k, v, true, false))
+            }
+            InitResult::ReadExisting(v) => Ok(Entry::new(k, v, false, false)),
+            InitResult::InitErr(e) => {
+                crossbeam_epoch::pin().flush();
+                Err(e)
+            }
+        }
+    }
+
+    /// Inserts a key-value pair into the cache.
+    ///
+    /// If the cache has this key present, the value is updated.
+    pub fn insert(&self, key: K, value: V) {
+        let hash = self.base.hash(&key);
+        let key = Arc::new(key);
+        self.insert_with_hash(key, hash, value);
+    }
+
+    pub(crate) fn insert_with_hash(&self, key: Arc<K>, hash: u64, value: V) {
+        if self.base.is_map_disabled() {
+            return;
+        }
+
+        let (op, now) = self.base.do_insert_with_hash(key, hash, value);
+        let hk = self.base.housekeeper.as_ref();
+        Self::schedule_write_op(
+            self.base.inner.as_ref(),
+            &self.base.write_op_ch,
+            op,
+            now,
+            hk,
+        )
+        .expect("Failed to insert");
+    }
+
+    pub(crate) fn compute_with_hash_and_fun<F>(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        f: F,
+    ) -> compute::CompResult<K, V>
+    where
+        F: FnOnce(Option<Entry<K, V>>) -> compute::Op<V>,
+    {
+        let post_init = ValueInitializer::<K, V, S>::post_init_for_compute_with;
+            })
+    }
+
+    /// If no value corresponds to the key, invoke a default function to insert
+    /// a new key-value pair into the map. Otherwise, modify the existing value
+    /// and return a clone of the value previously corresponding to the key.
+    ///
+    /// `on_insert` may be invoked, even if [`None`] is returned.
+    ///
+    /// `on_modify` will be invoked at least once if [`Some`] is returned. It
+    /// may also be invoked one or more times if [`None`] is returned.
+    ///
+    /// [`Some`]: https://doc.rust-lang.org/std/option/enum.Option.html#variant.Some
+    /// [`None`]: https://doc.rust-lang.org/std/option/enum.Option.html#variant.None
+    #[inline]
+    pub(crate) fn insert_with_or_modify(
+        &self,
+        key: K,
+        hash: u64,
+        on_insert: impl FnOnce() -> V,
+        on_modify: impl FnMut(&K, &V) -> V,
+    ) -> Option<V>
+    where
+        V: Clone,
+    {
+        self.insert_with_or_modify_entry_and(key, hash, on_insert, on_modify, |_, v| v.clone())
+    }
+
+    /// If no value corresponds to the key, invoke a default function to insert
+    /// a new key-value pair into the map. Otherwise, modify the existing value
+    /// and return the result of invoking a function with a reference to the
+    /// key-value pair previously corresponding to the supplied key.
+    ///
+    /// `on_insert` may be invoked, even if [`None`] is returned.
+    ///
+    /// `on_modify` will be invoked at least once if [`Some`] is returned. It
+    /// may also be invoked one or more times if [`None`] is returned.
+    ///
+    /// [`Some`]: https://doc.rust-lang.org/std/option/enum.Option.html#variant.Some
+    /// [`None`]: https://doc.rust-lang.org/std/option/enum.Option.html#variant.None
+    #[inline]
+    pub(crate) fn insert_with_or_modify_entry_and<T>(
+        &self,
+        key: K,
+        hash: u64,
+        on_insert: impl FnOnce() -> V,
+        on_modify: impl FnMut(&K, &V) -> V,
+        with_old_entry: impl FnOnce(&K, &V) -> T,
+    ) -> Option<T> {
+        let result = self.bucket_array_ref(hash).insert_with_or_modify_entry_and(
+            key,
+            hash,
+            on_insert,
+            on_modify,
+            with_old_entry,
+        );
+
+        if result.is_none() {
+            self.len.fetch_add(1, Ordering::Relaxed);
+        }
+
+        mut modifier: G,
+    ) -> Result<Shared<'g, Bucket<K, V>>, (InsertOrModifyState<K, V, F>, G)>
+    where
+        F: FnOnce() -> V,
+        G: FnMut(&K, &V) -> V,
+    {
+        let mut probe = self.probe(guard, hash);
+        while let Some(bucket) = probe.next() {
+            let Ok((_, this_bucket, this_bucket_ptr)) = bucket else {
+                return Err((state, modifier));
+            };
+
+            let (new_bucket, maybe_insert_value) =
+                if let Some(this_bucket_ref) = unsafe { this_bucket_ptr.as_ref() } {
+                    let this_key = &this_bucket_ref.key;
+
+                    if this_key != state.key() {
+                        // Different key. Try next bucket.
+                        continue;
+                    }
+
+                    if is_tombstone(this_bucket_ptr) {
+                        // Found a tombstone for this key. Replace it.
+                        (state.into_insert_bucket(), None)
+                    } else {
+                        // Found. Modify it.
+                        let this_value = unsafe { &*this_bucket_ref.maybe_value.as_ptr() };
+                        let new_value = modifier(this_key, this_value);
+
+                        let (new_bucket, insert_value) = state.into_modify_bucket(new_value);
+
+                        (new_bucket, Some(insert_value))
+                    }
+                } else {
+                    // Not found. Insert it.
+                    (state.into_insert_bucket(), None)
+                };
+
+            if let Err(CompareExchangeError { new, .. }) = this_bucket.compare_exchange_weak(
+                this_bucket_ptr,
+                new_bucket,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+                guard,
+            ) {
+                // Failed. Reload to retry.
+                state = InsertOrModifyState::from_bucket_value(new, maybe_insert_value);
+                probe.reload();
+            } else {
+                // Succeeded. Return the previous value. (can be null)
+                return Ok(this_bucket_ptr);
+            }
+        }
+    }
+
+    pub(crate) fn set_admitted(&self, value: bool) {
+        self.info.set_admitted(value);
+    }
+
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.info.is_dirty()
+    }
+
+    #[inline]
+    pub(crate) fn policy_weight(&self) -> u32 {
+        self.info.policy_weight()
+    }
+
+    pub(crate) fn deq_nodes(&self) -> &MiniArc<Mutex<DeqNodes<K>>> {
+        &self.nodes
+    }
+
+                Err((s, f)) => {
+                    state = s;
+                    on_modify = f;
+                    if let Some(r) =
+                        bucket_array_ref.rehash(guard, self.build_hasher, RehashOp::Expand)
+                    {
+                        bucket_array_ref = r;
+                    }
+                }
+            }
+        }
+
+        self.swing(guard, current_ref, bucket_array_ref);
+
+        result
+    }
+
+    pub(crate) fn keys<T>(&self, mut with_key: impl FnMut(&K) -> T) -> Vec<T> {
+        let guard = &crossbeam_epoch::pin();
+        let current_ref = self.get(guard);
+        let mut bucket_array_ref = current_ref;
+
+        let result;
+
+        loop {
+            match bucket_array_ref.keys(guard, &mut with_key) {
+                Ok(keys) => {
+                    result = keys;
+                    break;
+                }
+                Err(_) => {
+                    if let Some(r) =
+                        bucket_array_ref.rehash(guard, self.build_hasher, RehashOp::Expand)
+                    {
+                        bucket_array_ref = r;
+                    }
+                }
+            }
+        }
+
+        self.swing(guard, current_ref, bucket_array_ref);
+
+        result
+    }
+}
+
+impl<'g, K, V, S> BucketArrayRef<'_, K, V, S> {
+    fn get(&self, guard: &'g Guard) -> &'g BucketArray<K, V> {
+        let mut maybe_new_bucket_array = None;
+
+        loop {
+            let bucket_array_ptr = self.bucket_array.load_consume(guard);
+
+            if let Some(bucket_array_ref) = unsafe { bucket_array_ptr.as_ref() } {
+                return bucket_array_ref;
+            }
+
+            let new_bucket_array =
+                maybe_new_bucket_array.unwrap_or_else(|| Owned::new(BucketArray::default()));
+
+            match self.bucket_array.compare_exchange_weak(
+                Shared::null(),
+                new_bucket_array,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+                guard,
+            ) {
+                Ok(b) => return unsafe { b.as_ref() }.unwrap(),
+                Err(CompareExchangeError { new, .. }) => maybe_new_bucket_array = Some(new),
+            }
+        }
+    }
+
+    fn swing(
+        &self,
+        guard: &'g Guard,
+        mut current_ref: &'g BucketArray<K, V>,
+        min_ref: &'g BucketArray<K, V>,
+    ) {
+        let min_epoch = min_ref.epoch;
+
+        let mut current_ptr = (current_ref as *const BucketArray<K, V>).into();
+        let min_ptr: Shared<'g, _> = (min_ref as *const BucketArray<K, V>).into();
+
+        loop {
+            if current_ref.epoch >= min_epoch {
+                return;
+            }
+
+            match self.bucket_array.compare_exchange_weak(
+                current_ptr,
+                min_ptr,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+                guard,
+            ) {

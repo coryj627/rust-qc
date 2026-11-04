@@ -1,0 +1,1065 @@
+	fsit_opts.flags = ctx->backend->iterator_flags;
+
+	git_str_clear(&ctx->path);
+	git_str_puts(&ctx->path, root_path);
+	git_str_put(&ctx->path, ctx->ref_prefix, ctx->ref_prefix_len);
+
+	fsit_opts.flags = ctx->backend->iterator_flags;
+	fsit_opts.oid_type = ctx->backend->oid_type;
+
+	if ((error = git_iterator_for_filesystem(&fsit, ctx->path.ptr, &fsit_opts)) < 0) {
+		/*
+		 * Subdirectories - either glob provided or per-worktree refs - need
+		 * not exist.
+		 */
+		if ((worktree || ctx->iter->glob) && error == GIT_ENOTFOUND)
+			error = 0;
+
+		goto done;
+	}
+
+	git_str_clear(&ctx->ref_name);
+	git_str_put(&ctx->ref_name, ctx->ref_prefix, ctx->ref_prefix_len);
+
+	while (git_iterator_advance(&entry, fsit) == 0) {
+		char *ref_dup;
+
+		git_str_truncate(&ctx->ref_name, ctx->ref_prefix_len);
+		git_str_puts(&ctx->ref_name, entry->path);
+
+		if (worktree) {
+			if (!is_per_worktree_ref(ctx->ref_name.ptr))
+				continue;
+		} else {
+			if (git_repository_is_worktree(ctx->backend->repo) &&
+			    is_per_worktree_ref(ctx->ref_name.ptr))
+				continue;
+		}
+
+		if (git__suffixcmp(ctx->ref_name.ptr, ".lock") == 0)
+			continue;
+
+		if (ctx->iter->glob && wildmatch(ctx->iter->glob, ctx->ref_name.ptr, 0))
+			continue;
+
+		ref_dup = git_pool_strdup(&ctx->iter->pool, ctx->ref_name.ptr);
+		GIT_ERROR_CHECK_ALLOC(ref_dup);
+
+		if ((error = git_vector_insert(&ctx->iter->loose, ref_dup)) < 0)
+			goto done;
+	}
+
+done:
+	git_iterator_free(fsit);
+	return error;
+}
+
+#define iter_load_context_init(b, i) { b, i, GIT_REFS_DIR, CONST_STRLEN(GIT_REFS_DIR) }
+#define iter_load_context_dispose(ctx) do {  \
+	git_str_dispose(&((ctx)->path));     \
+	git_str_dispose(&((ctx)->ref_name)); \
+} while(0)
+
+static int iter_load_loose_paths(
+	refdb_fs_backend *backend,
+	refdb_fs_iter *iter)
+{
+	struct iter_load_context ctx = iter_load_context_init(backend, iter);
+
+	int error = 0;
+
+	if (!backend->commonpath)
+		return 0;
+
+	iter_load_optimize_prefix(&ctx);
+
+	if ((error = iter_load_paths(&ctx,
+			backend->commonpath, false)) < 0)
+		goto done;
+
+	if (git_repository_is_worktree(backend->repo)) {
+		if ((error = iter_load_paths(&ctx,
+				backend->gitpath, true)) < 0)
+			goto done;
+	}
+
+done:
+	iter_load_context_dispose(&ctx);
+	return error;
+}
+
+static int refdb_fs_backend__iterator_next(
+	git_reference **out, git_reference_iterator *_iter)
+{
+	int error = GIT_ITEROVER;
+	refdb_fs_iter *iter = GIT_CONTAINER_OF(_iter, refdb_fs_iter, parent);
+	refdb_fs_backend *backend = GIT_CONTAINER_OF(iter->parent.db->backend, refdb_fs_backend, parent);
+	struct packref *ref;
+
+	while (iter->loose_pos < iter->loose.length) {
+		const char *path = git_vector_get(&iter->loose, iter->loose_pos++);
+
+		if (loose_lookup(out, backend, path) == 0) {
+			ref = git_sortedcache_lookup(iter->cache, path);
+			if (ref)
+				ref->flags |= PACKREF_SHADOWED;
+
+			return 0;
+		}
+
+		git_error_clear();
+	}
+
+	error = GIT_ITEROVER;
+	while (iter->packed_pos < git_sortedcache_entrycount(iter->cache)) {
+		ref = git_sortedcache_entry(iter->cache, iter->packed_pos++);
+		if (!ref) /* stop now if another thread deleted refs and we past end */
+			break;
+
+		if (ref->flags & PACKREF_SHADOWED)
+			continue;
+		if (iter->glob && wildmatch(iter->glob, ref->name, 0) != 0)
+			continue;
+
+		*out = git_reference__alloc(ref->name, &ref->oid, &ref->peel);
+		error = (*out != NULL) ? 0 : -1;
+		break;
+	}
+
+	return error;
+}
+
+static int refdb_fs_backend__iterator_next_name(
+	const char **out, git_reference_iterator *_iter)
+{
+	int error = GIT_ITEROVER;
+	refdb_fs_iter *iter = GIT_CONTAINER_OF(_iter, refdb_fs_iter, parent);
+	refdb_fs_backend *backend = GIT_CONTAINER_OF(iter->parent.db->backend, refdb_fs_backend, parent);
+	struct packref *ref;
+
+	while (iter->loose_pos < iter->loose.length) {
+		const char *path = git_vector_get(&iter->loose, iter->loose_pos++);
+		struct packref *ref;
+
+		if (loose_lookup(NULL, backend, path) == 0) {
+			ref = git_sortedcache_lookup(iter->cache, path);
+			if (ref)
+				ref->flags |= PACKREF_SHADOWED;
+
+			*out = path;
+			return 0;
+		}
+
+		git_error_clear();
+	}
+
+	error = GIT_ITEROVER;
+	while (iter->packed_pos < git_sortedcache_entrycount(iter->cache)) {
+		ref = git_sortedcache_entry(iter->cache, iter->packed_pos++);
+		if (!ref) /* stop now if another thread deleted refs and we past end */
+			break;
+
+		if (ref->flags & PACKREF_SHADOWED)
+			continue;
+		if (iter->glob && wildmatch(iter->glob, ref->name, 0) != 0)
+			continue;
+
+		*out = ref->name;
+		error = 0;
+		break;
+	}
+
+	return error;
+}
+
+static int refdb_fs_backend__iterator(
+	git_reference_iterator **out, git_refdb_backend *_backend, const char *glob)
+{
+	refdb_fs_backend *backend = GIT_CONTAINER_OF(_backend, refdb_fs_backend, parent);
+	refdb_fs_iter *iter = NULL;
+	int error;
+
+use std::marker;
+
+use crate::util::Binding;
+use crate::{raw, Buf, Error, Odb, Repository};
+
+/// A structure to represent a mempack backend for the object database. The
+/// Mempack is bound to the Odb that it was created from, and cannot outlive
+/// that Odb.
+pub struct Mempack<'odb> {
+    raw: *mut raw::git_odb_backend,
+    _marker: marker::PhantomData<&'odb Odb<'odb>>,
+}
+
+impl<'odb> Binding for Mempack<'odb> {
+    type Raw = *mut raw::git_odb_backend;
+
+    unsafe fn from_raw(raw: *mut raw::git_odb_backend) -> Mempack<'odb> {
+        Mempack {
+            raw,
+            _marker: marker::PhantomData,
+        }
+    }
+
+    fn raw(&self) -> *mut raw::git_odb_backend {
+        self.raw
+    }
+}
+
+// We don't need to implement `Drop` for Mempack because it is owned by the
+// odb to which it is attached, and that will take care of freeing the mempack
+// and associated memory.
+
+impl<'odb> Mempack<'odb> {
+    /// Dumps the contents of the mempack into the provided buffer.
+    pub fn dump(&self, repo: &Repository, buf: &mut Buf) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_mempack_dump(buf.raw(), repo.raw(), self.raw));
+        }
+        Ok(())
+    }
+
+    /// Clears all data in the mempack.
+    pub fn reset(&self) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_mempack_reset(self.raw));
+        }
+        Ok(())
+    }
+}
+use std::io;
+use std::marker;
+use std::ptr;
+use std::slice;
+
+use std::ffi::CString;
+
+use libc::{c_char, c_int, c_uint, c_void, size_t};
+
+use crate::panic;
+use crate::util::Binding;
+use crate::{
+    raw, Error, IndexerProgress, Mempack, Object, ObjectType, OdbLookupFlags, Oid, Progress,
+};
+
+/// A structure to represent a git object database
+pub struct Odb<'repo> {
+    raw: *mut raw::git_odb,
+    _marker: marker::PhantomData<Object<'repo>>,
+}
+
+// `git_odb` uses locking and atomics internally.
+unsafe impl<'repo> Send for Odb<'repo> {}
+unsafe impl<'repo> Sync for Odb<'repo> {}
+
+impl<'repo> Binding for Odb<'repo> {
+    type Raw = *mut raw::git_odb;
+
+    unsafe fn from_raw(raw: *mut raw::git_odb) -> Odb<'repo> {
+        Odb {
+            raw,
+            _marker: marker::PhantomData,
+        }
+    }
+    fn raw(&self) -> *mut raw::git_odb {
+        self.raw
+    }
+}
+
+impl<'repo> Drop for Odb<'repo> {
+    fn drop(&mut self) {
+        unsafe { raw::git_odb_free(self.raw) }
+    }
+}
+
+impl<'repo> Odb<'repo> {
+    /// Creates an object database without any backends.
+    pub fn new<'a>() -> Result<Odb<'a>, Error> {
+        crate::init();
+        unsafe {
+            let mut out = ptr::null_mut();
+            try_call!(raw::git_odb_new(&mut out));
+            Ok(Odb::from_raw(out))
+        }
+    }
+
+    /// Create object database reading stream.
+    ///
+    /// Note that most backends do not support streaming reads because they store their objects as compressed/delta'ed blobs.
+    /// If the backend does not support streaming reads, use the `read` method instead.
+    pub fn reader(&self, oid: Oid) -> Result<(OdbReader<'_>, usize, ObjectType), Error> {
+        let mut out = ptr::null_mut();
+        let mut size = 0usize;
+        let mut otype: raw::git_object_t = ObjectType::Any.raw();
+        unsafe {
+            try_call!(raw::git_odb_open_rstream(
+                &mut out,
+                &mut size,
+                &mut otype,
+                self.raw,
+                oid.raw()
+            ));
+            Ok((
+                OdbReader::from_raw(out),
+                size,
+                ObjectType::from_raw(otype).unwrap(),
+            ))
+        }
+    }
+
+    /// Create object database writing stream.
+    ///
+    /// The type and final length of the object must be specified when opening the stream.
+    /// If the backend does not support streaming writes, use the `write` method instead.
+    pub fn writer(&self, size: usize, obj_type: ObjectType) -> Result<OdbWriter<'_>, Error> {
+        let mut out = ptr::null_mut();
+        unsafe {
+            try_call!(raw::git_odb_open_wstream(
+                &mut out,
+                self.raw,
+                size as raw::git_object_size_t,
+                obj_type.raw()
+            ));
+            Ok(OdbWriter::from_raw(out))
+        }
+    }
+
+    /// Iterate over all objects in the object database.s
+    pub fn foreach<C>(&self, mut callback: C) -> Result<(), Error>
+    where
+        C: FnMut(&Oid) -> bool,
+    {
+        unsafe {
+            let mut data = ForeachCbData {
+                callback: &mut callback,
+            };
+            let cb: raw::git_odb_foreach_cb = Some(foreach_cb);
+            try_call!(raw::git_odb_foreach(
+                self.raw(),
+                cb,
+                &mut data as *mut _ as *mut _
+            ));
+            Ok(())
+        }
+    }
+
+    /// Read an object from the database.
+    pub fn read(&self, oid: Oid) -> Result<OdbObject<'_>, Error> {
+        let mut out = ptr::null_mut();
+        unsafe {
+            try_call!(raw::git_odb_read(&mut out, self.raw, oid.raw()));
+            Ok(OdbObject::from_raw(out))
+        }
+    }
+
+    /// Reads the header of an object from the database
+    /// without reading the full content.
+    pub fn read_header(&self, oid: Oid) -> Result<(usize, ObjectType), Error> {
+        let mut size: usize = 0;
+        let mut kind_id: i32 = ObjectType::Any.raw();
+
+        unsafe {
+            try_call!(raw::git_odb_read_header(
+                &mut size as *mut size_t,
+                &mut kind_id as *mut raw::git_object_t,
+                self.raw,
+                oid.raw()
+            ));
+
+            Ok((size, ObjectType::from_raw(kind_id).unwrap()))
+        }
+    }
+
+    /// Write an object to the database.
+    pub fn write(&self, kind: ObjectType, data: &[u8]) -> Result<Oid, Error> {
+        unsafe {
+            let mut out = raw::git_oid {
+                id: [0; raw::GIT_OID_RAWSZ],
+            };
+            try_call!(raw::git_odb_write(
+                &mut out,
+                self.raw,
+                data.as_ptr() as *const c_void,
+                data.len(),
+                kind.raw()
+            ));
+            Ok(Oid::from_raw(&mut out))
+        }
+    }
+
+    /// Create stream for writing a pack file to the ODB
+    pub fn packwriter(&self) -> Result<OdbPackwriter<'_>, Error> {
+        let mut out = ptr::null_mut();
+        let progress_cb: raw::git_indexer_progress_cb = Some(write_pack_progress_cb);
+        let progress_payload = Box::new(OdbPackwriterCb { cb: None });
+        let progress_payload_ptr = Box::into_raw(progress_payload);
+
+        unsafe {
+            try_call!(raw::git_odb_write_pack(
+                &mut out,
+                self.raw,
+                progress_cb,
+                progress_payload_ptr as *mut c_void
+            ));
+        }
+
+        Ok(OdbPackwriter {
+            raw: out,
+            progress: Default::default(),
+            progress_payload_ptr,
+        })
+    }
+
+    /// Checks if the object database has an object.
+    pub fn exists(&self, oid: Oid) -> bool {
+        unsafe { raw::git_odb_exists(self.raw, oid.raw()) != 0 }
+    }
+
+    /// Checks if the object database has an object, with extended flags.
+    pub fn exists_ext(&self, oid: Oid, flags: OdbLookupFlags) -> bool {
+        unsafe { raw::git_odb_exists_ext(self.raw, oid.raw(), flags.bits() as c_uint) != 0 }
+    }
+
+    /// Potentially finds an object that starts with the given prefix.
+    pub fn exists_prefix(&self, short_oid: Oid, len: usize) -> Result<Oid, Error> {
+        unsafe {
+            let mut out = raw::git_oid {
+                id: [0; raw::GIT_OID_RAWSZ],
+            };
+            try_call!(raw::git_odb_exists_prefix(
+                &mut out,
+                self.raw,
+                short_oid.raw(),
+                len
+            ));
+            Ok(Oid::from_raw(&out))
+        }
+    }
+
+    /// Refresh the object database.
+    /// This should never be needed, and is
+    /// provided purely for convenience.
+    /// The object database will automatically
+    /// refresh when an object is not found when
+    /// requested.
+    pub fn refresh(&self) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_odb_refresh(self.raw));
+            Ok(())
+        }
+    }
+
+    /// Adds an alternate disk backend to the object database.
+    pub fn add_disk_alternate(&self, path: &str) -> Result<(), Error> {
+        unsafe {
+            let path = CString::new(path)?;
+            try_call!(raw::git_odb_add_disk_alternate(self.raw, path));
+            Ok(())
+        }
+    }
+
+    /// Create a new mempack backend, and add it to this odb with the given
+    /// priority. Higher values give the backend higher precedence. The default
+    /// loose and pack backends have priorities 1 and 2 respectively (hard-coded
+    /// in libgit2). A reference to the new mempack backend is returned on
+    /// success. The lifetime of the backend must be contained within the
+    /// lifetime of this odb, since deletion of the odb will also result in
+    /// deletion of the mempack backend.
+    ///
+    /// Here is an example that fails to compile because it tries to hold the
+    /// mempack reference beyond the Odb's lifetime:
+    ///
+    /// ```compile_fail
+    /// use git2::Odb;
+    /// let mempack = {
+    ///     let odb = Odb::new().unwrap();
+    ///     odb.add_new_mempack_backend(1000).unwrap()
+    /// };
+    /// ```
+    pub fn add_new_mempack_backend<'odb>(
+        &'odb self,
+        priority: i32,
+    ) -> Result<Mempack<'odb>, Error> {
+        unsafe {
+            let mut mempack = ptr::null_mut();
+            // The mempack backend object in libgit2 is only ever freed by an
+            // odb that has the backend in its list. So to avoid potentially
+            // leaking the mempack backend, this API ensures that the backend
+            // is added to the odb before returning it. The lifetime of the
+            // mempack is also bound to the lifetime of the odb, so that users
+            // can't end up with a dangling reference to a mempack object that
+            // was actually freed when the odb was destroyed.
+            try_call!(raw::git_mempack_new(&mut mempack));
+            try_call!(raw::git_odb_add_backend(
+                self.raw,
+                mempack,
+                priority as c_int
+            ));
+            Ok(Mempack::from_raw(mempack))
+        }
+    }
+}
+
+/// An object from the Object Database.
+pub struct OdbObject<'a> {
+    raw: *mut raw::git_odb_object,
+    _marker: marker::PhantomData<Object<'a>>,
+}
+
+impl<'a> Binding for OdbObject<'a> {
+    type Raw = *mut raw::git_odb_object;
+
+    unsafe fn from_raw(raw: *mut raw::git_odb_object) -> OdbObject<'a> {
+        OdbObject {
+            raw,
+            _marker: marker::PhantomData,
+        }
+    }
+
+    fn raw(&self) -> *mut raw::git_odb_object {
+        self.raw
+    }
+}
+
+impl<'a> Drop for OdbObject<'a> {
+    fn drop(&mut self) {
+        unsafe { raw::git_odb_object_free(self.raw) }
+    }
+}
+
+impl<'a> OdbObject<'a> {
+    /// Get the object type.
+    pub fn kind(&self) -> ObjectType {
+        unsafe { ObjectType::from_raw(raw::git_odb_object_type(self.raw)).unwrap() }
+    }
+
+    /// Get the object size.
+    pub fn len(&self) -> usize {
+        unsafe { raw::git_odb_object_size(self.raw) }
+    }
+
+    /// Get the object data.
+    pub fn data(&self) -> &[u8] {
+        unsafe {
+            let size = self.len();
+            let ptr: *const u8 = raw::git_odb_object_data(self.raw) as *const u8;
+            let buffer = slice::from_raw_parts(ptr, size);
+            return buffer;
+        }
+    }
+
+    /// Get the object id.
+    pub fn id(&self) -> Oid {
+        unsafe { Oid::from_raw(raw::git_odb_object_id(self.raw)) }
+    }
+}
+
+/// A structure to represent a git ODB rstream
+pub struct OdbReader<'repo> {
+    raw: *mut raw::git_odb_stream,
+    _marker: marker::PhantomData<Object<'repo>>,
+}
+
+// `git_odb_stream` is not thread-safe internally, so it can't use `Sync`, but moving it to another
+// thread and continuing to read will work.
+unsafe impl<'repo> Send for OdbReader<'repo> {}
+
+impl<'repo> Binding for OdbReader<'repo> {
+    type Raw = *mut raw::git_odb_stream;
+
+    unsafe fn from_raw(raw: *mut raw::git_odb_stream) -> OdbReader<'repo> {
+        OdbReader {
+            raw,
+            _marker: marker::PhantomData,
+        }
+    }
+    fn raw(&self) -> *mut raw::git_odb_stream {
+        self.raw
+    }
+}
+
+impl<'repo> Drop for OdbReader<'repo> {
+    fn drop(&mut self) {
+        unsafe { raw::git_odb_stream_free(self.raw) }
+    }
+}
+
+impl<'repo> io::Read for OdbReader<'repo> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        unsafe {
+            let ptr = buf.as_ptr() as *mut c_char;
+            let len = buf.len();
+            let res = raw::git_odb_stream_read(self.raw, ptr, len);
+            if res < 0 {
+                Err(io::Error::new(io::ErrorKind::Other, "Read error"))
+            } else {
+                Ok(res as _)
+            }
+        }
+    }
+}
+
+/// A structure to represent a git ODB wstream
+pub struct OdbWriter<'repo> {
+    raw: *mut raw::git_odb_stream,
+    _marker: marker::PhantomData<Object<'repo>>,
+}
+
+// `git_odb_stream` is not thread-safe internally, so it can't use `Sync`, but moving it to another
+// thread and continuing to write will work.
+unsafe impl<'repo> Send for OdbWriter<'repo> {}
+
+impl<'repo> OdbWriter<'repo> {
+    /// Finish writing to an ODB stream
+    ///
+    /// This method can be used to finalize writing object to the database and get an identifier.
+    /// The object will take its final name and will be available to the odb.
+    /// This method will fail if the total number of received bytes differs from the size declared with odb_writer()
+    /// Attempting write after finishing will be ignored.
+    pub fn finalize(&mut self) -> Result<Oid, Error> {
+        let mut raw = raw::git_oid {
+            id: [0; raw::GIT_OID_RAWSZ],
+        };
+        unsafe {
+            try_call!(raw::git_odb_stream_finalize_write(&mut raw, self.raw));
+            Ok(Binding::from_raw(&raw as *const _))
+        }
+    }
+}
+
+impl<'repo> Binding for OdbWriter<'repo> {
+    type Raw = *mut raw::git_odb_stream;
+
+    unsafe fn from_raw(raw: *mut raw::git_odb_stream) -> OdbWriter<'repo> {
+        OdbWriter {
+            raw,
+            _marker: marker::PhantomData,
+        }
+    }
+    fn raw(&self) -> *mut raw::git_odb_stream {
+        self.raw
+    }
+}
+
+impl<'repo> Drop for OdbWriter<'repo> {
+    fn drop(&mut self) {
+        unsafe { raw::git_odb_stream_free(self.raw) }
+    }
+}
+
+impl<'repo> io::Write for OdbWriter<'repo> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        unsafe {
+            let ptr = buf.as_ptr() as *const c_char;
+            let len = buf.len();
+            let res = raw::git_odb_stream_write(self.raw, ptr, len);
+            if res < 0 {
+                Err(io::Error::new(io::ErrorKind::Other, "Write error"))
+            } else {
+                Ok(buf.len())
+            }
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub(crate) struct OdbPackwriterCb<'repo> {
+    pub(crate) cb: Option<Box<IndexerProgress<'repo>>>,
+}
+
+/// A stream to write a packfile to the ODB
+pub struct OdbPackwriter<'repo> {
+    raw: *mut raw::git_odb_writepack,
+    progress: raw::git_indexer_progress,
+    progress_payload_ptr: *mut OdbPackwriterCb<'repo>,
+}
+
+impl<'repo> OdbPackwriter<'repo> {
+    /// Finish writing the packfile
+    pub fn commit(&mut self) -> Result<i32, Error> {
+        unsafe {
+            let writepack = &*self.raw;
+            let res = match writepack.commit {
+                Some(commit) => commit(self.raw, &mut self.progress),
+                None => -1,
+            };
+
+            if res < 0 {
+                Err(Error::last_error(res))
+            } else {
+                Ok(res)
+            }
+        }
+    }
+
+    /// The callback through which progress is monitored. Be aware that this is
+    /// called inline, so performance may be affected.
+    pub fn progress<F>(&mut self, cb: F) -> &mut OdbPackwriter<'repo>
+    where
+        F: FnMut(Progress<'_>) -> bool + 'repo,
+    {
+        let progress_payload =
+            unsafe { &mut *(self.progress_payload_ptr as *mut OdbPackwriterCb<'_>) };
+
+        progress_payload.cb = Some(Box::new(cb) as Box<IndexerProgress<'repo>>);
+        self
+    }
+}
+
+impl<'repo> io::Write for OdbPackwriter<'repo> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        unsafe {
+            let ptr = buf.as_ptr() as *mut c_void;
+            let len = buf.len();
+
+            let writepack = &*self.raw;
+            let res = match writepack.append {
+                Some(append) => append(self.raw, ptr, len, &mut self.progress),
+                None => -1,
+            };
+
+            if res < 0 {
+                Err(io::Error::new(io::ErrorKind::Other, "Write error"))
+            } else {
+                Ok(buf.len())
+            }
+        }
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'repo> Drop for OdbPackwriter<'repo> {
+    fn drop(&mut self) {
+        unsafe {
+            let writepack = &*self.raw;
+            match writepack.free {
+                Some(free) => free(self.raw),
+                None => (),
+            };
+
+            drop(Box::from_raw(self.progress_payload_ptr));
+        }
+    }
+}
+
+pub type ForeachCb<'a> = dyn FnMut(&Oid) -> bool + 'a;
+
+struct ForeachCbData<'a> {
+    pub callback: &'a mut ForeachCb<'a>,
+}
+
+extern "C" fn foreach_cb(id: *const raw::git_oid, payload: *mut c_void) -> c_int {
+    panic::wrap(|| unsafe {
+        let data = &mut *(payload as *mut ForeachCbData<'_>);
+        let res = {
+            let callback = &mut data.callback;
+            callback(&Binding::from_raw(id))
+        };
+
+        if res {
+            0
+        } else {
+            1
+        }
+    })
+    .unwrap_or(1)
+}
+
+pub(crate) extern "C" fn write_pack_progress_cb(
+    stats: *const raw::git_indexer_progress,
+    payload: *mut c_void,
+) -> c_int {
+    let ok = panic::wrap(|| unsafe {
+        let payload = &mut *(payload as *mut OdbPackwriterCb<'_>);
+
+        let callback = match payload.cb {
+            Some(ref mut cb) => cb,
+            None => return true,
+        };
+
+        let progress: Progress<'_> = Binding::from_raw(stats);
+        callback(progress)
+    });
+    if ok == Some(true) {
+        0
+    } else {
+        -1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Buf, ObjectType, Oid, Repository};
+    use std::io::prelude::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn read() {
+        let td = TempDir::new().unwrap();
+        let repo = Repository::init(td.path()).unwrap();
+        let dat = [4, 3, 5, 6, 9];
+        let id = repo.blob(&dat).unwrap();
+        let db = repo.odb().unwrap();
+        let obj = db.read(id).unwrap();
+        let data = obj.data();
+        let size = obj.len();
+use std::ffi::CStr;
+use std::path::Path;
+use std::{io, marker, mem, ptr};
+
+use libc::c_void;
+
+use crate::odb::{write_pack_progress_cb, OdbPackwriterCb};
+use crate::util::Binding;
+use crate::{raw, Error, IntoCString, Odb};
+
+/// Struct representing the progress by an in-flight transfer.
+pub struct Progress<'a> {
+    pub(crate) raw: ProgressState,
+    pub(crate) _marker: marker::PhantomData<&'a raw::git_indexer_progress>,
+}
+
+pub(crate) enum ProgressState {
+    Borrowed(*const raw::git_indexer_progress),
+    Owned(raw::git_indexer_progress),
+}
+
+/// Callback to be invoked while indexing is in progress.
+///
+/// This callback will be periodically called with updates to the progress of
+/// the indexing so far. The return value indicates whether the indexing or
+/// transfer should continue. A return value of `false` will cancel the
+/// indexing or transfer.
+///
+/// * `progress` - the progress being made so far.
+pub type IndexerProgress<'a> = dyn FnMut(Progress<'_>) -> bool + 'a;
+
+impl<'a> Progress<'a> {
+    /// Number of objects in the packfile being downloaded
+    pub fn total_objects(&self) -> usize {
+        unsafe { (*self.raw()).total_objects as usize }
+    }
+    /// Received objects that have been hashed
+    pub fn indexed_objects(&self) -> usize {
+        unsafe { (*self.raw()).indexed_objects as usize }
+    }
+    /// Objects which have been downloaded
+    pub fn received_objects(&self) -> usize {
+        unsafe { (*self.raw()).received_objects as usize }
+    }
+    /// Locally-available objects that have been injected in order to fix a thin
+    /// pack.
+    pub fn local_objects(&self) -> usize {
+        unsafe { (*self.raw()).local_objects as usize }
+    }
+    /// Number of deltas in the packfile being downloaded
+    pub fn total_deltas(&self) -> usize {
+        unsafe { (*self.raw()).total_deltas as usize }
+    }
+    /// Received deltas that have been hashed.
+    pub fn indexed_deltas(&self) -> usize {
+        unsafe { (*self.raw()).indexed_deltas as usize }
+    }
+    /// Size of the packfile received up to now
+    pub fn received_bytes(&self) -> usize {
+        unsafe { (*self.raw()).received_bytes as usize }
+    }
+
+    /// Convert this to an owned version of `Progress`.
+    pub fn to_owned(&self) -> Progress<'static> {
+        Progress {
+            raw: ProgressState::Owned(unsafe { *self.raw() }),
+            _marker: marker::PhantomData,
+        }
+    }
+}
+
+impl<'a> Binding for Progress<'a> {
+    type Raw = *const raw::git_indexer_progress;
+    unsafe fn from_raw(raw: *const raw::git_indexer_progress) -> Progress<'a> {
+        Progress {
+            raw: ProgressState::Borrowed(raw),
+            _marker: marker::PhantomData,
+        }
+    }
+
+    fn raw(&self) -> *const raw::git_indexer_progress {
+        match self.raw {
+            ProgressState::Borrowed(raw) => raw,
+            ProgressState::Owned(ref raw) => raw as *const _,
+        }
+    }
+}
+
+/// Callback to be invoked while a transfer is in progress.
+///
+/// This callback will be periodically called with updates to the progress of
+/// the transfer so far. The return value indicates whether the transfer should
+/// continue. A return value of `false` will cancel the transfer.
+///
+/// * `progress` - the progress being made so far.
+#[deprecated(
+    since = "0.11.0",
+    note = "renamed to `IndexerProgress` to match upstream"
+)]
+#[allow(dead_code)]
+pub type TransportProgress<'a> = IndexerProgress<'a>;
+
+/// A stream to write and index a packfile
+///
+/// This is equivalent to [`crate::OdbPackwriter`], but allows to store the pack
+/// and index at an arbitrary path. It also does not require access to an object
+/// database if, and only if, the pack file is self-contained (i.e. not "thin").
+pub struct Indexer<'odb> {
+    raw: *mut raw::git_indexer,
+    progress: raw::git_indexer_progress,
+    progress_payload_ptr: *mut OdbPackwriterCb<'odb>,
+}
+
+impl<'a> Indexer<'a> {
+    /// Create a new indexer
+    ///
+    /// The [`Odb`] is used to resolve base objects when fixing thin packs. It
+    /// can be `None` if no thin pack is expected, in which case missing bases
+    /// will result in an error.
+    ///
+    /// `path` is the directory where the packfile should be stored.
+    ///
+    /// `mode` is the permissions to use for the output files, use `0` for defaults.
+    ///
+    /// If `verify` is `false`, the indexer will bypass object connectivity checks.
+    pub fn new(odb: Option<&Odb<'a>>, path: &Path, mode: u32, verify: bool) -> Result<Self, Error> {
+        crate::init();
+        let path = path.into_c_string()?;
+
+        let odb = odb.map(Binding::raw).unwrap_or_else(ptr::null_mut);
+
+        let mut out = ptr::null_mut();
+        let progress_cb: raw::git_indexer_progress_cb = Some(write_pack_progress_cb);
+        let progress_payload = Box::new(OdbPackwriterCb { cb: None });
+        let progress_payload_ptr = Box::into_raw(progress_payload);
+
+        unsafe {
+            let mut opts = mem::zeroed();
+            try_call!(raw::git_indexer_options_init(
+                &mut opts,
+                raw::GIT_INDEXER_OPTIONS_VERSION
+            ));
+            opts.progress_cb = progress_cb;
+            opts.progress_cb_payload = progress_payload_ptr as *mut c_void;
+            opts.verify = verify.into();
+
+            try_call!(raw::git_indexer_new(&mut out, path, mode, odb, &mut opts));
+        }
+
+        Ok(Self {
+            raw: out,
+            progress: Default::default(),
+            progress_payload_ptr,
+        })
+    }
+
+    /// Finalize the pack and index
+    ///
+    /// Resolves any pending deltas and writes out the index file. The returned
+    /// string is the hexadecimal checksum of the packfile, which is also used
+    /// to name the pack and index files (`pack-<checksum>.pack` and
+    /// `pack-<checksum>.idx` respectively).
+    pub fn commit(mut self) -> Result<String, Error> {
+        unsafe {
+            try_call!(raw::git_indexer_commit(self.raw, &mut self.progress));
+
+            let name = CStr::from_ptr(raw::git_indexer_name(self.raw));
+            Ok(name.to_str().expect("pack name not utf8").to_owned())
+        }
+    }
+
+    /// The callback through which progress is monitored. Be aware that this is
+    /// called inline, so performance may be affected.
+    pub fn progress<F>(&mut self, cb: F) -> &mut Self
+    where
+        F: FnMut(Progress<'_>) -> bool + 'a,
+    {
+        let progress_payload =
+            unsafe { &mut *(self.progress_payload_ptr as *mut OdbPackwriterCb<'_>) };
+        progress_payload.cb = Some(Box::new(cb) as Box<IndexerProgress<'a>>);
+
+        self
+    }
+}
+
+impl io::Write for Indexer<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        unsafe {
+            let ptr = buf.as_ptr() as *mut c_void;
+            let len = buf.len();
+
+            let res = raw::git_indexer_append(self.raw, ptr, len, &mut self.progress);
+            if res < 0 {
+                Err(io::Error::new(io::ErrorKind::Other, Error::last_error(res)))
+            } else {
+                Ok(buf.len())
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for Indexer<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            raw::git_indexer_free(self.raw);
+            drop(Box::from_raw(self.progress_payload_ptr))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Buf, Indexer};
+    use std::io::prelude::*;
+
+    #[test]
+    fn indexer() {
+        let (_td, repo_source) = crate::test::repo_init();
+        let (_td, repo_target) = crate::test::repo_init();
+
+        let mut progress_called = false;
+
+        // Create an in-memory packfile
+        let mut builder = t!(repo_source.packbuilder());
+        let mut buf = Buf::new();
+        let (commit_source_id, _tree) = crate::test::commit(&repo_source);
+        t!(builder.insert_object(commit_source_id, None));
+        t!(builder.write_buf(&mut buf));
+
+        // Write it to the standard location in the target repo, but via indexer
+        let odb = repo_source.odb().unwrap();
+        let mut indexer = Indexer::new(
+            Some(&odb),
+            repo_target.path().join("objects").join("pack").as_path(),
+            0o644,
+            true,
+        )
+        .unwrap();
+        indexer.progress(|_| {
+            progress_called = true;
+            true
+        });
+        indexer.write(&buf).unwrap();
+        indexer.commit().unwrap();
+
+        // Assert that target repo picks it up as valid
+        let commit_target = repo_target.find_commit(commit_source_id).unwrap();
+        assert_eq!(commit_target.id(), commit_source_id);
+        assert!(progress_called);
+    }
+}

@@ -1,0 +1,812 @@
+        counts: &mut Counts,
+    ) {
+        let span = tracing::trace_span!(
+            "reserve_capacity",
+            ?stream.id,
+            requested = capacity,
+            effective = (capacity as usize) + stream.buffered_send_data,
+            curr = stream.requested_send_capacity
+        );
+        let _e = span.enter();
+
+        // Actual capacity is `capacity` + the current amount of buffered data.
+        // If it were less, then we could never send out the buffered data.
+        let capacity = (capacity as usize) + stream.buffered_send_data;
+
+        match capacity.cmp(&(stream.requested_send_capacity as usize)) {
+            Ordering::Equal => {
+                // Nothing to do
+            }
+            Ordering::Less => {
+                // Update the target requested capacity
+                stream.requested_send_capacity = capacity as WindowSize;
+
+                // Currently available capacity assigned to the stream
+                let available = stream.send_flow.available().as_size();
+
+                // If the stream has more assigned capacity than requested, reclaim
+                // some for the connection
+                if available as usize > capacity {
+                    let diff = available - capacity as WindowSize;
+
+                    // TODO: proper error handling
+                    let _res = stream.send_flow.claim_capacity(diff);
+                    debug_assert!(_res.is_ok());
+
+                    self.assign_connection_capacity(diff, stream, counts);
+                }
+            }
+            Ordering::Greater => {
+                // If trying to *add* capacity, but the stream send side is closed,
+                // there's nothing to be done.
+                if stream.state.is_send_closed() {
+                    return;
+                }
+
+                // Update the target requested capacity
+                stream.requested_send_capacity =
+                    cmp::min(capacity, WindowSize::MAX as usize) as WindowSize;
+
+                // Try to assign additional capacity to the stream. If none is
+                // currently available, the stream will be queued to receive some
+                // when more becomes available.
+                self.try_assign_capacity(stream);
+            }
+        }
+    }
+
+    pub fn recv_stream_window_update(
+        &mut self,
+        inc: WindowSize,
+        stream: &mut store::Ptr,
+    ) -> Result<(), Reason> {
+        let span = tracing::trace_span!(
+            "recv_stream_window_update",
+            ?stream.id,
+            ?stream.state,
+            inc,
+            flow = ?stream.send_flow
+        );
+        let _e = span.enter();
+
+        if stream.state.is_send_closed() && stream.buffered_send_data == 0 {
+            // We can't send any data, so don't bother doing anything else.
+            return Ok(());
+        }
+
+        // Update the stream level flow control.
+        stream.send_flow.inc_window(inc)?;
+
+        // If the stream is waiting on additional capacity, then this will
+        // assign it (if available on the connection) and notify the producer
+        self.try_assign_capacity(stream);
+
+        Ok(())
+    }
+
+    pub fn recv_connection_window_update(
+        &mut self,
+        inc: WindowSize,
+        store: &mut Store,
+        counts: &mut Counts,
+        // If a receiver is waiting, notify it
+        stream.notify_send();
+        stream.notify_recv();
+        stream.notify_push();
+    }
+
+    pub fn go_away(&mut self, last_processed_id: StreamId) {
+        assert!(self.max_stream_id >= last_processed_id);
+        self.max_stream_id = last_processed_id;
+    }
+
+    pub fn recv_eof(&mut self, stream: &mut Stream) {
+        stream.state.recv_eof();
+        stream.notify_send();
+        stream.notify_recv();
+        stream.notify_push();
+    }
+
+    pub(super) fn clear_recv_buffer(&mut self, stream: &mut Stream) {
+        while stream.pending_recv.pop_front(&mut self.buffer).is_some() {
+            // drop it
+        }
+    }
+
+    /// Get the max ID of streams we can receive.
+    ///
+    /// This gets lowered if we send a GOAWAY frame.
+    pub fn max_stream_id(&self) -> StreamId {
+        self.max_stream_id
+    }
+
+    pub fn next_stream_id(&self) -> Result<StreamId, Error> {
+        if let Ok(id) = self.next_stream_id {
+            Ok(id)
+        } else {
+            Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
+        }
+    }
+
+    pub fn may_have_created_stream(&self, id: StreamId) -> bool {
+        if let Ok(next_id) = self.next_stream_id {
+            // Peer::is_local_init should have been called beforehand
+            debug_assert_eq!(id.is_server_initiated(), next_id.is_server_initiated(),);
+            id < next_id
+        } else {
+            true
+        }
+    }
+
+    pub(super) fn maybe_reset_next_stream_id(&mut self, id: StreamId) {
+        if let Ok(next_id) = self.next_stream_id {
+            // !Peer::is_local_init should have been called beforehand
+            debug_assert_eq!(id.is_server_initiated(), next_id.is_server_initiated());
+            if id >= next_id {
+                self.next_stream_id = id.next_id();
+            }
+        }
+    }
+
+    /// Returns true if the remote peer can reserve a stream with the given ID.
+    pub fn ensure_can_reserve(&self) -> Result<(), Error> {
+        if !self.is_push_enabled {
+            proto_err!(conn: "recv_push_promise: push is disabled");
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+        }
+
+        Ok(())
+    }
+
+    /// Add a locally reset stream to queue to be eventually reaped.
+    pub fn enqueue_reset_expiration(&mut self, stream: &mut store::Ptr, counts: &mut Counts) {
+        if !stream.state.is_local_error() || stream.is_pending_reset_expiration() {
+            return;
+        }
+
+        if counts.can_inc_num_reset_streams() {
+            counts.inc_num_reset_streams();
+            tracing::trace!("enqueue_reset_expiration; added {:?}", stream.id);
+            self.pending_reset_expired.push(stream);
+        } else {
+            tracing::trace!(
+                "enqueue_reset_expiration; dropped {:?}, over max_concurrent_reset_streams",
+                stream.id
+            );
+        }
+    }
+
+    /// Send any pending refusals.
+    pub fn send_pending_refusal<T, B>(
+        &mut self,
+        cx: &mut Context,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        if let Some(stream_id) = self.refused {
+            ready!(dst.poll_ready(cx))?;
+
+            // Create the RST_STREAM frame
+use crate::frame::Reason;
+use crate::proto::{WindowSize, MAX_WINDOW_SIZE};
+
+use std::fmt;
+
+// We don't want to send WINDOW_UPDATE frames for tiny changes, but instead
+// aggregate them when the changes are significant. Many implementations do
+// this by keeping a "ratio" of the update version the allowed window size.
+//
+// While some may wish to represent this ratio as percentage, using a f32,
+// we skip having to deal with float math and stick to integers. To do so,
+// the "ratio" is represented by 2 i32s, split into the numerator and
+// denominator. For example, a 50% ratio is simply represented as 1/2.
+//
+// An example applying this ratio: If a stream has an allowed window size of
+// 100 bytes, WINDOW_UPDATE frames are scheduled when the unclaimed change
+// becomes greater than 1/2, or 50 bytes.
+const UNCLAIMED_NUMERATOR: i32 = 1;
+const UNCLAIMED_DENOMINATOR: i32 = 2;
+
+#[test]
+#[allow(clippy::assertions_on_constants)]
+fn sanity_unclaimed_ratio() {
+    assert!(UNCLAIMED_NUMERATOR < UNCLAIMED_DENOMINATOR);
+    assert!(UNCLAIMED_NUMERATOR >= 0);
+    assert!(UNCLAIMED_DENOMINATOR > 0);
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct FlowControl {
+    /// Window the peer knows about.
+    ///
+    /// This can go negative if a SETTINGS_INITIAL_WINDOW_SIZE is received.
+    ///
+    /// For example, say the peer sends a request and uses 32kb of the window.
+    /// We send a SETTINGS_INITIAL_WINDOW_SIZE of 16kb. The peer has to adjust
+    /// its understanding of the capacity of the window, and that would be:
+    ///
+    /// ```notrust
+    /// default (64kb) - used (32kb) - settings_diff (64kb - 16kb): -16kb
+    /// ```
+    window_size: Window,
+
+    /// Window that we know about.
+    ///
+    /// This can go negative if a user declares a smaller target window than
+    /// the peer knows about.
+    available: Window,
+}
+
+impl FlowControl {
+    pub fn new() -> FlowControl {
+        FlowControl {
+            window_size: Window(0),
+            available: Window(0),
+        }
+    }
+
+    /// Returns the window size as known by the peer
+    pub fn window_size(&self) -> WindowSize {
+        self.window_size.as_size()
+    }
+
+    /// Returns the window size available to the consumer
+    pub fn available(&self) -> Window {
+        self.available
+    }
+
+    /// Returns true if there is unavailable window capacity
+    pub fn has_unavailable(&self) -> bool {
+        if self.window_size < 0 {
+            return false;
+        }
+
+        self.window_size > self.available
+    }
+
+    pub fn claim_capacity(&mut self, capacity: WindowSize) -> Result<(), Reason> {
+        self.available.decrease_by(capacity)
+    }
+
+    pub fn assign_capacity(&mut self, capacity: WindowSize) -> Result<(), Reason> {
+        self.available.increase_by(capacity)
+    }
+
+    /// If a WINDOW_UPDATE frame should be sent, returns a positive number
+    /// representing the increment to be used.
+    ///
+    /// If there is no available bytes to be reclaimed, or the number of
+    /// available bytes does not reach the threshold, this returns `None`.
+    ///
+    /// This represents pending outbound WINDOW_UPDATE frames.
+    pub fn unclaimed_capacity(&self) -> Option<WindowSize> {
+        let available = self.available;
+
+        if self.window_size >= available {
+            return None;
+        }
+
+        let unclaimed = available.0 - self.window_size.0;
+        let threshold = self.window_size.0 / UNCLAIMED_DENOMINATOR * UNCLAIMED_NUMERATOR;
+
+        if unclaimed < threshold {
+            None
+        } else {
+            Some(unclaimed as WindowSize)
+        }
+    }
+
+    /// Increase the window size.
+    ///
+    /// This is called after receiving a WINDOW_UPDATE frame
+    pub fn inc_window(&mut self, sz: WindowSize) -> Result<(), Reason> {
+        let (val, overflow) = self.window_size.0.overflowing_add(sz as i32);
+
+        if overflow {
+            return Err(Reason::FLOW_CONTROL_ERROR);
+        }
+
+        if val > MAX_WINDOW_SIZE as i32 {
+            return Err(Reason::FLOW_CONTROL_ERROR);
+        }
+
+        tracing::trace!(
+            "inc_window; sz={}; old={}; new={}",
+            sz,
+            self.window_size,
+            val
+        );
+
+        self.window_size = Window(val);
+        Ok(())
+    }
+
+    /// Decrement the send-side window size.
+    ///
+    /// This is called after receiving a SETTINGS frame with a lower
+    /// INITIAL_WINDOW_SIZE value.
+    pub fn dec_send_window(&mut self, sz: WindowSize) -> Result<(), Reason> {
+        tracing::trace!(
+            "dec_window; sz={}; window={}, available={}",
+            sz,
+            self.window_size,
+            self.available
+        );
+        // ~~This should not be able to overflow `window_size` from the bottom.~~ wrong. it can.
+        self.window_size.decrease_by(sz)?;
+        Ok(())
+    }
+
+    /// Decrement the recv-side window size.
+    ///
+    /// This is called after receiving a SETTINGS ACK frame with a lower
+    /// INITIAL_WINDOW_SIZE value.
+    pub fn dec_recv_window(&mut self, sz: WindowSize) -> Result<(), Reason> {
+        tracing::trace!(
+            "dec_recv_window; sz={}; window={}, available={}",
+            sz,
+            self.window_size,
+            self.available
+        );
+        // This should not be able to overflow `window_size` from the bottom.
+        self.window_size.decrease_by(sz)?;
+        self.available.decrease_by(sz)?;
+        Ok(())
+    }
+
+    /// Decrements the window reflecting data has actually been sent. The caller
+    /// must ensure that the window has capacity.
+    pub fn send_data(&mut self, sz: WindowSize) -> Result<(), Reason> {
+        tracing::trace!(
+            "send_data; sz={}; window={}; available={}",
+            sz,
+            self.window_size,
+            self.available
+        );
+
+        // If send size is zero it's meaningless to update flow control window
+        if sz > 0 {
+            // Ensure that the argument is correct
+            assert!(self.window_size.0 >= sz as i32);
+
+            // Update values
+            self.window_size.decrease_by(sz)?;
+            self.available.decrease_by(sz)?;
+        }
+        Ok(())
+    }
+}
+
+/// The current capacity of a flow-controlled Window.
+///
+/// This number can go negative when either side has used a certain amount
+/// of capacity when the other side advertises a reduction in size.
+///
+/// This type tries to centralize the knowledge of addition and subtraction
+/// to this capacity, instead of having integer casts throughout the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd)]
+pub struct Window(i32);
+
+impl Window {
+    pub fn as_size(&self) -> WindowSize {
+        if self.0 < 0 {
+            0
+        } else {
+            self.0 as WindowSize
+        }
+    }
+
+    pub fn checked_size(&self) -> WindowSize {
+        assert!(self.0 >= 0, "negative Window");
+        self.0 as WindowSize
+    }
+
+    pub fn decrease_by(&mut self, other: WindowSize) -> Result<(), Reason> {
+        if let Some(v) = self.0.checked_sub(other as i32) {
+            self.0 = v;
+            Ok(())
+        } else {
+            Err(Reason::FLOW_CONTROL_ERROR)
+tests/h2-tests/tests/client_request.rs:375:async fn send_request_poll_ready_when_connection_error() {
+tests/h2-tests/tests/client_request.rs:589:async fn http_2_connect_request_omit_scheme_and_path_fields() {
+tests/h2-tests/tests/client_request.rs:632:async fn request_with_connection_headers() {
+tests/h2-tests/tests/client_request.rs:675:async fn connection_close_notifies_response_future() {
+tests/h2-tests/tests/client_request.rs:714:async fn connection_close_notifies_client_poll_ready() {
+tests/h2-tests/tests/client_request.rs:762:async fn sending_request_on_closed_connection() {
+tests/h2-tests/tests/client_request.rs:824:async fn recv_too_big_headers() {
+tests/h2-tests/tests/client_request.rs:1239:async fn malformed_response_headers_dont_unlink_stream() {
+tests/h2-tests/tests/client_request.rs:1311:async fn allow_empty_data_for_head() {
+tests/h2-tests/tests/client_request.rs:1355:async fn reject_none_zero_content_length_header_with_end_stream() {
+tests/h2-tests/tests/client_request.rs:1440:async fn informational_while_local_streaming() {
+tests/h2-tests/tests/client_request.rs:1484:async fn extended_connect_protocol_disabled_by_default() {
+tests/h2-tests/tests/client_request.rs:1518:async fn extended_connect_protocol_enabled_during_handshake() {
+tests/h2-tests/tests/client_request.rs:1553:async fn invalid_connect_protocol_enabled_setting() {
+tests/h2-tests/tests/client_request.rs:1595:async fn extended_connect_request() {
+tests/h2-tests/tests/client_request.rs:1637:async fn rogue_server_odd_headers() {
+tests/h2-tests/tests/client_request.rs:1660:async fn rogue_server_even_headers() {
+tests/h2-tests/tests/client_request.rs:1683:async fn rogue_server_reused_headers() {
+tests/h2-tests/tests/client_request.rs:1722:async fn client_builder_header_table_size() {
+tests/h2-tests/tests/client_request.rs:1919:async fn server_drop_connection_unexpectedly_return_unexpected_eof_err() {
+tests/h2-tests/tests/client_request.rs:1959:async fn server_drop_connection_after_go_away() {
+tests/h2-tests/tests/server.rs:108:async fn serve_connect() {
+tests/h2-tests/tests/server.rs:518:async fn recv_connection_header() {
+tests/h2-tests/tests/server.rs:815:async fn too_big_headers_sends_431() {
+tests/h2-tests/tests/server.rs:851:async fn too_big_headers_sends_reset_after_431_if_not_eos() {
+tests/h2-tests/tests/server.rs:935:async fn pending_accept_recv_illegal_content_length_data() {
+tests/h2-tests/tests/server.rs:1117:async fn server_error_on_status_in_request() {
+tests/h2-tests/tests/server.rs:1243:async fn extended_connect_protocol_disabled_by_default() {
+tests/h2-tests/tests/server.rs:1276:async fn extended_connect_protocol_enabled_during_handshake() {
+tests/h2-tests/tests/server.rs:1323:async fn reject_pseudo_protocol_on_non_connect_request() {
+tests/h2-tests/tests/server.rs:1362:async fn reject_extended_connect_request_without_scheme() {
+tests/h2-tests/tests/server.rs:1402:async fn reject_extended_connect_request_without_path() {
+tests/h2-tests/tests/server.rs:1442:async fn reject_informational_status_header_in_request() {
+tests/h2-tests/tests/server.rs:1475:async fn client_drop_connection_without_close_notify() {
+        srv.send_frame(frames::headers(1).response(200).field("content-length", 2))
+            .await;
+        srv.recv_frame(frames::data(1, "hello").eos()).await;
+        srv.send_frame(frames::data(1, "ok").eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::Builder::new()
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        tokio::spawn(async {
+            h2.await.expect("connection failed");
+        });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+        // don't EOS stream yet..
+        let (response, mut body_tx) = client.send_request(request, false).unwrap();
+        // eventual response is 200, not 103
+        let resp = response.await.expect("response");
+        // assert_eq!(resp.status(), 200);
+        // now we can end the stream
+        body_tx.send_data("hello".into(), true).expect("send_data");
+        let mut body = resp.into_body();
+        assert_eq!(body.data().await.unwrap().unwrap(), "ok");
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn extended_connect_protocol_disabled_by_default() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+
+        // we send a simple req here just to drive the connection so we can
+        // receive the server settings.
+        let request = Request::get("https://example.com/").body(()).unwrap();
+        // first request is allowed
+        let (response, _) = client.send_request(request, true).unwrap();
+        h2.drive(response).await.unwrap();
+
+        assert!(!client.is_extended_connect_protocol_enabled());
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn extended_connect_protocol_enabled_during_handshake() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv
+            .assert_client_handshake_with_settings(frames::settings().enable_connect_protocol(1))
+            .await;
+        assert_default_settings!(settings);
+
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+
+        // we send a simple req here just to drive the connection so we can
+        // receive the server settings.
+        let request = Request::get("https://example.com/").body(()).unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        h2.drive(response).await.unwrap();
+
+        assert!(client.is_extended_connect_protocol_enabled());
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn invalid_connect_protocol_enabled_setting() {
+    h2_support::trace_init!();
+
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        // Send a settings frame
+        srv.send(frames::settings().enable_connect_protocol(2).into())
+            .await
+            .unwrap();
+        srv.read_preface().await.unwrap();
+
+        let settings = assert_settings!(srv.next().await.expect("unexpected EOF").unwrap());
+        assert_default_settings!(settings);
+
+        // Send the ACK
+        let ack = frame::Settings::ack();
+
+        // TODO: Don't unwrap?
+        srv.send(ack.into()).await.unwrap();
+
+        let frame = srv.next().await.unwrap().unwrap();
+        let go_away = assert_go_away!(frame);
+        assert_eq!(go_away.reason(), Reason::PROTOCOL_ERROR);
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+
+        // we send a simple req here just to drive the connection so we can
+        // receive the server settings.
+        let request = Request::get("https://example.com/").body(()).unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+
+        let error = h2.drive(response).await.unwrap_err();
+        assert_eq!(error.reason(), Some(Reason::PROTOCOL_ERROR));
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn extended_connect_request() {
+    h2_support::trace_init!();
+
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv
+            .assert_client_handshake_with_settings(frames::settings().enable_connect_protocol(1))
+            .await;
+        assert_default_settings!(settings);
+
+        srv.recv_frame(
+            frames::headers(1)
+                .pseudo(frame::Pseudo {
+                    method: Method::CONNECT.into(),
+                    scheme: util::byte_str("http").into(),
+                    authority: util::byte_str("bread").into(),
+                    path: util::byte_str("/baguette").into(),
+                    protocol: Protocol::from_static("the-bread-protocol").into(),
+                    ..Default::default()
+                })
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+
+        let request = Request::connect("http://bread/baguette")
+            .extension(Protocol::from("the-bread-protocol"))
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        h2.drive(response).await.unwrap();
+    };
+
+    join(srv, h2).await;
+}
+
+use crate::SendFrame;
+
+use h2::frame::{self, Frame};
+use h2::proto::Error;
+use h2::SendError;
+
+use futures::future::poll_fn;
+use futures::{ready, Stream, StreamExt};
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+use super::assert::assert_frame_eq;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
+use std::{cmp, io, usize};
+
+/// A mock I/O
+#[derive(Debug)]
+pub struct Mock {
+    pipe: Pipe,
+}
+
+#[derive(Debug)]
+pub struct Handle {
+    codec: crate::Codec<Pipe>,
+}
+
+#[derive(Debug)]
+pub struct Pipe {
+    inner: Arc<Mutex<Inner>>,
+}
+
+#[derive(Debug)]
+struct Inner {
+    /// Data written by the test case to the h2 lib.
+    rx: Vec<u8>,
+
+    /// Notify when data is ready to be received.
+    rx_task: Option<Waker>,
+
+    /// Data written by the `h2` library to be read by the test case.
+    tx: Vec<u8>,
+
+    /// Notify when data is written. This notifies the test case waiters.
+    tx_task: Option<Waker>,
+
+    /// Number of bytes that can be written before `write` returns `Poll::Pending`.
+    tx_rem: usize,
+
+    /// Task to notify when write capacity becomes available.
+    tx_rem_task: Option<Waker>,
+
+    /// True when the pipe is closed.
+    closed: bool,
+
+    /// Trigger an `UnexpectedEof` error on read
+    unexpected_eof: bool,
+}
+
+const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Create a new mock and handle
+pub fn new() -> (Mock, Handle) {
+    new_with_write_capacity(usize::MAX)
+}
+
+/// Create a new mock and handle allowing up to `cap` bytes to be written.
+pub fn new_with_write_capacity(cap: usize) -> (Mock, Handle) {
+    let inner = Arc::new(Mutex::new(Inner {
+        rx: vec![],
+        rx_task: None,
+        tx: vec![],
+        tx_task: None,
+        tx_rem: cap,
+        tx_rem_task: None,
+        closed: false,
+        unexpected_eof: false,
+    }));
+
+    let mock = Mock {
+        pipe: Pipe {
+            inner: inner.clone(),
+        },
+    };
+
+    let handle = Handle {
+        codec: h2::Codec::new(Pipe { inner }),
+    };
+
+    (mock, handle)
+}
+
+// ===== impl Handle =====
+
+impl Handle {
+    /// Get a mutable reference to inner Codec.
+    pub fn codec_mut(&mut self) -> &mut crate::Codec<Pipe> {
+        &mut self.codec
+    }
+
+    pub fn close_without_notify(&mut self) {
+        let mut me = self.codec.get_mut().inner.lock().unwrap();
+        me.unexpected_eof = true;
+    }
+
+    /// Send a frame
+    pub async fn send(&mut self, item: SendFrame) -> Result<(), SendError> {
+        // Queue the frame
+        self.codec.buffer(item).unwrap();
+
+        // Flush the frame
+        poll_fn(|cx| {
+            let p = self.codec.flush(cx);
+            assert!(p.is_ready());
+            p
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Writes the client preface
+    pub async fn write_preface(&mut self) {
+        self.codec.get_mut().write_all(PREFACE).await.unwrap();
+    }
+
+    /// Read the client preface
+    pub async fn read_preface(&mut self) -> io::Result<()> {
+        let mut buf = vec![0u8; PREFACE.len()];
+        self.read_exact(&mut buf).await?;
+        assert_eq!(buf, PREFACE);
+        Ok(())
+    }
+
+    pub async fn recv_frame<F: Into<Frame>>(&mut self, expected: F) {
+        let frame = self.next().await.unwrap().unwrap();
+        assert_frame_eq(frame, expected);
+    }
+
+    pub async fn send_frame<F: Into<SendFrame>>(&mut self, frame: F) {
+        self.send(frame.into()).await.unwrap();
+    }
+
+    pub async fn recv_eof(&mut self) {
+        let frame = self.next().await;
+        assert!(frame.is_none());
+    }
+
+    pub async fn send_bytes(&mut self, data: &[u8]) {
+        use bytes::Buf;
+        use std::io::Cursor;
+
+        let buf: Vec<_> = data.into();
+        let mut buf = Cursor::new(buf);
+
+        poll_fn(move |cx| {
+            while buf.has_remaining() {
+                let res = Pin::new(self.codec.get_mut())
+                    .poll_write(cx, buf.chunk())
+                    .map_err(|e| panic!("write err={:?}", e));
+
+                let n = ready!(res).unwrap();
+                buf.advance(n);
+            }
+
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    /// Perform the H2 handshake
+    pub async fn assert_client_handshake(&mut self) -> frame::Settings {
+        self.assert_client_handshake_with_settings(frame::Settings::default())
+            .await
+    }
+
+    /// Perform the H2 handshake
+    pub async fn assert_client_handshake_with_settings<T>(&mut self, settings: T) -> frame::Settings
+    where

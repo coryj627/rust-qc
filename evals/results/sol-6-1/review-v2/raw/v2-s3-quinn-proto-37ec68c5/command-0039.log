@@ -1,0 +1,351 @@
+   235	            self.next[dir as usize] = 0;
+   236	
+   237	            // If 0-RTT was rejected, any flow control frames we sent were lost.
+   238	            if self.flow_control_adjusted {
+   239	                // Conservative approximation of whatever we sent in transport parameters
+   240	                self.sent_max_remote[dir as usize] = 0;
+   241	            }
+   242	        }
+   243	
+   244	        self.pending.clear();
+   245	        self.send_streams = 0;
+   246	        self.data_sent = 0;
+   247	        self.connection_blocked.clear();
+   248	    }
+   249	
+   250	    /// Process incoming stream frame
+   251	    ///
+   252	    /// If successful, returns whether a `MAX_DATA` frame needs to be transmitted
+   253	    pub(crate) fn received(
+   254	        &mut self,
+   255	        frame: frame::Stream,
+   256	        payload_len: usize,
+   257	    ) -> Result<ShouldTransmit, TransportError> {
+   258	        let id = frame.id;
+   327	            }
+   328	        };
+   329	
+   330	        // State transition
+   331	        if !rs.reset(
+   332	            error_code,
+   333	            final_offset,
+   334	            self.data_recvd,
+   335	            self.local_max_data,
+   336	        )? {
+   337	            // Redundant reset
+   338	            return Ok(ShouldTransmit(false));
+   339	        }
+   340	        let bytes_read = rs.assembler.bytes_read();
+   341	        let stopped = rs.stopped;
+   342	        let end = rs.end;
+   343	        if stopped {
+   344	            // Stopped streams should be disposed immediately on reset
+   345	            let rs = self.recv.remove(&id).flatten().unwrap();
+   346	            self.stream_recv_freed(id, rs);
+   347	        }
+   348	        self.on_stream_frame(!stopped, id);
+   349	
+   350	        // Update connection-level flow control
+   351	        Ok(if bytes_read != final_offset.into_inner() {
+   352	            // bytes_read is always <= end, so this won't underflow.
+   353	            self.data_recvd = self
+   354	                .data_recvd
+   355	                .saturating_add(u64::from(final_offset) - end);
+   356	            self.add_read_credits(u64::from(final_offset) - bytes_read)
+   357	        } else {
+   358	            ShouldTransmit(false)
+   359	        })
+   360	    }
+   361	
+   362	    /// Process incoming `STOP_SENDING` frame
+   363	    #[allow(unreachable_pub)] // fuzzing only
+   364	    pub fn received_stop_sending(&mut self, id: StreamId, error_code: VarInt) {
+   365	        let max_send_data = self.max_send_data(id);
+   867	
+   868	    /// Set the receive_window and returns whether the receive_window has been
+   869	    /// expanded or shrunk: true if expanded, false if shrunk.
+   870	    pub(crate) fn set_receive_window(&mut self, receive_window: VarInt) -> bool {
+   871	        let receive_window = receive_window.into();
+   872	        let mut expanded = false;
+   873	        if receive_window > self.receive_window {
+   874	            self.local_max_data = self
+   875	                .local_max_data
+   876	                .saturating_add(receive_window - self.receive_window);
+   877	            expanded = true;
+   878	        } else {
+   879	            let diff = self.receive_window - receive_window;
+   880	            self.receive_window_shrink_debt = self.receive_window_shrink_debt.saturating_add(diff);
+   881	        }
+   882	        self.receive_window = receive_window;
+   883	        expanded
+   884	    }
+   885	
+   886	    pub(super) fn insert(&mut self, remote: bool, id: StreamId) {
+   887	        let bi = id.dir() == Dir::Bi;
+   888	        // bidirectional OR (unidirectional AND NOT remote)
+   889	        if bi || !remote {
+   890	            assert!(self.send.insert(id, None).is_none());
+   891	        }
+   892	        // bidirectional OR (unidirectional AND remote)
+   893	        if bi || remote {
+   894	            let recv = self.free_recv.pop();
+   895	            assert!(self.recv.insert(id, recv).is_none());
+   896	        }
+   897	    }
+   898	
+   899	    /// Adds credits to the connection flow control window
+   254	impl<'a> Chunks<'a> {
+   255	    pub(super) fn new(
+   256	        id: StreamId,
+   257	        ordered: bool,
+   258	        streams: &'a mut StreamsState,
+   259	        pending: &'a mut Retransmits,
+   260	    ) -> Result<Self, ReadableError> {
+   261	        let mut entry = match streams.recv.entry(id) {
+   262	            Entry::Occupied(entry) => entry,
+   263	            Entry::Vacant(_) => return Err(ReadableError::ClosedStream),
+   264	        };
+   265	
+   266	        let mut recv =
+   267	            match get_or_insert_recv(streams.stream_receive_window)(entry.get_mut()).stopped {
+   268	                true => return Err(ReadableError::ClosedStream),
+   269	                false => entry.remove().unwrap().into_inner(), // this can't fail due to the previous get_or_insert_with
+   270	            };
+   271	
+   272	        recv.assembler.ensure_ordering(ordered)?;
+   273	        Ok(Self {
+   274	            id,
+   275	            ordered,
+   276	            streams,
+   277	            pending,
+   278	            state: ChunksState::Readable(recv),
+   279	            read: 0,
+   280	        })
+   130	    }
+   131	
+   132	    /// Stop accepting data on the given receive stream
+   133	    ///
+   134	    /// Discards unread data and notifies the peer to stop transmitting. Once stopped, further
+   135	    /// attempts to operate on a stream will yield `ClosedStream` errors.
+   136	    pub fn stop(&mut self, error_code: VarInt) -> Result<(), ClosedStream> {
+   137	        let mut entry = match self.state.recv.entry(self.id) {
+   138	            hash_map::Entry::Occupied(s) => s,
+   139	            hash_map::Entry::Vacant(_) => return Err(ClosedStream { _private: () }),
+   140	        };
+   141	        let stream = get_or_insert_recv(self.state.stream_receive_window)(entry.get_mut());
+   142	
+   143	        let (read_credits, stop_sending) = stream.stop()?;
+   144	        if stop_sending.should_transmit() {
+   145	            self.pending.stop_sending.push(frame::StopSending {
+   146	                id: self.id,
+   147	                error_code,
+   148	            });
+   149	        }
+   150	
+   151	        // We need to keep stopped streams around until they're finished or reset so we can update
+   152	        // connection-level flow control to account for discarded data. Otherwise, we can discard
+   153	        // state immediately.
+   154	        if !stream.final_offset_unknown() {
+   155	            let recv = entry.remove().expect("must have recv when stopping");
+   156	            self.state.stream_recv_freed(self.id, recv);
+   157	        }
+   158	
+   159	        if self.state.add_read_credits(read_credits).should_transmit() {
+   160	            self.pending.max_data = true;
+   161	        }
+   162	
+   163	        Ok(())
+   164	    }
+   165	
+   166	    /// Check whether this stream has been reset by the peer, returning the reset error code if so
+   167	    ///
+   168	    /// After returning `Ok(Some(_))` once, stream state will be discarded and all future calls will
+   169	    /// return `Err(ClosedStream)`.
+   170	    pub fn received_reset(&mut self) -> Result<Option<VarInt>, ClosedStream> {
+   171	        let hash_map::Entry::Occupied(entry) = self.state.recv.entry(self.id) else {
+    25	    /// have been sent.
+    26	    ///
+    27	    /// Returns `Err` iff a `len`-byte datagram cannot currently be sent.
+    28	    pub fn send(&mut self, data: Bytes, drop: bool) -> Result<(), SendDatagramError> {
+    29	        if self.conn.config.datagram_receive_buffer_size.is_none() {
+    30	            return Err(SendDatagramError::Disabled);
+    31	        }
+    32	        let max = self
+    33	            .max_size()
+    34	            .ok_or(SendDatagramError::UnsupportedByPeer)?;
+    35	        if data.len() > max {
+    36	            return Err(SendDatagramError::TooLarge);
+    37	        }
+    38	        if drop {
+    39	            while self.conn.datagrams.outgoing_total > self.conn.config.datagram_send_buffer_size {
+    40	                let prev = self
+    41	                    .conn
+    42	                    .datagrams
+    43	                    .outgoing
+    44	                    .pop_front()
+    45	                    .expect("datagrams.outgoing_total desynchronized");
+    46	                trace!(len = prev.data.len(), "dropping outgoing datagram");
+    47	                self.conn.datagrams.outgoing_total -= prev.data.len();
+    48	            }
+    49	        } else if self.conn.datagrams.outgoing_total + data.len()
+    50	            > self.conn.config.datagram_send_buffer_size
+    51	        {
+    52	            self.conn.datagrams.send_blocked = true;
+    53	            return Err(SendDatagramError::Blocked(data));
+    54	        }
+    55	        self.conn.datagrams.outgoing_total += data.len();
+    56	        self.conn.datagrams.outgoing.push_back(Datagram { data });
+    57	        Ok(())
+    58	    }
+    59	
+    60	    /// Compute the maximum size of datagrams that may passed to `send_datagram`
+    61	    ///
+    62	    /// Returns `None` if datagrams are unsupported by the peer or disabled locally.
+    63	    ///
+    64	    /// This may change over the lifetime of a connection according to variation in the path MTU
+    65	    /// estimate. The peer can also enforce an arbitrarily small fixed limit, but if the peer's
+    66	    /// limit is large this is guaranteed to be a little over a kilobyte at minimum.
+    67	    ///
+    68	    /// Not necessarily the maximum size of received datagrams.
+    69	    pub fn max_size(&self) -> Option<usize> {
+    70	        // We use the conservative overhead bound for any packet number, reducing the budget by at
+    71	        // most 3 bytes, so that PN size fluctuations don't cause users sending maximum-size
+    72	        // datagrams to suffer avoidable packet loss.
+    73	        let max_size = self.conn.path.current_mtu() as usize
+    74	            - self.conn.predict_1rtt_overhead(None)
+    75	            - Datagram::SIZE_BOUND;
+    76	        let limit = self
+    77	            .conn
+    78	            .peer_params
+    79	            .max_datagram_frame_size?
+    80	            .into_inner()
+    81	            .saturating_sub(Datagram::SIZE_BOUND as u64);
+    82	        Some(limit.min(max_size as u64) as usize)
+    83	    }
+    84	
+    85	    /// Receive an unreliable, unordered datagram
+    86	    pub fn recv(&mut self) -> Option<Bytes> {
+    87	        self.conn.datagrams.recv()
+    88	    }
+    89	
+    90	    /// Bytes available in the outgoing datagram buffer
+    91	    ///
+    92	    /// When greater than zero, [`send`](Self::send)ing a datagram of at most this size is
+    93	    /// guaranteed not to cause older datagrams to be dropped.
+    94	    pub fn send_buffer_space(&self) -> usize {
+    95	        self.conn
+    46	        let send_rate = match self.sent_time {
+    47	            Some(sent_time) if sent_time > prev_sent_time => Self::bw_from_delta(
+    48	                self.total_sent - self.prev_total_sent,
+    49	                sent_time - prev_sent_time,
+    50	            )
+    51	            .unwrap_or(0),
+    52	            _ => u64::MAX, // will take the min of send and ack, so this is just a skip
+    53	        };
+    54	
+    55	        let ack_rate = match self.prev_acked_time {
+    56	            Some(prev_acked_time) => Self::bw_from_delta(
+    57	                self.total_acked - self.prev_total_acked,
+    58	                now - prev_acked_time,
+    59	            )
+    60	            .unwrap_or(0),
+    61	            None => 0,
+    62	        };
+    63	
+    64	        let bandwidth = send_rate.min(ack_rate);
+    65	        if !app_limited && self.max_filter.get() < bandwidth {
+    66	            self.max_filter.update_max(round, bandwidth);
+    67	        }
+    68	    }
+    69	
+    70	    pub(crate) fn bytes_acked_this_window(&self) -> u64 {
+    71	        self.total_acked - self.acked_at_last_window
+    72	    }
+   462	                TransportParameterId::InitialSourceConnectionId => {
+   463	                    decode_cid(len, &mut params.initial_src_cid, r)?
+   464	                }
+   465	                TransportParameterId::RetrySourceConnectionId => {
+   466	                    decode_cid(len, &mut params.retry_src_cid, r)?
+   467	                }
+   468	                TransportParameterId::MaxDatagramFrameSize => {
+   469	                    if len > 8 || params.max_datagram_frame_size.is_some() {
+   470	                        return Err(Error::Malformed);
+   471	                    }
+   472	                    params.max_datagram_frame_size = Some(r.get().unwrap());
+   473	                }
+   474	                TransportParameterId::GreaseQuicBit => match len {
+   475	                    0 => params.grease_quic_bit = true,
+   476	                    _ => return Err(Error::Malformed),
+   477	                },
+   478	                TransportParameterId::MinAckDelayDraft07 => {
+   479	                    params.min_ack_delay = Some(r.get().unwrap())
+   480	                }
+   481	                _ => {
+   482	                    macro_rules! parse {
+   483	                        {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
+   484	                            match id {
+   485	                                $(TransportParameterId::$id => {
+   486	                                    let value = r.get::<VarInt>()?;
+   487	                                    if len != value.size() || got.$name { return Err(Error::Malformed); }
+   488	                                    params.$name = value.into();
+   489	                                    got.$name = true;
+   490	                                })*
+   491	                                _ => r.advance(len),
+   492	                            }
+   493	                        }
+   494	                    }
+   495	                    apply_params!(parse);
+    88	    }
+    89	
+    90	    /// Replace the server configuration, affecting new incoming connections only
+    91	    pub fn set_server_config(&mut self, server_config: Option<Arc<ServerConfig>>) {
+    92	        self.server_config = server_config;
+    93	    }
+    94	
+    95	    /// Process `EndpointEvent`s emitted from related `Connection`s
+    96	    ///
+    97	    /// In turn, processing this event may return a `ConnectionEvent` for the same `Connection`.
+   205	
+   206	        if let Some(route_to) = self.index.get(&addresses, &event.first_decode) {
+   207	            // Handle packet on existing connection
+   208	            match route_to {
+   209	                RouteDatagramTo::Incoming(incoming_idx) => {
+   210	                    let incoming_buffer = &mut self.incoming_buffers[incoming_idx];
+   211	                    let config = &self.server_config.as_ref().unwrap();
+   212	
+   213	                    if incoming_buffer
+   214	                        .total_bytes
+   215	                        .checked_add(datagram_len as u64)
+   535	            dst_cid,
+   536	            version,
+   537	            ..
+   538	        } = incoming.packet.header;
+   539	        let server_config =
+   540	            server_config.unwrap_or_else(|| self.server_config.as_ref().unwrap().clone());
+   541	
+   542	        if server_config
+   142	        bytes_arr[NONCE_LEN..].copy_from_slice(&hasher.finish().to_le_bytes()[..SIGNATURE_LEN]);
+   143	        ConnectionId::new(&bytes_arr)
+   144	    }
+   145	
+   146	    fn validate(&self, cid: &ConnectionId) -> Result<(), InvalidCid> {
+   147	        let (nonce, signature) = cid.split_at(NONCE_LEN);
+   148	        let mut hasher = rustc_hash::FxHasher::default();
+   149	        hasher.write_u64(self.key);
+   150	        hasher.write(nonce);
+   151	        let expected = hasher.finish().to_le_bytes();
+   152	        match expected[..SIGNATURE_LEN] == signature[..] {
+   153	            true => Ok(()),
+
+== format
+
+== clippy
+   Compiling syn v2.0.106
+    Checking cfg-if v1.0.3
+    Checking libc v0.2.175
+    Checking pin-project-lite v0.2.16
+   Compiling jobserver v0.1.34
+   Compiling cc v1.2.34
+   Compiling serde v1.0.219
+    Checking once_cell v1.21.3
+10.0199 minutes used of 45.0

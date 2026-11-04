@@ -1,0 +1,524 @@
+quinn-proto/src/crypto/rustls.rs
+quinn-proto/src/crypto/ring_like.rs
+quinn-proto/src/congestion.rs
+quinn-proto/src/connection/spaces.rs
+quinn-proto/src/connection/assembler.rs
+quinn-proto/src/connection/timer.rs
+quinn-proto/src/connection/mtud.rs
+quinn-proto/src/connection/send_buffer.rs
+quinn-proto/src/connection/streams/send.rs
+quinn-proto/src/connection/streams/mod.rs
+quinn-proto/src/connection/streams/state.rs
+quinn-proto/src/connection/streams/recv.rs
+quinn-proto/src/connection/paths.rs
+quinn-proto/src/connection/packet_builder.rs
+quinn-proto/src/connection/qlog.rs
+quinn-proto/src/connection/ack_frequency.rs
+quinn-proto/src/connection/cid_state.rs
+quinn-proto/src/connection/mod.rs
+quinn-proto/src/connection/packet_crypto.rs
+quinn-proto/src/connection/pacing.rs
+quinn-proto/src/connection/stats.rs
+quinn-proto/src/connection/datagrams.rs
+quinn-proto/src/config/transport.rs
+quinn-proto/src/config/mod.rs
+quinn-proto/src/token.rs
+quinn-proto/src/coding.rs
+quinn-proto/src/lib.rs
+quinn-proto/src/tests/util.rs
+quinn-proto/src/tests/token.rs
+quinn-proto/src/tests/mod.rs
+quinn-proto/src/cid_generator.rs
+quinn-proto/src/cid_queue.rs
+quinn-proto/src/congestion/cubic.rs
+quinn-proto/src/congestion/new_reno.rs
+quinn-proto/src/congestion/bbr/bw_estimation.rs
+quinn-proto/src/congestion/bbr/mod.rs
+quinn-proto/src/congestion/bbr/min_max.rs
+quinn-proto/src/transport_parameters.rs
+quinn-proto/src/range_set/mod.rs
+quinn-proto/src/range_set/btree_range_set.rs
+quinn-proto/src/range_set/tests.rs
+quinn-proto/src/range_set/array_range_set.rs
+quinn-proto/src/token_memory_cache.rs
+quinn-proto/src/varint.rs
+quinn-proto/src/frame.rs
+quinn-proto/src/constant_time.rs
+quinn-proto/src/bloom_token_log.rs
+quinn-proto/src/packet.rs
+quinn-proto/src/transport_error.rs
+quinn-proto/src/endpoint.rs
+quinn-proto/src/shared.rs
+quinn-proto/src/crypto.rs
+//! Low-level protocol logic for the QUIC protoocol
+//!
+//! quinn-proto contains a fully deterministic implementation of QUIC protocol logic. It contains
+//! no networking code and does not get any relevant timestamps from the operating system. Most
+//! users may want to use the futures-based quinn API instead.
+//!
+//! The quinn-proto API might be of interest if you want to use it from a C or C++ project
+//! through C bindings or if you want to use a different event loop than the one tokio provides.
+//!
+//! The most important types are `Endpoint`, which conceptually represents the protocol state for
+//! a single socket and mostly manages configuration and dispatches incoming datagrams to the
+//! related `Connection`. `Connection` types contain the bulk of the protocol logic related to
+//! managing a single connection and all the related state (such as streams).
+
+#![cfg_attr(not(fuzzing), warn(missing_docs))]
+#![cfg_attr(test, allow(dead_code))]
+// Fixes welcome:
+#![warn(unreachable_pub)]
+#![allow(clippy::cognitive_complexity)]
+#![allow(clippy::too_many_arguments)]
+#![warn(clippy::use_self)]
+
+use std::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+    ops,
+};
+
+mod cid_queue;
+pub mod coding;
+mod constant_time;
+mod range_set;
+#[cfg(all(test, any(feature = "rustls-aws-lc-rs", feature = "rustls-ring")))]
+mod tests;
+pub mod transport_parameters;
+mod varint;
+
+pub use varint::{VarInt, VarIntBoundsExceeded};
+
+#[cfg(feature = "bloom")]
+mod bloom_token_log;
+#[cfg(feature = "bloom")]
+pub use bloom_token_log::BloomTokenLog;
+
+mod connection;
+pub use crate::connection::{
+    Chunk, Chunks, ClosedStream, Connection, ConnectionError, ConnectionStats, Datagrams, Event,
+    FinishError, FrameStats, PathStats, ReadError, ReadableError, RecvStream, RttEstimator,
+    SendDatagramError, SendStream, ShouldTransmit, StreamEvent, Streams, UdpStats, WriteError,
+    Written,
+};
+#[cfg(feature = "qlog")]
+pub use connection::qlog::QlogStream;
+
+#[cfg(feature = "rustls")]
+pub use rustls;
+
+mod config;
+#[cfg(feature = "qlog")]
+pub use config::QlogConfig;
+pub use config::{
+    AckFrequencyConfig, ClientConfig, ConfigError, EndpointConfig, IdleTimeout, MtuDiscoveryConfig,
+    ServerConfig, StdSystemTime, TimeSource, TransportConfig, ValidationTokenConfig,
+};
+
+pub mod crypto;
+
+mod frame;
+use crate::frame::Frame;
+pub use crate::frame::{ApplicationClose, ConnectionClose, Datagram, FrameType};
+
+mod endpoint;
+pub use crate::endpoint::{
+    AcceptError, ConnectError, ConnectionHandle, DatagramEvent, Endpoint, Incoming, RetryError,
+};
+
+mod packet;
+pub use packet::{
+    ConnectionIdParser, FixedLengthConnectionIdParser, LongType, PacketDecodeError, PartialDecode,
+    ProtectedHeader, ProtectedInitialHeader,
+};
+
+mod shared;
+pub use crate::shared::{ConnectionEvent, ConnectionId, EcnCodepoint, EndpointEvent};
+
+mod transport_error;
+pub use crate::transport_error::{Code as TransportErrorCode, Error as TransportError};
+
+pub mod congestion;
+
+mod cid_generator;
+pub use crate::cid_generator::{
+    ConnectionIdGenerator, HashedConnectionIdGenerator, InvalidCid, RandomConnectionIdGenerator,
+};
+
+mod token;
+use token::ResetToken;
+pub use token::{NoneTokenLog, NoneTokenStore, TokenLog, TokenReuseError, TokenStore};
+
+mod token_memory_cache;
+pub use token_memory_cache::TokenMemoryCache;
+
+#[cfg(feature = "arbitrary")]
+use arbitrary::Arbitrary;
+
+// Deal with time
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub(crate) use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub(crate) use web_time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(fuzzing)]
+pub mod fuzzing {
+    pub use crate::connection::{Retransmits, State as ConnectionState, StreamsState};
+    pub use crate::frame::ResetStream;
+    pub use crate::packet::PartialDecode;
+    pub use crate::transport_parameters::TransportParameters;
+    pub use bytes::{BufMut, BytesMut};
+
+    #[cfg(feature = "arbitrary")]
+    use arbitrary::{Arbitrary, Result, Unstructured};
+
+    #[cfg(feature = "arbitrary")]
+    impl<'arbitrary> Arbitrary<'arbitrary> for TransportParameters {
+        fn arbitrary(u: &mut Unstructured<'arbitrary>) -> Result<Self> {
+            Ok(Self {
+                initial_max_streams_bidi: u.arbitrary()?,
+                initial_max_streams_uni: u.arbitrary()?,
+                ack_delay_exponent: u.arbitrary()?,
+                max_udp_payload_size: u.arbitrary()?,
+                ..Self::default()
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct PacketParams {
+        pub local_cid_len: usize,
+        pub buf: BytesMut,
+        pub grease_quic_bit: bool,
+    }
+
+    #[cfg(feature = "arbitrary")]
+    impl<'arbitrary> Arbitrary<'arbitrary> for PacketParams {
+        fn arbitrary(u: &mut Unstructured<'arbitrary>) -> Result<Self> {
+            let local_cid_len: usize = u.int_in_range(0..=crate::MAX_CID_SIZE)?;
+            let bytes: Vec<u8> = Vec::arbitrary(u)?;
+            let mut buf = BytesMut::new();
+            buf.put_slice(&bytes[..]);
+            Ok(Self {
+                local_cid_len,
+                buf,
+                grease_quic_bit: bool::arbitrary(u)?,
+            })
+        }
+    }
+}
+
+/// The QUIC protocol version implemented.
+pub const DEFAULT_SUPPORTED_VERSIONS: &[u32] = &[
+    0x00000001,
+    0xff00_001d,
+    0xff00_001e,
+    0xff00_001f,
+    0xff00_0020,
+    0xff00_0021,
+    0xff00_0022,
+];
+
+/// Whether an endpoint was the initiator of a connection
+#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum Side {
+    /// The initiator of a connection
+    Client = 0,
+    /// The acceptor of a connection
+    Server = 1,
+}
+
+impl Side {
+    #[inline]
+    /// Shorthand for `self == Side::Client`
+    pub fn is_client(self) -> bool {
+        self == Self::Client
+    }
+
+    #[inline]
+    /// Shorthand for `self == Side::Server`
+    pub fn is_server(self) -> bool {
+        self == Self::Server
+    }
+}
+
+impl ops::Not for Side {
+    type Output = Self;
+    fn not(self) -> Self {
+        match self {
+            Self::Client => Self::Server,
+            Self::Server => Self::Client,
+        }
+    }
+}
+
+/// Whether a stream communicates data in both directions or only from the initiator
+#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum Dir {
+    /// Data flows in both directions
+    Bi = 0,
+    /// Data flows only from the stream's initiator
+    Uni = 1,
+}
+
+impl Dir {
+    fn iter() -> impl Iterator<Item = Self> {
+        [Self::Bi, Self::Uni].iter().cloned()
+    }
+}
+
+impl fmt::Display for Dir {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use Dir::*;
+        f.pad(match *self {
+            Bi => "bidirectional",
+            Uni => "unidirectional",
+        })
+    }
+}
+
+/// Identifier for a stream within a particular connection
+#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct StreamId(u64);
+
+impl fmt::Display for StreamId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let initiator = match self.initiator() {
+            Side::Client => "client",
+            Side::Server => "server",
+        };
+        let dir = match self.dir() {
+            Dir::Uni => "uni",
+            Dir::Bi => "bi",
+        };
+        write!(
+            f,
+            "{} {}directional stream {}",
+            initiator,
+            dir,
+            self.index()
+        )
+    }
+}
+
+impl StreamId {
+    /// Create a new StreamId
+    pub fn new(initiator: Side, dir: Dir, index: u64) -> Self {
+        Self((index << 2) | ((dir as u64) << 1) | initiator as u64)
+    }
+    /// Which side of a connection initiated the stream
+    pub fn initiator(self) -> Side {
+        if self.0 & 0x1 == 0 {
+            Side::Client
+        } else {
+            Side::Server
+        }
+    }
+    /// Which directions data flows in
+    pub fn dir(self) -> Dir {
+        if self.0 & 0x2 == 0 { Dir::Bi } else { Dir::Uni }
+    }
+    /// Distinguishes streams of the same initiator and directionality
+    pub fn index(self) -> u64 {
+        self.0 >> 2
+    }
+}
+
+impl From<StreamId> for VarInt {
+    fn from(x: StreamId) -> Self {
+        unsafe { Self::from_u64_unchecked(x.0) }
+    }
+}
+
+impl From<VarInt> for StreamId {
+    fn from(v: VarInt) -> Self {
+        Self(v.0)
+    }
+}
+
+impl From<StreamId> for u64 {
+    fn from(x: StreamId) -> Self {
+        x.0
+    }
+}
+
+impl coding::Codec for StreamId {
+    fn decode<B: bytes::Buf>(buf: &mut B) -> coding::Result<Self> {
+        VarInt::decode(buf).map(|x| Self(x.into_inner()))
+    }
+    fn encode<B: bytes::BufMut>(&self, buf: &mut B) {
+        VarInt::from_u64(self.0).unwrap().encode(buf);
+    }
+}
+
+/// An outgoing packet
+#[derive(Debug)]
+#[must_use]
+pub struct Transmit {
+    /// The socket this datagram should be sent to
+    pub destination: SocketAddr,
+    /// Explicit congestion notification bits to set on the packet
+    pub ecn: Option<EcnCodepoint>,
+    /// Amount of data written to the caller-supplied buffer
+    pub size: usize,
+    /// The segment size if this transmission contains multiple datagrams.
+    /// This is `None` if the transmit only contains a single datagram
+    pub segment_size: Option<usize>,
+    /// Optional source IP address for the datagram
+    pub src_ip: Option<IpAddr>,
+}
+
+//
+// Useful internal constants
+//
+
+/// The maximum number of CIDs we bother to issue per connection
+const LOC_CID_COUNT: u64 = 8;
+const RESET_TOKEN_SIZE: usize = 16;
+const MAX_CID_SIZE: usize = 20;
+const MIN_INITIAL_SIZE: u16 = 1200;
+/// <https://www.rfc-editor.org/rfc/rfc9000.html#name-datagram-size>
+const INITIAL_MTU: u16 = 1200;
+const MAX_UDP_PAYLOAD: u16 = 65527;
+const TIMER_GRANULARITY: Duration = Duration::from_millis(1);
+/// Maximum number of streams that can be uniquely identified by a stream ID
+const MAX_STREAM_COUNT: u64 = 1 << 60;
+<h1 align="center"><img width="500" src="https://raw.githubusercontent.com/quinn-rs/quinn/51a3cea225670757cb844a342428e4e1341d9f13/docs/thumbnail.svg" /></h1>
+
+[![Documentation](https://docs.rs/quinn/badge.svg)](https://docs.rs/quinn/)
+[![Crates.io](https://img.shields.io/crates/v/quinn.svg)](https://crates.io/crates/quinn)
+[![Build status](https://github.com/quinn-rs/quinn/workflows/CI/badge.svg)](https://github.com/djc/quinn/actions?query=workflow%3ACI)
+[![codecov](https://codecov.io/gh/quinn-rs/quinn/branch/main/graph/badge.svg)](https://codecov.io/gh/quinn-rs/quinn)
+[![Chat](https://img.shields.io/badge/chat-%23quinn:matrix.org-%2346BC99?logo=matrix)](https://matrix.to/#/#quinn:matrix.org)
+[![Chat](https://img.shields.io/discord/976380008299917365?logo=discord)](https://discord.gg/SGPEcDfVzh)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE-MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE-APACHE)
+
+Quinn is a pure-Rust, async-compatible implementation of the IETF [QUIC][quic] transport protocol.
+The project was founded by [Dirkjan Ochtman](https://github.com/djc) and
+[Benjamin Saunders](https://github.com/Ralith) as a side project in 2018, and has seen more than
+30 releases since then. If you're using Quinn in a commercial setting, please consider
+[sponsoring](https://opencollective.com/quinn-rs) the project.
+
+## Features
+
+- Simultaneous client/server operation
+- Ordered and unordered stream reads for improved performance
+- Works on stable Rust, tested on Linux, macOS and Windows
+- Pluggable cryptography, with a standard implementation backed by
+  [rustls][rustls] and [*ring*][ring]
+- Application-layer datagrams for small, unreliable messages
+- Future-based async API
+- Minimum supported Rust version of 1.74.1
+
+## Overview
+
+- **quinn:** High-level async API based on tokio, see [examples][examples] for usage. This will be used by most developers. (Basic benchmarks are included.)
+- **quinn-proto:** Deterministic state machine of the protocol which performs [**no** I/O][sans-io] internally and is suitable for use with custom event loops (and potentially a C or C++ API).
+- **quinn-udp:** UDP sockets with ECN information tuned for the protocol.
+- **bench:** Benchmarks without any framework.
+- **fuzz:** Fuzz tests.
+
+# Getting Started
+
+**Examples**
+
+```sh
+$ cargo run --example server ./
+$ cargo run --example client https://localhost:4433/Cargo.toml
+```
+
+This launches an HTTP 0.9 server on the loopback address serving the current
+working directory, with the client fetching `./Cargo.toml`. By default, the
+server generates a self-signed certificate and stores it to disk, where the
+client will automatically find and trust it.
+
+**Links**
+
+- Talk at [RustFest Paris (May 2018) presentation][talk]; [slides][slides]; [YouTube][youtube]
+- Usage [examples][examples]
+- Guide [book][documentation]
+
+## Usage Notes
+
+<details>
+<summary>
+Click to show the notes
+</summary>
+
+### Buffers
+
+A Quinn endpoint corresponds to a single UDP socket, no matter how many
+connections are in use. Handling high aggregate data rates on a single endpoint
+can require a larger UDP buffer than is configured by default in most
+environments. If you observe erratic latency and/or throughput over a stable
+network link, consider increasing the buffer sizes used. For example, you could
+adjust the `SO_SNDBUF` and `SO_RCVBUF` options of the UDP socket to be used
+before passing it in to Quinn. Note that some platforms (e.g. Linux) require
+elevated privileges or modified system configuration for a process to increase
+its UDP buffer sizes.
+
+### Certificates
+
+By default, Quinn clients validate the cryptographic identity of servers they
+connect to. This prevents an active, on-path attacker from intercepting
+messages, but requires trusting some certificate authority. For many purposes,
+this can be accomplished by using certificates from [Let's Encrypt][letsencrypt]
+for servers, and relying on the default configuration for clients.
+
+For some cases, including peer-to-peer, trust-on-first-use, deliberately
+insecure applications, or any case where servers are not identified by domain
+name, this isn't practical. Arbitrary certificate validation logic can be
+implemented by enabling the `dangerous_configuration` feature of `rustls` and
+constructing a Quinn `ClientConfig` with an overridden certificate verifier by
+hand.
+
+When operating your own certificate authority doesn't make sense, [rcgen][rcgen]
+can be used to generate self-signed certificates on demand. To support
+trust-on-first-use, servers that automatically generate self-signed certificates
+should write their generated certificate to persistent storage and reuse it on
+future runs.
+
+</details>
+<p></p>
+
+## Contribution
+
+All feedback welcome. Feel free to file bugs, requests for documentation and
+any other feedback to the [issue tracker][issues].
+
+The quinn-proto test suite uses simulated IO for reproducibility and to avoid
+long sleeps in certain timing-sensitive tests. If the `SSLKEYLOGFILE`
+environment variable is set, the tests will emit UDP packets for inspection
+using external protocol analyzers like Wireshark, and NSS-compatible key logs
+for the client side of each connection will be written to the path specified in
+the variable.
+
+The minimum supported Rust version for published releases of our
+crates will always be at least 6 months old at the time of release.
+
+[quic]: https://quicwg.github.io/
+[issues]: https://github.com/djc/quinn/issues
+[rustls]: https://github.com/ctz/rustls
+[ring]: https://github.com/briansmith/ring
+[talk]: https://paris.rustfest.eu/sessions/a-quic-future-in-rust
+[slides]: https://github.com/djc/talks/blob/ff760845b51ba4836cce82e7f2c640ecb5fd59fa/2018-05-26%20A%20QUIC%20future%20in%20Rust/Quinn-Speaker.pdf
+[animation]: https://dirkjan.ochtman.nl/files/head-of-line-blocking.html
+[youtube]: https://www.youtube.com/watch?v=EHgyY5DNdvI
+[letsencrypt]: https://letsencrypt.org/
+[rcgen]: https://crates.io/crates/rcgen
+[examples]: https://github.com/djc/quinn/tree/main/quinn/examples
+[documentation]: https://quinn-rs.github.io/quinn/networking-introduction.html
+[sans-io]: https://sans-io.readthedocs.io/how-to-sans-io.html
+.github/FUNDING.yml
+.github/CODEOWNERS
+.github/workflows/codecov.yml
+.github/workflows/rust.yml
+.github/workflows/rust-android-run-tests-on-emulator.sh
+.github/workflows/book.yml
+.github/dependabot.yml
+./quinn-udp/build.rs
+./quinn/build.rs

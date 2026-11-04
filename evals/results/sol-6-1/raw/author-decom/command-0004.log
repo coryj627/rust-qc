@@ -1,0 +1,699 @@
+#![cfg(feature = "serde")]
+use serde::Deserialize;
+use serde_json as json;
+
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::Path;
+
+use alacritty_terminal::event::{Event, EventListener};
+use alacritty_terminal::grid::{Dimensions, Grid};
+use alacritty_terminal::index::{Column, Line};
+use alacritty_terminal::term::cell::Cell;
+use alacritty_terminal::term::test::TermSize;
+use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::vte::ansi;
+
+macro_rules! ref_tests {
+    ($($name:ident)*) => {
+        $(
+            #[test]
+            fn $name() {
+                let test_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/ref"));
+                let test_path = test_dir.join(stringify!($name));
+                ref_test(&test_path);
+            }
+        )*
+    }
+}
+
+ref_tests! {
+    alt_reset
+    clear_underline
+    colored_reset
+    colored_underline
+    csi_rep
+    decaln_reset
+    deccolm_reset
+    delete_chars_reset
+    delete_lines
+    erase_chars_reset
+    fish_cc
+    grid_reset
+    history
+    hyperlinks
+    indexed_256_colors
+    insert_blank_reset
+    issue_855
+    ll
+    newline_with_cursor_beyond_scroll_region
+    region_scroll_down
+    row_reset
+    saved_cursor
+    saved_cursor_alt
+    scroll_up_reset
+    selective_erasure
+    sgr
+    tab_rendering
+    tmux_git_log
+    tmux_htop
+    underline
+    vim_24bitcolors_bce
+    vim_large_window_scroll
+    vim_simple_edit
+    vttest_cursor_movement_1
+    vttest_insert
+    vttest_origin_mode_1
+    vttest_origin_mode_2
+    vttest_scroll
+    vttest_tab_clear_set
+    wrapline_alt_toggle
+    zerowidth
+    zsh_tab_completion
+    erase_in_line
+    scroll_in_region_up_preserves_history
+}
+
+fn read_u8<P>(path: P) -> Vec<u8>
+where
+    P: AsRef<Path>,
+{
+    let mut res = Vec::new();
+    File::open(path.as_ref()).unwrap().read_to_end(&mut res).unwrap();
+
+    res
+}
+
+#[derive(Deserialize, Default)]
+struct RefConfig {
+    history_size: u32,
+}
+
+#[derive(Copy, Clone)]
+struct Mock;
+
+impl EventListener for Mock {
+    fn send_event(&self, _event: Event) {}
+}
+
+fn ref_test(dir: &Path) {
+    let recording = read_u8(dir.join("alacritty.recording"));
+    let serialized_size = fs::read_to_string(dir.join("size.json")).unwrap();
+    let serialized_grid = fs::read_to_string(dir.join("grid.json")).unwrap();
+    let serialized_cfg = fs::read_to_string(dir.join("config.json")).unwrap();
+
+    let size: TermSize = json::from_str(&serialized_size).unwrap();
+    let grid: Grid<Cell> = json::from_str(&serialized_grid).unwrap();
+    let ref_config: RefConfig = json::from_str(&serialized_cfg).unwrap();
+
+    let options =
+        Config { scrolling_history: ref_config.history_size as usize, ..Default::default() };
+
+    let mut terminal = Term::new(options, &size, Mock);
+    let mut parser: ansi::Processor = ansi::Processor::new();
+
+    for byte in recording {
+        parser.advance(&mut terminal, byte);
+    }
+
+    // Truncate invisible lines from the grid.
+    let mut term_grid = terminal.grid().clone();
+    term_grid.initialize_all();
+    term_grid.truncate();
+
+    if grid != term_grid {
+        for i in 0..grid.total_lines() {
+            for j in 0..grid.columns() {
+                let cell = &term_grid[Line(i as i32)][Column(j)];
+                let original_cell = &grid[Line(i as i32)][Column(j)];
+                if original_cell != cell {
+                    println!("[{i}][{j}] {original_cell:?} => {cell:?}",);
+                }
+            }
+        }
+
+        panic!("Ref test failed; grid doesn't match");
+    }
+
+    assert_eq!(grid, term_grid);
+}
+//! A specialized 2D grid implementation optimized for use in a terminal.
+
+use std::cmp::{max, min};
+use std::ops::{Bound, Deref, Index, IndexMut, Range, RangeBounds};
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+use crate::index::{Column, Line, Point};
+use crate::term::cell::{Flags, ResetDiscriminant};
+use crate::vte::ansi::{CharsetIndex, StandardCharset};
+
+pub mod resize;
+mod row;
+mod storage;
+#[cfg(test)]
+mod tests;
+
+pub use self::row::Row;
+use self::storage::Storage;
+
+pub trait GridCell: Sized {
+    /// Check if the cell contains any content.
+    fn is_empty(&self) -> bool;
+
+    /// Perform an opinionated cell reset based on a template cell.
+    fn reset(&mut self, template: &Self);
+
+    fn flags(&self) -> &Flags;
+    fn flags_mut(&mut self) -> &mut Flags;
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Cursor<T> {
+    /// The location of this cursor.
+    pub point: Point,
+
+    /// Template cell when using this cursor.
+    pub template: T,
+
+    /// Currently configured graphic character sets.
+    pub charsets: Charsets,
+
+    /// Tracks if the next call to input will need to first handle wrapping.
+    ///
+    /// This is true after the last column is set with the input function. Any function that
+    /// implicitly sets the line or column needs to set this to false to avoid wrapping twice.
+    ///
+    /// Tracking `input_needs_wrap` makes it possible to not store a cursor position that exceeds
+    /// the number of columns, which would lead to index out of bounds when interacting with arrays
+    /// without sanitization.
+    pub input_needs_wrap: bool,
+}
+
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub struct Charsets([StandardCharset; 4]);
+
+impl Index<CharsetIndex> for Charsets {
+    type Output = StandardCharset;
+
+    fn index(&self, index: CharsetIndex) -> &StandardCharset {
+        &self.0[index as usize]
+    }
+}
+
+impl IndexMut<CharsetIndex> for Charsets {
+    fn index_mut(&mut self, index: CharsetIndex) -> &mut StandardCharset {
+        &mut self.0[index as usize]
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum Scroll {
+    Delta(i32),
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
+}
+
+/// Grid based terminal content storage.
+///
+/// ```notrust
+/// ┌─────────────────────────┐  <-- max_scroll_limit + lines
+/// │                         │
+/// │      UNINITIALIZED      │
+/// │                         │
+/// ├─────────────────────────┤  <-- self.raw.inner.len()
+/// │                         │
+/// │      RESIZE BUFFER      │
+/// │                         │
+/// ├─────────────────────────┤  <-- self.history_size() + lines
+/// │                         │
+/// │     SCROLLUP REGION     │
+/// │                         │
+/// ├─────────────────────────┤v lines
+/// │                         │|
+/// │     VISIBLE  REGION     │|
+/// │                         │|
+/// ├─────────────────────────┤^ <-- display_offset
+/// │                         │
+/// │    SCROLLDOWN REGION    │
+/// │                         │
+/// └─────────────────────────┘  <-- zero
+///                           ^
+///                        columns
+/// ```
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Grid<T> {
+    /// Current cursor for writing data.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub cursor: Cursor<T>,
+
+    /// Last saved cursor.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub saved_cursor: Cursor<T>,
+
+    /// Lines in the grid. Each row holds a list of cells corresponding to the
+    /// columns in that row.
+    raw: Storage<T>,
+
+    /// Number of columns.
+    columns: usize,
+
+    /// Number of visible lines.
+    lines: usize,
+
+    /// Offset of displayed area.
+    ///
+    /// If the displayed region isn't at the bottom of the screen, it stays
+    /// stationary while more text is emitted. The scrolling implementation
+    /// updates this offset accordingly.
+    display_offset: usize,
+
+    /// Maximum number of lines in history.
+    max_scroll_limit: usize,
+}
+
+impl<T: GridCell + Default + PartialEq> Grid<T> {
+    pub fn new(lines: usize, columns: usize, max_scroll_limit: usize) -> Grid<T> {
+        Grid {
+            raw: Storage::with_capacity(lines, columns),
+            max_scroll_limit,
+            display_offset: 0,
+            saved_cursor: Cursor::default(),
+            cursor: Cursor::default(),
+            lines,
+            columns,
+        }
+    #[inline]
+    fn decaln(&mut self) {
+        trace!("Decalnning");
+
+        for line in (0..self.screen_lines()).map(Line::from) {
+            for column in 0..self.columns() {
+                let cell = &mut self.grid[line][Column(column)];
+                *cell = Cell::default();
+                cell.c = 'E';
+            }
+        }
+
+        self.mark_fully_damaged();
+    }
+
+    #[inline]
+    fn goto(&mut self, line: i32, col: usize) {
+        let line = Line(line);
+        let col = Column(col);
+
+        trace!("Going to: line={}, col={}", line, col);
+        let (y_offset, max_y) = if self.mode.contains(TermMode::ORIGIN) {
+            (self.scroll_region.start, self.scroll_region.end - 1)
+        } else {
+            (Line(0), self.bottommost_line())
+        };
+
+        self.damage_cursor();
+        self.grid.cursor.point.line = cmp::max(cmp::min(line + y_offset, max_y), Line(0));
+        self.grid.cursor.point.column = cmp::min(col, self.last_column());
+        self.damage_cursor();
+        self.grid.cursor.input_needs_wrap = false;
+    }
+
+    #[inline]
+    fn goto_line(&mut self, line: i32) {
+        trace!("Going to line: {}", line);
+        self.goto(line, self.grid.cursor.point.column.0)
+    }
+
+    #[inline]
+    fn goto_col(&mut self, col: usize) {
+        trace!("Going to column: {}", col);
+        self.goto(self.grid.cursor.point.line.0, col)
+    }
+
+    #[inline]
+    fn insert_blank(&mut self, count: usize) {
+        let cursor = &self.grid.cursor;
+        let bg = cursor.template.bg;
+
+        // Ensure inserting within terminal bounds
+        let count = cmp::min(count, self.columns() - cursor.point.column.0);
+
+        let source = cursor.point.column;
+        let destination = cursor.point.column.0 + count;
+            if col == num_cols - 1 {
+                break;
+            }
+
+            for i in col.0 + 1..num_cols {
+                col = index::Column(i);
+                if self.tabs[col] {
+                    break;
+                }
+            }
+
+            self.grid.cursor.point.column = col;
+        }
+
+        let line = self.grid.cursor.point.line.0 as usize;
+        self.damage.damage_line(line, old_col, self.grid.cursor.point.column.0);
+    }
+
+    #[inline]
+    fn save_cursor_position(&mut self) {
+        trace!("Saving cursor position");
+
+        self.grid.saved_cursor = self.grid.cursor.clone();
+    }
+
+    #[inline]
+    fn restore_cursor_position(&mut self) {
+        trace!("Restoring cursor position");
+
+        self.damage_cursor();
+        self.grid.cursor = self.grid.saved_cursor.clone();
+        self.damage_cursor();
+    }
+
+    #[inline]
+    fn clear_line(&mut self, mode: ansi::LineClearMode) {
+        trace!("Clearing line: {:?}", mode);
+
+        let cursor = &self.grid.cursor;
+        let bg = cursor.template.bg;
+        let point = cursor.point;
+
+        let (left, right) = match mode {
+            ansi::LineClearMode::Right if cursor.input_needs_wrap => return,
+            ansi::LineClearMode::Right => (point.column, Column(self.columns())),
+            ansi::LineClearMode::Left => (Column(0), point.column + 1),
+            ansi::LineClearMode::All => (Column(0), Column(self.columns())),
+        };
+
+        self.damage.damage_line(point.line.0 as usize, left.0, right.0 - 1);
+
+    #[inline]
+    fn terminal_attribute(&mut self, attr: Attr) {
+        trace!("Setting attribute: {:?}", attr);
+        let cursor = &mut self.grid.cursor;
+        match attr {
+            Attr::Foreground(color) => cursor.template.fg = color,
+            Attr::Background(color) => cursor.template.bg = color,
+            Attr::UnderlineColor(color) => cursor.template.set_underline_color(color),
+            Attr::Reset => {
+                cursor.template.fg = Color::Named(NamedColor::Foreground);
+                cursor.template.bg = Color::Named(NamedColor::Background);
+                cursor.template.flags = Flags::empty();
+                cursor.template.set_underline_color(None);
+            },
+            Attr::Reverse => cursor.template.flags.insert(Flags::INVERSE),
+            Attr::CancelReverse => cursor.template.flags.remove(Flags::INVERSE),
+            Attr::Bold => cursor.template.flags.insert(Flags::BOLD),
+            Attr::CancelBold => cursor.template.flags.remove(Flags::BOLD),
+            Attr::Dim => cursor.template.flags.insert(Flags::DIM),
+            Attr::CancelBoldDim => cursor.template.flags.remove(Flags::BOLD | Flags::DIM),
+            Attr::Italic => cursor.template.flags.insert(Flags::ITALIC),
+            Attr::CancelItalic => cursor.template.flags.remove(Flags::ITALIC),
+            Attr::Underline => {
+                cursor.template.flags.remove(Flags::ALL_UNDERLINES);
+                cursor.template.flags.insert(Flags::UNDERLINE);
+            },
+            Attr::DoubleUnderline => {
+                cursor.template.flags.remove(Flags::ALL_UNDERLINES);
+                cursor.template.flags.insert(Flags::DOUBLE_UNDERLINE);
+            },
+            Attr::Undercurl => {
+                cursor.template.flags.remove(Flags::ALL_UNDERLINES);
+                cursor.template.flags.insert(Flags::UNDERCURL);
+            },
+            Attr::DottedUnderline => {
+                cursor.template.flags.remove(Flags::ALL_UNDERLINES);
+                cursor.template.flags.insert(Flags::DOTTED_UNDERLINE);
+            },
+            Attr::DashedUnderline => {
+                cursor.template.flags.remove(Flags::ALL_UNDERLINES);
+                cursor.template.flags.insert(Flags::DASHED_UNDERLINE);
+            },
+            Attr::CancelUnderline => cursor.template.flags.remove(Flags::ALL_UNDERLINES),
+            Attr::Hidden => cursor.template.flags.insert(Flags::HIDDEN),
+            Attr::CancelHidden => cursor.template.flags.remove(Flags::HIDDEN),
+            Attr::Strike => cursor.template.flags.insert(Flags::STRIKEOUT),
+            Attr::CancelStrike => cursor.template.flags.remove(Flags::STRIKEOUT),
+            _ => {
+                debug!("Term got unhandled attr: {:?}", attr);
+            },
+        }
+    }
+
+    #[inline]
+    fn set_private_mode(&mut self, mode: PrivateMode) {
+        let mode = match mode {
+            PrivateMode::Named(mode) => mode,
+            PrivateMode::Unknown(mode) => {
+                debug!("Ignoring unknown mode {} in set_private_mode", mode);
+                return;
+            },
+        };
+
+        trace!("Setting private mode: {:?}", mode);
+        match mode {
+            NamedPrivateMode::UrgencyHints => self.mode.insert(TermMode::URGENCY_HINTS),
+            NamedPrivateMode::SwapScreenAndSetRestoreCursor => {
+                if !self.mode.contains(TermMode::ALT_SCREEN) {
+                    self.swap_alt();
+                }
+            },
+            NamedPrivateMode::ShowCursor => self.mode.insert(TermMode::SHOW_CURSOR),
+            NamedPrivateMode::CursorKeys => self.mode.insert(TermMode::APP_CURSOR),
+            // Mouse protocols are mutually exclusive.
+            NamedPrivateMode::ReportMouseClicks => {
+                self.mode.remove(TermMode::MOUSE_MODE);
+                self.mode.insert(TermMode::MOUSE_REPORT_CLICK);
+                self.event_proxy.send_event(Event::MouseCursorDirty);
+            },
+            NamedPrivateMode::ReportCellMouseMotion => {
+                self.mode.remove(TermMode::MOUSE_MODE);
+                self.mode.insert(TermMode::MOUSE_DRAG);
+                self.event_proxy.send_event(Event::MouseCursorDirty);
+            },
+            NamedPrivateMode::ReportAllMouseMotion => {
+                self.mode.remove(TermMode::MOUSE_MODE);
+                self.mode.insert(TermMode::MOUSE_MOTION);
+                self.event_proxy.send_event(Event::MouseCursorDirty);
+            },
+            NamedPrivateMode::ReportFocusInOut => self.mode.insert(TermMode::FOCUS_IN_OUT),
+            NamedPrivateMode::BracketedPaste => self.mode.insert(TermMode::BRACKETED_PASTE),
+            // Mouse encodings are mutually exclusive.
+            NamedPrivateMode::SgrMouse => {
+                self.mode.remove(TermMode::UTF8_MOUSE);
+                self.mode.insert(TermMode::SGR_MOUSE);
+            },
+            NamedPrivateMode::Utf8Mouse => {
+                self.mode.remove(TermMode::SGR_MOUSE);
+                self.mode.insert(TermMode::UTF8_MOUSE);
+            },
+            NamedPrivateMode::AlternateScroll => self.mode.insert(TermMode::ALTERNATE_SCROLL),
+            NamedPrivateMode::LineWrap => self.mode.insert(TermMode::LINE_WRAP),
+            NamedPrivateMode::Origin => self.mode.insert(TermMode::ORIGIN),
+            NamedPrivateMode::ColumnMode => self.deccolm(),
+            NamedPrivateMode::BlinkingCursor => {
+                let style = self.cursor_style.get_or_insert(self.config.default_cursor_style);
+                style.blinking = true;
+                self.event_proxy.send_event(Event::CursorBlinkingChange);
+            },
+            NamedPrivateMode::SyncUpdate => (),
+        }
+    }
+
+    #[inline]
+    fn unset_private_mode(&mut self, mode: PrivateMode) {
+        let mode = match mode {
+            PrivateMode::Named(mode) => mode,
+            PrivateMode::Unknown(mode) => {
+                debug!("Ignoring unknown mode {} in unset_private_mode", mode);
+                return;
+            },
+        };
+
+        trace!("Unsetting private mode: {:?}", mode);
+        match mode {
+            NamedPrivateMode::UrgencyHints => self.mode.remove(TermMode::URGENCY_HINTS),
+            NamedPrivateMode::SwapScreenAndSetRestoreCursor => {
+                if self.mode.contains(TermMode::ALT_SCREEN) {
+                    self.swap_alt();
+                }
+            },
+            NamedPrivateMode::ShowCursor => self.mode.remove(TermMode::SHOW_CURSOR),
+            NamedPrivateMode::CursorKeys => self.mode.remove(TermMode::APP_CURSOR),
+            NamedPrivateMode::ReportMouseClicks => {
+                self.mode.remove(TermMode::MOUSE_REPORT_CLICK);
+                self.event_proxy.send_event(Event::MouseCursorDirty);
+            },
+            NamedPrivateMode::ReportCellMouseMotion => {
+                self.mode.remove(TermMode::MOUSE_DRAG);
+                self.event_proxy.send_event(Event::MouseCursorDirty);
+            },
+            NamedPrivateMode::ReportAllMouseMotion => {
+                self.mode.remove(TermMode::MOUSE_MOTION);
+                self.event_proxy.send_event(Event::MouseCursorDirty);
+            },
+            NamedPrivateMode::ReportFocusInOut => self.mode.remove(TermMode::FOCUS_IN_OUT),
+            NamedPrivateMode::BracketedPaste => self.mode.remove(TermMode::BRACKETED_PASTE),
+            NamedPrivateMode::SgrMouse => self.mode.remove(TermMode::SGR_MOUSE),
+            NamedPrivateMode::Utf8Mouse => self.mode.remove(TermMode::UTF8_MOUSE),
+            NamedPrivateMode::AlternateScroll => self.mode.remove(TermMode::ALTERNATE_SCROLL),
+            NamedPrivateMode::LineWrap => self.mode.remove(TermMode::LINE_WRAP),
+            NamedPrivateMode::Origin => self.mode.remove(TermMode::ORIGIN),
+            NamedPrivateMode::ColumnMode => self.deccolm(),
+            NamedPrivateMode::BlinkingCursor => {
+                let style = self.cursor_style.get_or_insert(self.config.default_cursor_style);
+                style.blinking = false;
+                self.event_proxy.send_event(Event::CursorBlinkingChange);
+            },
+            NamedPrivateMode::SyncUpdate => (),
+        }
+    }
+
+    #[inline]
+    fn report_private_mode(&mut self, mode: PrivateMode) {
+        trace!("Reporting private mode {mode:?}");
+        let state = match mode {
+            PrivateMode::Named(mode) => match mode {
+                NamedPrivateMode::CursorKeys => self.mode.contains(TermMode::APP_CURSOR).into(),
+                NamedPrivateMode::Origin => self.mode.contains(TermMode::ORIGIN).into(),
+                NamedPrivateMode::LineWrap => self.mode.contains(TermMode::LINE_WRAP).into(),
+                NamedPrivateMode::BlinkingCursor => {
+            },
+            ansi::Mode::Unknown(_) => ModeState::NotSupported,
+        };
+
+        self.event_proxy.send_event(Event::PtyWrite(format!(
+            "\x1b[{};{}$y",
+            mode.raw(),
+            state as u8,
+        )));
+    }
+
+    #[inline]
+    fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
+        // Fallback to the last line as default.
+        let bottom = bottom.unwrap_or_else(|| self.screen_lines());
+
+        if top >= bottom {
+            debug!("Invalid scrolling region: ({};{})", top, bottom);
+            return;
+        }
+
+        // Bottom should be included in the range, but range end is not
+        // usually included. One option would be to use an inclusive
+        // range, but instead we just let the open range end be 1
+        // higher.
+        let start = Line(top as i32 - 1);
+        let end = Line(bottom as i32);
+
+        trace!("Setting scrolling region: ({};{})", start, end);
+
+        let screen_lines = Line(self.screen_lines() as i32);
+        self.scroll_region.start = cmp::min(start, screen_lines);
+        self.scroll_region.end = cmp::min(end, screen_lines);
+        self.goto(0, 0);
+    }
+
+    #[inline]
+    fn set_keypad_application_mode(&mut self) {
+        trace!("Setting keypad application mode");
+        self.mode.insert(TermMode::APP_KEYPAD);
+    }
+
+    #[inline]
+    fn unset_keypad_application_mode(&mut self) {
+        trace!("Unsetting keypad application mode");
+        self.mode.remove(TermMode::APP_KEYPAD);
+    }
+
+    #[inline]
+    fn configure_charset(&mut self, index: CharsetIndex, charset: StandardCharset) {
+        trace!("Configuring charset {:?} as {:?}", index, charset);
+
+    #[cfg(feature = "serde")]
+    use serde::{Deserialize, Serialize};
+
+    use crate::event::VoidListener;
+
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    pub struct TermSize {
+        pub columns: usize,
+        pub screen_lines: usize,
+    }
+
+    impl TermSize {
+        pub fn new(columns: usize, screen_lines: usize) -> Self {
+            Self { columns, screen_lines }
+        }
+    }
+
+    impl Dimensions for TermSize {
+        fn total_lines(&self) -> usize {
+            self.screen_lines()
+        }
+
+        fn screen_lines(&self) -> usize {
+            self.screen_lines
+        }
+
+        fn columns(&self) -> usize {
+            self.columns
+        }
+    }
+
+    /// Construct a terminal from its content as string.
+    ///
+    /// A `\n` will break line and `\r\n` will break line without wrapping.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use alacritty_terminal::term::test::mock_term;
+    ///
+    /// // Create a terminal with the following cells:
+    /// //
+    /// // [h][e][l][l][o] <- WRAPLINE flag set
+    /// // [:][)][ ][ ][ ]
+    /// // [t][e][s][t][ ]
+    /// mock_term(
+    ///     "\
+    ///     hello\n:)\r\ntest",
+    /// );
+    /// ```
+    pub fn mock_term(content: &str) -> Term<VoidListener> {
+        let lines: Vec<&str> = content.split('\n').collect();
+        let num_cols = lines
+            .iter()
+            .map(|line| line.chars().filter(|c| *c != '\r').map(|c| c.width().unwrap()).sum())
+            .max()
+            .unwrap_or(0);
+
+        // Create terminal with the appropriate dimensions.
+        let size = TermSize::new(num_cols, lines.len());
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+
+        // Fill terminal with content.
+        for (line, text) in lines.iter().enumerate() {
+            let line = Line(line as i32);
+            if !text.ends_with('\r') && line + 1 != lines.len() {
+                term.grid[line][Column(num_cols - 1)].flags.insert(Flags::WRAPLINE);
+            }
+
+            let mut index = 0;
+cat: /work/crate/.cargo/config.toml: No such file or directory
+CARGO_HOME=/work/.cargo-home
+CARGO_NET_OFFLINE=true
+CARGO_TARGET_DIR=/target
+PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+RUSTUP_AUTO_INSTALL=0
+RUSTUP_HOME=/usr/local/rustup
+RUSTUP_TOOLCHAIN=
+RUST_VERSION=1.99.1
+TMPDIR=/work/tmp

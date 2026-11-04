@@ -1,0 +1,863 @@
+use {super::*, TokenKind::*};
+
+/// Just language parser
+///
+/// The parser is a (hopefully) straightforward recursive descent parser.
+///
+/// It uses a few tokens of lookahead to disambiguate different constructs.
+///
+/// The `expect_*` and `presume_*` methods are similar in that they assert the
+/// type of unparsed tokens and consume them. However, upon encountering an
+/// unexpected token, the `expect_*` methods return an unexpected token error,
+/// whereas the `presume_*` tokens return an internal error.
+///
+/// The `presume_*` methods are used when the token stream has been inspected in
+/// some other way, and thus encountering an unexpected token is a bug in Just,
+/// and not a syntax error.
+///
+/// All methods starting with `parse_*` parse and return a language construct.
+///
+/// The parser tracks an expected set of tokens as it parses. This set contains
+/// all tokens which would have been accepted at the current point in the
+/// parse. Whenever the parser tests for a token that would be accepted, but
+/// does not find it, it adds that token to the set. When the parser accepts a
+/// token, the set is cleared. If the parser finds a token which is unexpected,
+/// the elements of the set are printed in the resultant error message.
+pub(crate) struct Parser<'run, 'src> {
+  expected_tokens: BTreeSet<TokenKind>,
+  file_depth: u32,
+  import_offsets: Vec<usize>,
+  items: Vec<Item<'src>>,
+  module_namepath: Option<&'run Namepath<'src>>,
+  next_token: usize,
+  numerator: &'run mut Numerator,
+  recursion_depth: usize,
+  tokens: &'run [Token<'src>],
+  unstable_features: BTreeSet<UnstableFeature>,
+  working_directory: &'run Path,
+}
+
+impl<'run, 'src> Parser<'run, 'src> {
+  /// Parse `tokens` into an `Ast`
+  pub(crate) fn parse(
+    file_depth: u32,
+    import_offsets: &[usize],
+    module_namepath: Option<&'run Namepath<'src>>,
+    numerator: &'run mut Numerator,
+    tokens: &'run [Token<'src>],
+    working_directory: &'run Path,
+  ) -> CompileResult<'src, Ast<'src>> {
+    Self {
+      expected_tokens: BTreeSet::new(),
+      file_depth,
+      import_offsets: import_offsets.to_vec(),
+      items: Vec::new(),
+      module_namepath,
+      next_token: 0,
+      numerator,
+      recursion_depth: 0,
+      tokens,
+      unstable_features: BTreeSet::new(),
+      working_directory,
+    }
+    .parse_ast()
+  }
+
+  pub(crate) fn parse_source(
+    numerator: &mut Numerator,
+    path: &'src Path,
+    source: &Source<'src>,
+    src: &'src str,
+  ) -> CompileResult<'src, Ast<'src>> {
+    let tokens = Lexer::lex(path, src)?;
+
+    Parser::parse(
+      source.file_depth,
+      &source.import_offsets,
+      source.namepath.as_ref(),
+      numerator,
+      &tokens,
+      &source.working_directory,
+    )
+  }
+
+  #[cfg(test)]
+  pub(crate) fn parse_tokens(
+    numerator: &'run mut Numerator,
+    tokens: &'run [Token<'src>],
+  ) -> CompileResult<'src, Ast<'src>> {
+    Self::parse(0, &[], None, numerator, tokens, "".as_ref())
+  }
+
+  fn error(&self, kind: CompileErrorKind<'src>) -> CompileResult<'src, CompileError<'src>> {
+    Ok(self.next()?.error(kind))
+  }
+
+  /// Construct an unexpected token error with the token returned by
+  /// `Parser::next`
+  fn unexpected_token(&self) -> CompileResult<'src, CompileError<'src>> {
+    self.error(CompileErrorKind::UnexpectedToken {
+      expected: self
+        .expected_tokens
+        .iter()
+        .copied()
+        .filter(|kind| *kind != ByteOrderMark)
+        .collect::<Vec<TokenKind>>(),
+      found: self.next()?.kind,
+    })
+  }
+
+  fn internal_error(&self, message: impl Into<String>) -> CompileResult<'src, CompileError<'src>> {
+    self.error(CompileErrorKind::Internal {
+      message: message.into(),
+    })
+  }
+
+  /// An iterator over the remaining significant tokens
+  fn rest(&self) -> impl Iterator<Item = Token<'src>> + 'run {
+    self.tokens[self.next_token..]
+      .iter()
+      .copied()
+      .filter(|token| token.kind != Whitespace)
+  }
+
+  /// The next significant token
+  fn next(&self) -> CompileResult<'src, Token<'src>> {
+    if let Some(token) = self.rest().next() {
+      Ok(token)
+    } else {
+      Err(self.internal_error("`Parser::next()` called after end of token stream")?)
+    }
+  }
+
+  /// Check if the next significant token is of kind `kind`
+  fn next_is(&mut self, kind: TokenKind) -> bool {
+    self.next_are(&[kind])
+  }
+
+  /// Check if the next significant tokens are of kinds `kinds`
+  ///
+  /// The first token in `kinds` will be added to the expected token set.
+  fn next_are(&mut self, kinds: &[TokenKind]) -> bool {
+    if let Some(&kind) = kinds.first() {
+      self.expected_tokens.insert(kind);
+    }
+
+    let mut rest = self.rest();
+    for kind in kinds {
+      match rest.next() {
+        Some(token) => {
+          if token.kind != *kind {
+            return false;
+          }
+        }
+        None => return false,
+      }
+    }
+    true
+  }
+
+  /// Check if the next significant tokens are of kinds `kinds`, followed by a
+  /// comment, end-of-file, or end-of-line.
+  ///
+  /// The first token in `kinds` will be added to the expected token set.
+  fn line_is(&mut self, kinds: &[TokenKind]) -> bool {
+    if let Some(&kind) = kinds.first() {
+      self.expected_tokens.insert(kind);
+    }
+
+    let mut rest = self.rest();
+    for kind in kinds {
+      match rest.next() {
+        Some(token) => {
+          if token.kind != *kind {
+            return false;
+          }
+        }
+        None => return false,
+      }
+    }
+
+    if let Some(token) = rest.next() {
+      if matches!(token.kind, Comment | Eof | Eol) {
+        return true;
+      }
+    }
+
+    false
+  }
+
+  /// Advance past one significant token, clearing the expected token set.
+  fn advance(&mut self) -> CompileResult<'src, Token<'src>> {
+    self.expected_tokens.clear();
+
+    for skipped in &self.tokens[self.next_token..] {
+      self.next_token += 1;
+
+      if skipped.kind != Whitespace {
+        return Ok(*skipped);
+      }
+    }
+
+    Err(self.internal_error("`Parser::advance()` advanced past end of token stream")?)
+  }
+
+  /// Return next token if it is of kind `expected`, otherwise, return an
+  /// unexpected token error
+  fn expect(&mut self, expected: TokenKind) -> CompileResult<'src, Token<'src>> {
+    if let Some(token) = self.accept(expected)? {
+      Ok(token)
+    } else {
+      Err(self.unexpected_token()?)
+    }
+  }
+
+  /// Return the next token if it is any of kinds in `expected`, otherwise,
+  /// return an unexpected token error
+  fn expect_any(&mut self, expected: &[TokenKind]) -> CompileResult<'src, Token<'src>> {
+    for &kind in expected {
+      if let Some(token) = self.accept(kind)? {
+        return Ok(token);
+      }
+    }
+
+    Err(self.unexpected_token()?)
+  }
+
+  /// Return an unexpected token error if the next token is not an EOL
+  fn expect_eol(&mut self) -> CompileResult<'src> {
+    self.accept(Comment)?;
+
+    if self.next_is(Eof) {
+      return Ok(());
+    }
+
+    self.expect(Eol).map(|_| ())
+  }
+
+  fn expect_keyword(&mut self, expected: Keyword) -> CompileResult<'src> {
+    let found = self.advance()?;
+
+    if found.kind == Identifier && expected == found.lexeme() {
+      Ok(())
+    } else {
+      Err(found.error(CompileErrorKind::ExpectedKeyword {
+        expected: vec![expected],
+        found,
+      }))
+    }
+  }
+
+  /// Return an internal error if the next token is not of kind `Identifier`
+  /// with lexeme `lexeme`.
+  fn presume_keyword(&mut self, keyword: Keyword) -> CompileResult<'src> {
+    let next = self.advance()?;
+
+    if next.kind != Identifier {
+      Err(self.internal_error(format!(
+        "Presumed next token would have kind {Identifier}, but found {}",
+        next.kind
+      ))?)
+    } else if keyword == next.lexeme() {
+      Ok(())
+    } else {
+      Err(self.internal_error(format!(
+        "Presumed next token would have lexeme \"{keyword}\", but found \"{}\"",
+        next.lexeme(),
+      ))?)
+    }
+  }
+
+  /// Return an internal error if the next token is not of kind `kind`.
+  fn presume(&mut self, kind: TokenKind) -> CompileResult<'src, Token<'src>> {
+    let next = self.advance()?;
+
+    if next.kind == kind {
+      Ok(next)
+    } else {
+      Err(self.internal_error(format!(
+        "Presumed next token would have kind {kind:?}, but found {:?}",
+        next.kind
+        next.kind
+      ))?)
+    }
+  }
+
+  /// Return an internal error if the next token is not one of kinds `kinds`.
+  fn presume_any(&mut self, kinds: &[TokenKind]) -> CompileResult<'src, Token<'src>> {
+    let next = self.advance()?;
+    if kinds.contains(&next.kind) {
+      Ok(next)
+    } else {
+      Err(self.internal_error(format!(
+        "Presumed next token would be {}, but found {}",
+        List::or(kinds),
+        next.kind
+      ))?)
+    }
+  }
+
+  /// Accept and return a token of kind `kind`
+  fn accept(&mut self, kind: TokenKind) -> CompileResult<'src, Option<Token<'src>>> {
+    if self.next_is(kind) {
+      Ok(Some(self.advance()?))
+    } else {
+      Ok(None)
+    }
+  }
+
+  /// Return an error if the next token is of kind `forbidden`
+  fn forbid<F>(&self, forbidden: TokenKind, error: F) -> CompileResult<'src>
+  where
+    F: FnOnce(Token) -> CompileError,
+  {
+    let next = self.next()?;
+
+    if next.kind == forbidden {
+      Err(error(next))
+    } else {
+      Ok(())
+    }
+  }
+
+  /// Accept a double-colon separated sequence of identifiers
+  fn accept_namepath(&mut self) -> CompileResult<'src, Option<Namepath<'src>>> {
+    if self.next_is(Identifier) {
+      Ok(Some(self.parse_namepath()?))
+    } else {
+      Ok(None)
+    }
+  }
+
+  fn accept_keyword(&mut self, keyword: Keyword) -> CompileResult<'src, Option<Name<'src>>> {
+    let next = self.next()?;
+
+    if next.kind == Identifier && next.lexeme() == keyword.lexeme() {
+      self.advance()?;
+      Ok(Some(Name::from_identifier(next)))
+    } else {
+      Ok(None)
+    }
+  }
+
+  fn accepted_keyword(&mut self, keyword: Keyword) -> CompileResult<'src, bool> {
+    Ok(self.accept_keyword(keyword)?.is_some())
+  }
+
+  /// Accept a dependency
+  fn accept_dependency(&mut self) -> CompileResult<'src, Option<UnresolvedDependency<'src>>> {
+    if let Some(recipe) = self.accept_namepath()? {
+      Ok(Some(UnresolvedDependency {
+        arguments: Vec::new(),
+        recipe,
+      }))
+    } else if self.accepted(ParenL)? {
+      let recipe = self.parse_namepath()?;
+
+      let mut arguments = Vec::new();
+
+      while !self.accepted(ParenR)? {
+        arguments.push(self.parse_expression()?);
+      }
+
+      Ok(Some(UnresolvedDependency { arguments, recipe }))
+    } else {
+      Ok(None)
+    }
+  }
+
+  /// Accept and return `true` if next token is of kind `kind`
+  fn accepted(&mut self, kind: TokenKind) -> CompileResult<'src, bool> {
+    Ok(self.accept(kind)?.is_some())
+  }
+
+  fn take_doc_comment(&mut self, attributes: &AttributeSet<'src>) -> Option<String> {
+    for attribute in attributes {
+      if let Attribute::Doc(doc) = attribute {
+        return doc.as_ref().map(|doc| doc.cooked.clone());
+      }
+    }
+
+    let mut items = self.items.iter().rev();
+    if matches!(items.next(), Some(Item::Newline))
+      && matches!(items.next(), Some(Item::Comment(_)))
+      && matches!(items.next(), Some(Item::Newline) | None)
+    {
+      self.items.pop().unwrap();
+
+      if let Item::Comment(contents) = self.items.pop().unwrap() {
+        Some(contents[1..].trim_start().into())
+      } else {
+        unreachable!();
+      }
+    } else {
+      None
+    }
+  }
+
+  /// Parse a justfile, consumes self
+  fn parse_ast(mut self) -> CompileResult<'src, Ast<'src>> {
+    self.accept(ByteOrderMark)?;
+
+    while !self.accepted(Eof)? {
+      let mut attributes = self.parse_attributes()?;
+
+      let item = self.parse_item(&mut attributes)?;
+      self.items.push(item);
+
+      let unterminated = match self.items.iter().last().unwrap() {
+        Item::Newline => false,
+        Item::Recipe(recipe) => {
+          if recipe.body.is_empty() {
+            true
+          } else {
+            self.items.push(Item::Newline);
+            false
+          }
+        }
+        _ => true,
+      };
+
+      if let Some((token, attributes)) = attributes {
+        return Err(token.error(CompileErrorKind::ExtraneousAttributes {
+          count: attributes.len(),
+        }));
+      }
+
+      if unterminated {
+        if let Some(comment) = self.accept(Comment)? {
+          self.items.push(Item::Comment(comment.lexeme().trim_end()));
+        }
+
+        if !self.next_is(Eof) {
+          self.expect(Eol)?;
+          self.items.push(Item::Newline);
+        }
+      }
+    }
+
+    if self.next_token != self.tokens.len() {
+      return Err(self.internal_error(format!(
+        "Parse completed with {} unparsed tokens",
+        self.tokens.len() - self.next_token,
+      ))?);
+    }
+
+    Ok(Ast {
+      items: self.items,
+      module_path: self.module_namepath.map(Into::into).unwrap_or_default(),
+      unstable_features: self.unstable_features,
+      warnings: Vec::new(),
+      working_directory: self.working_directory.into(),
+    })
+  }
+
+  fn parse_item(
+    &mut self,
+    attributes: &mut Option<(Token<'src>, AttributeSet<'src>)>,
+  ) -> CompileResult<'src, Item<'src>> {
+    let mut take_attributes = || {
+      attributes
+        .take()
+        .map(|(_token, attributes)| attributes)
+        .unwrap_or_default()
+    };
+
+    let item = if let Some(comment) = self.accept(Comment)? {
+      Item::Comment(comment.lexeme().trim_end())
+    } else if self.accepted(Eol)? {
+      Item::Newline
+    } else if self.next_is(Identifier) {
+      let next = self.next()?;
+      match Keyword::from_lexeme(next.lexeme()) {
+        Some(Keyword::Alias) if self.next_are(&[Identifier, Identifier, ColonEquals]) => {
+          Item::Alias(self.parse_alias(take_attributes())?)
+        }
+        Some(Keyword::Eager) if self.next_are(&[Identifier, Identifier, ColonEquals]) => {
+          self.presume_keyword(Keyword::Eager)?;
+          Item::Assignment(self.parse_assignment(take_attributes(), true, false)?)
+        }
+        Some(Keyword::Export) if self.next_are(&[Identifier, Identifier, ColonEquals]) => {
+          self.presume_keyword(Keyword::Export)?;
+          Item::Assignment(self.parse_assignment(take_attributes(), false, true)?)
+        }
+        Some(Keyword::Unexport) if self.line_is(&[Identifier, Identifier]) => {
+          self.presume_keyword(Keyword::Unexport)?;
+          let name = self.parse_name()?;
+          Item::Unexport { name }
+        }
+        Some(Keyword::Import)
+          if self.next_are(&[Identifier, Identifier, StringToken])
+            || self.next_are(&[Identifier, QuestionMark])
+            || self.next_are(&[Identifier, StringToken]) =>
+        {
+          self.presume_keyword(Keyword::Import)?;
+          let optional = self.accepted(QuestionMark)?;
+          let relative = self.parse_string_literal()?;
+          Item::Import {
+            absolute: None,
+            optional,
+            relative,
+          }
+        }
+        Some(Keyword::Mod)
+          if self.line_is(&[Identifier, Identifier])
+            || self.next_are(&[Identifier, Identifier, Identifier, StringToken])
+            || self.next_are(&[Identifier, Identifier, StringToken])
+            || self.next_are(&[Identifier, QuestionMark]) =>
+        {
+          self.presume_keyword(Keyword::Mod)?;
+
+          let optional = self.accepted(QuestionMark)?;
+
+          let name = self.parse_name()?;
+
+          let relative = if self.next_is(StringToken) || self.next_are(&[Identifier, StringToken]) {
+            Some(self.parse_string_literal()?)
+          } else {
+            None
+          };
+
+          let attributes = take_attributes();
+
+          attributes.ensure_valid_attributes(
+            "Module",
+            *name,
+            &[
+              AttributeDiscriminant::Doc,
+              AttributeDiscriminant::Group,
+              AttributeDiscriminant::Private,
+            ],
+          )?;
+
+          let doc = self.take_doc_comment(&attributes);
+
+          let private = attributes.contains(AttributeDiscriminant::Private);
+
+          let mut groups = Vec::new();
+          for attribute in attributes {
+            if let Attribute::Group(group) = attribute {
+              groups.push(group);
+            }
+          }
+
+          Item::Module {
+            absolute: None,
+            doc,
+            groups,
+            name,
+            optional,
+            private,
+            relative,
+          }
+        }
+        Some(Keyword::Set)
+          if self.next_are(&[Identifier, Identifier, ColonEquals])
+            || self.line_is(&[Identifier, Identifier]) =>
+        {
+          Item::Set(self.parse_set()?)
+        }
+        _ => {
+          if self.next_are(&[Identifier, ParenL]) {
+            Item::Function(self.parse_function_definition()?)
+          } else if self.next_are(&[Identifier, ColonEquals]) {
+            Item::Assignment(self.parse_assignment(take_attributes(), false, false)?)
+          } else {
+            Item::Recipe(self.parse_recipe(take_attributes(), false)?)
+          }
+        }
+      }
+    } else if self.accepted(At)? {
+      Item::Recipe(self.parse_recipe(take_attributes(), true)?)
+    } else {
+      return Err(self.unexpected_token()?);
+    };
+
+    Ok(item)
+  }
+
+  /// Parse an alias, e.g `alias name := target`
+  fn parse_alias(
+    &mut self,
+    attributes: AttributeSet<'src>,
+  ) -> CompileResult<'src, Alias<'src, Namepath<'src>>> {
+    self.presume_keyword(Keyword::Alias)?;
+    let name = self.parse_name()?;
+    self.presume_any(&[Equals, ColonEquals])?;
+    let target = self.parse_namepath()?;
+
+    attributes.ensure_valid_attributes("Alias", *name, &[AttributeDiscriminant::Private])?;
+
+    Ok(Alias {
+      attributes,
+      name,
+      target,
+    })
+  }
+
+  fn parse_function_definition(&mut self) -> CompileResult<'src, FunctionDefinition<'src>> {
+    self
+      .unstable_features
+      .insert(UnstableFeature::UserDefinedFunction);
+
+    let name = self.parse_name()?;
+
+    self.presume(ParenL)?;
+
+    let mut parameters = Vec::new();
+    while !self.next_is(ParenR) {
+      parameters.push((self.parse_name()?, self.numerator.next()));
+      if !self.accepted(Comma)? {
+        break;
+use super::*;
+
+pub(crate) struct Usage<'a, D> {
+  pub(crate) long: bool,
+  pub(crate) path: &'a Modulepath,
+  pub(crate) recipe: &'a Recipe<'a, D>,
+}
+
+impl<D> ColorDisplay for Usage<'_, D> {
+  fn fmt(&self, f: &mut Formatter, color: Color) -> fmt::Result {
+    write!(
+      f,
+      "{}{}{} {}",
+      color
+        .heading()
+        .paint(if self.long { "Usage:" } else { "usage:" }),
+      if self.long { " " } else { "\n    " },
+      color.argument().paint("just"),
+      color.argument().paint(&self.path.to_string()),
+    )?;
+
+    let options = self.recipe.parameters.iter().any(Parameter::is_option);
+
+    let arguments = self.recipe.parameters.iter().any(|p| !p.is_option());
+
+    if options {
+      write!(f, " {}", color.argument().paint("[OPTIONS]"))?;
+    }
+
+    for parameter in &self.recipe.parameters {
+      if parameter.is_option() {
+        continue;
+      }
+
+      write!(f, " ")?;
+
+      write!(
+        f,
+        "{}",
+        UsageParameter {
+          parameter,
+          long: false,
+        }
+        .color_display(color),
+      )?;
+    }
+
+    if !self.long {
+      return Ok(());
+    }
+
+    if arguments {
+      writeln!(f)?;
+      writeln!(f)?;
+      writeln!(f, "{}", color.heading().paint("Arguments:"))?;
+
+      for (i, parameter) in self
+        .recipe
+        .parameters
+        .iter()
+        .filter(|p| !p.is_option())
+        .enumerate()
+      {
+        if i > 0 {
+          writeln!(f)?;
+        }
+
+        write!(f, "  ")?;
+
+        write!(
+          f,
+          "{}",
+          UsageParameter {
+            parameter,
+            long: true,
+          }
+          .color_display(color),
+        )?;
+      }
+    }
+
+    if options {
+      if arguments {
+        writeln!(f)?;
+      }
+
+      writeln!(f)?;
+      writeln!(f, "{}", color.heading().paint("Options:"))?;
+      for (i, parameter) in self
+        .recipe
+        .parameters
+        .iter()
+        .filter(|p| p.is_option())
+        .enumerate()
+      {
+        if i > 0 {
+          writeln!(f)?;
+        }
+
+        write!(f, "  ")?;
+
+        write!(
+          f,
+          "{}",
+          UsageParameter {
+            parameter,
+            long: true,
+          }
+          .color_display(color),
+        )?;
+      }
+    }
+
+    Ok(())
+  }
+}
+
+struct UsageParameter<'a> {
+  long: bool,
+  parameter: &'a Parameter<'a>,
+}
+
+impl ColorDisplay for UsageParameter<'_> {
+  fn fmt(&self, f: &mut Formatter, color: Color) -> fmt::Result {
+    if self.parameter.is_option() {
+      if let Some(short) = self.parameter.short {
+        write!(f, "{}", color.option().paint(&format!("-{short}")))?;
+      } else {
+        write!(f, "  ")?;
+      }
+
+      if let Some(long) = &self.parameter.long {
+        if self.parameter.short.is_some() {
+          write!(f, ", ")?;
+        } else {
+          write!(f, "  ")?;
+        }
+
+        write!(f, "{}", color.option().paint(&format!("--{long}")))?;
+      }
+
+      if self.parameter.value.is_none() {
+        write!(
+          f,
+          " {}",
+          color.argument().paint(self.parameter.name.lexeme()),
+        )?;
+      }
+    } else {
+      if !self.parameter.is_required() {
+        write!(f, "{}", color.argument().paint("["))?;
+      }
+
+      write!(
+        f,
+        "{}",
+        color.argument().paint(self.parameter.name.lexeme()),
+      )?;
+
+      if self.parameter.kind.is_variadic() {
+        write!(f, "{}", color.argument().paint("..."))?;
+      }
+
+      if !self.parameter.is_required() {
+        write!(f, "{}", color.argument().paint("]"))?;
+      }
+    }
+
+    if !self.long {
+      return Ok(());
+    }
+
+    if let Some(help) = &self.parameter.help {
+      write!(f, " {help}")?;
+    }
+
+    if let Some(default) = &self.parameter.default {
+      if self.parameter.value.is_none() {
+        write!(f, " [default: {default}]")?;
+      }
+    }
+
+    if let Some(pattern) = &self.parameter.pattern {
+      write!(f, " [pattern: '{}']", pattern.original())?;
+    }
+
+    Ok(())
+  }
+}
+use super::*;
+
+#[derive(PartialEq, Debug, Clone, Serialize)]
+pub(crate) struct Parameter<'src> {
+  pub(crate) default: Option<Expression<'src>>,
+  pub(crate) export: bool,
+  pub(crate) help: Option<String>,
+  pub(crate) kind: ParameterKind,
+  pub(crate) long: Option<String>,
+  pub(crate) name: Name<'src>,
+  #[serde(skip)]
+  pub(crate) number: Number,
+  pub(crate) pattern: Option<Pattern<'src>>,
+  pub(crate) short: Option<char>,
+  pub(crate) value: Option<String>,
+}
+
+impl<'src> Parameter<'src> {
+  pub(crate) fn is_option(&self) -> bool {
+    self.long.is_some() || self.short.is_some()
+  }
+
+  pub(crate) fn is_required(&self) -> bool {
+    self.default.is_none() && self.kind != ParameterKind::Star
+  }
+
+  pub(crate) fn check_pattern_match(
+    &self,
+    recipe: &Recipe<'src>,
+    value: &str,
+  ) -> Result<(), Error<'src>> {
+    let Some(pattern) = &self.pattern else {
+      return Ok(());
+    };
+
+    if pattern.is_match(value) {
+      return Ok(());
+    }
+
+    Err(Error::ArgumentPatternMismatch {
+      argument: value.into(),
+      parameter: self.name.lexeme(),
+      pattern: Box::new(pattern.clone()),
+      recipe: recipe.name(),
+    })
+  }
+}
+
+impl ColorDisplay for Parameter<'_> {
+  fn fmt(&self, f: &mut Formatter, color: Color) -> fmt::Result {
+    if let Some(prefix) = self.kind.prefix() {
+      write!(f, "{}", color.annotation().paint(prefix))?;
+    }
+    if self.export {
+      write!(f, "$")?;
+    }
+    write!(f, "{}", color.parameter().paint(self.name.lexeme()))?;
+    if let Some(ref default) = self.default {
+      write!(f, "={}", color.string().paint(&default.to_string()))?;
+    }
+    Ok(())
+  }
+}

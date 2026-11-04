@@ -1,0 +1,1343 @@
+use super::*;
+
+#[allow(clippy::doc_markdown)]
+/// The invocation parser is responsible for grouping command-line positional
+/// arguments into invocations, which consist of a recipe and its arguments.
+///
+/// Invocation parsing is substantially complicated by the fact that recipe
+/// paths can be given on the command line as multiple arguments, i.e., "foo"
+/// "bar" baz", or as a single "::"-separated argument.
+///
+/// Error messages produced by the invocation parser should use the format of
+/// the recipe path as passed on the command line.
+///
+/// Additionally, if a recipe is specified with a "::"-separated path, extra
+/// components of that path after a valid recipe must not be used as arguments,
+/// whereas arguments after multiple argument path may be used as arguments. As
+/// an example, `foo bar baz` may refer to recipe `foo::bar` with argument
+/// `baz`, but `foo::bar::baz` is an error, since `bar` is a recipe, not a
+/// module.
+pub(crate) struct InvocationParser<'src: 'run, 'run> {
+  arguments: &'run [&'run str],
+  next: usize,
+  root: &'run Justfile<'src>,
+}
+
+impl<'src: 'run, 'run> InvocationParser<'src, 'run> {
+  pub(crate) fn parse_invocations(
+    root: &'run Justfile<'src>,
+    arguments: &'run [&'run str],
+  ) -> RunResult<'src, Vec<Invocation<'src, 'run>>> {
+    let mut invocations = Vec::new();
+
+    let mut invocation_parser = Self {
+      arguments,
+      next: 0,
+      root,
+    };
+
+    loop {
+      invocations.push(invocation_parser.parse_invocation()?);
+
+      if invocation_parser.next == arguments.len() {
+        break;
+      }
+    }
+
+    Ok(invocations)
+  }
+
+  fn parse_invocation(&mut self) -> RunResult<'src, Invocation<'src, 'run>> {
+    let recipe = if let Some(next) = self.next() {
+      if next.contains(':') {
+        let path = if self.next + 1 == self.arguments.len() {
+          next.strip_suffix("::").unwrap_or(next)
+        } else {
+          next
+        };
+        let modulepath =
+          Modulepath::try_from([path].as_slice()).map_err(|()| Error::UnknownRecipe {
+            recipe: next.into(),
+            suggestion: None,
+          })?;
+        let (recipe, _) = self.resolve_recipe(true, &modulepath.components)?;
+        self.next += 1;
+        recipe
+      } else {
+        let (recipe, consumed) = self.resolve_recipe(false, self.rest())?;
+        self.next += consumed;
+        recipe
+      }
+    } else {
+      let (recipe, consumed) = self.resolve_recipe(false, self.rest())?;
+      assert_eq!(consumed, 0);
+      recipe
+    };
+
+    let mut arguments = vec![Vec::<String>::new(); recipe.parameters.len()];
+
+    let long = recipe
+      .parameters
+      .iter()
+      .enumerate()
+      .filter_map(|(i, parameter)| parameter.long.as_ref().map(|name| (name.as_str(), i)))
+      .collect::<BTreeMap<&str, usize>>();
+
+    let short = recipe
+      .parameters
+      .iter()
+      .enumerate()
+      .filter_map(|(i, parameter)| parameter.short.map(|name| (name, i)))
+      .collect::<BTreeMap<char, usize>>();
+
+    let positional = recipe
+      .parameters
+      .iter()
+      .enumerate()
+      .filter_map(|(i, parameter)| (!parameter.is_option()).then_some(i))
+      .collect::<Vec<usize>>();
+
+    let mut end_of_options = long.is_empty() && short.is_empty();
+
+    let rest = self.rest();
+
+    let mut i = 0;
+    let mut positional_index = 0;
+    let mut positional_accepted = 0;
+    while let Some(argument) = rest.get(i) {
+      if !end_of_options && *argument == "--" {
+        end_of_options = true;
+        i += 1;
+      } else if !end_of_options && argument.starts_with('-') && *argument != "-" {
+        let mut name = argument
+          .strip_prefix("--")
+          .or_else(|| argument.strip_prefix('-'))
+          .unwrap();
+
+        let value = if let Some((left, right)) = name.split_once('=') {
+          name = left;
+          Some(right)
+        } else {
+          None
+        };
+
+        let switch = if argument.starts_with("--") {
+          Switch::Long(name.into())
+        } else {
+          if name.chars().count() != 1 {
+            return Err(Error::MultipleShortOptions {
+              options: name.into(),
+            });
+          }
+          Switch::Short(name.chars().next().unwrap())
+        };
+
+        let index = match &switch {
+          Switch::Long(name) => long.get(name.as_str()),
+          Switch::Short(name) => short.get(name),
+        };
+
+        let Some(&index) = index else {
+          return Err(Error::UnknownOption {
+            recipe: recipe.name(),
+            option: switch,
+          });
+        };
+
+        let value = if let Some(flag_value) = &recipe.parameters[index].value {
+          if value.is_some() {
+            return Err(Error::FlagWithValue {
+              recipe: recipe.name(),
+              option: switch,
+            });
+          }
+          i += 1;
+          flag_value
+        } else if let Some(value) = value {
+          i += 1;
+          value
+        } else {
+          let Some(&value) = rest.get(i + 1) else {
+            return Err(Error::OptionMissingValue {
+              recipe: recipe.name(),
+              option: switch,
+            });
+          };
+          i += 2;
+          value
+        };
+
+        let group = &mut arguments[index];
+
+        if !group.is_empty() {
+          return Err(Error::DuplicateOption {
+            recipe: recipe.name(),
+            option: switch,
+          });
+        }
+
+        group.push((*value).into());
+      } else {
+        let Some(&index) = positional.get(positional_index) else {
+          break;
+        };
+        let group = &mut arguments[index];
+        group.push((*argument).into());
+        if !recipe.parameters[index].kind.is_variadic() {
+          positional_index += 1;
+        }
+        positional_accepted += 1;
+        i += 1;
+      }
+    }
+
+    let mut missing_positional = 0;
+
+    for (parameter, group) in recipe.parameters.iter().zip(&arguments) {
+      if !group.is_empty() {
+        continue;
+      }
+
+      if parameter.default.is_some() || parameter.kind == ParameterKind::Star {
+        continue;
+      }
+
+      if let Some(name) = &parameter.long {
+        return Err(Error::MissingOption {
+          recipe: recipe.name(),
+          option: Switch::Long(name.into()),
+        });
+      }
+
+      if let Some(name) = &parameter.short {
+        return Err(Error::MissingOption {
+          recipe: recipe.name(),
+          option: Switch::Short(*name),
+        });
+      }
+
+      missing_positional += 1;
+    }
+
+    if missing_positional > 0 {
+      return Err(Error::PositionalArgumentCountMismatch {
+        recipe: Box::new(recipe.clone()),
+        found: positional_accepted,
+        min: recipe
+          .parameters
+          .iter()
+          .filter(|p| p.is_required() && !p.is_option())
+          .count(),
+use {super::*, serde::Serialize};
+
+type Scopes<'src, 'run> = BTreeMap<
+  Modulepath,
+  (
+    &'run Justfile<'src>,
+    &'run Scope<'src, 'run>,
+    &'run BTreeMap<String, String>,
+  ),
+>;
+
+#[derive(Debug, PartialEq, Serialize)]
+pub(crate) struct Justfile<'src> {
+  pub(crate) aliases: Table<'src, Alias<'src>>,
+  pub(crate) assignments: Table<'src, Assignment<'src>>,
+  #[serde(rename = "first", serialize_with = "keyed::serialize_option")]
+  pub(crate) default: Option<Arc<Recipe<'src>>>,
+  pub(crate) doc: Option<String>,
+  #[serde(skip)]
+  pub(crate) functions: Table<'src, FunctionDefinition<'src>>,
+  pub(crate) groups: Vec<StringLiteral<'src>>,
+  #[serde(skip)]
+  pub(crate) loaded: Vec<PathBuf>,
+  pub(crate) module_path: Modulepath,
+  pub(crate) modules: Table<'src, Self>,
+  #[serde(skip)]
+  pub(crate) name: Option<Name<'src>>,
+  #[serde(skip)]
+  pub(crate) private: bool,
+  pub(crate) recipes: Table<'src, Arc<Recipe<'src>>>,
+  pub(crate) settings: Settings,
+  pub(crate) source: PathBuf,
+  pub(crate) unexports: HashSet<String>,
+  #[serde(skip)]
+  pub(crate) unstable_features: BTreeSet<UnstableFeature>,
+  pub(crate) warnings: Vec<Warning>,
+  #[serde(skip)]
+  pub(crate) working_directory: PathBuf,
+}
+
+impl<'src> Justfile<'src> {
+  fn find_suggestion(
+    input: &str,
+    candidates: impl Iterator<Item = Suggestion<'src>>,
+  ) -> Option<Suggestion<'src>> {
+    candidates
+      .map(|suggestion| (edit_distance(input, suggestion.name), suggestion))
+      .filter(|(distance, _suggestion)| *distance < 3)
+      .min_by_key(|(distance, _suggestion)| *distance)
+      .map(|(_distance, suggestion)| suggestion)
+  }
+
+  pub(crate) fn suggest_recipe(&self, input: &str) -> Option<Suggestion<'src>> {
+    Self::find_suggestion(
+      input,
+      self
+        .recipes
+        .values()
+        .filter(|recipe| recipe.is_public())
+        .map(|recipe| Suggestion {
+          name: recipe.name(),
+          target: None,
+        })
+        .chain(
+          self
+            .aliases
+            .values()
+            .filter(|alias| alias.is_public())
+            .map(|alias| Suggestion {
+              name: alias.name.lexeme(),
+              target: Some(alias.target.name.lexeme()),
+            }),
+        ),
+    )
+  }
+
+  pub(crate) fn suggest_submodule(&self, input: &str) -> Option<Suggestion<'src>> {
+    Self::find_suggestion(
+      input,
+      self
+        .modules
+        .keys()
+        .map(|name| Suggestion { name, target: None }),
+    )
+  }
+
+  pub(crate) fn suggest_variable_or_submodule(&self, input: &str) -> Option<Suggestion<'src>> {
+    Self::find_suggestion(
+      input,
+      self
+        .assignments
+        .keys()
+        .chain(self.modules.keys())
+        .map(|name| Suggestion { name, target: None }),
+    )
+  }
+
+  fn evaluate_scopes<'run>(
+    &'run self,
+    config: &'run Config,
+    dotenv_arena: &'run Arena<BTreeMap<String, String>>,
+    overrides: &'run HashMap<Number, String>,
+    parent_dotenv: Option<&'run BTreeMap<String, String>>,
+    root: &'run Scope<'src, 'run>,
+    scope_arena: &'run Arena<Scope<'src, 'run>>,
+    scopes: &mut Scopes<'src, 'run>,
+    search: &'run Search,
+    variable_references: Option<&HashSet<Number>>,
+  ) -> RunResult<'src> {
+    let dotenv = if config.load_dotenv {
+      let working_directory = if self.is_submodule() {
+        &self.working_directory
+      } else {
+        &search.working_directory
+      };
+      load_dotenv(config, &self.settings, working_directory)?
+    } else {
+      BTreeMap::new()
+    };
+
+    let dotenv = if let Some(parent_dotenv) = parent_dotenv {
+      parent_dotenv
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .chain(dotenv)
+        .collect()
+    } else {
+      dotenv
+    };
+
+    let dotenv = dotenv_arena.alloc(dotenv);
+
+    let scope = Evaluator::evaluate_assignments(
+      config,
+      dotenv,
+      self,
+      overrides,
+      root,
+      search,
+      variable_references,
+    )?;
+
+    let scope = scope_arena.alloc(scope);
+    scopes.insert(self.module_path.clone(), (self, scope, dotenv));
+
+    for module in self.modules.values() {
+      module.evaluate_scopes(
+        config,
+        dotenv_arena,
+        overrides,
+        Some(dotenv),
+        scope,
+        scope_arena,
+        scopes,
+        search,
+        variable_references,
+      )?;
+    }
+
+    Ok(())
+  }
+
+  pub(crate) fn run(
+    &self,
+    config: &Config,
+    search: &Search,
+    arguments: &[String],
+    overrides: &HashMap<Number, String>,
+  ) -> RunResult<'src> {
+    let root = Scope::root();
+    let dotenv_arena = Arena::new();
+    let scope_arena = Arena::new();
+    let mut scopes = BTreeMap::new();
+
+    match &config.subcommand {
+      Subcommand::Choose { .. } | Subcommand::Run { .. } => {
+        let arguments = arguments.iter().map(String::as_str).collect::<Vec<&str>>();
+
+        let invocations = InvocationParser::parse_invocations(self, &arguments)?;
+
+        if config.one && invocations.len() > 1 {
+          return Err(Error::ExcessInvocations {
+            invocations: invocations.len(),
+          });
+        }
+
+        let variable_references = if self.settings.lazy {
+          let mut variable_references = HashSet::new();
+
+          let mut stack = Vec::new();
+
+          for invocation in &invocations {
+            stack.push(invocation.recipe);
+          }
+
+          while let Some(recipe) = stack.pop() {
+            variable_references.extend(&recipe.variable_references);
+            for dependency in &recipe.dependencies {
+              stack.push(&dependency.recipe);
+            }
+          }
+
+          Some(variable_references)
+        } else {
+          None
+        };
+
+        self.evaluate_scopes(
+          config,
+          &dotenv_arena,
+          overrides,
+          None,
+          &root,
+          &scope_arena,
+          &mut scopes,
+          search,
+          variable_references.as_ref(),
+        )?;
+
+        let ran = Ran::default();
+        for invocation in invocations {
+          Self::run_recipe(
+            &invocation.arguments,
+            config,
+            false,
+            &ran,
+            invocation.recipe,
+            &scopes,
+            search,
+          )?;
+        }
+
+        Ok(())
+      }
+      Subcommand::Command {
+        binary, arguments, ..
+      } => {
+        let mut command = if config.shell_command {
+          let mut command = self.settings.shell_command(config);
+          command.arg(binary);
+          command
+        } else {
+          Command::resolve(binary)
+        };
+
+        command
+          .args(arguments)
+          .current_dir(&search.working_directory);
+
+        self.evaluate_scopes(
+          config,
+          &dotenv_arena,
+          overrides,
+          None,
+          &root,
+          &scope_arena,
+          &mut scopes,
+          search,
+          Some(HashSet::new()).as_ref(),
+        )?;
+use {super::*, clap_mangen::Man};
+
+pub const INIT_JUSTFILE: &str = "\
+# https://just.systems
+
+default:
+    echo 'Hello, world!'
+";
+
+static BACKTICK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new("(`.*?`)|(`[^`]*$)").unwrap());
+
+const CHOOSER_CANCELLED_EXIT_STATUS: i32 = 130;
+
+#[derive(PartialEq, Clone, Debug, IntoStaticStr)]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum Subcommand {
+  Changelog,
+  Choose {
+    chooser: Option<PathBuf>,
+  },
+  Command {
+    arguments: Vec<OsString>,
+    binary: OsString,
+  },
+  Completions {
+    shell: Shell,
+  },
+  Dump {
+    format: DumpFormat,
+  },
+  Edit,
+  Evaluate {
+    format: EvaluateFormat,
+    path: Modulepath,
+  },
+  Format,
+  Groups,
+  Init,
+  List {
+    path: Modulepath,
+  },
+  Man,
+  Request {
+    request: Request,
+  },
+  Run {
+    arguments: Vec<String>,
+  },
+  Show {
+    path: Modulepath,
+  },
+  Summary,
+  Usage {
+    path: Modulepath,
+  },
+  Variables,
+}
+
+impl Default for Subcommand {
+  fn default() -> Self {
+    Self::Run {
+      arguments: Vec::new(),
+    }
+  }
+}
+
+impl Subcommand {
+  pub(crate) fn execute<'src>(&self, config: &Config, loader: &'src Loader) -> RunResult<'src> {
+    use Subcommand::*;
+
+    match self {
+      Changelog => {
+        Self::changelog();
+        return Ok(());
+      }
+      Completions { shell } => {
+        Self::completions(*shell);
+        return Ok(());
+      }
+      Init => return Self::init(config),
+      Man => return Self::man(),
+      Request { request } => return Self::request(request),
+      _ => {}
+    }
+
+    let search = Search::search(config)?;
+
+    if matches!(self, Edit) {
+      return Self::edit(&search);
+    }
+
+    if matches!(self, Format) {
+      return Self::format(config, loader, &search);
+    }
+
+    let compilation = Self::compile(config, loader, &search)?;
+    let justfile = &compilation.justfile;
+
+    match self {
+      Choose { chooser } => {
+        Self::choose(
+          chooser.as_deref(),
+          config,
+          justfile,
+          &compilation.overrides,
+          &search,
+        )?;
+      }
+      Command { .. } | Evaluate { .. } => {
+        justfile.run(config, &search, &[], &compilation.overrides)?;
+      }
+      Dump { format } => Self::dump(config, compilation, *format)?,
+      Groups => Self::groups(config, justfile),
+      List { path } => Self::list(config, justfile, path)?,
+      Run { arguments } => Self::run(config, loader, search, compilation, arguments)?,
+      Show { path } => Self::show(config, justfile, path)?,
+      Summary => Self::summary(config, justfile),
+      Usage { path } => Self::usage(config, justfile, path)?,
+      Variables => Self::variables(justfile),
+      Changelog | Completions { .. } | Edit | Format | Init | Man | Request { .. } => {
+        unreachable!()
+      }
+    }
+
+    Ok(())
+  }
+
+  fn groups(config: &Config, justfile: &Justfile) {
+    println!("Recipe groups:");
+    for group in justfile.public_groups(config) {
+      println!("{}{group}", config.list_prefix);
+    }
+  }
+
+  pub(crate) fn name(&self) -> &'static str {
+    self.into()
+  }
+
+  fn run<'src>(
+    config: &Config,
+    loader: &'src Loader,
+    mut search: Search,
+    mut compilation: Compilation<'src>,
+    arguments: &[String],
+  ) -> RunResult<'src> {
+    let starting_parent = search.justfile.parent().as_ref().unwrap().lexiclean();
+
+    loop {
+      let justfile = &compilation.justfile;
+      let fallback = justfile.settings.fallback
+        && matches!(
+          config.search_config,
+          SearchConfig::FromInvocationDirectory | SearchConfig::FromSearchDirectory { .. }
+        );
+
+      let result = justfile.run(config, &search, arguments, &compilation.overrides);
+
+      if fallback {
+        if let Err(err @ (Error::UnknownRecipe { .. } | Error::UnknownSubmodule { .. })) = result {
+          search = search.search_parent_directory(config).map_err(|_| err)?;
+
+          if config.verbosity.loquacious() {
+            eprintln!(
+              "Trying {}",
+              starting_parent
+                .strip_prefix(search.justfile.parent().unwrap())
+                .unwrap()
+                .components()
+                .map(|_| path::Component::ParentDir)
+                .collect::<PathBuf>()
+                .join(search.justfile.file_name().unwrap())
+                .display()
+            );
+          }
+
+          compilation = Self::compile(config, loader, &search)?;
+
+          continue;
+        }
+      }
+
+      if config.allow_missing
+        && matches!(
+          result,
+          Err(Error::UnknownRecipe { .. } | Error::UnknownSubmodule { .. })
+        )
+      {
+        return Ok(());
+      }
+
+      return result;
+    }
+  }
+
+  fn compile<'src>(
+    config: &Config,
+    loader: &'src Loader,
+    search: &Search,
+  ) -> RunResult<'src, Compilation<'src>> {
+    let compilation = Compiler::compile(config, loader, &search.justfile)?;
+
+    compilation.justfile.check_unstable(config)?;
+
+    if config.verbosity.loud() {
+      for warning in &compilation.justfile.warnings {
+        eprintln!("{}", warning.color_display(config.color.stderr()));
+      }
+    }
+
+    Ok(compilation)
+  }
+
+  fn changelog() {
+    write!(io::stdout(), "{}", include_str!("../CHANGELOG.md")).ok();
+  }
+
+  fn choose<'src>(
+    chooser: Option<&Path>,
+    config: &Config,
+    justfile: &Justfile<'src>,
+    overrides: &HashMap<Number, String>,
+    search: &Search,
+  ) -> RunResult<'src> {
+    let groups = config.groups.iter().cloned().collect::<BTreeSet<String>>();
+    let mut recipes = Vec::<&Recipe>::new();
+    let mut stack = vec![justfile];
+    while let Some(module) = stack.pop() {
+      recipes.extend(module.public_recipes(config).iter().filter(|recipe| {
+        recipe.min_arguments() == 0
+          && (groups.is_empty() || groups.intersection(&recipe.groups()).next().is_some())
+      }));
+      stack.extend(module.modules.values());
+    }
+
+    if recipes.is_empty() {
+      return Err(Error::NoChoosableRecipes);
+    }
+
+    let chooser = if let Some(chooser) = chooser {
+      OsString::from(chooser)
+    } else {
+      let mut chooser = OsString::new();
+      chooser.push("fzf --multi --preview 'just --unstable --color always --justfile \"");
+      chooser.push(&search.justfile);
+      chooser.push("\" --show {}'");
+      chooser
+    };
+
+    let result = justfile
+      .settings
+      .shell_command(config)
+      .arg(&chooser)
+      .current_dir(&search.working_directory)
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .spawn();
+
+    let mut child = match result {
+      Ok(child) => child,
+      Err(io_error) => {
+        let (shell_binary, shell_arguments) = justfile.settings.shell(config);
+        return Err(Error::ChooserInvoke {
+          shell_binary: shell_binary.to_owned(),
+          shell_arguments: shell_arguments.join(" "),
+          chooser,
+          io_error,
+        });
+      }
+    };
+
+    let stdin = child.stdin.as_mut().unwrap();
+    for recipe in recipes {
+      if let Err(io_error) = writeln!(stdin, "{}", recipe.spaced_recipe_path()) {
+        if io_error.kind() != std::io::ErrorKind::BrokenPipe {
+          return Err(Error::ChooserWrite { io_error, chooser });
+        }
+      }
+    }
+
+    let output = match child.wait_with_output() {
+use super::*;
+
+/// A recipe, e.g. `foo: bar baz`
+#[derive(PartialEq, Debug, Clone, Serialize)]
+pub(crate) struct Recipe<'src, D = Dependency<'src>> {
+  pub(crate) attributes: AttributeSet<'src>,
+  pub(crate) body: Vec<Line<'src>>,
+  pub(crate) dependencies: Vec<D>,
+  pub(crate) doc: Option<String>,
+  #[serde(skip)]
+  pub(crate) file_depth: u32,
+  #[serde(skip)]
+  pub(crate) import_offsets: Vec<usize>,
+  #[serde(skip)]
+  pub(crate) module_path: Option<Modulepath>,
+  pub(crate) name: Name<'src>,
+  pub(crate) parameters: Vec<Parameter<'src>>,
+  pub(crate) priors: usize,
+  pub(crate) private: bool,
+  pub(crate) quiet: bool,
+  #[serde(rename = "namepath")]
+  pub(crate) recipe_path: Option<Modulepath>,
+  pub(crate) shebang: bool,
+  #[serde(skip)]
+  pub(crate) variable_references: HashSet<Number>,
+}
+
+impl<'src, D> Recipe<'src, D> {
+  pub(crate) fn enabled(&self) -> bool {
+    let android = self.attributes.contains(AttributeDiscriminant::Android);
+    let dragonfly = self.attributes.contains(AttributeDiscriminant::Dragonfly);
+    let freebsd = self.attributes.contains(AttributeDiscriminant::Freebsd);
+    let linux = self.attributes.contains(AttributeDiscriminant::Linux);
+    let macos = self.attributes.contains(AttributeDiscriminant::Macos);
+    let netbsd = self.attributes.contains(AttributeDiscriminant::Netbsd);
+    let openbsd = self.attributes.contains(AttributeDiscriminant::Openbsd);
+    let unix = self.attributes.contains(AttributeDiscriminant::Unix);
+    let windows = self.attributes.contains(AttributeDiscriminant::Windows);
+
+    (!windows
+      && !linux
+      && !macos
+      && !openbsd
+      && !freebsd
+      && !dragonfly
+      && !netbsd
+      && !unix
+      && !android)
+      || (cfg!(target_os = "android") && (android || unix))
+      || (cfg!(target_os = "dragonfly") && (dragonfly || unix))
+      || (cfg!(target_os = "freebsd") && (freebsd || unix))
+      || (cfg!(target_os = "linux") && (linux || unix))
+      || (cfg!(target_os = "macos") && (macos || unix))
+      || (cfg!(target_os = "netbsd") && (netbsd || unix))
+      || (cfg!(target_os = "openbsd") && (openbsd || unix))
+      || (cfg!(target_os = "windows") && windows)
+      || (cfg!(unix) && unix)
+      || (cfg!(windows) && windows)
+  }
+
+  pub(crate) fn is_script(&self) -> bool {
+    self.shebang
+  }
+
+  pub(crate) fn name(&self) -> &'src str {
+    self.name.lexeme()
+  }
+}
+
+impl<'src> Recipe<'src> {
+  pub(crate) fn module_path(&self) -> &Modulepath {
+    self.module_path.as_ref().unwrap()
+  }
+
+  pub(crate) fn recipe_path(&self) -> &Modulepath {
+    self.recipe_path.as_ref().unwrap()
+  }
+
+  pub(crate) fn spaced_recipe_path(&self) -> String {
+    self.recipe_path().to_string().replace("::", " ")
+  }
+
+  pub(crate) fn argument_range(&self) -> RangeInclusive<usize> {
+    self.min_arguments()..=self.max_arguments()
+  }
+
+  pub(crate) fn group_arguments(
+    &self,
+    arguments: &[Expression<'src>],
+  ) -> Vec<Vec<Expression<'src>>> {
+    let mut groups = Vec::new();
+    let mut rest = arguments;
+
+    for parameter in &self.parameters {
+      let group = if parameter.kind.is_variadic() {
+        mem::take(&mut rest).into()
+      } else if let Some(argument) = rest.first() {
+        rest = &rest[1..];
+        vec![argument.clone()]
+      } else {
+        debug_assert!(parameter.default.is_some());
+        Vec::new()
+      };
+
+      groups.push(group);
+    }
+
+    groups
+  }
+
+  pub(crate) fn min_arguments(&self) -> usize {
+    self.parameters.iter().filter(|p| p.is_required()).count()
+  }
+
+  pub(crate) fn max_arguments(&self) -> usize {
+    if self.parameters.iter().any(|p| p.kind.is_variadic()) {
+      usize::MAX - 1
+    } else {
+      self.parameters.len()
+    }
+  }
+
+  pub(crate) fn line_number(&self) -> usize {
+    self.name.line
+  }
+
+  pub(crate) fn confirm(&self, evaluator: &mut Evaluator<'src, '_>) -> RunResult<'src, bool> {
+    if let Some(Attribute::Confirm(prompt)) = self.attributes.get(AttributeDiscriminant::Confirm) {
+      if let Some(expression) = prompt {
+        eprint!("{} ", evaluator.evaluate_expression(expression)?);
+      } else {
+        eprint!("Run recipe `{}`? ", self.name);
+      }
+      let mut line = String::new();
+      std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|io_error| Error::GetConfirmation { io_error })?;
+      let line = line.trim().to_lowercase();
+      Ok(line == "y" || line == "yes")
+    } else {
+      Ok(true)
+    }
+  }
+
+  pub(crate) fn check_can_be_default_recipe(&self) -> RunResult<'src> {
+    let min_arguments = self.min_arguments();
+    if min_arguments > 0 {
+      return Err(Error::DefaultRecipeRequiresArguments {
+        recipe: self.name.lexeme(),
+        min_arguments,
+      });
+    }
+
+    Ok(())
+  }
+
+  pub(crate) fn is_parallel(&self) -> bool {
+    self.attributes.contains(AttributeDiscriminant::Parallel)
+  }
+
+  pub(crate) fn is_public(&self) -> bool {
+    !self.private && !self.attributes.contains(AttributeDiscriminant::Private)
+  }
+
+  pub(crate) fn takes_positional_arguments(&self, settings: &Settings) -> bool {
+    settings.positional_arguments
+      || self
+        .attributes
+        .contains(AttributeDiscriminant::PositionalArguments)
+  }
+
+  pub(crate) fn change_directory(&self) -> bool {
+    !self.attributes.contains(AttributeDiscriminant::NoCd)
+  }
+
+  fn print_exit_message(&self, settings: &Settings) -> bool {
+    if self.attributes.contains(AttributeDiscriminant::ExitMessage) {
+      true
+    } else if settings.no_exit_message {
+      false
+    } else {
+      !self
+        .attributes
+        .contains(AttributeDiscriminant::NoExitMessage)
+    }
+  }
+
+  fn working_directory<'a>(&'a self, context: &'a ExecutionContext) -> Option<PathBuf> {
+    if !self.change_directory() {
+      return None;
+    }
+
+    let working_directory = context.working_directory();
+
+    for attribute in &self.attributes {
+      if let Attribute::WorkingDirectory(dir) = attribute {
+        return Some(working_directory.join(&dir.cooked));
+      }
+    }
+
+    Some(working_directory)
+  }
+
+  fn no_quiet(&self) -> bool {
+    self.attributes.contains(AttributeDiscriminant::NoQuiet)
+  }
+
+  pub(crate) fn run<'run>(
+    &self,
+    context: &ExecutionContext<'src, 'run>,
+    scope: &Scope<'src, 'run>,
+    positional: &[String],
+    is_dependency: bool,
+  ) -> RunResult<'src> {
+    let color = context.config.color.stderr().banner();
+    let prefix = color.prefix();
+    let suffix = color.suffix();
+
+    if context.config.verbosity.loquacious() {
+      eprintln!(
+use super::*;
+
+pub(crate) struct SignalHandler {
+  caught: Option<Signal>,
+  children: BTreeMap<i32, Command>,
+  initialized: bool,
+  verbosity: Verbosity,
+}
+
+impl SignalHandler {
+  pub(crate) fn install(verbosity: Verbosity) -> RunResult<'static> {
+    let mut instance = Self::instance();
+    instance.verbosity = verbosity;
+    if !instance.initialized {
+      Platform::install_signal_handler(|signal| Self::instance().handle(signal))?;
+      instance.initialized = true;
+    }
+    Ok(())
+  }
+
+  pub(crate) fn instance() -> MutexGuard<'static, Self> {
+    static INSTANCE: Mutex<SignalHandler> = Mutex::new(SignalHandler::new());
+
+    match INSTANCE.lock() {
+      Ok(guard) => guard,
+      Err(poison_error) => {
+        eprintln!(
+          "{}",
+          Error::internal(format!("signal handler mutex poisoned: {poison_error}"),)
+            .color_display(Color::auto().stderr())
+        );
+        process::exit(EXIT_FAILURE);
+      }
+    }
+  }
+
+  const fn new() -> Self {
+    Self {
+      caught: None,
+      children: BTreeMap::new(),
+      initialized: false,
+      verbosity: Verbosity::default(),
+    }
+  }
+
+  fn handle(&mut self, signal: Signal) {
+    if signal.is_fatal() {
+      if self.children.is_empty() {
+        process::exit(signal.code());
+      }
+
+      if self.caught.is_none() {
+        self.caught = Some(signal);
+      }
+    }
+
+    match signal {
+      // SIGHUP, SIGINT, and SIGQUIT are normally sent on terminal close,
+      // ctrl-c, and ctrl-\, respectively, and are sent to all processes in the
+      // foreground process group. this includes child processes, so we ignore
+      // the signal and wait for them to exit
+      Signal::Hangup | Signal::Interrupt | Signal::Quit => {}
+      #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+      ))]
+      Signal::Info => {
+        let id = process::id();
+        if self.children.is_empty() {
+          eprintln!("just {id}: no child processes");
+        } else {
+          let n = self.children.len();
+
+          let mut message = format!(
+            "just {id}: {n} child {}:\n",
+            if n == 1 { "process" } else { "processes" }
+          );
+
+          for (&child, command) in &self.children {
+            use std::fmt::Write;
+            writeln!(message, "{child}: {command:?}").unwrap();
+          }
+
+          eprint!("{message}");
+        }
+      }
+      // SIGTERM is the default signal sent by kill. forward it to child
+      // processes and wait for them to exit
+      Signal::Terminate =>
+      {
+        #[cfg(not(windows))]
+        for &child in self.children.keys() {
+          if self.verbosity.loquacious() {
+            eprintln!("just: sending SIGTERM to child process {child}");
+          }
+          nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child),
+            Some(Signal::Terminate.into()),
+          )
+          .ok();
+        }
+      }
+    }
+  }
+
+  pub(crate) fn spawn<T>(
+    mut command: Command,
+    f: impl Fn(process::Child) -> io::Result<T>,
+  ) -> (io::Result<T>, Option<Signal>) {
+    let mut instance = Self::instance();
+
+    let child = match command.spawn() {
+      Err(err) => return (Err(err), None),
+      Ok(child) => child,
+    };
+
+    let pid = match child.id().try_into() {
+      Err(err) => {
+        return (
+          Err(io::Error::other(format!("invalid child PID: {err}"))),
+          None,
+        );
+      }
+      Ok(pid) => pid,
+    };
+
+    instance.children.insert(pid, command);
+
+    drop(instance);
+
+    let result = f(child);
+
+    let mut instance = Self::instance();
+
+    instance.children.remove(&pid);
+
+    (result, instance.caught)
+  }
+}
+use {
+  super::*,
+  nix::{
+    errno::Errno,
+    fcntl::{FcntlArg, FdFlag},
+    sys::signal::{SaFlags, SigAction, SigHandler, SigSet},
+  },
+  std::{
+    fs::File,
+    io::Read,
+    os::fd::{BorrowedFd, IntoRawFd, OwnedFd},
+    sync::atomic::{self, AtomicI32},
+  },
+};
+
+const INVALID_FILENO: i32 = -1;
+
+static WRITE: AtomicI32 = AtomicI32::new(INVALID_FILENO);
+
+fn die(message: &str) -> ! {
+  // SAFETY:
+  //
+  // Standard error is open for the duration of the program.
+  const STDERR: BorrowedFd = unsafe { BorrowedFd::borrow_raw(libc::STDERR_FILENO) };
+
+  let mut i = 0;
+  let mut buffer = [0; 512];
+
+  let mut append = |s: &str| {
+    let remaining = buffer.len() - i;
+    let n = s.len().min(remaining);
+    let end = i + n;
+    buffer[i..end].copy_from_slice(&s.as_bytes()[0..n]);
+    i = end;
+  };
+
+  append("error: ");
+  append(message);
+  append("\n");
+
+  nix::unistd::write(STDERR, &buffer[0..i]).ok();
+
+  process::abort();
+}
+
+extern "C" fn handler(signal: libc::c_int) {
+  let errno = Errno::last();
+
+  let Ok(signal) = u8::try_from(signal) else {
+    die("unexpected signal");
+  };
+
+  // SAFETY:
+  //
+  // `WRITE` is initialized before the signal handler can run and remains open
+  // for the duration of the program.
+  let fd = unsafe { BorrowedFd::borrow_raw(WRITE.load(atomic::Ordering::Relaxed)) };
+
+  if let Err(err) = nix::unistd::write(fd, &[signal]) {
+    die(err.desc());
+  }
+
+  errno.set();
+}
+
+fn fcntl(fd: &OwnedFd, arg: FcntlArg) -> RunResult<'static, libc::c_int> {
+  nix::fcntl::fcntl(fd, arg).map_err(|errno| Error::SignalHandlerPipeCloexec {
+    io_error: errno.into(),
+  })
+}
+
+fn set_cloexec(fd: &OwnedFd) -> RunResult<'static> {
+  // It would be better to use pipe2(O_CLOEXEC) rather than pipe-then-fcntl,
+  // but it isn't supported on all platforms (most notably, not macos) and in
+  // the atomicity guarantees that pipe2 provides aren't needed.
+  let existing_flags = fcntl(fd, FcntlArg::F_GETFD)?;
+  let combined_flags = FdFlag::from_bits_retain(existing_flags) | FdFlag::FD_CLOEXEC;
+  fcntl(fd, FcntlArg::F_SETFD(combined_flags))?;
+  Ok(())
+}
+
+pub(crate) struct Signals(File);
+
+impl Signals {
+  pub(crate) fn new() -> RunResult<'static, Self> {
+    let (read, write) = nix::unistd::pipe().map_err(|errno| Error::SignalHandlerPipeOpen {
+      io_error: errno.into(),
+    })?;
+
+    set_cloexec(&read)?;
+    set_cloexec(&write)?;
+
+    if WRITE
+      .compare_exchange(
+        INVALID_FILENO,
+        write.into_raw_fd(),
+        atomic::Ordering::Relaxed,
+        atomic::Ordering::Relaxed,
+      )
+      .is_err()
+    {
+      panic!("signal iterator cannot be initialized twice");
+    }
+
+    let sa = SigAction::new(
+      SigHandler::Handler(handler),
+      SaFlags::SA_RESTART,
+      SigSet::empty(),
+    );
+
+    for &signal in Signal::ALL {
+      // SAFETY:
+      //
+      // This is the only place we modify signal handlers, and
+      // `nix::sys::signal::sigaction` is unsafe only if an invalid signal
+      // handler has already been installed.
+      unsafe {
+        nix::sys::signal::sigaction(signal.into(), &sa).map_err(|errno| {
+          Error::SignalHandlerSigaction {
+            signal,
+            io_error: errno.into(),
+          }
+        })?;
+      }
+    }
+
+    Ok(Self(File::from(read)))
+  }
+}
+
+impl Iterator for Signals {
+  type Item = io::Result<Signal>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    let mut signal = [0];
+    Some(
+      self
+        .0
+        .read_exact(&mut signal)
+        .and_then(|()| Signal::try_from(signal[0])),
+    )
+  }
+}
+use super::*;
+
+impl PlatformInterface for Platform {
+  fn make_shebang_command(
+    _config: &Config,
+    path: &Path,
+    _shebang: Shebang,
+    working_directory: Option<&Path>,
+  ) -> Result<Command, OutputError> {
+    // shebang scripts can be executed directly on unix
+    let mut command = Command::resolve(path);
+
+    if let Some(working_directory) = working_directory {
+      command.current_dir(working_directory);
+    }
+
+    Ok(command)
+  }
+
+  fn set_execute_permission(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // get current permissions
+    let mut permissions = fs::metadata(path)?.permissions();
+
+    // set the execute bit
+    let current_mode = permissions.mode();
+    permissions.set_mode(current_mode | 0o100);
+
+    // set the new permissions
+    fs::set_permissions(path, permissions)
+  }
+
+  fn signal_from_exit_status(exit_status: ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    exit_status.signal()
+  }
+
+  fn convert_native_path(
+    _config: &Config,
+    _working_directory: &Path,
+    path: &Path,
+  ) -> FunctionResult {
+    path
+      .to_str()
+      .map(str::to_string)
+      .ok_or_else(|| String::from("Error getting current directory: unicode decode error"))
+  }
+
+  fn install_signal_handler<T: Fn(Signal) + Send + 'static>(handler: T) -> RunResult<'static> {
+    let signals = crate::signals::Signals::new()?;
+
+    std::thread::Builder::new()
+      .name("signal handler".into())
+      .spawn(move || {
+        for signal in signals {
+          match signal {
+            Ok(signal) => handler(signal),
+            Err(io_error) => eprintln!("warning: I/O error reading from signal pipe: {io_error}"),
+          }
+        }
+      })
+      .map_err(|io_error| Error::SignalHandlerSpawnThread { io_error })?;
+
+    Ok(())
+  }
+}

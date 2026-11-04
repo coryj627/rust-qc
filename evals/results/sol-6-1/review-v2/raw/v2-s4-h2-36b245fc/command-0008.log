@@ -1,0 +1,1034 @@
+        match capacity.cmp(&(stream.requested_send_capacity as usize)) {
+            Ordering::Equal => {
+                // Nothing to do
+            }
+            Ordering::Less => {
+                // Update the target requested capacity
+                stream.requested_send_capacity = capacity as WindowSize;
+
+                // Currently available capacity assigned to the stream
+                let available = stream.send_flow.available().as_size();
+
+                // If the stream has more assigned capacity than requested, reclaim
+                // some for the connection
+                if available as usize > capacity {
+                    let diff = available - capacity as WindowSize;
+
+                    // TODO: proper error handling
+                    let _res = stream.send_flow.claim_capacity(diff);
+                    debug_assert!(_res.is_ok());
+
+                    self.assign_connection_capacity(diff, stream, counts);
+                }
+            }
+            Ordering::Greater => {
+                // If trying to *add* capacity, but the stream send side is closed,
+                // there's nothing to be done.
+                if stream.state.is_send_closed() {
+                    return;
+                }
+
+                // Update the target requested capacity
+                stream.requested_send_capacity =
+                    cmp::min(capacity, WindowSize::MAX as usize) as WindowSize;
+
+                // Try to assign additional capacity to the stream. If none is
+                // currently available, the stream will be queued to receive some
+                // when more becomes available.
+                self.try_assign_capacity(stream);
+            }
+        }
+    }
+
+    pub fn recv_stream_window_update(
+        &mut self,
+        inc: WindowSize,
+        stream: &mut store::Ptr,
+    ) -> Result<(), Reason> {
+        let span = tracing::trace_span!(
+            "recv_stream_window_update",
+            ?stream.id,
+            ?stream.state,
+            inc,
+            flow = ?stream.send_flow
+        );
+        let _e = span.enter();
+
+        if stream.state.is_send_closed() && stream.buffered_send_data == 0 {
+            // We can't send any data, so don't bother doing anything else.
+            return Ok(());
+        }
+
+        // Update the stream level flow control.
+        stream.send_flow.inc_window(inc)?;
+
+        // If the stream is waiting on additional capacity, then this will
+        // assign it (if available on the connection) and notify the producer
+        self.try_assign_capacity(stream);
+
+        Ok(())
+    }
+
+    pub fn recv_connection_window_update(
+        &mut self,
+        inc: WindowSize,
+        store: &mut Store,
+        counts: &mut Counts,
+    ) -> Result<(), Reason> {
+        // Update the connection's window
+        self.flow.inc_window(inc)?;
+
+        self.assign_connection_capacity(inc, store, counts);
+        Ok(())
+    }
+
+    /// Reclaim all capacity assigned to the stream and re-assign it to the
+    /// connection
+        self.prioritize.reclaim_reserved_capacity(stream, counts);
+        self.prioritize.schedule_send(stream, task);
+    }
+
+    pub fn send_data<B>(
+        &mut self,
+        frame: frame::Data<B>,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError>
+    where
+        B: Buf,
+    {
+        self.prioritize
+            .send_data(frame, buffer, stream, counts, task)
+    }
+
+    pub fn send_trailers<B>(
+        &mut self,
+        frame: frame::Headers,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError> {
+        // TODO: Should this logic be moved into state.rs?
+        if !stream.state.is_send_streaming() {
+            return Err(UserError::UnexpectedFrameType);
+        }
+
+        stream.state.send_close();
+
+        tracing::trace!("send_trailers -- queuing; frame={:?}", frame);
+        self.prioritize
+            .queue_frame(frame.into(), buffer, stream, task);
+
+        // Release any excess capacity
+        self.prioritize.reserve_capacity(0, stream, counts);
+
+        Ok(())
+    }
+
+    pub fn poll_complete<T, B>(
+        &mut self,
+        cx: &mut Context,
+        buffer: &mut Buffer<Frame<B>>,
+        store: &mut Store,
+        counts: &mut Counts,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        self.prioritize
+            .poll_complete(cx, buffer, store, counts, dst)
+    }
+
+    /// Request capacity to send data
+    pub fn reserve_capacity(
+        &mut self,
+        capacity: WindowSize,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) {
+        self.prioritize.reserve_capacity(capacity, stream, counts)
+    }
+
+    pub fn poll_capacity(
+        &mut self,
+        cx: &Context,
+        stream: &mut store::Ptr,
+    ) -> Poll<Option<Result<WindowSize, UserError>>> {
+        if !stream.state.is_send_streaming() {
+            return Poll::Ready(None);
+        }
+
+        if !stream.send_capacity_inc {
+            stream.wait_send(cx);
+            return Poll::Pending;
+        }
+
+        stream.send_capacity_inc = false;
+
+        Poll::Ready(Some(Ok(self.capacity(stream))))
+    }
+
+    /// Current available stream send capacity
+    pub fn capacity(&self, stream: &mut store::Ptr) -> WindowSize {
+        stream.capacity(self.prioritize.max_buffer_size())
+    }
+
+    pub fn poll_reset(
+        &self,
+        cx: &Context,
+        stream: &mut Stream,
+        mode: PollReset,
+    ) -> Poll<Result<Reason, crate::Error>> {
+        match stream.state.ensure_reason(mode)? {
+            Some(reason) => Poll::Ready(Ok(reason)),
+            None => {
+                stream.wait_send(cx);
+                Poll::Pending
+            }
+        }
+    }
+
+    pub fn recv_connection_window_update(
+        &mut self,
+        frame: frame::WindowUpdate,
+        store: &mut Store,
+        counts: &mut Counts,
+    ) -> Result<(), Reason> {
+        self.prioritize
+            .recv_connection_window_update(frame.size_increment(), store, counts)
+    }
+
+    pub fn recv_stream_window_update<B>(
+        &mut self,
+        sz: WindowSize,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), Reason> {
+        if let Err(e) = self.prioritize.recv_stream_window_update(sz, stream) {
+            tracing::debug!("recv_stream_window_update !!; err={:?}", e);
+
+            self.send_reset(
+                Reason::FLOW_CONTROL_ERROR,
+                Initiator::Library,
+                buffer,
+                stream,
+                counts,
+                task,
+            );
+
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn recv_go_away(&mut self, last_stream_id: StreamId) -> Result<(), Error> {
+        if last_stream_id > self.max_stream_id {
+            // The remote endpoint sent a `GOAWAY` frame indicating a stream
+            // that we never sent, or that we have already terminated on account
+            // of previous `GOAWAY` frame. In either case, that is illegal.
+            // (When sending multiple `GOAWAY`s, "Endpoints MUST NOT increase
+            // the value they send in the last stream identifier, since the
+            // peers might already have retried unprocessed requests on another
+            // connection.")
+            proto_err!(conn:
+                "recv_go_away: last_stream_id ({:?}) > max_stream_id ({:?})",
+                last_stream_id, self.max_stream_id,
+            );
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+        }
+
+        self.max_stream_id = last_stream_id;
+        Ok(())
+    }
+
+    pub fn handle_error<B>(
+        &mut self,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) {
+        // Clear all pending outbound frames
+        self.prioritize.clear_queue(buffer, stream);
+        self.prioritize.reclaim_all_capacity(stream, counts);
+    }
+
+}
+
+impl<T, B> fmt::Debug for Handshake<T, B>
+where
+    T: AsyncRead + AsyncWrite + fmt::Debug,
+    B: fmt::Debug + Buf,
+{
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write!(fmt, "server::Handshake")
+    }
+}
+
+impl Peer {
+    pub fn convert_send_message(
+        id: StreamId,
+        response: Response<()>,
+        end_of_stream: bool,
+    ) -> frame::Headers {
+        use http::response::Parts;
+
+        // Extract the components of the HTTP request
+        let (
+            Parts {
+                status, headers, ..
+            },
+            _,
+        ) = response.into_parts();
+
+        // Build the set pseudo header set. All requests will include `method`
+        // and `path`.
+        let pseudo = Pseudo::response(status);
+
+        // Create the HEADERS frame
+        let mut frame = frame::Headers::new(id, pseudo, headers);
+
+        if end_of_stream {
+            frame.set_end_stream()
+        }
+
+        frame
+    }
+
+    pub fn convert_push_message(
+        stream_id: StreamId,
+        promised_id: StreamId,
+        request: Request<()>,
+    ) -> Result<frame::PushPromise, UserError> {
+        use http::request::Parts;
+
+        if let Err(e) = frame::PushPromise::validate_request(&request) {
+            use PushPromiseHeaderError::*;
+            match e {
+                NotSafeAndCacheable => tracing::debug!(
+                    ?promised_id,
+                    "convert_push_message: method {} is not safe and cacheable",
+                    request.method(),
+                ),
+                InvalidContentLength(e) => tracing::debug!(
+                    ?promised_id,
+                    "convert_push_message; promised request has invalid content-length {:?}",
+                    e,
+                ),
+            }
+            return Err(UserError::MalformedHeaders);
+        }
+
+        // Extract the components of the HTTP request
+        let (
+            Parts {
+                method,
+                uri,
+                headers,
+                ..
+            },
+            _,
+        ) = request.into_parts();
+
+        let pseudo = Pseudo::request(method, uri, None);
+
+        Ok(frame::PushPromise::new(
+            stream_id,
+            promised_id,
+            pseudo,
+            headers,
+        ))
+    }
+}
+
+impl proto::Peer for Peer {
+    type Poll = Request<()>;
+
+    const NAME: &'static str = "Server";
+
+    /*
+    fn is_server() -> bool {
+        true
+    }
+    */
+
+    fn r#dyn() -> proto::DynPeer {
+        proto::DynPeer::Server
+    }
+
+    fn convert_poll_message(
+        pseudo: Pseudo,
+        fields: HeaderMap,
+        stream_id: StreamId,
+    ) -> Result<Self::Poll, Error> {
+        use http::{uri, Version};
+
+        let mut b = Request::builder();
+
+        macro_rules! malformed {
+            ($($arg:tt)*) => {{
+                tracing::debug!($($arg)*);
+                return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
+            }}
+        }
+
+        b = b.version(Version::HTTP_2);
+
+        let is_connect;
+        if let Some(method) = pseudo.method {
+            is_connect = method == Method::CONNECT;
+            b = b.method(method);
+        } else {
+            malformed!("malformed headers: missing method");
+        }
+
+        let has_protocol = pseudo.protocol.is_some();
+        if has_protocol {
+            if is_connect {
+                // Assert that we have the right type.
+                b = b.extension::<crate::ext::Protocol>(pseudo.protocol.unwrap());
+            } else {
+                malformed!("malformed headers: :protocol on non-CONNECT request");
+            }
+        }
+
+        if pseudo.status.is_some() {
+            malformed!("malformed headers: :status field on request");
+        }
+
+        // Convert the URI
+        let mut parts = uri::Parts::default();
+
+        // A request translated from HTTP/1 must not include the :authority
+        // header
+        if let Some(authority) = pseudo.authority {
+            let maybe_authority = uri::Authority::from_maybe_shared(authority.clone().into_inner());
+            parts.authority = Some(maybe_authority.or_else(|why| {
+                malformed!(
+                    "malformed headers: malformed authority ({:?}): {}",
+                    authority,
+                    why,
+                )
+            })?);
+        }
+
+        // A :scheme is required, except CONNECT.
+        if let Some(scheme) = pseudo.scheme {
+            if is_connect && !has_protocol {
+                malformed!("malformed headers: :scheme in CONNECT");
+            }
+            let maybe_scheme = scheme.parse();
+            let scheme = maybe_scheme.or_else(|why| {
+                malformed!(
+                    "malformed headers: malformed scheme ({:?}): {}",
+                    scheme,
+                    why,
+                )
+            })?;
+
+            // It's not possible to build an `Uri` from a scheme and path. So,
+            // after validating is was a valid scheme, we just have to drop it
+            // if there isn't an :authority.
+            if parts.authority.is_some() {
+                parts.scheme = Some(scheme);
+            }
+        } else if !is_connect || has_protocol {
+            malformed!("malformed headers: missing scheme");
+        }
+
+        if let Some(path) = pseudo.path {
+            if is_connect && !has_protocol {
+                malformed!("malformed headers: :path in CONNECT");
+            }
+
+            // This cannot be empty
+            if path.is_empty() {
+                malformed!("malformed headers: missing path");
+            }
+
+            let maybe_path = uri::PathAndQuery::from_maybe_shared(path.clone().into_inner());
+            parts.path_and_query = Some(maybe_path.or_else(|why| {
+                malformed!("malformed headers: malformed path ({:?}): {}", path, why,)
+            })?);
+        } else if is_connect && has_protocol {
+            malformed!("malformed headers: missing path in extended CONNECT");
+        }
+
+        b = b.uri(parts);
+
+        let mut request = match b.body(()) {
+            Ok(request) => request,
+            Err(e) => {
+                // TODO: Should there be more specialized handling for different
+                // kinds of errors
+                proto_err!(stream: "error building request: {}; stream={:?}", e, stream_id);
+                return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
+            }
+        };
+
+        *request.headers_mut() = fields;
+
+        Ok(request)
+            pending_accept_reset_stream_max: proto::DEFAULT_REMOTE_RESET_STREAM_MAX,
+            initial_target_connection_window_size: None,
+            initial_max_send_streams: usize::MAX,
+            settings: Default::default(),
+            stream_id: 1.into(),
+            local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
+        }
+    }
+
+    /// Indicates the initial window size (in octets) for stream-level
+    /// flow control for received data.
+    ///
+    /// The initial window of a stream is used as part of flow control. For more
+    /// details, see [`FlowControl`].
+    ///
+    /// The default value is 65,535.
+    ///
+    /// [`FlowControl`]: ../struct.FlowControl.html
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use tokio::io::{AsyncRead, AsyncWrite};
+    /// # use h2::client::*;
+    /// # use bytes::Bytes;
+    /// #
+    /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
+    /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), h2::Error>
+    /// # {
+    /// // `client_fut` is a future representing the completion of the HTTP/2
+    /// // handshake.
+    /// let client_fut = Builder::new()
+    ///     .initial_window_size(1_000_000)
+    ///     .handshake(my_io);
+    /// # client_fut.await
+    /// # }
+    /// #
+    /// # pub fn main() {}
+    /// ```
+    pub fn initial_window_size(&mut self, size: u32) -> &mut Self {
+        self.settings.set_initial_window_size(Some(size));
+        self
+    }
+
+    /// Indicates the initial window size (in octets) for connection-level flow control
+    /// for received data.
+    ///
+    /// The initial window of a connection is used as part of flow control. For more details,
+    /// see [`FlowControl`].
+    ///
+    /// The default value is 65,535.
+    ///
+    /// [`FlowControl`]: ../struct.FlowControl.html
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use tokio::io::{AsyncRead, AsyncWrite};
+    /// # use h2::client::*;
+    /// # use bytes::Bytes;
+    /// #
+    /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
+    /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), h2::Error>
+    /// # {
+    /// // `client_fut` is a future representing the completion of the HTTP/2
+    /// // handshake.
+    /// let client_fut = Builder::new()
+    ///     .initial_connection_window_size(1_000_000)
+    ///     .handshake(my_io);
+    /// # client_fut.await
+    /// # }
+    /// #
+    /// # pub fn main() {}
+    /// ```
+    pub fn initial_connection_window_size(&mut self, size: u32) -> &mut Self {
+        self.initial_target_connection_window_size = Some(size);
+        self
+    }
+
+    /// Indicates the size (in octets) of the largest HTTP/2 frame payload that the
+    /// configured client is able to accept.
+        Ok((send_request, connection))
+    }
+
+    /// Sets the target window size for the whole connection.
+    ///
+    /// If `size` is greater than the current value, then a `WINDOW_UPDATE`
+    /// frame will be immediately sent to the remote, increasing the connection
+    /// level window by `size - current_value`.
+    ///
+    /// If `size` is less than the current value, nothing will happen
+    /// immediately. However, as window capacity is released by
+    /// [`FlowControl`] instances, no `WINDOW_UPDATE` frames will be sent
+    /// out until the number of "in flight" bytes drops below `size`.
+    ///
+    /// The default value is 65,535.
+    ///
+    /// See [`FlowControl`] documentation for more details.
+    ///
+    /// [`FlowControl`]: ../struct.FlowControl.html
+    /// [library level]: ../index.html#flow-control
+    pub fn set_target_window_size(&mut self, size: u32) {
+        assert!(size <= proto::MAX_WINDOW_SIZE);
+        self.inner.set_target_window_size(size);
+    }
+
+    /// Set a new `INITIAL_WINDOW_SIZE` setting (in octets) for stream-level
+    /// flow control for received data.
+    ///
+    /// The `SETTINGS` will be sent to the remote, and only applied once the
+    /// remote acknowledges the change.
+    ///
+    /// This can be used to increase or decrease the window size for existing
+    /// streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a previous call is still pending acknowledgement
+    /// from the remote endpoint.
+    pub fn set_initial_window_size(&mut self, size: u32) -> Result<(), crate::Error> {
+        assert!(size <= proto::MAX_WINDOW_SIZE);
+        self.inner.set_initial_window_size(size)?;
+        Ok(())
+    }
+
+    /// Takes a `PingPong` instance from the connection.
+    ///
+    /// # Note
+    ///
+    /// This may only be called once. Calling multiple times will return `None`.
+    pub fn ping_pong(&mut self) -> Option<PingPong> {
+        self.inner.take_user_pings().map(PingPong::new)
+//! Managing flow control for inbound data is done through [`FlowControl`].
+//! Managing flow control for outbound data is done through [`SendStream`]. See
+//! the struct level documentation for those two types for more details.
+//!
+//! [HTTP/2]: https://http2.github.io/
+//! [futures]: https://docs.rs/futures/
+//! [`client`]: client/index.html
+//! [`server`]: server/index.html
+//! [Flow control]: http://httpwg.org/specs/rfc7540.html#FlowControl
+//! [`FlowControl`]: struct.FlowControl.html
+//! [`SendStream`]: struct.SendStream.html
+//! [Starting HTTP/2]: http://httpwg.org/specs/rfc7540.html#starting
+//! [upgrade]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Protocol_upgrade_mechanism
+//! [`server::handshake`]: server/fn.handshake.html
+//! [`client::handshake`]: client/fn.handshake.html
+
+#![deny(
+    missing_debug_implementations,
+    missing_docs,
+    clippy::missing_safety_doc,
+    clippy::undocumented_unsafe_blocks
+)]
+#![allow(clippy::type_complexity, clippy::manual_range_contains)]
+#![cfg_attr(test, deny(warnings))]
+
+macro_rules! proto_err {
+    (conn: $($msg:tt)+) => {
+        tracing::debug!("connection error PROTOCOL_ERROR -- {};", format_args!($($msg)+))
+    };
+    (stream: $($msg:tt)+) => {
+        tracing::debug!("stream error PROTOCOL_ERROR -- {};", format_args!($($msg)+))
+    };
+}
+
+macro_rules! ready {
+    ($e:expr) => {
+        match $e {
+            ::std::task::Poll::Ready(r) => r,
+            ::std::task::Poll::Pending => return ::std::task::Poll::Pending,
+        }
+    };
+}
+
+#[cfg_attr(feature = "unstable", allow(missing_docs))]
+mod codec;
+mod error;
+mod hpack;
+
+#[cfg(not(feature = "unstable"))]
+mod proto;
+
+
+    pub fn as_slice(&self) -> &[u8] {
+        match *self {
+            Name::Field(ref name) => name.as_ref(),
+            Name::Authority => b":authority",
+            Name::Method => b":method",
+            Name::Scheme => b":scheme",
+            Name::Path => b":path",
+            Name::Protocol => b":protocol",
+            Name::Status => b":status",
+        }
+    }
+}
+
+// ===== impl BytesStr =====
+
+impl BytesStr {
+    pub(crate) const fn from_static(value: &'static str) -> Self {
+        BytesStr(Bytes::from_static(value.as_bytes()))
+    }
+
+    pub(crate) fn from(value: &str) -> Self {
+        BytesStr(Bytes::copy_from_slice(value.as_bytes()))
+    }
+
+    #[doc(hidden)]
+    pub fn try_from(bytes: Bytes) -> Result<Self, std::str::Utf8Error> {
+        std::str::from_utf8(bytes.as_ref())?;
+        Ok(BytesStr(bytes))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        // Safety: check valid utf-8 in constructor
+        unsafe { std::str::from_utf8_unchecked(self.0.as_ref()) }
+    }
+
+    pub(crate) fn into_inner(self) -> Bytes {
+        self.0
+    }
+}
+
+use futures::StreamExt;
+use h2_support::prelude::*;
+
+#[tokio::test]
+async fn recv_trailers_only() {
+    h2_support::trace_init!();
+
+    let mock = mock_io::Builder::new()
+        .handshake()
+        // Write GET /
+        .write(&[
+            0, 0, 0x10, 1, 5, 0, 0, 0, 1, 0x82, 0x87, 0x41, 0x8B, 0x9D, 0x29, 0xAC, 0x4B, 0x8F,
+            0xA8, 0xE9, 0x19, 0x97, 0x21, 0xE9, 0x84,
+        ])
+        .write(frames::SETTINGS_ACK)
+        // Read response
+        .read(&[
+            0, 0, 1, 1, 4, 0, 0, 0, 1, 0x88, 0, 0, 9, 1, 5, 0, 0, 0, 1, 0x40, 0x84, 0x42, 0x46,
+            0x9B, 0x51, 0x82, 0x3F, 0x5F,
+        ])
+        .build();
+
+    let (mut client, mut h2) = client::handshake(mock).await.unwrap();
+
+    // Send the request
+    let request = Request::builder()
+        .uri("https://http2.akamai.com/")
+        .body(())
+        .unwrap();
+
+    tracing::info!("sending request");
+    let (response, _) = client.send_request(request, true).unwrap();
+
+    let response = h2.run(response).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (_, mut body) = response.into_parts();
+
+    // Make sure there is no body
+    let chunk = h2.run(Box::pin(body.next())).await;
+    assert!(chunk.is_none());
+
+    let trailers = h2
+        .run(poll_fn(|cx| body.poll_trailers(cx)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(1, trailers.len());
+    assert_eq!(trailers["status"], "ok");
+
+    h2.await.unwrap();
+}
+
+#[tokio::test]
+async fn send_trailers_immediately() {
+    h2_support::trace_init!();
+
+    let mock = mock_io::Builder::new()
+        .handshake()
+        // Write GET /
+        .write(&[
+            0, 0, 0x10, 1, 4, 0, 0, 0, 1, 0x82, 0x87, 0x41, 0x8B, 0x9D, 0x29, 0xAC, 0x4B, 0x8F,
+            0xA8, 0xE9, 0x19, 0x97, 0x21, 0xE9, 0x84, 0, 0, 0x0A, 1, 5, 0, 0, 0, 1, 0x40, 0x83,
+            0xF6, 0x7A, 0x66, 0x84, 0x9C, 0xB4, 0x50, 0x7F,
+        ])
+        .write(frames::SETTINGS_ACK)
+        // Read response
+        .read(&[
+            0, 0, 1, 1, 4, 0, 0, 0, 1, 0x88, 0, 0, 0x0B, 0, 1, 0, 0, 0, 1, 0x68, 0x65, 0x6C, 0x6C,
+            0x6F, 0x20, 0x77, 0x6F, 0x72, 0x6C, 0x64,
+        ])
+        .build();
+
+    let (mut client, mut h2) = client::handshake(mock).await.unwrap();
+
+    // Send the request
+    let request = Request::builder()
+        .uri("https://http2.akamai.com/")
+        .body(())
+        .unwrap();
+
+    tracing::info!("sending request");
+    let (response, mut stream) = client.send_request(request, false).unwrap();
+
+    let mut trailers = HeaderMap::new();
+    trailers.insert("zomg", "hello".parse().unwrap());
+
+    stream.send_trailers(trailers).unwrap();
+
+    let response = h2.run(response).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (_, mut body) = response.into_parts();
+
+    // There is a data chunk
+    let _ = h2.run(body.next()).await.unwrap().unwrap();
+
+    let chunk = h2.run(body.next()).await;
+    assert!(chunk.is_none());
+
+    let trailers = h2.run(poll_fn(|cx| body.poll_trailers(cx))).await.unwrap();
+    assert!(trailers.is_none());
+
+    h2.await.unwrap();
+}
+
+#[test]
+#[ignore]
+fn recv_trailers_without_eos() {
+    // This should be a protocol error?
+}
+        let mut pseudo = Pseudo {
+            method: Some(method),
+            scheme: None,
+            authority: None,
+            path,
+            protocol,
+            status: None,
+        };
+
+        // If the URI includes a scheme component, add it to the pseudo headers
+        if let Some(scheme) = scheme {
+            pseudo.set_scheme(scheme);
+        }
+
+        // If the URI includes an authority component, add it to the pseudo
+        // headers
+        if let Some(authority) = parts.authority {
+            pseudo.set_authority(BytesStr::from(authority.as_str()));
+        }
+
+        pseudo
+    }
+
+    pub fn response(status: StatusCode) -> Self {
+        Pseudo {
+            method: None,
+            scheme: None,
+            authority: None,
+            path: None,
+            protocol: None,
+            status: Some(status),
+        }
+    }
+
+    #[cfg(feature = "unstable")]
+    pub fn set_status(&mut self, value: StatusCode) {
+        self.status = Some(value);
+    }
+
+    pub fn set_scheme(&mut self, scheme: uri::Scheme) {
+        let bytes_str = match scheme.as_str() {
+            "http" => BytesStr::from_static("http"),
+            "https" => BytesStr::from_static("https"),
+            s => BytesStr::from(s),
+        };
+        self.scheme = Some(bytes_str);
+    }
+
+    #[cfg(feature = "unstable")]
+    pub fn set_protocol(&mut self, protocol: Protocol) {
+        self.protocol = Some(protocol);
+    }
+
+    pub fn set_authority(&mut self, authority: BytesStr) {
+        self.authority = Some(authority);
+    }
+
+    /// Whether it has status 1xx
+    pub(crate) fn is_informational(&self) -> bool {
+        self.status
+            .map_or(false, |status| status.is_informational())
+    }
+}
+
+// ===== impl EncodingHeaderBlock =====
+
+impl EncodingHeaderBlock {
+    fn encode<F>(mut self, head: &Head, dst: &mut EncodeBuf<'_>, f: F) -> Option<Continuation>
+    where
+        F: FnOnce(&mut EncodeBuf<'_>),
+    {
+        let head_pos = dst.get_ref().len();
+
+        // At this point, we don't know how big the h2 frame will be.
+        // So, we write the head with length 0, then write the body, and
+        // finally write the length once we know the size.
+        head.encode(0, dst);
+
+        let payload_pos = dst.get_ref().len();
+
+        f(dst);
+
+        // Now, encode the header payload
+        let continuation = if self.hpack.len() > dst.remaining_mut() {
+            dst.put((&mut self.hpack).take(dst.remaining_mut()));
+
+            Some(Continuation {
+                stream_id: head.stream_id(),
+                header_block: self,
+            })
+        } else {
+            dst.put_slice(&self.hpack);
+
+            None
+        };
+
+        // Compute the header block length
+        let payload_len = (dst.get_ref().len() - payload_pos) as u64;
+
+        // Write the frame length
+        let payload_len_be = payload_len.to_be_bytes();
+        assert!(payload_len_be[0..5].iter().all(|b| *b == 0));
+        (dst.get_mut()[head_pos..head_pos + 3]).copy_from_slice(&payload_len_be[5..]);
+
+        if continuation.is_some() {
+            // There will be continuation frames, so the `is_end_headers` flag
+            // must be unset
+            debug_assert!(dst.get_ref()[head_pos + 4] & END_HEADERS == END_HEADERS);
+
+            dst.get_mut()[head_pos + 4] -= END_HEADERS;
+        }
+
+        continuation
+    }
+}
+
+// ===== impl Iter =====
+
+impl Iterator for Iter {
+    type Item = hpack::Header<Option<HeaderName>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use crate::hpack::Header::*;
+
+        if let Some(ref mut pseudo) = self.pseudo {
+            if let Some(method) = pseudo.method.take() {
+                return Some(Method(method));
+            }
+
+            if let Some(scheme) = pseudo.scheme.take() {
+                return Some(Scheme(scheme));
+            }
+
+            if let Some(authority) = pseudo.authority.take() {
+                return Some(Authority(authority));
+            }
+
+            if let Some(path) = pseudo.path.take() {
+                return Some(Path(path));
+            }
+
+            if let Some(protocol) = pseudo.protocol.take() {
+                return Some(Protocol(protocol));
+            }
+
+            if let Some(status) = pseudo.status.take() {
+                return Some(Status(status));
+            }
+        }
+
+        self.pseudo = None;
+
+        self.fields
+            .next()
+            .map(|(name, value)| Field { name, value })
+    }
+}
+
+// ===== impl HeadersFlag =====
+
+impl HeadersFlag {
+    pub fn empty() -> HeadersFlag {
+        HeadersFlag(0)
+    }
+
+    pub fn load(bits: u8) -> HeadersFlag {
+        HeadersFlag(bits & ALL)
+    }
+
+    pub fn is_end_stream(&self) -> bool {
+        self.0 & END_STREAM == END_STREAM
+    }
+
+    pub fn set_end_stream(&mut self) {
+        self.0 |= END_STREAM;
+    }
+
+    pub fn is_end_headers(&self) -> bool {
+        self.0 & END_HEADERS == END_HEADERS
+    }
+
+    pub fn set_end_headers(&mut self) {
+        self.0 |= END_HEADERS;
+    }
+
+    pub fn is_padded(&self) -> bool {
+        self.0 & PADDED == PADDED
+    }
+
+    pub fn is_priority(&self) -> bool {
+        self.0 & PRIORITY == PRIORITY
+    }
+}
+
+impl Default for HeadersFlag {
+    /// Returns a `HeadersFlag` value with `END_HEADERS` set.
+    fn default() -> Self {
+        HeadersFlag(END_HEADERS)
+    }
+}
+
+impl From<HeadersFlag> for u8 {
+    fn from(src: HeadersFlag) -> u8 {
+        src.0
+    }
+}
+
+impl fmt::Debug for HeadersFlag {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        util::debug_flags(fmt, self.0)
+            .flag_if(self.is_end_headers(), "END_HEADERS")
+            .flag_if(self.is_end_stream(), "END_STREAM")
+            .flag_if(self.is_padded(), "PADDED")
+            .flag_if(self.is_priority(), "PRIORITY")
+            .finish()
+    }
+}
+
+// ===== impl PushPromiseFlag =====
+
+impl PushPromiseFlag {

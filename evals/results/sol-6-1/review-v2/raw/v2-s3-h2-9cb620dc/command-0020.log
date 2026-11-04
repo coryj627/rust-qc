@@ -1,0 +1,749 @@
+
+        Ok(())
+    }
+
+    pub fn poll_complete<T, B>(
+        &mut self,
+        cx: &mut Context,
+        buffer: &mut Buffer<Frame<B>>,
+        store: &mut Store,
+        counts: &mut Counts,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        self.prioritize
+            .poll_complete(cx, buffer, store, counts, dst)
+    }
+
+    /// Request capacity to send data
+    pub fn reserve_capacity(
+        &mut self,
+        capacity: WindowSize,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) {
+        self.prioritize.reserve_capacity(capacity, stream, counts)
+    }
+
+    pub fn poll_capacity(
+        &mut self,
+        cx: &Context,
+        stream: &mut store::Ptr,
+    ) -> Poll<Option<Result<WindowSize, UserError>>> {
+        if !stream.state.is_send_streaming() {
+            return Poll::Ready(None);
+        }
+
+        if !stream.send_capacity_inc {
+            stream.wait_send(cx);
+            return Poll::Pending;
+        }
+
+        stream.send_capacity_inc = false;
+
+        Poll::Ready(Some(Ok(self.capacity(stream))))
+    }
+
+    /// Current available stream send capacity
+    pub fn capacity(&self, stream: &mut store::Ptr) -> WindowSize {
+        stream.capacity(self.prioritize.max_buffer_size())
+    }
+
+    pub fn poll_reset(
+        &self,
+        cx: &Context,
+        stream: &mut Stream,
+        mode: PollReset,
+    ) -> Poll<Result<Reason, crate::Error>> {
+        match stream.state.ensure_reason(mode)? {
+            Some(reason) => Poll::Ready(Ok(reason)),
+            None => {
+                stream.wait_send(cx);
+                Poll::Pending
+            }
+        }
+    }
+
+    pub fn recv_connection_window_update(
+        &mut self,
+        frame: frame::WindowUpdate,
+        store: &mut Store,
+        counts: &mut Counts,
+    ) -> Result<(), Reason> {
+        self.prioritize
+            .recv_connection_window_update(frame.size_increment(), store, counts)
+    }
+
+    pub fn recv_stream_window_update<B>(
+        &mut self,
+        sz: WindowSize,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), Reason> {
+        if let Err(e) = self.prioritize.recv_stream_window_update(sz, stream) {
+            tracing::debug!("recv_stream_window_update !!; err={:?}", e);
+
+            self.send_reset(
+                Reason::FLOW_CONTROL_ERROR,
+                Initiator::Library,
+                buffer,
+                stream,
+                counts,
+                task,
+            );
+
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn recv_go_away(&mut self, last_stream_id: StreamId) -> Result<(), Error> {
+        if last_stream_id > self.max_stream_id {
+            // The remote endpoint sent a `GOAWAY` frame indicating a stream
+            // that we never sent, or that we have already terminated on account
+            // of previous `GOAWAY` frame. In either case, that is illegal.
+            // (When sending multiple `GOAWAY`s, "Endpoints MUST NOT increase
+            // the value they send in the last stream identifier, since the
+            // peers might already have retried unprocessed requests on another
+            // connection.")
+            proto_err!(conn:
+                "recv_go_away: last_stream_id ({:?}) > max_stream_id ({:?})",
+                last_stream_id, self.max_stream_id,
+            );
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+        }
+
+        self.max_stream_id = last_stream_id;
+        Ok(())
+    }
+
+    pub fn handle_error<B>(
+        &mut self,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) {
+        // Clear all pending outbound frames
+        self.prioritize.clear_queue(buffer, stream);
+        self.prioritize.reclaim_all_capacity(stream, counts);
+    }
+
+    pub fn apply_remote_settings<B>(
+        &mut self,
+        settings: &frame::Settings,
+        buffer: &mut Buffer<Frame<B>>,
+        store: &mut Store,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), Error> {
+        if let Some(val) = settings.is_extended_connect_protocol_enabled() {
+            self.is_extended_connect_protocol_enabled = val;
+        }
+
+        // Applies an update to the remote endpoint's initial window size.
+        //
+        // Per RFC 7540 §6.9.2:
+        //
+        // In addition to changing the flow-control window for streams that are
+        // not yet active, a SETTINGS frame can alter the initial flow-control
+        // window size for streams with active flow-control windows (that is,
+        // streams in the "open" or "half-closed (remote)" state). When the
+        // value of SETTINGS_INITIAL_WINDOW_SIZE changes, a receiver MUST adjust
+        // the size of all stream flow-control windows that it maintains by the
+        // difference between the new value and the old value.
+        //
+        // A change to `SETTINGS_INITIAL_WINDOW_SIZE` can cause the available
+        // space in a flow-control window to become negative. A sender MUST
+        // track the negative flow-control window and MUST NOT send new
+        // flow-controlled frames until it receives WINDOW_UPDATE frames that
+        // cause the flow-control window to become positive.
+        if let Some(val) = settings.initial_window_size() {
+            let old_val = self.init_window_sz;
+            self.init_window_sz = val;
+
+            match val.cmp(&old_val) {
+                Ordering::Less => {
+                    // We must decrease the (remote) window on every open stream.
+                    let dec = old_val - val;
+                    tracing::trace!("decrementing all windows; dec={}", dec);
+
+                    let mut total_reclaimed = 0;
+                    store.try_for_each(|mut stream| {
+                        let stream = &mut *stream;
+
+                        if stream.state.is_send_closed() && stream.buffered_send_data == 0 {
+                            tracing::trace!(
+                                "skipping send-closed stream; id={:?}; flow={:?}",
+                                stream.id,
+                                stream.send_flow
+                            );
+
+                            return Ok(());
+                        }
+
+                        tracing::trace!(
+                            "decrementing stream window; id={:?}; decr={}; flow={:?}",
+                            stream.id,
+                            dec,
+                            stream.send_flow
+                        );
+
+                        // TODO: this decrement can underflow based on received frames!
+                        stream
+                            .send_flow
+                            .dec_send_window(dec)
+                            .map_err(proto::Error::library_go_away)?;
+
+                        // It's possible that decreasing the window causes
+                        // `window_size` (the stream-specific window) to fall below
+                        // `available` (the portion of the connection-level window
+                        // that we have allocated to the stream).
+                        // In this case, we should take that excess allocation away
+                        // and reassign it to other streams.
+                        let window_size = stream.send_flow.window_size();
+                        let available = stream.send_flow.available().as_size();
+                        let reclaimed = if available > window_size {
+                            // Drop down to `window_size`.
+                            let reclaim = available - window_size;
+                            stream
+                                .send_flow
+                                .claim_capacity(reclaim)
+                                .map_err(proto::Error::library_go_away)?;
+                            total_reclaimed += reclaim;
+                            reclaim
+                        } else {
+                            0
+                        };
+
+                        tracing::trace!(
+                            "decremented stream window; id={:?}; decr={}; reclaimed={}; flow={:?}",
+                            stream.id,
+                            dec,
+                            reclaimed,
+                            stream.send_flow
+                        );
+
+                        // TODO: Should this notify the producer when the capacity
+                        // of a stream is reduced? Maybe it should if the capacity
+                        // is reduced to zero, allowing the producer to stop work.
+
+                        Ok::<_, proto::Error>(())
+                    })?;
+
+                    self.prioritize
+                        .assign_connection_capacity(total_reclaimed, store, counts);
+                }
+                Ordering::Greater => {
+                    let inc = val - old_val;
+
+                    store.try_for_each(|mut stream| {
+                        self.recv_stream_window_update(inc, buffer, &mut stream, counts, task)
+                            .map_err(Error::library_go_away)
+                    })?;
+                }
+                Ordering::Equal => (),
+            }
+        }
+
+        if let Some(val) = settings.is_push_enabled() {
+            self.is_push_enabled = val
+        }
+
+        Ok(())
+    }
+
+    pub fn clear_queues(&mut self, store: &mut Store, counts: &mut Counts) {
+        self.prioritize.clear_pending_capacity(store, counts);
+        self.prioritize.clear_pending_send(store, counts);
+        self.prioritize.clear_pending_open(store, counts);
+    }
+
+    pub fn ensure_not_idle(&self, id: StreamId) -> Result<(), Reason> {
+        if let Ok(next) = self.next_stream_id {
+            if id >= next {
+                return Err(Reason::PROTOCOL_ERROR);
+            }
+        }
+        // if next_stream_id is overflowed, that's ok.
+
+        Ok(())
+    }
+
+    pub fn ensure_next_stream_id(&self) -> Result<StreamId, UserError> {
+        self.next_stream_id
+            .map_err(|_| UserError::OverflowedStreamId)
+    }
+
+    pub fn may_have_created_stream(&self, id: StreamId) -> bool {
+        if let Ok(next_id) = self.next_stream_id {
+            // Peer::is_local_init should have been called beforehand
+            debug_assert_eq!(id.is_server_initiated(), next_id.is_server_initiated(),);
+            id < next_id
+        } else {
+            true
+        }
+    }
+
+    pub(super) fn maybe_reset_next_stream_id(&mut self, id: StreamId) {
+        if let Ok(next_id) = self.next_stream_id {
+            // Peer::is_local_init should have been called beforehand
+            debug_assert_eq!(id.is_server_initiated(), next_id.is_server_initiated());
+            if id >= next_id {
+                self.next_stream_id = id.next_id();
+            }
+        }
+    }
+}
+
+// ===== impl StreamRef =====
+
+impl<B> StreamRef<B> {
+    pub fn send_data(&mut self, data: B, end_stream: bool) -> Result<(), UserError>
+    where
+        B: Buf,
+    {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let stream = me.store.resolve(self.opaque.key);
+        let actions = &mut me.actions;
+        let mut send_buffer = self.send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        me.counts.transition(stream, |counts, stream| {
+            // Create the data frame
+            let mut frame = frame::Data::new(stream.id, data);
+            frame.set_end_stream(end_stream);
+
+            // Send the data frame
+            actions
+                .send
+                .send_data(frame, send_buffer, stream, counts, &mut actions.task)
+        })
+    }
+
+    pub fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), UserError> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let stream = me.store.resolve(self.opaque.key);
+        let actions = &mut me.actions;
+        let mut send_buffer = self.send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        me.counts.transition(stream, |counts, stream| {
+            // Create the trailers frame
+            let frame = frame::Headers::trailers(stream.id, trailers);
+
+            // Send the trailers frame
+            actions
+                .send
+                .send_trailers(frame, send_buffer, stream, counts, &mut actions.task)
+        })
+    }
+
+    pub fn send_reset(&mut self, reason: Reason) {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let stream = me.store.resolve(self.opaque.key);
+        let mut send_buffer = self.send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        match me
+            .actions
+            .send_reset(stream, reason, Initiator::User, &mut me.counts, send_buffer)
+        {
+            Ok(()) => (),
+            Err(crate::proto::error::GoAway { .. }) => {
+                // this should never happen, because Initiator::User resets do
+                // not count toward the local limit.
+                // we could perhaps make this state impossible, if we made the
+                // initiator argument a generic, and so this could return
+                // Infallible instead of an impossible GoAway, but oh well.
+                unreachable!("Initiator::User should not error sending reset");
+            }
+        }
+    }
+
+    pub fn send_response(
+        &mut self,
+        mut response: Response<()>,
+        end_of_stream: bool,
+    ) -> Result<(), UserError> {
+        // Clear before taking lock, incase extensions contain a StreamRef.
+        response.extensions_mut().clear();
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let stream = me.store.resolve(self.opaque.key);
+        let actions = &mut me.actions;
+        let mut send_buffer = self.send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        me.counts.transition(stream, |counts, stream| {
+            let frame = server::Peer::convert_send_message(stream.id, response, end_of_stream);
+
+            actions
+                .send
+                .send_headers(frame, send_buffer, stream, counts, &mut actions.task)
+        })
+    }
+
+    pub fn send_push_promise(
+        &mut self,
+        mut request: Request<()>,
+    ) -> Result<StreamRef<B>, UserError> {
+        // Clear before taking lock, incase extensions contain a StreamRef.
+        request.extensions_mut().clear();
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut send_buffer = self.send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        let actions = &mut me.actions;
+        let promised_id = actions.send.reserve_local()?;
+
+        let child_key = {
+            let mut child_stream = me.store.insert(
+                promised_id,
+                Stream::new(
+                    promised_id,
+                    actions.send.init_window_sz(),
+                    actions.recv.init_window_sz(),
+                ),
+            );
+            child_stream.state.reserve_local()?;
+            child_stream.is_pending_push = true;
+            child_stream.key()
+        };
+
+        let pushed = {
+            let mut stream = me.store.resolve(self.opaque.key);
+
+            let frame = crate::server::Peer::convert_push_message(stream.id, promised_id, request)?;
+
+            actions
+                .send
+                .send_push_promise(frame, send_buffer, &mut stream, &mut actions.task)
+        };
+
+        if let Err(err) = pushed {
+            let mut child_stream = me.store.resolve(child_key);
+            child_stream.unlink();
+            child_stream.remove();
+            return Err(err);
+        }
+
+        me.refs += 1;
+        let opaque =
+            OpaqueStreamRef::new(self.opaque.inner.clone(), &mut me.store.resolve(child_key));
+
+        Ok(StreamRef {
+            opaque,
+            send_buffer: self.send_buffer.clone(),
+        })
+    }
+
+    /// Called by the server after the stream is accepted. Given that clients
+    /// initialize streams by sending HEADERS, the request will always be
+    /// available.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if the request isn't present.
+    pub fn take_request(&self) -> Request<()> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.opaque.key);
+        me.actions.recv.take_request(&mut stream)
+use crate::codec::UserError;
+use crate::frame::{Reason, StreamId};
+use crate::{client, server};
+
+use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
+use crate::proto::*;
+
+use bytes::Bytes;
+use futures_core::Stream;
+use std::io;
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::io::AsyncRead;
+
+/// An H2 connection
+#[derive(Debug)]
+pub(crate) struct Connection<T, P, B: Buf = Bytes>
+where
+    P: Peer,
+{
+    /// Read / write frame values
+    codec: Codec<T, Prioritized<B>>,
+
+    inner: ConnectionInner<P, B>,
+}
+
+// Extracted part of `Connection` which does not depend on `T`. Reduces the amount of duplicated
+// method instantiations.
+#[derive(Debug)]
+struct ConnectionInner<P, B: Buf = Bytes>
+where
+    P: Peer,
+{
+    /// Tracks the connection level state transitions.
+    state: State,
+
+    /// An error to report back once complete.
+    ///
+    /// This exists separately from State in order to support
+    /// graceful shutdown.
+    error: Option<frame::GoAway>,
+
+    /// Pending GOAWAY frames to write.
+    go_away: GoAway,
+
+    /// Ping/pong handler
+    ping_pong: PingPong,
+
+    /// Connection settings
+    settings: Settings,
+
+    /// Stream state handler
+    streams: Streams<B, P>,
+
+    /// A `tracing` span tracking the lifetime of the connection.
+    span: tracing::Span,
+
+    /// Client or server
+    _phantom: PhantomData<P>,
+}
+
+struct DynConnection<'a, B: Buf = Bytes> {
+    state: &'a mut State,
+
+    go_away: &'a mut GoAway,
+
+    streams: DynStreams<'a, B>,
+
+    error: &'a mut Option<frame::GoAway>,
+
+    ping_pong: &'a mut PingPong,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Config {
+    pub next_stream_id: StreamId,
+    pub initial_max_send_streams: usize,
+    pub max_send_buffer_size: usize,
+    pub reset_stream_duration: Duration,
+    pub reset_stream_max: usize,
+    pub remote_reset_stream_max: usize,
+    pub local_error_reset_streams_max: Option<usize>,
+    pub settings: frame::Settings,
+}
+
+#[derive(Debug)]
+enum State {
+    /// Currently open in a sane state
+    Open,
+
+    /// The codec must be flushed
+    Closing(Reason, Initiator),
+
+    /// In a closed state
+    Closed(Reason, Initiator),
+}
+
+impl<T, P, B> Connection<T, P, B>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+    P: Peer,
+    B: Buf,
+{
+    pub fn new(codec: Codec<T, Prioritized<B>>, config: Config) -> Connection<T, P, B> {
+        fn streams_config(config: &Config) -> streams::Config {
+            streams::Config {
+                initial_max_send_streams: config.initial_max_send_streams,
+                local_max_buffer_size: config.max_send_buffer_size,
+                local_next_stream_id: config.next_stream_id,
+                local_push_enabled: config.settings.is_push_enabled().unwrap_or(true),
+                extended_connect_protocol_enabled: config
+                    .settings
+                    .is_extended_connect_protocol_enabled()
+                    .unwrap_or(false),
+                local_reset_duration: config.reset_stream_duration,
+                local_reset_max: config.reset_stream_max,
+                remote_reset_max: config.remote_reset_stream_max,
+                remote_init_window_sz: DEFAULT_INITIAL_WINDOW_SIZE,
+                remote_max_initiated: config
+                    .settings
+                    .max_concurrent_streams()
+                    .map(|max| max as usize),
+                local_max_error_reset_streams: config.local_error_reset_streams_max,
+            }
+        }
+        let streams = Streams::new(streams_config(&config));
+        Connection {
+            codec,
+            inner: ConnectionInner {
+                state: State::Open,
+                error: None,
+                go_away: GoAway::new(),
+                ping_pong: PingPong::new(),
+                settings: Settings::new(config.settings),
+                streams,
+                span: tracing::debug_span!("Connection", peer = %P::NAME),
+                _phantom: PhantomData,
+            },
+        }
+    }
+
+    /// connection flow control
+    pub(crate) fn set_target_window_size(&mut self, size: WindowSize) {
+        let _res = self.inner.streams.set_target_connection_window_size(size);
+        // TODO: proper error handling
+        debug_assert!(_res.is_ok());
+    }
+
+    /// Send a new SETTINGS frame with an updated initial window size.
+    pub(crate) fn set_initial_window_size(&mut self, size: WindowSize) -> Result<(), UserError> {
+        let mut settings = frame::Settings::default();
+        settings.set_initial_window_size(Some(size));
+        self.inner.settings.send_settings(settings)
+    }
+
+    /// Send a new SETTINGS frame with extended CONNECT protocol enabled.
+    pub(crate) fn set_enable_connect_protocol(&mut self) -> Result<(), UserError> {
+        let mut settings = frame::Settings::default();
+        settings.set_enable_connect_protocol(Some(1));
+        self.inner.settings.send_settings(settings)
+    }
+
+    /// Returns the maximum number of concurrent streams that may be initiated
+    /// by this peer.
+    pub(crate) fn max_send_streams(&self) -> usize {
+        self.inner.streams.max_send_streams()
+    }
+
+    /// Returns the maximum number of concurrent streams that may be initiated
+    /// by the remote peer.
+    pub(crate) fn max_recv_streams(&self) -> usize {
+        self.inner.streams.max_recv_streams()
+    }
+
+    #[cfg(feature = "unstable")]
+    pub fn num_wired_streams(&self) -> usize {
+        self.inner.streams.num_wired_streams()
+    }
+
+    /// Returns `Ready` when the connection is ready to receive a frame.
+    ///
+    /// Returns `Error` as this may raise errors that are caused by delayed
+    /// processing of received frames.
+    fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+        let _e = self.inner.span.enter();
+        let span = tracing::trace_span!("poll_ready");
+        let _e = span.enter();
+        // The order of these calls don't really matter too much
+        ready!(self.inner.ping_pong.send_pending_pong(cx, &mut self.codec))?;
+        ready!(self.inner.ping_pong.send_pending_ping(cx, &mut self.codec))?;
+        ready!(self
+            .inner
+            .settings
+            .poll_send(cx, &mut self.codec, &mut self.inner.streams))?;
+        ready!(self.inner.streams.send_pending_refusal(cx, &mut self.codec))?;
+
+        Poll::Ready(Ok(()))
+    }
+
+    /// Send any pending GOAWAY frames.
+    ///
+    /// This will return `Some(reason)` if the connection should be closed
+    /// afterwards. If this is a graceful shutdown, this returns `None`.
+    fn poll_go_away(&mut self, cx: &mut Context) -> Poll<Option<io::Result<Reason>>> {
+        self.inner.go_away.send_pending_go_away(cx, &mut self.codec)
+    }
+
+    pub fn go_away_from_user(&mut self, e: Reason) {
+        self.inner.as_dyn().go_away_from_user(e)
+    }
+
+    fn take_error(&mut self, ours: Reason, initiator: Initiator) -> Result<(), Error> {
+        let (debug_data, theirs) = self
+            .inner
+            .error
+            .take()
+            .as_ref()
+            .map_or((Bytes::new(), Reason::NO_ERROR), |frame| {
+                (frame.debug_data().clone(), frame.reason())
+            });
+
+        match (ours, theirs) {
+            (Reason::NO_ERROR, Reason::NO_ERROR) => Ok(()),
+            (ours, Reason::NO_ERROR) => Err(Error::GoAway(Bytes::new(), ours, initiator)),
+            // If both sides reported an error, give their
+            // error back to th user. We assume our error
+            // was a consequence of their error, and less
+            // important.
+            (_, theirs) => Err(Error::remote_go_away(debug_data, theirs)),
+        }
+    }
+
+    /// Closes the connection by transitioning to a GOAWAY state
+    /// iff there are no streams or references
+    pub fn maybe_close_connection_if_no_streams(&mut self) {
+        // If we poll() and realize that there are no streams or references
+        // then we can close the connection by transitioning to GOAWAY
+        if !self.inner.streams.has_streams_or_other_references() {
+            self.inner.as_dyn().go_away_now(Reason::NO_ERROR);
+        }
+    }
+
+    /// Checks if there are any streams
+    pub fn has_streams(&self) -> bool {
+        self.inner.streams.has_streams()
+    }
+
+    /// Checks if there are any streams or references left
+    pub fn has_streams_or_other_references(&self) -> bool {
+        // If we poll() and realize that there are no streams or references
+        // then we can close the connection by transitioning to GOAWAY
+        self.inner.streams.has_streams_or_other_references()
+    }
+
+    pub(crate) fn take_user_pings(&mut self) -> Option<UserPings> {
+        self.inner.ping_pong.take_user_pings()
+    }
+
+    /// Advances the internal state of the connection.
+    pub fn poll(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+        // XXX(eliza): cloning the span is unfortunately necessary here in
+        // order to placate the borrow checker — `self` is mutably borrowed by
+        // `poll2`, which means that we can't borrow `self.span` to enter it.
+        // The clone is just an atomic ref bump.
+        let span = self.inner.span.clone();
+        let _e = span.enter();
+        let span = tracing::trace_span!("poll");
+        let _e = span.enter();
+
+        loop {
+            tracing::trace!(connection.state = ?self.inner.state);
+            // TODO: probably clean up this glob of code
+            match self.inner.state {
+                // When open, continue to poll a frame
+                State::Open => {
+                    let result = match self.poll2(cx) {
+                        Poll::Ready(result) => result,
+                        // The connection is not ready to make progress
+/work/.cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-util-0.7.20/src/util/poll_buf.rs:122:pub fn poll_write_buf<T: AsyncWrite + ?Sized, B: Buf>(
+7.556150000000001 minutes used of 45.0

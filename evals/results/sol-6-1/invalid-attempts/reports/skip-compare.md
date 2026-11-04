@@ -1,0 +1,9 @@
+Rust manages memory through ownership rules checked by the compiler. Each value has an owner, and borrowing lets other code access it under controlled conditions. Memory is usually released when its owner goes out of scope, without a garbage collector. This gives predictable cleanup and fine control, but requires more care when designing how data is shared.
+
+Go uses a garbage collector to reclaim memory that is no longer needed. This makes sharing data and managing its lifetime simpler for programmers. The tradeoff is runtime work: garbage collection consumes processing time, needs some memory overhead, and can introduce brief pauses.
+
+For concurrency, Rust emphasizes checking shared access before the program runs. Safe Rust prevents data races—situations where concurrent operations access the same memory without proper coordination and at least one writes to it. Rust supports threads and asynchronous tasks, with asynchronous scheduling typically supplied by a library. These checks provide strong guarantees, but can make concurrent code harder to write initially.
+
+Go emphasizes lightweight concurrent tasks called goroutines, which its runtime schedules across operating-system threads. Channels let goroutines communicate, while locks coordinate access to shared data. Starting concurrent work is straightforward, but Go generally does not prevent data races at compile time; its race detector can find races exercised during testing.
+
+Both languages can run work in parallel, and both can still suffer from deadlocks and other coordination bugs. Rust puts more responsibility into compile-time rules; Go puts more support into its runtime.

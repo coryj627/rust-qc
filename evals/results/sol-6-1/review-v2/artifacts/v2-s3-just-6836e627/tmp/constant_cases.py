@@ -1,0 +1,6 @@
+exec(open('/work/tmp/regressions.py').read().split("case('private-module'")[0])
+case('constant-before',"A := HEX\nHEX := 'custom'\n@show:\n  echo {{A}} {{HEX}}\n", ['show'])
+case('constant-after',"z := HEX\nHEX := 'custom'\n@show:\n  echo {{z}} {{HEX}}\n", ['show'])
+case('constant-lazy',"set lazy\nHEX := 'custom'\nA := HEX\n@show:\n  echo {{A}}\n", ['show'])
+case('constant-eval',"HEX := 'custom'\nz := HEX\n", ['--evaluate','z'])
+case('constant-override',"A := HEX\nHEX := 'custom'\n@show:\n  echo {{A}} {{HEX}}\n", ['HEX=override','show'])

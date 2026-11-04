@@ -1,0 +1,780 @@
+src/future/cache.rs:641:1
+src/future/cache.rs:649:1
+src/sync/cache.rs:576:1
+src/sync/cache.rs:584:1
+src/sync/segment.rs:37:1
+src/sync/segment.rs:45:1
+src/common/concurrent/arc.rs:60:1
+src/common/concurrent/arc.rs:61:1
+src/common/concurrent/deques.rs:23:1
+src/common/concurrent.rs:156:1
+src/common/iter.rs:132:1
+src/common/iter.rs:144:1
+src/common/timer_wheel.rs:167:1
+//! A lock-free hash map implemented with bucket pointer arrays, open addressing,
+//! and linear probing.
+
+pub(crate) mod bucket;
+pub(crate) mod bucket_array_ref;
+
+use std::collections::hash_map::RandomState;
+
+/// Default hasher for `HashMap`.
+pub type DefaultHashBuilder = RandomState;
+use std::{
+    hash::{BuildHasher, Hash, Hasher},
+    mem::{self, MaybeUninit},
+    ptr,
+    sync::{
+        atomic::{self, AtomicUsize, Ordering},
+        Arc, Mutex, TryLockError,
+    },
+};
+
+#[cfg(feature = "unstable-debug-counters")]
+use crate::common::concurrent::debug_counters;
+
+use crossbeam_epoch::{Atomic, CompareExchangeError, Guard, Owned, Shared};
+
+pub(crate) const BUCKET_ARRAY_DEFAULT_LENGTH: usize = 128;
+
+pub(crate) struct BucketArray<K, V> {
+    pub(crate) buckets: Box<[Atomic<Bucket<K, V>>]>,
+    pub(crate) next: Atomic<BucketArray<K, V>>,
+    pub(crate) epoch: usize,
+    pub(crate) rehash_lock: Arc<Mutex<()>>,
+    pub(crate) tombstone_count: AtomicUsize,
+}
+
+impl<K, V> Default for BucketArray<K, V> {
+    fn default() -> Self {
+        Self::with_length(0, BUCKET_ARRAY_DEFAULT_LENGTH)
+    }
+}
+
+impl<K, V> BucketArray<K, V> {
+    pub(crate) fn with_length(epoch: usize, length: usize) -> Self {
+        assert!(length.is_power_of_two());
+        let mut buckets = Vec::with_capacity(length);
+
+        unsafe {
+            ptr::write_bytes(buckets.as_mut_ptr(), 0, length);
+            buckets.set_len(length);
+        }
+
+        let buckets = buckets.into_boxed_slice();
+
+        #[cfg(feature = "unstable-debug-counters")]
+        {
+            use debug_counters::InternalGlobalDebugCounters as Counters;
+
+            let size = (buckets.len() * std::mem::size_of::<Atomic<Bucket<K, V>>>()) as u64;
+            Counters::bucket_array_created(size);
+        }
+
+        Self {
+            buckets,
+            next: Atomic::null(),
+            epoch,
+            rehash_lock: Arc::new(Mutex::new(())),
+            tombstone_count: AtomicUsize::default(),
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        assert!(self.buckets.len().is_power_of_two());
+
+        self.buckets.len() / 2
+    }
+}
+
+#[cfg(feature = "unstable-debug-counters")]
+impl<K, V> Drop for BucketArray<K, V> {
+    fn drop(&mut self) {
+        use debug_counters::InternalGlobalDebugCounters as Counters;
+
+        let size = (self.buckets.len() * std::mem::size_of::<Atomic<Bucket<K, V>>>()) as u64;
+        Counters::bucket_array_dropped(size);
+    }
+}
+
+impl<'g, K: 'g + Eq, V: 'g> BucketArray<K, V> {
+    pub(crate) fn get(
+        &self,
+        guard: &'g Guard,
+        hash: u64,
+        mut eq: impl FnMut(&K) -> bool,
+    ) -> Result<Shared<'g, Bucket<K, V>>, RelocatedError> {
+        for bucket in self.probe(guard, hash) {
+            let Ok((_, _, this_bucket_ptr)) = bucket else {
+                return Err(RelocatedError);
+            };
+
+            let Some(this_bucket_ref) = (unsafe { this_bucket_ptr.as_ref() }) else {
+                // Not found.
+                return Ok(Shared::null());
+            };
+
+            if !eq(&this_bucket_ref.key) {
+                // Different key. Try next bucket
+                continue;
+            }
+
+            if is_tombstone(this_bucket_ptr) {
+                // Not found. (It has been removed)
+                return Ok(Shared::null());
+            } else {
+                // Found.
+                return Ok(this_bucket_ptr);
+            }
+        }
+
+        Ok(Shared::null())
+    }
+
+    pub(crate) fn remove_if<F>(
+        &self,
+        guard: &'g Guard,
+        hash: u64,
+        mut eq: impl FnMut(&K) -> bool,
+        mut condition: F,
+    ) -> Result<Shared<'g, Bucket<K, V>>, F>
+    where
+        F: FnMut(&K, &V) -> bool,
+    {
+        let mut probe = self.probe(guard, hash);
+        while let Some(bucket) = probe.next() {
+            let Ok((_, this_bucket, this_bucket_ptr)) = bucket else {
+                return Err(condition);
+            };
+
+            let Some(this_bucket_ref) = (unsafe { this_bucket_ptr.as_ref() }) else {
+                // Nothing to remove.
+                return Ok(Shared::null());
+            };
+
+            let this_key = &this_bucket_ref.key;
+
+            if !eq(this_key) {
+                // Different key. Try next bucket.
+                continue;
+            }
+
+            if is_tombstone(this_bucket_ptr) {
+                // Already removed.
+                return Ok(Shared::null());
+            }
+
+            let this_value = unsafe { &*this_bucket_ref.maybe_value.as_ptr() };
+
+            if !condition(this_key, this_value) {
+                // Found but the condition is false. Do not remove.
+                return Ok(Shared::null());
+            }
+
+            // Found and the condition is true. Remove it. (Make it a tombstone)
+
+            let new_bucket_ptr = this_bucket_ptr.with_tag(TOMBSTONE_TAG);
+
+            match this_bucket.compare_exchange_weak(
+                this_bucket_ptr,
+                new_bucket_ptr,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+// This module's source code was written by us, the `moka` developers, referring to
+// the following book and code:
+//
+// - Chapter 6. Building Our Own "Arc" of the Rust Atomics and Locks book.
+//     - Rust Atomics and Locks by Mara Bos (O’Reilly). Copyright 2023 Mara Bos,
+//       ISBN: 978-1-098-11944-7
+//     - https://marabos.nl/atomics/
+// - The `triomphe` crate v0.1.13 and v0.1.11 by Manish Goregaokar (Manishearth)
+//     - MIT or Apache-2.0 License
+//     - https://github.com/Manishearth/triomphe
+// - `std::sync::Arc` in the Rust Standard Library (1.81.0).
+//     -  MIT or Apache-2.0 License
+
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+    ops::Deref,
+    ptr::NonNull,
+};
+
+#[cfg(not(moka_loom))]
+use std::sync::atomic::{self, AtomicU32};
+
+#[cfg(moka_loom)]
+use loom::sync::atomic::{self, AtomicU32};
+
+/// A thread-safe reference-counting pointer. `MiniArc` is similar to
+/// `std::sync::Arc`, Atomically Reference Counted shared pointer, but with a few
+/// differences:
+///
+/// - Smaller memory overhead:
+///     - `MiniArc` does not support weak references, so it does not need to store a
+///       weak reference count.
+///     - `MiniArc` uses `AtomicU32` for the reference count, while `std::sync::Arc`
+///       uses `AtomicUsize`. On a 64-bit system, `AtomicU32` is half the size of
+///       `AtomicUsize`.
+///         - Note: Depending on the value type `T`, the Rust compiler may add
+///           padding to the internal struct of `MiniArc<T>`, so the actual memory
+///           overhead may vary.
+/// - Smaller code size:
+///     - Only about 100 lines of code.
+///         - This is because `MiniArc` provides only the methods needed for the
+///           `moka` and `mini-moka` crates.
+///     - Smaller code size means less chance of bugs.
+pub(crate) struct MiniArc<T: ?Sized> {
+    ptr: NonNull<ArcData<T>>,
+}
+
+struct ArcData<T: ?Sized> {
+    ref_count: AtomicU32,
+    data: T,
+}
+
+/// A soft limit on the amount of references that may be made to an `MiniArc`.
+///
+/// Going above this limit will abort your program (although not necessarily)
+/// at _exactly_ `MAX_REFCOUNT + 1` references.
+const MAX_REFCOUNT: u32 = (i32::MAX) as u32;
+
+unsafe impl<T: ?Sized + Send + Sync> Send for MiniArc<T> {}
+unsafe impl<T: ?Sized + Send + Sync> Sync for MiniArc<T> {}
+
+impl<T> MiniArc<T> {
+    pub(crate) fn new(data: T) -> MiniArc<T> {
+        MiniArc {
+            ptr: NonNull::from(Box::leak(Box::new(ArcData {
+                ref_count: AtomicU32::new(1),
+                data,
+            }))),
+        }
+    }
+}
+
+impl<T: ?Sized> MiniArc<T> {
+    /// Gets the number of [`MiniArc`] pointers to this allocation
+    pub(crate) fn count(this: &Self) -> u32 {
+        use atomic::Ordering::Acquire;
+
+        this.data().ref_count.load(Acquire)
+    }
+
+    /// Returns `true` if the two `MiniArc`s point to the same allocation in a
+    /// vein similar to [`ptr::eq`].
+    ///
+    /// # Safety
+    ///
+    /// This function is unreliable when `T` is a `dyn Trait`. Currently
+    /// coercing `MiniArc<SomeTime>` to `MiniArc<dyn Trait>` is not possible, so
+    /// this is not a problem in practice. However, if this coercion becomes
+    /// possible in the future, this function may return incorrect results when
+    /// comparing `MiniArc<dyn Trait>` instances.
+    ///
+    /// To fix this, we must rise the minimum supported Rust version (MSRV) to
+    /// 1.76 and use `std::ptr::addr_eq` internally instead of `eq` (`==`).
+    /// `addr_eq` compares the _addresses_ of the pointers for equality,
+    /// ignoring any metadata in fat pointers.
+    ///
+    /// See the following `triomphe` issue for more information:
+    /// https://github.com/Manishearth/triomphe/pull/84
+    ///
+    /// Note that `triomphe` has a feature called `unsize`, which enables the
+    /// coercion by using the `unsize` crate. `MiniArc` does not have such a
+    /// feature, so we are safe for now.
+    #[inline]
+    #[allow(ambiguous_wide_pointer_comparisons)] // Remove this when MSRV is 1.76 or newer.
+    #[allow(clippy::ptr_eq)] // Remove this when MSRV is 1.76 or newer.
+    pub(crate) fn ptr_eq(this: &Self, other: &Self) -> bool {
+        // `addr_eq` requires Rust 1.76 or newer.
+        // ptr::addr_eq(this.ptr.as_ptr(), other.ptr.as_ptr())
+        this.ptr.as_ptr() == other.ptr.as_ptr()
+    }
+
+    #[inline]
+    fn data(&self) -> &ArcData<T> {
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
+impl<T: ?Sized> Deref for MiniArc<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.data().data
+    }
+}
+
+impl<T: ?Sized> Clone for MiniArc<T> {
+    fn clone(&self) -> Self {
+        use atomic::Ordering::Relaxed;
+
+        if self.data().ref_count.fetch_add(1, Relaxed) > MAX_REFCOUNT {
+            std::process::abort();
+        }
+
+        MiniArc { ptr: self.ptr }
+    }
+}
+
+impl<T: ?Sized> Drop for MiniArc<T> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+
+        if self.data().ref_count.fetch_sub(1, Release) == 1 {
+            atomic::fence(Acquire);
+            unsafe {
+                drop(Box::from_raw(self.ptr.as_ptr()));
+            }
+        }
+    }
+}
+
+impl<T: Default> Default for MiniArc<T> {
+    /// Creates a new `MiniArc<T>`, with the `Default` value for `T`.
+    fn default() -> MiniArc<T> {
+        MiniArc::new(Default::default())
+    }
+}
+
+impl<T: ?Sized + PartialEq> PartialEq for MiniArc<T> {
+    fn eq(&self, other: &MiniArc<T>) -> bool {
+        // TODO: pointer equality is incorrect if `T` is not `Eq`.
+        // See: https://github.com/Manishearth/triomphe/pull/88
+        Self::ptr_eq(self, other) || *(*self) == *(*other)
+    }
+
+    #[allow(clippy::partialeq_ne_impl)]
+    fn ne(&self, other: &MiniArc<T>) -> bool {
+        !Self::ptr_eq(self, other) && *(*self) != *(*other)
+    }
+}
+
+impl<T: ?Sized + Eq> Eq for MiniArc<T> {}
+
+impl<T: ?Sized + fmt::Display> fmt::Display for MiniArc<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&**self, f)
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for MiniArc<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<T: ?Sized> fmt::Pointer for MiniArc<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Pointer::fmt(&self.ptr.as_ptr(), f)
+    }
+}
+
+impl<T: ?Sized + Hash> Hash for MiniArc<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (**self).hash(state)
+    }
+}
+
+#[cfg(all(test, not(moka_loom)))]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    use super::*;
+
+    #[test]
+    fn test_drop() {
+        static NUM_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        struct DetectDrop;
+
+        impl Drop for DetectDrop {
+            fn drop(&mut self) {
+                NUM_DROPS.fetch_add(1, Relaxed);
+            }
+        }
+
+        // Create two MiniArcs sharing an object containing a string
+        // and a DetectDrop, to detect when it is dropped.
+        let x = MiniArc::new(("hello", DetectDrop));
+        let y = x.clone();
+
+// License and Copyright Notice:
+//
+// Some of the code and doc comments in this module were copied from
+// `std::collections::LinkedList` in the Rust standard library.
+// https://github.com/rust-lang/rust/blob/master/src/liballoc/collections/linked_list.rs
+//
+// The original code/comments from LinkedList are dual-licensed under
+// the Apache License, Version 2.0 <https://github.com/rust-lang/rust/blob/master/LICENSE-APACHE>
+// or the MIT license <https://github.com/rust-lang/rust/blob/master/LICENSE-MIT>
+//
+// Copyrights of the original code/comments are retained by their contributors.
+// For full authorship information, see the version control history of
+// https://github.com/rust-lang/rust/ or https://thanks.rust-lang.org
+
+use std::{marker::PhantomData, ptr::NonNull};
+
+use super::CacheRegion;
+
+#[cfg(feature = "unstable-debug-counters")]
+use crate::common::concurrent::debug_counters;
+
+// `crate::{sync,unsync}::DeqNodes` uses a `tagptr::TagNonNull<DeqNode<T>, 2>`
+// pointer. To reserve the space for the 2-bit tag, use 4 bytes as the *minimum*
+// alignment.
+// https://doc.rust-lang.org/reference/type-layout.html#the-alignment-modifiers
+#[repr(align(4))]
+#[derive(PartialEq, Eq)]
+pub(crate) struct DeqNode<T> {
+    next: Option<NonNull<DeqNode<T>>>,
+    prev: Option<NonNull<DeqNode<T>>>,
+    pub(crate) element: T,
+}
+
+impl<T> std::fmt::Debug for DeqNode<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeqNode")
+            .field("next", &self.next)
+            .field("prev", &self.prev)
+            .finish()
+    }
+}
+
+impl<T> DeqNode<T> {
+    pub(crate) fn new(element: T) -> Self {
+        #[cfg(feature = "unstable-debug-counters")]
+        debug_counters::InternalGlobalDebugCounters::deq_node_created();
+
+        Self {
+            next: None,
+            prev: None,
+            element,
+        }
+    }
+
+    pub(crate) fn next_node_ptr(this: NonNull<Self>) -> Option<NonNull<DeqNode<T>>> {
+        unsafe { this.as_ref() }.next
+    }
+}
+
+#[cfg(feature = "unstable-debug-counters")]
+impl<T> Drop for DeqNode<T> {
+    fn drop(&mut self) {
+        debug_counters::InternalGlobalDebugCounters::deq_node_dropped();
+    }
+}
+
+/// Cursor is used to remember the current iterating position.
+enum DeqCursor<T> {
+    Node(NonNull<DeqNode<T>>),
+    Done,
+}
+
+pub(crate) struct Deque<T> {
+    region: CacheRegion,
+    len: usize,
+    head: Option<NonNull<DeqNode<T>>>,
+    tail: Option<NonNull<DeqNode<T>>>,
+    cursor: Option<DeqCursor<T>>,
+    marker: PhantomData<Box<DeqNode<T>>>,
+}
+
+impl<T> Drop for Deque<T> {
+    fn drop(&mut self) {
+        struct DropGuard<'a, T>(&'a mut Deque<T>);
+
+        impl<T> Drop for DropGuard<'_, T> {
+            fn drop(&mut self) {
+                // Continue the same loop we do below. This only runs when a destructor has
+                // panicked. If another one panics this will abort.
+                while self.0.pop_front().is_some() {}
+            }
+        }
+
+        while let Some(node) = self.pop_front() {
+            let guard = DropGuard(self);
+            drop(node);
+            std::mem::forget(guard);
+        }
+    }
+}
+
+// Inner crate public function/methods
+impl<T> Deque<T> {
+    pub(crate) fn new(region: CacheRegion) -> Self {
+        Self {
+            region,
+            len: 0,
+            head: None,
+            tail: None,
+            cursor: None,
+            marker: PhantomData,
+        }
+    }
+
+    pub(crate) fn region(&self) -> CacheRegion {
+        self.region
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn contains(&self, node: &DeqNode<T>) -> bool {
+        node.prev.is_some() || self.is_head(node)
+    }
+
+    pub(crate) fn peek_front(&self) -> Option<&DeqNode<T>> {
+        self.head.as_ref().map(|node| unsafe { node.as_ref() })
+    }
+
+    pub(crate) fn peek_front_ptr(&self) -> Option<NonNull<DeqNode<T>>> {
+        self.head.as_ref().copied()
+    }
+
+    /// Removes and returns the node at the front of the list.
+    pub(crate) fn pop_front(&mut self) -> Option<Box<DeqNode<T>>> {
+        // This method takes care not to create mutable references to whole nodes,
+        // to maintain validity of aliasing pointers into `element`.
+        self.head.map(|node| unsafe {
+            if self.is_at_cursor(node.as_ref()) {
+                self.advance_cursor();
+            }
+
+            let mut node = Box::from_raw(node.as_ptr());
+            self.head = node.next;
+
+            match self.head {
+                None => self.tail = None,
+                // Not creating new mutable (unique!) references overlapping `element`.
+                Some(head) => (*head.as_ptr()).prev = None,
+            }
+
+            self.len -= 1;
+
+            node.prev = None;
+            node.next = None;
+            node
+        })
+    }
+
+    pub(crate) fn peek_back(&self) -> Option<&DeqNode<T>> {
+        self.tail.as_ref().map(|node| unsafe { node.as_ref() })
+    }
+
+    /// Adds the given node to the back of the list.
+    pub(crate) fn push_back(&mut self, mut node: Box<DeqNode<T>>) -> NonNull<DeqNode<T>> {
+        // This method takes care not to create mutable references to whole nodes,
+        // to maintain validity of aliasing pointers into `element`.
+        unsafe {
+            node.next = None;
+            node.prev = self.tail;
+            let node = NonNull::new(Box::into_raw(node)).expect("Got a null ptr");
+
+            match self.tail {
+                None => self.head = Some(node),
+                // Not creating new mutable (unique!) references overlapping `element`.
+                Some(tail) => (*tail.as_ptr()).next = Some(node),
+            }
+
+            self.tail = Some(node);
+            self.len += 1;
+            node
+        }
+    }
+
+    pub(crate) unsafe fn move_to_back(&mut self, mut node: NonNull<DeqNode<T>>) {
+        if self.is_tail(node.as_ref()) {
+            // Already at the tail. Nothing to do.
+            return;
+        }
+
+        if self.is_at_cursor(node.as_ref()) {
+            self.advance_cursor();
+        }
+
+        let node = node.as_mut(); // this one is ours now, we can create an &mut.
+
+        // Not creating new mutable (unique!) references overlapping `element`.
+        match node.prev {
+            Some(prev) if node.next.is_some() => (*prev.as_ptr()).next = node.next,
+        d_map.finish()
+    }
+}
+
+impl<K, V, S> Cache<K, V, S> {
+    /// Returns cache’s name.
+    pub fn name(&self) -> Option<&str> {
+        self.base.name()
+    }
+
+    /// Returns a read-only cache policy of this cache.
+    ///
+    /// At this time, cache policy cannot be modified after cache creation.
+    /// A future version may support to modify it.
+    pub fn policy(&self) -> Policy {
+        self.base.policy()
+    }
+
+    /// Returns an approximate number of entries in this cache.
+    ///
+    /// The value returned is _an estimate_; the actual count may differ if there are
+    /// concurrent insertions or removals, or if some entries are pending removal due
+    /// to expiration. This inaccuracy can be mitigated by calling
+    /// `run_pending_tasks` first.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// // Cargo.toml
+    /// //
+    /// // [dependencies]
+    /// // moka = { version = "0.12", features = ["future"] }
+    /// // tokio = { version = "1", features = ["rt-multi-thread", "macros" ] }
+    /// use moka::future::Cache;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let cache = Cache::new(10);
+    ///     cache.insert('n', "Netherland Dwarf").await;
+    ///     cache.insert('l', "Lop Eared").await;
+    ///     cache.insert('d', "Dutch").await;
+    ///
+    ///     // Ensure an entry exists.
+    ///     assert!(cache.contains_key(&'n'));
+    ///
+    ///     // However, followings may print stale number zeros instead of threes.
+    ///     println!("{}", cache.entry_count());   // -> 0
+    ///     println!("{}", cache.weighted_size()); // -> 0
+    ///
+    ///     // To mitigate the inaccuracy, call `run_pending_tasks` to run pending
+    ///     // internal tasks.
+    ///     cache.run_pending_tasks().await;
+    ///
+    ///     // Followings will print the actual numbers.
+    ///     println!("{}", cache.entry_count());   // -> 3
+    ///     println!("{}", cache.weighted_size()); // -> 3
+    /// }
+    /// ```
+    ///
+    pub fn entry_count(&self) -> u64 {
+        self.base.entry_count()
+    }
+
+    /// Returns an approximate total weighted size of entries in this cache.
+    ///
+    /// The value returned is _an estimate_; the actual size may differ if there are
+    /// concurrent insertions or removals, or if some entries are pending removal due
+    /// to expiration. This inaccuracy can be mitigated by calling
+    /// `run_pending_tasks` first. See [`entry_count`](#method.entry_count) for a
+    /// sample code.
+    pub fn weighted_size(&self) -> u64 {
+        self.base.weighted_size()
+    }
+
+    #[cfg(feature = "unstable-debug-counters")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "unstable-debug-counters")))]
+    pub async fn debug_stats(&self) -> CacheDebugStats {
+        self.base.debug_stats().await
+    }
+}
+
+impl<K, V> Cache<K, V, RandomState>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    /// Constructs a new `Cache<K, V>` that will store up to the `max_capacity`.
+    ///
+    /// To adjust various configuration knobs such as `initial_capacity` or
+    /// `time_to_live`, use the [`CacheBuilder`][builder-struct].
+    ///
+    /// [builder-struct]: ./struct.CacheBuilder.html
+    pub fn new(max_capacity: u64) -> Self {
+        let build_hasher = RandomState::default();
+        Self::with_everything(
+            None,
+            Some(max_capacity),
+            None,
+            build_hasher,
+            None,
+            EvictionPolicy::default(),
+///
+pub struct Cache<K, V, S = RandomState> {
+    pub(crate) base: BaseCache<K, V, S>,
+    value_initializer: Arc<ValueInitializer<K, V, S>>,
+}
+
+unsafe impl<K, V, S> Send for Cache<K, V, S>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+    S: Send,
+{
+}
+
+unsafe impl<K, V, S> Sync for Cache<K, V, S>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+    S: Sync,
+{
+}
+
+// NOTE: We cannot do `#[derive(Clone)]` because it will add `Clone` bound to `K`.
+impl<K, V, S> Clone for Cache<K, V, S> {
+    /// Makes a clone of this shared cache.
+    ///
+    /// This operation is cheap as it only creates thread-safe reference counted
+    /// pointers to the shared internal data structures.
+    fn clone(&self) -> Self {
+        Self {
+            base: self.base.clone(),
+            value_initializer: Arc::clone(&self.value_initializer),
+        }
+    }
+}
+
+impl<K, V, S> fmt::Debug for Cache<K, V, S>
+where
+    K: fmt::Debug + Eq + Hash + Send + Sync + 'static,
+    V: fmt::Debug + Clone + Send + Sync + 'static,
+    // TODO: Remove these bounds from S.
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut d_map = f.debug_map();
+
+        for (k, v) in self {
+            d_map.entry(&k, &v);
+        }
+
+        d_map.finish()
+    }
+}
+
+impl<K, V, S> Cache<K, V, S> {
+    /// Returns cache’s name.
+    pub fn name(&self) -> Option<&str> {
+        self.base.name()
+    }
+
+    /// Returns a read-only cache policy of this cache.
+    ///
+    /// At this time, cache policy cannot be modified after cache creation.
+    /// A future version may support to modify it.
+    pub fn policy(&self) -> Policy {
+        self.base.policy()
+    }
+
+    /// Returns an approximate number of entries in this cache.
+    ///
+    /// The value returned is _an estimate_; the actual count may differ if there are
+    /// concurrent insertions or removals, or if some entries are pending removal due
+    /// to expiration. This inaccuracy can be mitigated by performing a
+    /// `run_pending_tasks` first.
+    ///
+    /// # Example

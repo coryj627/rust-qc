@@ -1,0 +1,481 @@
+src/codec/framed_write.rs:10:use tokio_util::io::poll_write_buf;
+src/codec/framed_write.rs:86:        let chain_threshold = if inner.is_write_vectored() {
+src/codec/framed_write.rs:142:                        ready!(poll_write_buf(Pin::new(&mut self.inner), cx, &mut buf))?
+src/codec/framed_write.rs:146:                        ready!(poll_write_buf(
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Flush the codec
+        ready!(self.codec.as_mut().unwrap().flush(cx)).map_err(crate::Error::from_io)?;
+
+        // Return the codec
+        Poll::Ready(Ok(self.codec.take().unwrap()))
+    }
+}
+
+impl<T, B: Buf> ReadPreface<T, B> {
+    fn new(codec: Codec<T, B>) -> Self {
+        ReadPreface {
+            codec: Some(codec),
+            pos: 0,
+        }
+    }
+
+    fn inner_mut(&mut self) -> &mut T {
+        self.codec.as_mut().unwrap().get_mut()
+    }
+}
+
+impl<T, B> Future for ReadPreface<T, B>
+where
+    T: AsyncRead + Unpin,
+    B: Buf,
+{
+    type Output = Result<Codec<T, B>, crate::Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut buf = [0; 24];
+        let mut rem = PREFACE.len() - self.pos;
+
+        while rem > 0 {
+            let mut buf = ReadBuf::new(&mut buf[..rem]);
+            ready!(Pin::new(self.inner_mut()).poll_read(cx, &mut buf))
+                .map_err(crate::Error::from_io)?;
+            let n = buf.filled().len();
+            if n == 0 {
+                return Poll::Ready(Err(crate::Error::from_io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed before reading preface",
+                ))));
+            }
+
+            if &PREFACE[self.pos..self.pos + n] != buf.filled() {
+                proto_err!(conn: "read_preface: invalid preface");
+                // TODO: Should this just write the GO_AWAY frame directly?
+                return Poll::Ready(Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into()));
+            }
+
+            self.pos += n;
+            rem -= n; // TODO test
+        }
+
+        Poll::Ready(Ok(self.codec.take().unwrap()))
+    }
+}
+
+// ===== impl Handshake =====
+mod error;
+mod framed_read;
+mod framed_write;
+
+pub use self::error::{SendError, UserError};
+
+use self::framed_read::FramedRead;
+use self::framed_write::FramedWrite;
+
+use crate::frame::{self, Data, Frame};
+use crate::proto::Error;
+
+use bytes::Buf;
+use futures_core::Stream;
+use futures_sink::Sink;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::codec::length_delimited;
+
+use std::io;
+
+#[derive(Debug)]
+pub struct Codec<T, B> {
+    inner: FramedRead<FramedWrite<T, B>>,
+}
+
+impl<T, B> Codec<T, B>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+    B: Buf,
+{
+    /// Returns a new `Codec` with the default max frame size
+    #[inline]
+    pub fn new(io: T) -> Self {
+        Self::with_max_recv_frame_size(io, frame::DEFAULT_MAX_FRAME_SIZE as usize)
+    }
+
+    /// Returns a new `Codec` with the given maximum frame size
+    pub fn with_max_recv_frame_size(io: T, max_frame_size: usize) -> Self {
+        // Wrap with writer
+        let framed_write = FramedWrite::new(io);
+
+        // Delimit the frames
+        let delimited = length_delimited::Builder::new()
+            .big_endian()
+            .length_field_length(3)
+            .length_adjustment(9)
+            .num_skip(0) // Don't skip the header
+            .new_read(framed_write);
+
+        let mut inner = FramedRead::new(delimited);
+
+        // Use FramedRead's method since it checks the value is within range.
+        inner.set_max_frame_size(max_frame_size);
+
+        Codec { inner }
+    }
+}
+
+impl<T, B> Codec<T, B> {
+    /// Updates the max received frame size.
+    ///
+    /// The change takes effect the next time a frame is decoded. In other
+    /// words, if a frame is currently in process of being decoded with a frame
+    /// size greater than `val` but less than the max frame size in effect
+    /// before calling this function, then the frame will be allowed.
+    #[inline]
+    pub fn set_max_recv_frame_size(&mut self, val: usize) {
+        self.inner.set_max_frame_size(val)
+    }
+
+    /// Returns the current max received frame size setting.
+    ///
+    /// This is the largest size this codec will accept from the wire. Larger
+    /// frames will be rejected.
+    #[cfg(feature = "unstable")]
+    #[inline]
+    pub fn max_recv_frame_size(&self) -> usize {
+        self.inner.max_frame_size()
+    }
+
+    /// Returns the max frame size that can be sent to the peer.
+    pub fn max_send_frame_size(&self) -> usize {
+        self.inner.get_ref().max_frame_size()
+    }
+
+    /// Set the peer's max frame size.
+    pub fn set_max_send_frame_size(&mut self, val: usize) {
+        self.framed_write().set_max_frame_size(val)
+    }
+
+    /// Set the peer's header table size size.
+    pub fn set_send_header_table_size(&mut self, val: usize) {
+        self.framed_write().set_header_table_size(val)
+    }
+
+    /// Set the decoder header table size size.
+    pub fn set_recv_header_table_size(&mut self, val: usize) {
+        self.inner.set_header_table_size(val)
+    }
+
+    /// Set the max header list size that can be received.
+    pub fn set_max_recv_header_list_size(&mut self, val: usize) {
+        self.inner.set_max_header_list_size(val);
+    }
+
+    /// Get a reference to the inner stream.
+    #[cfg(feature = "unstable")]
+    pub fn get_ref(&self) -> &T {
+        self.inner.get_ref().get_ref()
+    }
+
+    /// Get a mutable reference to the inner stream.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.inner.get_mut().get_mut()
+    }
+
+    /// Takes the data payload value that was fully written to the socket
+    pub(crate) fn take_last_data_frame(&mut self) -> Option<Data<B>> {
+        self.framed_write().take_last_data_frame()
+    }
+
+    fn framed_write(&mut self) -> &mut FramedWrite<T, B> {
+        self.inner.get_mut()
+    }
+}
+
+impl<T, B> Codec<T, B>
+where
+    T: AsyncWrite + Unpin,
+    B: Buf,
+{
+    /// Returns `Ready` when the codec can buffer a frame
+    pub fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.framed_write().poll_ready(cx)
+    }
+
+    /// Buffer a frame.
+    ///
+    /// `poll_ready` must be called first to ensure that a frame may be
+    /// accepted.
+    ///
+    /// TODO: Rename this to avoid conflicts with Sink::buffer
+    pub fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
+        self.framed_write().buffer(item)
+    }
+
+    /// Flush buffered data to the wire
+    pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.framed_write().flush(cx)
+    }
+
+    /// Shutdown the send half
+    pub fn shutdown(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.framed_write().shutdown(cx)
+    }
+}
+
+impl<T, B> Stream for Codec<T, B>
+where
+    T: AsyncRead + Unpin,
+{
+    type Item = Result<Frame, Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+use super::table::{Index, Table};
+use super::{huffman, Header};
+
+use bytes::{BufMut, BytesMut};
+use http::header::{HeaderName, HeaderValue};
+
+#[derive(Debug)]
+pub struct Encoder {
+    table: Table,
+    size_update: Option<SizeUpdate>,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum SizeUpdate {
+    One(usize),
+    Two(usize, usize), // min, max
+}
+
+impl Encoder {
+    pub fn new(max_size: usize, capacity: usize) -> Encoder {
+        Encoder {
+            table: Table::new(max_size, capacity),
+            size_update: None,
+        }
+    }
+
+    /// Queues a max size update.
+    ///
+    /// The next call to `encode` will include a dynamic size update frame.
+    pub fn update_max_size(&mut self, val: usize) {
+        match self.size_update {
+            Some(SizeUpdate::One(old)) => {
+                if val > old {
+                    if old > self.table.max_size() {
+                        self.size_update = Some(SizeUpdate::One(val));
+                    } else {
+                        self.size_update = Some(SizeUpdate::Two(old, val));
+                    }
+                } else {
+                    self.size_update = Some(SizeUpdate::One(val));
+                }
+            }
+            Some(SizeUpdate::Two(min, _)) => {
+                if val < min {
+                    self.size_update = Some(SizeUpdate::One(val));
+                } else {
+                    self.size_update = Some(SizeUpdate::Two(min, val));
+                }
+            }
+            None => {
+                if val != self.table.max_size() {
+                    // Don't bother writing a frame if the value already matches
+                    // the table's max size.
+                    self.size_update = Some(SizeUpdate::One(val));
+                }
+            }
+        }
+    }
+
+    /// Encode a set of headers into the provide buffer
+    pub fn encode<I>(&mut self, headers: I, dst: &mut BytesMut)
+    where
+        I: IntoIterator<Item = Header<Option<HeaderName>>>,
+    {
+        let span = tracing::trace_span!("hpack::encode");
+        let _e = span.enter();
+
+        self.encode_size_updates(dst);
+
+        let mut last_index = None;
+
+        for header in headers {
+            match header.reify() {
+                // The header has an associated name. In which case, try to
+                // index it in the table.
+                Ok(header) => {
+                    let index = self.table.index(header);
+                    self.encode_header(&index, dst);
+
+                    last_index = Some(index);
+                }
+                // The header does not have an associated name. This means that
+                // the name is the same as the previously yielded header. In
+                // which case, we skip table lookup and just use the same index
+                // as the previous entry.
+                Err(value) => {
+                    self.encode_header_without_name(
+                        last_index.as_ref().unwrap_or_else(|| {
+                            panic!("encoding header without name, but no previous index to use for name");
+                        }),
+                        &value,
+                        dst,
+                    );
+                }
+            }
+        }
+    }
+
+    fn encode_size_updates(&mut self, dst: &mut BytesMut) {
+        match self.size_update.take() {
+            Some(SizeUpdate::One(val)) => {
+                self.table.resize(val);
+                encode_size_update(val, dst);
+            }
+            Some(SizeUpdate::Two(min, max)) => {
+                self.table.resize(min);
+                self.table.resize(max);
+                encode_size_update(min, dst);
+                encode_size_update(max, dst);
+            }
+            None => {}
+        }
+    }
+
+    fn encode_header(&mut self, index: &Index, dst: &mut BytesMut) {
+        match *index {
+            Index::Indexed(idx, _) => {
+                encode_int(idx, 7, 0x80, dst);
+            }
+            Index::Name(idx, _) => {
+            buffer: BytesMut::with_capacity(4096),
+        }
+    }
+
+    /// Queues a potential size update
+    #[allow(dead_code)]
+    pub fn queue_size_update(&mut self, size: usize) {
+        let size = match self.max_size_update {
+            Some(v) => cmp::max(v, size),
+            None => size,
+        };
+
+        self.max_size_update = Some(size);
+    }
+
+    /// Decodes the headers found in the given buffer.
+    pub fn decode<F>(
+        &mut self,
+        src: &mut Cursor<&mut BytesMut>,
+        mut f: F,
+    ) -> Result<(), DecoderError>
+    where
+        F: FnMut(Header),
+    {
+        use self::Representation::*;
+
+        let mut can_resize = true;
+
+        if let Some(size) = self.max_size_update.take() {
+            self.last_max_update = size;
+        }
+
+        let span = tracing::trace_span!("hpack::decode");
+        let _e = span.enter();
+
+        tracing::trace!("decode");
+
+        while let Some(ty) = peek_u8(src) {
+            // At this point we are always at the beginning of the next block
+            // within the HPACK data. The type of the block can always be
+            // determined from the first byte.
+            match Representation::load(ty)? {
+                Indexed => {
+                    tracing::trace!(rem = src.remaining(), kind = %"Indexed");
+                    can_resize = false;
+                    let entry = self.decode_indexed(src)?;
+                    consume(src);
+                    f(entry);
+                }
+                LiteralWithIndexing => {
+                    tracing::trace!(rem = src.remaining(), kind = %"LiteralWithIndexing");
+                    can_resize = false;
+                    let entry = self.decode_literal(src, true)?;
+
+                    // Insert the header into the table
+                    self.table.insert(entry.clone());
+                    consume(src);
+
+                    f(entry);
+                }
+                LiteralWithoutIndexing => {
+                    tracing::trace!(rem = src.remaining(), kind = %"LiteralWithoutIndexing");
+                    can_resize = false;
+                    let entry = self.decode_literal(src, false)?;
+                    consume(src);
+                    f(entry);
+                }
+                LiteralNeverIndexed => {
+                    tracing::trace!(rem = src.remaining(), kind = %"LiteralNeverIndexed");
+                    can_resize = false;
+                    let entry = self.decode_literal(src, false)?;
+                    consume(src);
+
+                    // TODO: Track that this should never be indexed
+
+                    f(entry);
+                }
+                SizeUpdate => {
+                    tracing::trace!(rem = src.remaining(), kind = %"SizeUpdate");
+                    if !can_resize {
+                        return Err(DecoderError::InvalidMaxDynamicSize);
+                    }
+
+                    // Handle the dynamic table size update
+                    self.process_size_update(src)?;
+                    consume(src);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn process_size_update(&mut self, buf: &mut Cursor<&mut BytesMut>) -> Result<(), DecoderError> {
+        let new_size = decode_int(buf, 5)?;
+
+        if new_size > self.last_max_update {
+            return Err(DecoderError::InvalidMaxDynamicSize);
+        }
+
+        tracing::debug!(
+            from = self.table.size(),
+            to = new_size,
+            "Decoder changed max table size"
+        );
+
+        self.table.set_max_size(new_size);
+
+        Ok(())
+    }
+
+    fn decode_indexed(&self, buf: &mut Cursor<&mut BytesMut>) -> Result<Header, DecoderError> {
+        let index = decode_int(buf, 7)?;
+        self.table.get(index)
+    }
+
+    fn decode_literal(
+        &mut self,
+        buf: &mut Cursor<&mut BytesMut>,
+        index: bool,
+    ) -> Result<Header, DecoderError> {
+        let prefix = if index { 6 } else { 4 };
+
+        // Extract the table index for the name, or 0 if not indexed
+        let table_idx = decode_int(buf, prefix)?;
+

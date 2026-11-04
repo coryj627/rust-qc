@@ -1,0 +1,611 @@
+        self.get_or_insert_with_hash_and_fun(key, hash, init, Some(replace_if), false)
+            .into_value()
+    }
+
+    pub(crate) fn get_or_insert_with_hash_and_fun(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        init: impl FnOnce() -> V,
+        mut replace_if: Option<impl FnMut(&V) -> bool>,
+        need_key: bool,
+    ) -> Entry<K, V> {
+        self.base
+            .get_with_hash_and_ignore_if(&*key, hash, replace_if.as_mut(), need_key)
+            .unwrap_or_else(|| self.insert_with_hash_and_fun(key, hash, init, replace_if, need_key))
+    }
+
+    // Need to create new function instead of using the existing
+    // `get_or_insert_with_hash_and_fun`. The reason is `by_ref` function will
+    // require key reference to have `ToOwned` trait. If we modify the existing
+    // `get_or_insert_with_hash_and_fun` function, it will require all the existing
+    // apis that depends on it to make the `K` to have `ToOwned` trait.
+    pub(crate) fn get_or_insert_with_hash_by_ref_and_fun<Q>(
+        &self,
+        key: &Q,
+        hash: u64,
+        init: impl FnOnce() -> V,
+        mut replace_if: Option<impl FnMut(&V) -> bool>,
+        need_key: bool,
+    ) -> Entry<K, V>
+    where
+        Q: Equivalent<K> + ToOwned<Owned = K> + Hash + ?Sized,
+    {
+        self.base
+            .get_with_hash_and_ignore_if(key, hash, replace_if.as_mut(), need_key)
+            .unwrap_or_else(|| {
+                let key = Arc::new(key.to_owned());
+                self.insert_with_hash_and_fun(key, hash, init, replace_if, need_key)
+            })
+    }
+
+    pub(crate) fn insert_with_hash_and_fun(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        init: impl FnOnce() -> V,
+        mut replace_if: Option<impl FnMut(&V) -> bool>,
+        need_key: bool,
+    ) -> Entry<K, V> {
+        let get = || {
+            self.base
+                .get_with_hash_without_recording(&*key, hash, replace_if.as_mut())
+        };
+        let insert = |v| self.insert_with_hash(key.clone(), hash, v);
+
+        let k = if need_key {
+            Some(Arc::clone(&key))
+        } else {
+            None
+        };
+
+        let type_id = ValueInitializer::<K, V, S>::type_id_for_get_with();
+        let post_init = ValueInitializer::<K, V, S>::post_init_for_get_with;
+
+        match self
+            .value_initializer
+            .try_init_or_read(&key, type_id, get, init, insert, post_init)
+        {
+            InitResult::Initialized(v) => {
+                crossbeam_epoch::pin().flush();
+                Entry::new(k, v, true, false)
+            }
+            InitResult::ReadExisting(v) => Entry::new(k, v, false, false),
+            InitResult::InitErr(_) => unreachable!(),
+        }
+    }
+
+    pub(crate) fn get_or_insert_with_hash(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        init: impl FnOnce() -> V,
+    ) -> Entry<K, V> {
+        match self.base.get_with_hash(&*key, hash, true) {
+            Some(entry) => entry,
+            None => {
+                let value = init();
+                self.insert_with_hash(Arc::clone(&key), hash, value.clone());
+                Entry::new(Some(key), value, true, false)
+            }
+        }
+    }
+
+    ///                 // Insert and get the value for key1. Although all four async
+    ///                 // tasks will call `get_with` at the same time, the `init`
+    ///                 // async block must be resolved only once.
+    ///                 let value = my_cache
+    ///                     .get_with("key1", async move {
+    ///                         println!("Task {task_id} inserting a value.");
+    ///                         Arc::new(vec![0u8; TEN_MIB])
+    ///                     })
+    ///                     .await;
+    ///
+    ///                 // Ensure the value exists now.
+    ///                 assert_eq!(value.len(), TEN_MIB);
+    ///                 assert!(my_cache.get(&"key1").await.is_some());
+    ///
+    ///                 println!("Task {task_id} got the value. (len: {})", value.len());
+    ///             })
+    ///         })
+    ///         .collect();
+    ///
+    ///     // Run all tasks concurrently and wait for them to complete.
+    ///     futures_util::future::join_all(tasks).await;
+    /// }
+    /// ```
+    ///
+    /// **A Sample Result**
+    ///
+    /// - The `init` future (async black) was resolved exactly once by task 3.
+    /// - Other tasks were blocked until task 3 inserted the value.
+    ///
+    /// ```console
+    /// Task 0 started.
+    /// Task 3 started.
+    /// Task 1 started.
+    /// Task 2 started.
+    /// Task 3 inserting a value.
+    /// Task 3 got the value. (len: 10485760)
+    /// Task 0 got the value. (len: 10485760)
+    /// Task 1 got the value. (len: 10485760)
+    /// Task 2 got the value. (len: 10485760)
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This method panics when the `init` future has panicked. When it happens, only
+    /// the caller whose `init` future panicked will get the panic (e.g. only task 3
+    /// in the above sample). If there are other calls in progress (e.g. task 0, 1
+    /// and 2 above), this method will restart and resolve one of the remaining
+    /// `init` futures.
+    ///
+    pub async fn get_with(&self, key: K, init: impl Future<Output = V>) -> V {
+        futures_util::pin_mut!(init);
+        let hash = self.base.hash(&key);
+        let key = Arc::new(key);
+        let replace_if = None as Option<fn(&V) -> bool>;
+        self.get_or_insert_with_hash_and_fun(key, hash, init, replace_if, false)
+            .await
+            .into_value()
+    }
+
+    /// Similar to [`get_with`](#method.get_with), but instead of passing an owned
+    /// key, you can pass a reference to the key. If the key does not exist in the
+    /// cache, the key will be cloned to create new entry in the cache.
+    pub async fn get_with_by_ref<Q>(&self, key: &Q, init: impl Future<Output = V>) -> V
+    where
+        Q: Equivalent<K> + ToOwned<Owned = K> + Hash + ?Sized,
+    {
+        futures_util::pin_mut!(init);
+        let hash = self.base.hash(key);
+        let replace_if = None as Option<fn(&V) -> bool>;
+        self.get_or_insert_with_hash_by_ref_and_fun(key, hash, init, replace_if, false)
+            .await
+            .into_value()
+    }
+
+    /// TODO: Remove this in v0.13.0.
+    /// Deprecated, replaced with
+    /// [`entry()::or_insert_with_if()`](./struct.OwnedKeyEntrySelector.html#method.or_insert_with_if)
+    #[deprecated(since = "0.10.0", note = "Replaced with `entry().or_insert_with_if()`")]
+    pub async fn get_with_if(
+        &self,
+        key: K,
+        init: impl Future<Output = V>,
+        replace_if: impl FnMut(&V) -> bool + Send,
+    ) -> V {
+        futures_util::pin_mut!(init);
+        let hash = self.base.hash(&key);
+        let key = Arc::new(key);
+        self.get_or_insert_with_hash_and_fun(key, hash, init, Some(replace_if), false)
+            .await
+            .into_value()
+    }
+
+    /// Returns a _clone_ of the value corresponding to the key. If the value does
+    /// not exist, resolves the `init` future, and inserts the value if `Some(value)`
+    /// was returned. If `None` was returned from the future, this method does not
+    /// insert a value and returns `None`.
+    ///
+    /// # Concurrent calls on the same key
+    ///
+    /// This method guarantees that concurrent calls on the same not-existing key are
+    /// coalesced into one evaluation of the `init` future. Only one of the calls
+    /// evaluates its future, and other calls wait for that future to resolve.
+    ///
+    /// The following code snippet demonstrates this behavior:
+    ///
+    /// ```rust
+    /// // Cargo.toml
+    /// //
+    ///
+    /// /// Increment a cached `u64` counter. If the counter is greater than or
+    /// /// equal to 2, remove it.
+    /// fn inclement_or_remove_counter(
+    ///     cache: &Cache<String, u64>,
+    ///     key: &str,
+    /// ) -> CompResult<String, u64> {
+    ///     cache
+    ///         .entry(key.to_string())
+    ///         .and_compute_with(|maybe_entry| {
+    ///             if let Some(entry) = maybe_entry {
+    ///                 let counter = entry.into_value();
+    ///                 if counter < 2 {
+    ///                     Op::Put(counter.saturating_add(1)) // Update
+    ///                 } else {
+    ///                     Op::Remove
+    ///                 }
+    ///             } else {
+    ///                   Op::Put(1) // Insert
+    ///             }
+    ///         })
+    /// }
+    ///
+    /// // This should insert a new counter value 1 to the cache, and return the
+    /// // value with the kind of the operation performed.
+    /// let result = inclement_or_remove_counter(&cache, &key);
+    /// let CompResult::Inserted(entry) = result else {
+    ///     panic!("`Inserted` should be returned: {result:?}");
+    /// };
+    /// assert_eq!(entry.into_value(), 1);
+    ///
+    /// // This should increment the cached counter value by 1.
+    /// let result = inclement_or_remove_counter(&cache, &key);
+    /// let CompResult::ReplacedWith(entry) = result else {
+    ///     panic!("`ReplacedWith` should be returned: {result:?}");
+    /// };
+    /// assert_eq!(entry.into_value(), 2);
+    ///
+    /// // This should remove the cached counter from the cache, and returns the
+    /// // _removed_ value.
+    /// let result = inclement_or_remove_counter(&cache, &key);
+    /// let CompResult::Removed(entry) = result else {
+    ///     panic!("`Removed` should be returned: {result:?}");
+    /// };
+    /// assert_eq!(entry.into_value(), 2);
+    ///
+    /// // The key should no longer exist.
+    /// assert!(!cache.contains_key(&key));
+    ///
+    /// // This should start over; insert a new counter value 1 to the cache.
+    /// let result = inclement_or_remove_counter(&cache, &key);
+    /// let CompResult::Inserted(entry) = result else {
+    ///     panic!("`Inserted` should be returned: {result:?}");
+    /// };
+    /// assert_eq!(entry.into_value(), 1);
+    /// ```
+    ///
+    /// # Concurrent calls on the same key
+    ///
+    /// This method guarantees that concurrent calls on the same key are executed
+    /// serially. That is, `and_compute_with` calls on the same key never run
+    /// concurrently. The calls are serialized by the order of their invocation. It
+    /// uses a key-level lock to achieve this.
+    pub fn and_compute_with<F>(self, f: F) -> compute::CompResult<K, V>
+    where
+        F: FnOnce(Option<Entry<K, V>>) -> compute::Op<V>,
+    {
+        let key = Arc::new(self.owned_key);
+        self.cache.compute_with_hash_and_fun(key, self.hash, f)
+    }
+
+    /// Performs a compute operation on a cached entry by using the given closure
+    /// `f`. A compute operation is either put, remove or no-operation (nop).
+    ///
+    /// The closure `f` should take the current entry of `Option<Entry<K, V>>` for
+    /// the key, and return a `Result<ops::compute::Op<V>, E>`.
+    ///
+    /// This method works as the followings:
+    ///
+    /// 1. Apply the closure `f` to the current cached `Entry`, and get a
+    ///    `Result<ops::compute::Op<V>, E>`.
+    /// 2. If resolved to `Err(E)`, return it.
+    /// 3. Else, execute the op on the cache:
+    ///    - `Ok(Op::Put(V))`: Put the new value `V` to the cache.
+    ///    - `Ok(Op::Remove)`: Remove the current cached entry.
+    ///    - `Ok(Op::Nop)`: Do nothing.
+    /// 4. Return an `Ok(ops::compute::CompResult<K, V>)` as the followings:
+    ///
+    /// | [`Op<V>`] | [`Entry<K, V>`] already exists? | [`CompResult<K, V>`] | Notes |
+    /// |:--------- |:--- |:--------------------------- |:------------------------------- |
+    /// | `Put(V)`  | no  | `Inserted(Entry<K, V>)`     | The new entry is returned.      |
+    /// | `Put(V)`  | yes | `ReplacedWith(Entry<K, V>)` | The new entry is returned.      |
+    /// | `Remove`  | no  | `StillNone(Arc<K>)`         |                                 |
+    /// | `Remove`  | yes | `Removed(Entry<K, V>)`      | The removed entry is returned.  |
+    /// | `Nop`     | no  | `StillNone(Arc<K>)`         |                                 |
+    /// | `Nop`     | yes | `Unchanged(Entry<K, V>)`    | The existing entry is returned. |
+        self.insert_with_hash(key, hash, value).await;
+    }
+
+    /// Discards any cached value for the key.
+    ///
+    /// If you need to get the value that has been discarded, use the
+    /// [`remove`](#method.remove) method instead.
+    ///
+    /// The key may be any borrowed form of the cache's key type, but `Hash` and `Eq`
+    /// on the borrowed form _must_ match those for the key type.
+    pub async fn invalidate<Q>(&self, key: &Q)
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        let hash = self.base.hash(key);
+        self.invalidate_with_hash(key, hash, false).await;
+    }
+
+    /// Discards any cached value for the key and returns a _clone_ of the value.
+    ///
+    /// If you do not need to get the value that has been discarded, use the
+    /// [`invalidate`](#method.invalidate) method instead.
+    ///
+    /// The key may be any borrowed form of the cache's key type, but `Hash` and `Eq`
+    /// on the borrowed form _must_ match those for the key type.
+    pub async fn remove<Q>(&self, key: &Q) -> Option<V>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        let hash = self.base.hash(key);
+        self.invalidate_with_hash(key, hash, true).await
+    }
+
+    /// Discards all cached values.
+    ///
+    /// This method returns immediately by just setting the current time as the
+    /// invalidation time. `get` and other retrieval methods are guaranteed not to
+    /// return the entries inserted before or at the invalidation time.
+    ///
+    /// The actual removal of the invalidated entries is done as a maintenance task
+    /// driven by a user thread. For more details, see
+    /// [the Maintenance Tasks section](../index.html#maintenance-tasks) in the crate
+    /// level documentation.
+    ///
+    /// Like the `invalidate` method, this method does not clear the historic
+    /// popularity estimator of keys so that it retains the client activities of
+    /// trying to retrieve an item.
+    pub fn invalidate_all(&self) {
+        self.base.invalidate_all();
+    }
+
+    /// Discards cached values that satisfy a predicate.
+    ///
+    /// `invalidate_entries_if` takes a closure that returns `true` or `false`. The
+    /// closure is called against each cached entry inserted before or at the time
+    /// when this method was called. If the closure returns `true` that entry will be
+    /// evicted from the cache.
+    ///
+    /// This method returns immediately by not actually removing the invalidated
+    /// entries. Instead, it just sets the predicate to the cache with the time when
+    /// this method was called. The actual removal of the invalidated entries is done
+    /// as a maintenance task driven by a user thread. For more details, see
+    /// [the Maintenance Tasks section](../index.html#maintenance-tasks) in the crate
+    /// level documentation.
+    ///
+    /// Also the `get` and other retrieval methods will apply the closure to a cached
+    /// entry to determine if it should have been invalidated. Therefore, it is
+    /// guaranteed that these methods must not return invalidated values.
+    ///
+    /// Note that you must call
+    /// [`CacheBuilder::support_invalidation_closures`][support-invalidation-closures]
+    /// at the cache creation time as the cache needs to maintain additional internal
+    /// data structures to support this method. Otherwise, calling this method will
+    /// fail with a
+    /// [`PredicateError::InvalidationClosuresDisabled`][invalidation-disabled-error].
+    ///
+    /// Like the `invalidate` method, this method does not clear the historic
+    /// popularity estimator of keys so that it retains the client activities of
+    /// trying to retrieve an item.
+    ///
+    /// [support-invalidation-closures]:
+    ///     ./struct.CacheBuilder.html#method.support_invalidation_closures
+    /// [invalidation-disabled-error]:
+    ///     ../enum.PredicateError.html#variant.InvalidationClosuresDisabled
+    pub fn invalidate_entries_if<F>(&self, predicate: F) -> Result<PredicateId, PredicateError>
+    where
+        F: Fn(&K, &V) -> bool + Send + Sync + 'static,
+    {
+        self.base.invalidate_entries_if(Arc::new(predicate))
+    }
+
+    /// Creates an iterator visiting all key-value pairs in arbitrary order. The
+    /// iterator element type is `(Arc<K>, V)`, where `V` is a clone of a stored
+    /// value.
+    ///
+    /// Iterators do not block concurrent reads and writes on the cache. An entry can
+    /// be inserted to, invalidated or evicted from a cache while iterators are alive
+    /// on the same cache.
+    ///
+    /// Unlike the `get` method, visiting entries via an iterator do not update the
+    /// historic popularity estimator or reset idle timers for keys.
+{
+    #[inline]
+    fn do_apply_predicates<I>(predicates: I, key: &K, value: &V, ts: Instant) -> bool
+    where
+        I: Iterator<Item = Predicate<K, V>>,
+    {
+        for predicate in predicates {
+            if predicate.is_applicable(ts) && predicate.apply(key, value) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn remove_finished_predicates(
+        &self,
+        mut predicates: MutexGuard<'_, Vec<Predicate<K, V>>>,
+        is_truncated: bool,
+        newest_timestamp: Option<Instant>,
+    ) where
+        K: Hash + Eq,
+        S: BuildHasher,
+    {
+        let predicates = &mut *predicates;
+        if is_truncated {
+            if let Some(ts) = newest_timestamp {
+                let (active, finished): (Vec<_>, Vec<_>) =
+                    predicates.drain(..).partition(|p| p.is_applicable(ts));
+
+                // Remove finished predicates from the predicate registry.
+                self.remove_predicates(&finished);
+                // Set the active predicates to the scan context.
+                *predicates = active;
+            } else {
+                unreachable!();
+            }
+        } else {
+            // Remove all the predicates from the predicate registry and scan context.
+            self.remove_predicates(predicates);
+            predicates.clear();
+        }
+    }
+
+    fn remove_predicates(&self, predicates: &[Predicate<K, V>])
+    where
+        K: Hash + Eq,
+        S: BuildHasher,
+    {
+        let pred_map = &self.predicates;
+        for p in predicates.iter() {
+            let hash = pred_map.hash(p.id());
+            pred_map.remove(hash, |k| k == p.id());
+        }
+
+        if pred_map.is_empty() {
+            self.is_empty.store(true, Ordering::Release);
+        }
+    }
+
+    fn apply(
+        &self,
+        predicates: &[Predicate<K, V>],
+        cache: &Inner<K, V, S>,
+        key: &Arc<K>,
+        hash: u64,
+        ts: Instant,
+    ) -> bool {
+        if let Some(entry) = cache.cache.get(hash, |k| k == key) {
+            if let Some(lm) = entry.last_modified() {
+                if lm == ts {
+                    return Invalidator::<_, _, S>::do_apply_predicates(
+                        predicates.iter().cloned(),
+                        key,
+                        &entry.value,
+                        lm,
+                    );
+                }
+            }
+        }
+
+        false
+    }
+
+    fn invalidate(
+        cache: &Inner<K, V, S>,
+        key: &Arc<K>,
+        hash: u64,
+        ts: Instant,
+    ) -> Option<MiniArc<ValueEntry<K, V>>>
+    where
+        K: Send + Sync + 'static,
+        &self,
+        predicates: &[Predicate<K, V>],
+        cache: &Inner<K, V, S>,
+        key: &Arc<K>,
+        hash: u64,
+        ts: Instant,
+    ) -> bool {
+        if let Some(entry) = cache.cache.get(hash, |k| k == key) {
+            if let Some(lm) = entry.last_modified() {
+                if lm == ts {
+                    return Self::do_apply_predicates(
+                        predicates.iter().cloned(),
+                        key,
+                        &entry.value,
+                        lm,
+                    );
+                }
+            }
+        }
+
+        false
+    }
+
+    async fn invalidate(
+        cache: &Inner<K, V, S>,
+        key: &Arc<K>,
+        hash: u64,
+        ts: Instant,
+    ) -> Option<MiniArc<ValueEntry<K, V>>>
+    where
+        K: Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+    {
+        // Lock the key for removal if blocking removal notification is enabled.
+        let kl = cache.maybe_key_lock(key);
+        let _klg = if let Some(lock) = &kl {
+            Some(lock.lock().await)
+        } else {
+            None
+        };
+
+        let maybe_entry = cache.cache.remove_if(
+            hash,
+            |k| k == key,
+            |_, v| {
+                if let Some(lm) = v.last_modified() {
+                    lm == ts
+                } else {
+                    false
+                }
+            },
+        );
+        if let Some(entry) = &maybe_entry {
+            if cache.is_removal_notifier_enabled() {
+                cache
+                    .notify_single_removal(Arc::clone(key), entry, RemovalCause::Explicit)
+                    .await;
+            }
+        }
+        maybe_entry
+    }
+}
+
+//
+// for testing
+//
+#[cfg(test)]
+impl<K, V, S> Invalidator<K, V, S> {
+    pub(crate) fn predicate_count(&self) -> usize {
+        self.predicates.len()
+    }
+}
+
+struct ScanContext<K, V> {
+    predicates: Mutex<Vec<Predicate<K, V>>>,
+}
+
+impl<K, V> Default for ScanContext<K, V> {
+    fn default() -> Self {
+        Self {
+            predicates: Mutex::new(Vec::default()),
+        }
+    }
+}
+
+struct Predicate<K, V> {
+    id: PredicateId,
+    f: PredicateFun<K, V>,
+    registered_at: Instant,
+}
+
+impl<K, V> Clone for Predicate<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            f: Arc::clone(&self.f),
+            registered_at: self.registered_at,
+        }
+    }
+}
+
+impl<K, V> Predicate<K, V> {
+    fn new(id: PredicateIdStr<'_>, f: PredicateFun<K, V>, registered_at: Instant) -> Self {
+        Self {
+            id: id.to_string(),
+            f,
+            registered_at,
+        }
+    }
+
+    fn id(&self) -> PredicateIdStr<'_> {
+        &self.id
+    }
+
+    fn is_applicable(&self, last_modified: Instant) -> bool {
+        last_modified <= self.registered_at
+    }
+
+    fn apply(&self, key: &K, value: &V) -> bool {
+        (self.f)(key, value)
+    }
+}

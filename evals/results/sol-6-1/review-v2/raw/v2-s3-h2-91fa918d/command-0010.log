@@ -1,0 +1,713 @@
+        self.last_processed_id
+    }
+
+    /// Update state reflecting a new, remotely opened stream
+    ///
+    /// Returns the stream state if successful. `None` if refused
+    pub fn open(
+        &mut self,
+        id: StreamId,
+        mode: Open,
+        counts: &mut Counts,
+    ) -> Result<Option<StreamId>, Error> {
+        assert!(self.refused.is_none());
+
+        counts.peer().ensure_can_open(id, mode)?;
+
+        let next_id = self.next_stream_id()?;
+        if id < next_id {
+            proto_err!(conn: "id ({:?}) < next_id ({:?})", id, next_id);
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+        }
+
+        self.next_stream_id = id.next_id();
+
+        if !counts.can_inc_num_recv_streams() {
+            self.refused = Some(id);
+            return Ok(None);
+        }
+
+        Ok(Some(id))
+    }
+
+    /// Transition the stream state based on receiving headers
+    ///
+    /// The caller ensures that the frame represents headers and not trailers.
+    pub fn recv_headers(
+        &mut self,
+        frame: frame::Headers,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) -> Result<(), RecvHeaderBlockError<Option<frame::Headers>>> {
+        tracing::trace!("opening stream; init_window={}", self.init_window_sz);
+        let is_initial = stream.state.recv_open(&frame)?;
+
+        if is_initial {
+            // TODO: be smarter about this logic
+            if frame.stream_id() > self.last_processed_id {
+                self.last_processed_id = frame.stream_id();
+            }
+
+            // Increment the number of concurrent streams
+            counts.inc_num_recv_streams(stream);
+        }
+
+        if !stream.content_length.is_head() {
+            use super::stream::ContentLength;
+            use http::header;
+
+            if let Some(content_length) = frame.fields().get(header::CONTENT_LENGTH) {
+                let content_length = match frame::parse_u64(content_length.as_bytes()) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        proto_err!(stream: "could not parse content-length; stream={:?}", stream.id);
+                        return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+                    }
+                };
+
+                stream.content_length = ContentLength::Remaining(content_length);
+                // END_STREAM on headers frame with non-zero content-length is malformed.
+                // https://datatracker.ietf.org/doc/html/rfc9113#section-8.1.1
+                if frame.is_end_stream()
+                    && content_length > 0
+                    && frame
+                        .pseudo()
+                        .status
+                        .map_or(true, |status| status != 204 && status != 304)
+                {
+                    proto_err!(stream: "recv_headers with END_STREAM: content-length is not zero; stream={:?};", stream.id);
+                    return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+                }
+            }
+        }
+
+        if frame.is_over_size() {
+            // A frame is over size if the decoded header block was bigger than
+            // SETTINGS_MAX_HEADER_LIST_SIZE.
+            //
+            // > A server that receives a larger header block than it is willing
+            // > to handle can send an HTTP 431 (Request Header Fields Too
+            // > Large) status code [RFC6585]. A client can discard responses
+            // > that it cannot process.
+            //
+            // So, if peer is a server, we'll send a 431. In either case,
+            // an error is recorded, which will send a REFUSED_STREAM,
+            // since we don't want any of the data frames either.
+            tracing::debug!(
+                "stream error REQUEST_HEADER_FIELDS_TOO_LARGE -- \
+                 recv_headers: frame is over size; stream={:?}",
+                stream.id
+            );
+            return if counts.peer().is_server() && is_initial {
+                let mut res = frame::Headers::new(
+                    stream.id,
+                    frame::Pseudo::response(::http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE),
+                    HeaderMap::new(),
+                );
+                res.set_end_stream();
+                Err(RecvHeaderBlockError::Oversize(Some(res)))
+            } else {
+                Err(RecvHeaderBlockError::Oversize(None))
+            };
+        }
+
+        let stream_id = frame.stream_id();
+        let (pseudo, fields) = frame.into_parts();
+
+        if pseudo.protocol.is_some()
+            && counts.peer().is_server()
+            && !self.is_extended_connect_protocol_enabled
+        {
+            proto_err!(stream: "cannot use :protocol if extended connect protocol is disabled; stream={:?}", stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+        }
+
+        if pseudo.status.is_some() && counts.peer().is_server() {
+            proto_err!(stream: "cannot use :status header for requests; stream={:?}", stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+        }
+
+        if !pseudo.is_informational() {
+            let message = counts
+                .peer()
+                .convert_poll_message(pseudo, fields, stream_id)?;
+
+            // Push the frame onto the stream's recv buffer
+            stream
+                .pending_recv
+                .push_back(&mut self.buffer, Event::Headers(message));
+            stream.notify_recv();
+
+            // Only servers can receive a headers frame that initiates the stream.
+            // This is verified in `Streams` before calling this function.
+            if counts.peer().is_server() {
+                // Correctness: never push a stream to `pending_accept` without having the
+                // corresponding headers frame pushed to `stream.pending_recv`.
+                self.pending_accept.push(stream);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Called by the server to get the request
+    ///
+    /// # Panics
+    ///
+    /// Panics if `stream.pending_recv` has no `Event::Headers` queued.
+    ///
+    pub fn take_request(&mut self, stream: &mut store::Ptr) -> Request<()> {
+        use super::peer::PollMessage::*;
+
+        match stream.pending_recv.pop_front(&mut self.buffer) {
+            Some(Event::Headers(Server(request))) => request,
+            _ => unreachable!("server stream queue must start with Headers"),
+        }
+    }
+
+    /// Called by the client to get pushed response
+    pub fn poll_pushed(
+        &mut self,
+        cx: &Context,
+        stream: &mut store::Ptr,
+    ) -> Poll<Option<Result<(Request<()>, store::Key), proto::Error>>> {
+        use super::peer::PollMessage::*;
+
+        let mut ppp = stream.pending_push_promises.take();
+        let pushed = ppp.pop(stream.store_mut()).map(|mut pushed| {
+            match pushed.pending_recv.pop_front(&mut self.buffer) {
+                Some(Event::Headers(Server(headers))) => (headers, pushed.key()),
+                // When frames are pushed into the queue, it is verified that
+                // the first frame is a HEADERS frame.
+                _ => panic!("Headers not set on pushed stream"),
+            }
+        });
+        stream.pending_push_promises = ppp;
+        if let Some(p) = pushed {
+            Poll::Ready(Some(Ok(p)))
+        } else {
+            let is_open = stream.state.ensure_recv_open()?;
+
+            if is_open {
+                stream.push_task = Some(cx.waker().clone());
+                Poll::Pending
+            } else {
+                Poll::Ready(None)
+            }
+        }
+    }
+
+    /// Called by the client to get the response
+    pub fn poll_response(
+        &mut self,
+        cx: &Context,
+        stream: &mut store::Ptr,
+    ) -> Poll<Result<Response<()>, proto::Error>> {
+        use super::peer::PollMessage::*;
+
+        // If the buffer is not empty, then the first frame must be a HEADERS
+        // frame or the user violated the contract.
+        match stream.pending_recv.pop_front(&mut self.buffer) {
+            Some(Event::Headers(Client(response))) => Poll::Ready(Ok(response)),
+            Some(_) => panic!("poll_response called after response returned"),
+            None => {
+                if !stream.state.ensure_recv_open()? {
+                    proto_err!(stream: "poll_response: stream={:?} is not opened;",  stream.id);
+                    return Poll::Ready(Err(Error::library_reset(
+                        stream.id,
+                        Reason::PROTOCOL_ERROR,
+                    )));
+                }
+
+                stream.recv_task = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+
+    /// Transition the stream based on receiving trailers
+    pub fn recv_trailers(
+        &mut self,
+        frame: frame::Headers,
+        stream: &mut store::Ptr,
+    ) -> Result<(), Error> {
+        // Transition the state
+        stream.state.recv_close()?;
+
+        if stream.ensure_content_length_zero().is_err() {
+            proto_err!(stream: "recv_trailers: content-length is not zero; stream={:?};",  stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
+        }
+
+        let trailers = frame.into_fields();
+
+        // Push the frame onto the stream's recv buffer
+        stream
+            .pending_recv
+            .push_back(&mut self.buffer, Event::Trailers(trailers));
+        stream.notify_recv();
+
+        Ok(())
+    }
+
+    /// Releases capacity of the connection
+    pub fn release_connection_capacity(&mut self, capacity: WindowSize, task: &mut Option<Waker>) {
+        tracing::trace!(
+            "release_connection_capacity; size={}, connection in_flight_data={}",
+            capacity,
+            self.in_flight_data,
+        );
+
+        // Decrement in-flight data
+        self.in_flight_data -= capacity;
+
+        // Assign capacity to connection
+        // TODO: proper error handling
+        let _res = self.flow.assign_capacity(capacity);
+        debug_assert!(_res.is_ok());
+
+        if self.flow.unclaimed_capacity().is_some() {
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+        }
+    }
+
+    /// Releases capacity back to the connection & stream
+    pub fn release_capacity(
+        &mut self,
+        capacity: WindowSize,
+        stream: &mut store::Ptr,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError> {
+        tracing::trace!("release_capacity; size={}", capacity);
+
+        if capacity > stream.in_flight_recv_data {
+            return Err(UserError::ReleaseCapacityTooBig);
+        }
+
+        self.release_connection_capacity(capacity, task);
+
+        // Decrement in-flight data
+        stream.in_flight_recv_data -= capacity;
+
+        // Assign capacity to stream
+        // TODO: proper error handling
+        let _res = stream.recv_flow.assign_capacity(capacity);
+        debug_assert!(_res.is_ok());
+
+        if stream.recv_flow.unclaimed_capacity().is_some() {
+            // Queue the stream for sending the WINDOW_UPDATE frame.
+            self.pending_window_updates.push(stream);
+
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Release any unclaimed capacity for a closed stream.
+    pub fn release_closed_capacity(&mut self, stream: &mut store::Ptr, task: &mut Option<Waker>) {
+        debug_assert_eq!(stream.ref_count, 0);
+
+        if stream.in_flight_recv_data == 0 {
+            return;
+        }
+
+        tracing::trace!(
+            "auto-release closed stream ({:?}) capacity: {:?}",
+            stream.id,
+            stream.in_flight_recv_data,
+        );
+
+        self.release_connection_capacity(stream.in_flight_recv_data, task);
+        stream.in_flight_recv_data = 0;
+
+        self.clear_recv_buffer(stream);
+    }
+
+    /// Set the "target" connection window size.
+    ///
+    /// By default, all new connections start with 64kb of window size. As
+    /// streams used and release capacity, we will send WINDOW_UPDATEs for the
+    /// connection to bring it back up to the initial "target".
+    ///
+    /// Setting a target means that we will try to tell the peer about
+    /// WINDOW_UPDATEs so the peer knows it has about `target` window to use
+    /// for the whole connection.
+    ///
+    /// The `task` is an optional parked task for the `Connection` that might
+    /// be blocked on needing more window capacity.
+    pub fn set_target_connection_window(
+        &mut self,
+        target: WindowSize,
+        task: &mut Option<Waker>,
+    ) -> Result<(), Reason> {
+        tracing::trace!(
+            "set_target_connection_window; target={}; available={}, reserved={}",
+            target,
+            self.flow.available(),
+            self.in_flight_data,
+        );
+
+        // The current target connection window is our `available` plus any
+        // in-flight data reserved by streams.
+        //
+        // Update the flow controller with the difference between the new
+        // target and the current target.
+        let current = self
+            .flow
+    pub fn is_canceled_interest(&self) -> bool {
+        self.ref_count == 0 && !self.state.is_closed()
+    }
+
+    /// Current available stream send capacity
+    pub fn capacity(&self, max_buffer_size: usize) -> WindowSize {
+        let available = self.send_flow.available().as_size() as usize;
+        let buffered = self.buffered_send_data;
+
+        available.min(max_buffer_size).saturating_sub(buffered) as WindowSize
+    }
+
+    pub fn assign_capacity(&mut self, capacity: WindowSize, max_buffer_size: usize) {
+        let prev_capacity = self.capacity(max_buffer_size);
+        debug_assert!(capacity > 0);
+        // TODO: proper error handling
+        let _res = self.send_flow.assign_capacity(capacity);
+        debug_assert!(_res.is_ok());
+
+        tracing::trace!(
+            "  assigned capacity to stream; available={}; buffered={}; id={:?}; max_buffer_size={} prev={}",
+            self.send_flow.available(),
+            self.buffered_send_data,
+            self.id,
+            max_buffer_size,
+            prev_capacity,
+        );
+
+        if prev_capacity < self.capacity(max_buffer_size) {
+            self.notify_capacity();
+        }
+    }
+
+    pub fn send_data(&mut self, len: WindowSize, max_buffer_size: usize) {
+        let prev_capacity = self.capacity(max_buffer_size);
+
+        // TODO: proper error handling
+        let _res = self.send_flow.send_data(len);
+        debug_assert!(_res.is_ok());
+
+        // Decrement the stream's buffered data counter
+        debug_assert!(self.buffered_send_data >= len as usize);
+        self.buffered_send_data -= len as usize;
+        self.requested_send_capacity -= len;
+
+        tracing::trace!(
+            "  sent stream data; available={}; buffered={}; id={:?}; max_buffer_size={} prev={}",
+            self.send_flow.available(),
+            self.buffered_send_data,
+            self.id,
+            max_buffer_size,
+            prev_capacity,
+        );
+
+        if prev_capacity < self.capacity(max_buffer_size) {
+            self.notify_capacity();
+        }
+    }
+
+    /// If the capacity was limited because of the max_send_buffer_size,
+    /// then consider waking the send task again...
+    pub fn notify_capacity(&mut self) {
+        self.send_capacity_inc = true;
+        tracing::trace!("  notifying task");
+        self.notify_send();
+    }
+
+    /// Returns `Err` when the decrement cannot be completed due to overflow.
+    pub fn dec_content_length(&mut self, len: usize) -> Result<(), ()> {
+        match self.content_length {
+            ContentLength::Remaining(ref mut rem) => match rem.checked_sub(len as u64) {
+                Some(val) => *rem = val,
+                None => return Err(()),
+            },
+            ContentLength::Head => {
+                if len != 0 {
+                    return Err(());
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    pub fn ensure_content_length_zero(&self) -> Result<(), ()> {
+        match self.content_length {
+            ContentLength::Remaining(0) => Ok(()),
+            ContentLength::Remaining(_) => Err(()),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn notify_send(&mut self) {
+        if let Some(task) = self.send_task.take() {
+            task.wake();
+        }
+    }
+
+    pub fn wait_send(&mut self, cx: &Context) {
+        self.send_task = Some(cx.waker().clone());
+    }
+
+    pub fn notify_recv(&mut self) {
+        if let Some(task) = self.recv_task.take() {
+            task.wake();
+        }
+    }
+
+    pub(super) fn notify_push(&mut self) {
+        if let Some(task) = self.push_task.take() {
+                    }
+
+                    return Poll::Ready(Ok(c));
+                }
+                Handshaking::Done => {
+                    panic!("Handshaking::poll() called again after handshaking was complete")
+                }
+            }
+        }
+    }
+}
+
+impl<T, B> fmt::Debug for Handshake<T, B>
+where
+    T: AsyncRead + AsyncWrite + fmt::Debug,
+    B: fmt::Debug + Buf,
+{
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write!(fmt, "server::Handshake")
+    }
+}
+
+impl Peer {
+    pub fn convert_send_message(
+        id: StreamId,
+        response: Response<()>,
+        end_of_stream: bool,
+    ) -> frame::Headers {
+        use http::response::Parts;
+
+        // Extract the components of the HTTP request
+        let (
+            Parts {
+                status, headers, ..
+            },
+            _,
+        ) = response.into_parts();
+
+        // Build the set pseudo header set. All requests will include `method`
+        // and `path`.
+        let pseudo = Pseudo::response(status);
+
+        // Create the HEADERS frame
+        let mut frame = frame::Headers::new(id, pseudo, headers);
+
+        if end_of_stream {
+            frame.set_end_stream()
+        }
+
+        frame
+    }
+
+    pub fn convert_push_message(
+        stream_id: StreamId,
+        promised_id: StreamId,
+        request: Request<()>,
+    ) -> Result<frame::PushPromise, UserError> {
+        use http::request::Parts;
+
+        if let Err(e) = frame::PushPromise::validate_request(&request) {
+            use PushPromiseHeaderError::*;
+            match e {
+                NotSafeAndCacheable => tracing::debug!(
+                    ?promised_id,
+                    "convert_push_message: method {} is not safe and cacheable",
+                    request.method(),
+                ),
+                InvalidContentLength(e) => tracing::debug!(
+                    ?promised_id,
+                    "convert_push_message; promised request has invalid content-length {:?}",
+                    e,
+                ),
+            }
+            return Err(UserError::MalformedHeaders);
+        }
+
+        // Extract the components of the HTTP request
+        let (
+            Parts {
+                method,
+                uri,
+                headers,
+                ..
+            },
+            _,
+        ) = request.into_parts();
+
+        let pseudo = Pseudo::request(method, uri, None);
+
+        Ok(frame::PushPromise::new(
+            stream_id,
+            promised_id,
+            pseudo,
+            headers,
+        ))
+    }
+}
+
+impl proto::Peer for Peer {
+    type Poll = Request<()>;
+
+    const NAME: &'static str = "Server";
+
+    /*
+    fn is_server() -> bool {
+        true
+    }
+    */
+
+    fn r#dyn() -> proto::DynPeer {
+        proto::DynPeer::Server
+    }
+
+    fn convert_poll_message(
+        pseudo: Pseudo,
+        fields: HeaderMap,
+        stream_id: StreamId,
+    ) -> Result<Self::Poll, Error> {
+        use http::{uri, Version};
+
+        let mut b = Request::builder();
+
+        macro_rules! malformed {
+            ($($arg:tt)*) => {{
+                tracing::debug!($($arg)*);
+                return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
+            }}
+        }
+
+        b = b.version(Version::HTTP_2);
+
+        let is_connect;
+        if let Some(method) = pseudo.method {
+            is_connect = method == Method::CONNECT;
+            b = b.method(method);
+        } else {
+            malformed!("malformed headers: missing method");
+        }
+
+        let has_protocol = pseudo.protocol.is_some();
+        if has_protocol {
+            if is_connect {
+                // Assert that we have the right type.
+                b = b.extension::<crate::ext::Protocol>(pseudo.protocol.unwrap());
+            } else {
+                malformed!("malformed headers: :protocol on non-CONNECT request");
+            }
+        }
+
+        if pseudo.status.is_some() {
+            malformed!("malformed headers: :status field on request");
+        }
+
+        // Convert the URI
+        let mut parts = uri::Parts::default();
+
+        // A request translated from HTTP/1 must not include the :authority
+        // header
+        if let Some(authority) = pseudo.authority {
+            let maybe_authority = uri::Authority::from_maybe_shared(authority.clone().into_inner());
+            parts.authority = Some(maybe_authority.or_else(|why| {
+                malformed!(
+                    "malformed headers: malformed authority ({:?}): {}",
+                    authority,
+                    why,
+                )
+            })?);
+        }
+
+        // A :scheme is required, except CONNECT.
+        if let Some(scheme) = pseudo.scheme {
+            if is_connect && !has_protocol {
+                malformed!("malformed headers: :scheme in CONNECT");
+            }
+            let maybe_scheme = scheme.parse();
+            let scheme = maybe_scheme.or_else(|why| {
+                malformed!(
+                    "malformed headers: malformed scheme ({:?}): {}",
+                    scheme,
+                    why,
+                )
+            })?;
+
+            // It's not possible to build an `Uri` from a scheme and path. So,
+            // after validating is was a valid scheme, we just have to drop it
+            // if there isn't an :authority.
+            if parts.authority.is_some() {
+                parts.scheme = Some(scheme);
+            }
+        } else if !is_connect || has_protocol {
+            malformed!("malformed headers: missing scheme");
+        }
+
+        if let Some(path) = pseudo.path {
+            if is_connect && !has_protocol {
+                malformed!("malformed headers: :path in CONNECT");
+            }
+
+            // This cannot be empty
+            if path.is_empty() {
+                malformed!("malformed headers: missing path");
+            }
+
+            let maybe_path = uri::PathAndQuery::from_maybe_shared(path.clone().into_inner());
+            parts.path_and_query = Some(maybe_path.or_else(|why| {
+                malformed!("malformed headers: malformed path ({:?}): {}", path, why,)
+            })?);
+        } else if is_connect && has_protocol {
+            malformed!("malformed headers: missing path in extended CONNECT");
+        }
+
+        b = b.uri(parts);
+
+        let mut request = match b.body(()) {
+            Ok(request) => request,
+            Err(e) => {
+                // TODO: Should there be more specialized handling for different
+                // kinds of errors
+                proto_err!(stream: "error building request: {}; stream={:?}", e, stream_id);
+                return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
+            }
+        };
+
+        *request.headers_mut() = fields;
+
+        Ok(request)
+    }
+}
+
+// ===== impl Handshaking =====
+
+impl<T, B> fmt::Debug for Handshaking<T, B>
+where
+    B: Buf,
+{
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        match *self {
+            Handshaking::Flushing(_) => f.write_str("Flushing(_)"),
+            Handshaking::ReadingPreface(_) => f.write_str("ReadingPreface(_)"),
+            Handshaking::Done => f.write_str("Done"),

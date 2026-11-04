@@ -1,0 +1,767 @@
+#![deny(warnings)]
+
+use futures::StreamExt;
+use h2_support::prelude::*;
+use tokio::io::AsyncWriteExt;
+
+const SETTINGS: &[u8] = &[0, 0, 0, 4, 0, 0, 0, 0, 0];
+const SETTINGS_ACK: &[u8] = &[0, 0, 0, 4, 1, 0, 0, 0, 0];
+
+#[tokio::test]
+async fn read_preface_in_multiple_frames() {
+    h2_support::trace_init!();
+
+    let mock = mock_io::Builder::new()
+        .read(b"PRI * HTTP/2.0")
+        .read(b"\r\n\r\nSM\r\n\r\n")
+        .write(SETTINGS)
+        .read(SETTINGS)
+        .write(SETTINGS_ACK)
+        .read(SETTINGS_ACK)
+        .build();
+
+    let mut h2 = server::handshake(mock).await.unwrap();
+
+    assert!(h2.next().await.is_none());
+}
+
+#[tokio::test]
+async fn server_builder_set_max_concurrent_streams() {
+    h2_support::trace_init!();
+    let (io, mut client) = mock::new();
+
+    let mut settings = frame::Settings::default();
+    settings.set_max_concurrent_streams(Some(1));
+
+    let client = async move {
+        let recv_settings = client.assert_server_handshake().await;
+        assert_frame_eq(recv_settings, settings);
+        client
+            .send_frame(frames::headers(1).request("GET", "https://example.com/"))
+            .await;
+        client
+            .send_frame(frames::headers(3).request("GET", "https://example.com/"))
+            .await;
+        client
+            .send_frame(frames::data(1, &b"hello"[..]).eos())
+            .await;
+        client.recv_frame(frames::reset(3).refused()).await;
+        client
+            .recv_frame(frames::headers(1).response(200).eos())
+            .await;
+    };
+
+    let mut builder = server::Builder::new();
+    builder.max_concurrent_streams(1);
+
+    let h2 = async move {
+        let mut srv = builder.handshake::<_, Bytes>(io).await.expect("handshake");
+        let (req, mut stream) = srv.next().await.unwrap().unwrap();
+
+        assert_eq!(req.method(), &http::Method::GET);
+
+        let rsp = http::Response::builder().status(200).body(()).unwrap();
+        stream.send_response(rsp, true).unwrap();
+
+        assert!(srv.next().await.is_none());
+    };
+
+    join(client, h2).await;
+}
+
+#[tokio::test]
+async fn serve_request() {
+    h2_support::trace_init!();
+    let (io, mut client) = mock::new();
+
+    let client = async move {
+        let settings = client.assert_server_handshake().await;
+        assert_default_settings!(settings);
+        client
+            .send_frame(
+                frames::headers(1)
+                    .request("GET", "https://example.com/")
+                    .eos(),
+            )
+            .await;
+        client
+            .recv_frame(frames::headers(1).response(200).eos())
+            .await;
+    };
+
+    let srv = async move {
+        let mut srv = server::handshake(io).await.expect("handshake");
+        let (req, mut stream) = srv.next().await.unwrap().unwrap();
+
+        assert_eq!(req.method(), &http::Method::GET);
+
+        let rsp = http::Response::builder().status(200).body(()).unwrap();
+        stream.send_response(rsp, true).unwrap();
+
+        assert!(srv.next().await.is_none());
+    };
+
+    join(client, srv).await;
+}
+
+#[tokio::test]
+async fn serve_connect() {
+    h2_support::trace_init!();
+    let (io, mut client) = mock::new();
+
+    let client = async move {
+        let settings = client.assert_server_handshake().await;
+        assert_default_settings!(settings);
+        client
+            .send_frame(frames::headers(1).request("CONNECT", "localhost").eos())
+            .await;
+        client
+            .recv_frame(frames::headers(1).response(200).eos())
+            .await;
+    };
+
+    let srv = async move {
+        let mut srv = server::handshake(io).await.expect("handshake");
+        let (req, mut stream) = srv.next().await.unwrap().unwrap();
+
+        assert_eq!(req.method(), &http::Method::CONNECT);
+
+        let rsp = http::Response::builder().status(200).body(()).unwrap();
+        stream.send_response(rsp, true).unwrap();
+
+        assert!(srv.next().await.is_none());
+    };
+
+    join(client, srv).await;
+}
+
+#[tokio::test]
+async fn push_request() {
+    h2_support::trace_init!();
+    let (io, mut client) = mock::new();
+
+    let client = async move {
+        client
+            .assert_server_handshake_with_settings(frames::settings().max_concurrent_streams(100))
+            .await;
+        client
+            .send_frame(
+                frames::headers(1)
+                    .request("GET", "https://example.com/")
+                    .eos(),
+            )
+            .await;
+        client
+            .recv_frame(
+                frames::push_promise(1, 2).request("GET", "https://http2.akamai.com/style.css"),
+            )
+            .await;
+        client
+            .recv_frame(frames::headers(2).response(200).eos())
+            .await;
+        client
+            .recv_frame(
+                frames::push_promise(1, 4).request("GET", "https://http2.akamai.com/style2.css"),
+            )
+            .await;
+        client
+            .recv_frame(frames::headers(4).response(200).eos())
+            .await;
+        client
+            .recv_frame(frames::headers(1).response(200).eos())
+            .await;
+    };
+
+    let srv = async move {
+        let mut srv = server::handshake(io).await.expect("handshake");
+        let (req, mut stream) = srv.next().await.unwrap().unwrap();
+
+        assert_eq!(req.method(), &http::Method::GET);
+
+use crate::codec::{SendError, UserError};
+use crate::frame::StreamId;
+use crate::proto::{self, Initiator};
+
+use bytes::Bytes;
+use std::{error, fmt, io};
+
+pub use crate::frame::Reason;
+
+/// Represents HTTP/2 operation errors.
+///
+/// `Error` covers error cases raised by protocol errors caused by the
+/// peer, I/O (transport) errors, and errors caused by the user of the library.
+///
+/// If the error was caused by the remote peer, then it will contain a
+/// [`Reason`] which can be obtained with the [`reason`] function.
+///
+/// [`Reason`]: struct.Reason.html
+/// [`reason`]: #method.reason
+#[derive(Debug)]
+pub struct Error {
+    kind: Kind,
+}
+
+#[derive(Debug)]
+enum Kind {
+    /// A RST_STREAM frame was received or sent.
+    #[allow(dead_code)]
+    Reset(StreamId, Reason, Initiator),
+
+    /// A GO_AWAY frame was received or sent.
+    GoAway(Bytes, Reason, Initiator),
+
+    /// The user created an error from a bare Reason.
+    Reason(Reason),
+
+    /// An error resulting from an invalid action taken by the user of this
+    /// library.
+    User(UserError),
+
+    /// An `io::Error` occurred while trying to read or write.
+    Io(io::Error),
+}
+
+// ===== impl Error =====
+
+impl Error {
+    /// If the error was caused by the remote peer, the error reason.
+    ///
+    /// This is either an error received by the peer or caused by an invalid
+    /// action taken by the peer (i.e. a protocol error).
+    pub fn reason(&self) -> Option<Reason> {
+        match self.kind {
+            Kind::Reset(_, reason, _) | Kind::GoAway(_, reason, _) | Kind::Reason(reason) => {
+                Some(reason)
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns true if the error is an io::Error
+    pub fn is_io(&self) -> bool {
+        matches!(self.kind, Kind::Io(..))
+    }
+
+    /// Returns the error if the error is an io::Error
+    pub fn get_io(&self) -> Option<&io::Error> {
+        match self.kind {
+            Kind::Io(ref e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Returns the error if the error is an io::Error
+    pub fn into_io(self) -> Option<io::Error> {
+        match self.kind {
+            Kind::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn from_io(err: io::Error) -> Self {
+        Error {
+            kind: Kind::Io(err),
+        }
+    }
+
+    /// Returns true if the error is from a `GOAWAY`.
+    pub fn is_go_away(&self) -> bool {
+        matches!(self.kind, Kind::GoAway(..))
+    }
+
+    /// Returns true if the error is from a `RST_STREAM`.
+    pub fn is_reset(&self) -> bool {
+        matches!(self.kind, Kind::Reset(..))
+    }
+
+    /// Returns true if the error was received in a frame from the remote.
+    ///
+    /// Such as from a received `RST_STREAM` or `GOAWAY` frame.
+    pub fn is_remote(&self) -> bool {
+        matches!(
+            self.kind,
+            Kind::GoAway(_, _, Initiator::Remote) | Kind::Reset(_, _, Initiator::Remote)
+        )
+    }
+
+    /// Returns true if the error was created by `h2`.
+    ///
+    /// Such as noticing some protocol error and sending a GOAWAY or RST_STREAM.
+    pub fn is_library(&self) -> bool {
+        matches!(
+            self.kind,
+            Kind::GoAway(_, _, Initiator::Library) | Kind::Reset(_, _, Initiator::Library)
+        )
+    }
+}
+
+impl From<proto::Error> for Error {
+    fn from(src: proto::Error) -> Error {
+        use crate::proto::Error::*;
+
+        Error {
+            kind: match src {
+                Reset(stream_id, reason, initiator) => Kind::Reset(stream_id, reason, initiator),
+                GoAway(debug_data, reason, initiator) => {
+                    Kind::GoAway(debug_data, reason, initiator)
+                }
+                Io(kind, inner) => {
+                    Kind::Io(inner.map_or_else(|| kind.into(), |inner| io::Error::new(kind, inner)))
+                }
+            },
+        }
+    }
+}
+
+impl From<Reason> for Error {
+    fn from(src: Reason) -> Error {
+        Error {
+            kind: Kind::Reason(src),
+        }
+    }
+}
+
+impl From<SendError> for Error {
+    fn from(src: SendError) -> Error {
+        match src {
+            SendError::User(e) => e.into(),
+            SendError::Connection(e) => e.into(),
+        }
+    }
+}
+
+impl From<UserError> for Error {
+    fn from(src: UserError) -> Error {
+        Error {
+            kind: Kind::User(src),
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        let debug_data = match self.kind {
+            Kind::Reset(_, reason, Initiator::User) => {
+                return write!(fmt, "stream error sent by user: {}", reason)
+            }
+            Kind::Reset(_, reason, Initiator::Library) => {
+                return write!(fmt, "stream error detected: {}", reason)
+            }
+            Kind::Reset(_, reason, Initiator::Remote) => {
+                return write!(fmt, "stream error received: {}", reason)
+            }
+            Kind::GoAway(ref debug_data, reason, Initiator::User) => {
+                write!(fmt, "connection error sent by user: {}", reason)?;
+                debug_data
+            }
+            Kind::GoAway(ref debug_data, reason, Initiator::Library) => {
+                write!(fmt, "connection error detected: {}", reason)?;
+                debug_data
+            }
+            Kind::GoAway(ref debug_data, reason, Initiator::Remote) => {
+                write!(fmt, "connection error received: {}", reason)?;
+                debug_data
+            }
+            Kind::Reason(reason) => return write!(fmt, "protocol error: {}", reason),
+            Kind::User(ref e) => return write!(fmt, "user error: {}", e),
+            Kind::Io(ref e) => return e.fmt(fmt),
+        };
+
+        if !debug_data.is_empty() {
+            write!(fmt, " ({:?})", debug_data)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl error::Error for Error {}
+
+        Ok(())
+    }
+
+    pub fn recv_push_promise(
+        &mut self,
+        frame: frame::PushPromise,
+        stream: &mut store::Ptr,
+    ) -> Result<(), Error> {
+        stream.state.reserve_remote()?;
+        if frame.is_over_size() {
+            // A frame is over size if the decoded header block was bigger than
+            // SETTINGS_MAX_HEADER_LIST_SIZE.
+            //
+            // > A server that receives a larger header block than it is willing
+            // > to handle can send an HTTP 431 (Request Header Fields Too
+            // > Large) status code [RFC6585]. A client can discard responses
+            // > that it cannot process.
+            //
+            // So, if peer is a server, we'll send a 431. In either case,
+            // an error is recorded, which will send a PROTOCOL_ERROR,
+            // since we don't want any of the data frames either.
+            tracing::debug!(
+                "stream error PROTOCOL_ERROR -- recv_push_promise: \
+                 headers frame is over size; promised_id={:?};",
+                frame.promised_id(),
+            );
+            return Err(Error::library_reset(
+                frame.promised_id(),
+                Reason::PROTOCOL_ERROR,
+            ));
+        }
+
+        let promised_id = frame.promised_id();
+        let (pseudo, fields) = frame.into_parts();
+        let req = crate::server::Peer::convert_poll_message(pseudo, fields, promised_id)?;
+
+        if let Err(e) = frame::PushPromise::validate_request(&req) {
+            use PushPromiseHeaderError::*;
+            match e {
+                NotSafeAndCacheable => proto_err!(
+                    stream:
+                    "recv_push_promise: method {} is not safe and cacheable; promised_id={:?}",
+                    req.method(),
+                    promised_id,
+                ),
+                InvalidContentLength(e) => proto_err!(
+                    stream:
+                    "recv_push_promise; promised request has invalid content-length {:?}; promised_id={:?}",
+                    e,
+                    promised_id,
+                ),
+            }
+            return Err(Error::library_reset(promised_id, Reason::PROTOCOL_ERROR));
+        }
+
+        use super::peer::PollMessage::*;
+        stream
+            .pending_recv
+            .push_back(&mut self.buffer, Event::Headers(Server(req)));
+        stream.notify_recv();
+        stream.notify_push();
+        Ok(())
+    }
+
+    /// Ensures that `id` is not in the `Idle` state.
+    pub fn ensure_not_idle(&self, id: StreamId) -> Result<(), Reason> {
+        if let Ok(next) = self.next_stream_id {
+            if id >= next {
+                tracing::debug!(
+                    "stream ID implicitly closed, PROTOCOL_ERROR; stream={:?}",
+                    id
+                );
+                return Err(Reason::PROTOCOL_ERROR);
+            }
+        }
+        // if next_stream_id is overflowed, that's ok.
+
+        Ok(())
+    }
+
+    /// Handle remote sending an explicit RST_STREAM.
+    pub fn recv_reset(
+        &mut self,
+        frame: frame::Reset,
+        stream: &mut Stream,
+        counts: &mut Counts,
+    ) -> Result<(), Error> {
+        // Reseting a stream that the user hasn't accepted is possible,
+        // but should be done with care. These streams will continue
+        // to take up memory in the accept queue, but will no longer be
+        // counted as "concurrent" streams.
+        //
+        // So, we have a separate limit for these.
+        //
+        // See https://github.com/hyperium/hyper/issues/2877
+        if stream.is_pending_accept {
+            if counts.can_inc_num_remote_reset_streams() {
+                counts.inc_num_remote_reset_streams();
+            } else {
+                tracing::warn!(
+                    "recv_reset; remotely-reset pending-accept streams reached limit ({:?})",
+                    counts.max_remote_reset_streams(),
+                );
+                return Err(Error::library_go_away_data(
+                    Reason::ENHANCE_YOUR_CALM,
+                    "too_many_resets",
+                ));
+            }
+        }
+
+        // Notify the stream
+        stream.state.recv_reset(frame, stream.is_pending_send);
+
+        stream.notify_send();
+        stream.notify_recv();
+        stream.notify_push();
+
+        Ok(())
+    }
+
+    /// Handle a connection-level error
+    pub fn handle_error(&mut self, err: &proto::Error, stream: &mut Stream) {
+        // Receive an error
+        stream.state.handle_error(err);
+
+        // If a receiver is waiting, notify it
+use super::*;
+
+#[derive(Debug)]
+pub(super) struct Counts {
+    /// Acting as a client or server. This allows us to track which values to
+    /// inc / dec.
+    peer: peer::Dyn,
+
+    /// Maximum number of locally initiated streams
+    max_send_streams: usize,
+
+    /// Current number of remote initiated streams
+    num_send_streams: usize,
+
+    /// Maximum number of remote initiated streams
+    max_recv_streams: usize,
+
+    /// Current number of locally initiated streams
+    num_recv_streams: usize,
+
+    /// Maximum number of pending locally reset streams
+    max_local_reset_streams: usize,
+
+    /// Current number of pending locally reset streams
+    num_local_reset_streams: usize,
+
+    /// Max number of "pending accept" streams that were remotely reset
+    max_remote_reset_streams: usize,
+
+    /// Current number of "pending accept" streams that were remotely reset
+    num_remote_reset_streams: usize,
+
+    /// Maximum number of locally reset streams due to protocol error across
+    /// the lifetime of the connection.
+    ///
+    /// When this gets exceeded, we issue GOAWAYs.
+    max_local_error_reset_streams: Option<usize>,
+
+    /// Total number of locally reset streams due to protocol error across the
+    /// lifetime of the connection.
+    num_local_error_reset_streams: usize,
+}
+
+impl Counts {
+    /// Create a new `Counts` using the provided configuration values.
+    pub fn new(peer: peer::Dyn, config: &Config) -> Self {
+        Counts {
+            peer,
+            max_send_streams: config.initial_max_send_streams,
+            num_send_streams: 0,
+            max_recv_streams: config.remote_max_initiated.unwrap_or(usize::MAX),
+            num_recv_streams: 0,
+            max_local_reset_streams: config.local_reset_max,
+            num_local_reset_streams: 0,
+            max_remote_reset_streams: config.remote_reset_max,
+            num_remote_reset_streams: 0,
+            max_local_error_reset_streams: config.local_max_error_reset_streams,
+            num_local_error_reset_streams: 0,
+        }
+    }
+
+    /// Returns true when the next opened stream will reach capacity of outbound streams
+    ///
+    /// The number of client send streams is incremented in prioritize; send_request has to guess if
+    /// it should wait before allowing another request to be sent.
+    pub fn next_send_stream_will_reach_capacity(&self) -> bool {
+        self.max_send_streams <= (self.num_send_streams + 1)
+    }
+
+    /// Returns the current peer
+    pub fn peer(&self) -> peer::Dyn {
+        self.peer
+    }
+
+    pub fn has_streams(&self) -> bool {
+        self.num_send_streams != 0 || self.num_recv_streams != 0
+    }
+
+    /// Returns true if we can issue another local reset due to protocol error.
+    pub fn can_inc_num_local_error_resets(&self) -> bool {
+        if let Some(max) = self.max_local_error_reset_streams {
+            max > self.num_local_error_reset_streams
+        } else {
+            true
+        }
+    }
+
+    pub fn inc_num_local_error_resets(&mut self) {
+        assert!(self.can_inc_num_local_error_resets());
+
+        // Increment the number of remote initiated streams
+        self.num_local_error_reset_streams += 1;
+    }
+
+    pub(crate) fn max_local_error_resets(&self) -> Option<usize> {
+        self.max_local_error_reset_streams
+    }
+
+    /// Returns true if the receive stream concurrency can be incremented
+    pub fn can_inc_num_recv_streams(&self) -> bool {
+        self.max_recv_streams > self.num_recv_streams
+    }
+
+    /// Increments the number of concurrent receive streams.
+    ///
+    /// # Panics
+    ///
+    /// Panics on failure as this should have been validated before hand.
+    pub fn inc_num_recv_streams(&mut self, stream: &mut store::Ptr) {
+        assert!(self.can_inc_num_recv_streams());
+        assert!(!stream.is_counted);
+
+        // Increment the number of remote initiated streams
+        self.num_recv_streams += 1;
+        stream.is_counted = true;
+    }
+
+    /// Returns true if the send stream concurrency can be incremented
+    pub fn can_inc_num_send_streams(&self) -> bool {
+        self.max_send_streams > self.num_send_streams
+    }
+
+    /// Increments the number of concurrent send streams.
+    ///
+    /// # Panics
+    ///
+    /// Panics on failure as this should have been validated before hand.
+    pub fn inc_num_send_streams(&mut self, stream: &mut store::Ptr) {
+        assert!(self.can_inc_num_send_streams());
+        assert!(!stream.is_counted);
+
+        // Increment the number of remote initiated streams
+        self.num_send_streams += 1;
+        stream.is_counted = true;
+    }
+
+    /// Returns true if the number of pending reset streams can be incremented.
+    pub fn can_inc_num_reset_streams(&self) -> bool {
+        self.max_local_reset_streams > self.num_local_reset_streams
+    }
+
+    /// Increments the number of pending reset streams.
+    ///
+    /// # Panics
+    ///
+    /// Panics on failure as this should have been validated before hand.
+    pub fn inc_num_reset_streams(&mut self) {
+        assert!(self.can_inc_num_reset_streams());
+
+        self.num_local_reset_streams += 1;
+    }
+
+    pub(crate) fn max_remote_reset_streams(&self) -> usize {
+        self.max_remote_reset_streams
+    }
+
+    /// Returns true if the number of pending REMOTE reset streams can be
+    /// incremented.
+    pub(crate) fn can_inc_num_remote_reset_streams(&self) -> bool {
+        self.max_remote_reset_streams > self.num_remote_reset_streams
+    }
+
+    /// Increments the number of pending REMOTE reset streams.
+    ///
+    /// # Panics
+    ///
+    /// Panics on failure as this should have been validated before hand.
+    pub(crate) fn inc_num_remote_reset_streams(&mut self) {
+        assert!(self.can_inc_num_remote_reset_streams());
+
+        self.num_remote_reset_streams += 1;
+    }
+
+    pub(crate) fn dec_num_remote_reset_streams(&mut self) {
+        assert!(self.num_remote_reset_streams > 0);
+
+        self.num_remote_reset_streams -= 1;
+    }
+
+    pub fn apply_remote_settings(&mut self, settings: &frame::Settings, is_initial: bool) {
+        match settings.max_concurrent_streams() {
+            Some(val) => self.max_send_streams = val as usize,
+            None if is_initial => self.max_send_streams = usize::MAX,
+            None => {}
+        }
+    }
+
+    /// Run a block of code that could potentially transition a stream's state.
+    ///
+    /// If the stream state transitions to closed, this function will perform
+    /// all necessary cleanup.
+    ///
+    /// TODO: Is this function still needed?
+    pub fn transition<F, U>(&mut self, mut stream: store::Ptr, f: F) -> U
+    where
+        F: FnOnce(&mut Self, &mut store::Ptr) -> U,
+    {
+        // TODO: Does this need to be computed before performing the action?
+        let is_pending_reset = stream.is_pending_reset_expiration();
+
+        // Run the action
+        let ret = f(self, &mut stream);
+
+        self.transition_after(stream, is_pending_reset);
+
+        ret
+    }
+
+    // TODO: move this to macro?
+    pub fn transition_after(&mut self, mut stream: store::Ptr, is_reset_counted: bool) {
+            return;
+        }
+
+        stream.state.set_scheduled_reset(reason);
+
+        self.prioritize.reclaim_reserved_capacity(stream, counts);
+        self.prioritize.schedule_send(stream, task);
+    }
+
+    pub fn send_data<B>(
+        &mut self,
+        frame: frame::Data<B>,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError>
+    where
+        B: Buf,
+    {
+        self.prioritize
+            .send_data(frame, buffer, stream, counts, task)
+    }
+
+    pub fn send_trailers<B>(
+        &mut self,
+        frame: frame::Headers,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError> {
+        // TODO: Should this logic be moved into state.rs?
+        if !stream.state.is_send_streaming() {
+            return Err(UserError::UnexpectedFrameType);
+        }
+
+        stream.state.send_close();
+
+        tracing::trace!("send_trailers -- queuing; frame={:?}", frame);
+        self.prioritize
+            .queue_frame(frame.into(), buffer, stream, task);
+
+        // Release any excess capacity
+        self.prioritize.reserve_capacity(0, stream, counts);
+
+        Ok(())
+    }
+
+    pub fn poll_complete<T, B>(
+        &mut self,

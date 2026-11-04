@@ -1,0 +1,1075 @@
+    {
+        // Define a closure to record a read op.
+        let record = |op, now| {
+            self.record_read_op(op, now)
+                .expect("Failed to record a get op");
+        };
+        self.do_get_with_hash(key, hash, record, ignore_if, need_key)
+    }
+
+    pub(crate) fn get_with_hash_without_recording<Q, I>(
+        &self,
+        key: &Q,
+        hash: u64,
+        ignore_if: Option<&mut I>,
+    ) -> Option<V>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+        I: FnMut(&V) -> bool,
+    {
+        // Define a closure that skips to record a read op.
+        let record = |_op, _now| {};
+        self.do_get_with_hash(key, hash, record, ignore_if, false)
+            .map(Entry::into_value)
+    }
+
+    fn do_get_with_hash<Q, R, I>(
+        &self,
+        key: &Q,
+        hash: u64,
+        read_recorder: R,
+        mut ignore_if: Option<&mut I>,
+        need_key: bool,
+    ) -> Option<Entry<K, V>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+        R: Fn(ReadOp<K, V>, Instant),
+        I: FnMut(&V) -> bool,
+    {
+        if self.is_map_disabled() {
+            return None;
+        }
+
+        let mut now = self.current_time();
+
+        let maybe_entry = self
+            .inner
+            .get_key_value_and_then(key, hash, move |k, entry| {
+                if let Some(ignore_if) = &mut ignore_if {
+                    if ignore_if(&entry.value) {
+                        // Ignore the entry.
+                        return None;
+                    }
+                }
+
+                let i = &self.inner;
+                let (ttl, tti, va) = (&i.time_to_live(), &i.time_to_idle(), &i.valid_after());
+
+                if is_expired_by_per_entry_ttl(entry.entry_info(), now)
+                    || is_expired_entry_wo(ttl, va, entry, now)
+                    || is_expired_entry_ao(tti, va, entry, now)
+                    || i.is_invalidated_entry(k, entry)
+                {
+                    // Expired or invalidated entry.
+                    None
+                } else {
+                    // Valid entry.
+                    let maybe_key = if need_key { Some(Arc::clone(k)) } else { None };
+                    Some((maybe_key, MiniArc::clone(entry)))
+                }
+            });
+
+        if let Some((maybe_key, entry)) = maybe_entry {
+            let mut is_expiry_modified = false;
+
+            // Call the user supplied `expire_after_read` method if any.
+            if let Some(expiry) = &self.inner.expiration_policy.expiry() {
+                let lm = entry.last_modified().expect("Last modified is not set");
+                // Check if the `last_modified` of entry is earlier than or equals to
+                // `now`. If not, update the `now` to `last_modified`. This is needed
+                // because there is a small chance that other threads have inserted
+                // the entry _after_ we obtained `now`.
+                now = now.max(lm);
+
+                // Convert `last_modified` from `moka::common::time::Instant` to
+                // `std::time::Instant`.
+                let lm = self.inner.clock().to_std_instant(lm);
+
+                // Call the user supplied `expire_after_read` method.
+                //
+                // We will put the return value (`is_expiry_modified: bool`) to a
+                // `ReadOp` so that `apply_reads` method can determine whether or not
+                // to reschedule the timer for the entry.
+                //
+                // NOTE: It is not guaranteed that the `ReadOp` is passed to
+                // `apply_reads`. Here are the corner cases that the `ReadOp` will
+                // not be passed to `apply_reads`:
+                //
+                // - If the bounded `read_op_ch` channel is full, the `ReadOp` will
+                //   be discarded.
+                // - If we were called by `get_with_hash_without_recording` method,
+                //   the `ReadOp` will not be recorded at all.
+                //
+                // These cases are okay because when the timer wheel tries to expire
+                // the entry, it will check if the entry is actually expired. If not,
+                // the timer wheel will reschedule the expiration timer for the
+                // entry.
+                is_expiry_modified = Self::expire_after_read_or_update(
+                    |k, v, t, d| expiry.expire_after_read(k, v, t, d, lm),
+                    &entry.entry_info().key_hash().key,
+                    &entry,
+                    self.inner.expiration_policy.time_to_live(),
+                    self.inner.expiration_policy.time_to_idle(),
+                    now,
+                    self.inner.clock(),
+                );
+            }
+
+            entry.set_last_accessed(now);
+
+            let v = entry.value.clone();
+            let op = ReadOp::Hit {
+                value_entry: entry,
+                is_expiry_modified,
+            };
+            read_recorder(op, now);
+            Some(Entry::new(maybe_key, v, false, false))
+        } else {
+            read_recorder(ReadOp::Miss(hash), now);
+            None
+        }
+    }
+
+    pub(crate) fn get_key_with_hash<Q>(&self, key: &Q, hash: u64) -> Option<Arc<K>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        self.inner
+            .get_key_value_and(key, hash, |k, _entry| Arc::clone(k))
+    }
+
+    #[inline]
+    pub(crate) fn remove_entry<Q>(&self, key: &Q, hash: u64) -> Option<KvEntry<K, V>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        self.inner.remove_entry(key, hash)
+    }
+
+    #[inline]
+    pub(crate) fn apply_reads_writes_if_needed(
+        inner: &impl InnerSync,
+        ch: &Sender<WriteOp<K, V>>,
+        now: Instant,
+        housekeeper: Option<&HouseKeeperArc>,
+    ) {
+        let w_len = ch.len();
+
+        if let Some(hk) = housekeeper {
+            if Self::should_apply_writes(hk, w_len, now) {
+                hk.try_run_pending_tasks(inner);
+            }
+        }
+    }
+
+    pub(crate) fn invalidate_all(&self) {
+        let now = self.current_time();
+        self.inner.set_valid_after(now);
+    }
+
+    pub(crate) fn invalidate_entries_if(
+        &self,
+        predicate: PredicateFun<K, V>,
+    ) -> Result<PredicateId, PredicateError> {
+        let now = self.current_time();
+        self.inner.register_invalidation_predicate(predicate, now)
+    }
+}
+
+//
+// Iterator support
+//
+impl<K, V, S> ScanningGet<K, V> for BaseCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn num_cht_segments(&self) -> usize {
+        self.inner.num_cht_segments()
+    }
+
+    fn scanning_get(&self, key: &Arc<K>) -> Option<V> {
+        let hash = self.hash(&**key);
+        self.inner.get_key_value_and_then(&**key, hash, |k, entry| {
+            let i = &self.inner;
+            let (ttl, tti, va) = (&i.time_to_live(), &i.time_to_idle(), &i.valid_after());
+            let now = self.current_time();
+
+            if is_expired_by_per_entry_ttl(entry.entry_info(), now)
+                || is_expired_entry_wo(ttl, va, entry, now)
+                || is_expired_entry_ao(tti, va, entry, now)
+                || i.is_invalidated_entry(k, entry)
+            {
+                // Expired or invalidated entry.
+                None
+            } else {
+                // Valid entry.
+                Some(entry.value.clone())
+            }
+        })
+    }
+
+    fn keys(&self, cht_segment: usize) -> Option<Vec<Arc<K>>> {
+        self.inner.keys(cht_segment)
+    }
+}
+
+//
+// private methods
+//
+impl<K, V, S> BaseCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    #[inline]
+    fn record_read_op(
+        &self,
+        op: ReadOp<K, V>,
+        now: Instant,
+    ) -> Result<(), TrySendError<ReadOp<K, V>>> {
+        self.apply_reads_if_needed(&self.inner, now);
+        let ch = &self.read_op_ch;
+        match ch.try_send(op) {
+            // Discard the ReadOp when the channel is full.
+            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+            Err(e @ TrySendError::Disconnected(_)) => Err(e),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn do_insert_with_hash(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        value: V,
+    ) -> (WriteOp<K, V>, Instant) {
+        let weight = self.inner.weigh(&key, &value);
+        let op_cnt1 = Rc::new(AtomicU8::new(0));
+        let op_cnt2 = Rc::clone(&op_cnt1);
+        let mut op1 = None;
+        let mut op2 = None;
+
+        // Lock the key for update if blocking removal notification is enabled.
+        let kl = self.maybe_key_lock(&key);
+        let _klg = &kl.as_ref().map(|kl| kl.lock());
+
+        let ts = self.current_time();
+
+        // TODO: Instead using Arc<AtomicU8> to check if the actual operation was
+        // insert or update, check the return value of insert_with_or_modify. If it
+        // is_some, the value was updated, otherwise the value was inserted.
+
+        // Since the cache (cht::SegmentedHashMap) employs optimistic locking
+        // strategy, insert_with_or_modify() may get an insert/modify operation
+        // conflicted with other concurrent hash table operations. In that case, it
+        // has to retry the insertion or modification, so on_insert and/or on_modify
+        // closures can be executed more than once. In order to identify the last
+        // call of these closures, we use a shared counter (op_cnt{1,2}) here to
+        // record a serial number on a WriteOp, and consider the WriteOp with the
+        // largest serial number is the one made by the last call of the closures.
+        self.inner.cache.insert_with_or_modify(
+            Arc::clone(&key),
+            hash,
+            // on_insert
+            || {
+                let (entry, gen) = self.new_value_entry(&key, hash, value.clone(), ts, weight);
+                let ins_op = WriteOp::new_upsert(&key, hash, &entry, gen, 0, weight);
+                let cnt = op_cnt1.fetch_add(1, Ordering::Relaxed);
+                op1 = Some((cnt, ins_op));
+                entry
+            },
+            // on_modify
+            |_k, old_entry| {
+                let old_weight = old_entry.policy_weight();
+
+                // Create this OldEntryInfo _before_ creating a new ValueEntry, so
+                // that the OldEntryInfo can preserve the old EntryInfo's
+                // last_accessed and last_modified timestamps.
+                let old_info = OldEntryInfo::new(old_entry);
+                let (entry, gen) = self.new_value_entry_from(value.clone(), ts, weight, old_entry);
+                let upd_op = WriteOp::new_upsert(&key, hash, &entry, gen, old_weight, weight);
+                let cnt = op_cnt2.fetch_add(1, Ordering::Relaxed);
+                op2 = Some((cnt, old_info, upd_op));
+                entry
+            },
+        );
+
+        match (op1, op2) {
+            (Some((_cnt, ins_op)), None) => self.do_post_insert_steps(ts, &key, ins_op),
+            (Some((cnt1, ins_op)), Some((cnt2, ..))) if cnt1 > cnt2 => {
+                self.do_post_insert_steps(ts, &key, ins_op)
+            }
+            (_, Some((_cnt, old_info, upd_op))) => {
+                self.do_post_update_steps(ts, key, old_info, upd_op)
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+
+    fn do_post_insert_steps(
+        &self,
+        ts: Instant,
+        key: &Arc<K>,
+        ins_op: WriteOp<K, V>,
+    ) -> (WriteOp<K, V>, Instant) {
+        if let (Some(expiry), WriteOp::Upsert { value_entry, .. }) =
+            (&self.inner.expiration_policy.expiry(), &ins_op)
+        {
+            Self::expire_after_create(expiry, key, value_entry, ts, self.inner.clock());
+        }
+        (ins_op, ts)
+    }
+
+    fn do_post_update_steps(
+        &self,
+        ts: Instant,
+        key: Arc<K>,
+        old_info: OldEntryInfo<K, V>,
+        upd_op: WriteOp<K, V>,
+    ) -> (WriteOp<K, V>, Instant) {
+        if let (Some(expiry), WriteOp::Upsert { value_entry, .. }) =
+            (&self.inner.expiration_policy.expiry(), &upd_op)
+        {
+            Self::expire_after_read_or_update(
+                |k, v, t, d| expiry.expire_after_update(k, v, t, d),
+                &key,
+                value_entry,
+                self.inner.expiration_policy.time_to_live(),
+                self.inner.expiration_policy.time_to_idle(),
+                ts,
+                self.inner.clock(),
+            );
+        }
+
+        if self.is_removal_notifier_enabled() {
+            self.inner.notify_upsert(
+                key,
+                &old_info.entry,
+                old_info.last_accessed,
+                old_info.last_modified,
+            );
+        }
+        crossbeam_epoch::pin().flush();
+        (upd_op, ts)
+    }
+
+    #[inline]
+    fn apply_reads_if_needed(&self, inner: &Inner<K, V, S>, now: Instant) {
+        let len = self.read_op_ch.len();
+
+        if let Some(hk) = &self.housekeeper {
+            if Self::should_apply_reads(hk, len, now) {
+                hk.try_run_pending_tasks(inner);
+            }
+        }
+    }
+
+    #[inline]
+    fn should_apply_reads(hk: &HouseKeeperArc, ch_len: usize, now: Instant) -> bool {
+        hk.should_apply_reads(ch_len, now)
+    }
+
+    #[inline]
+    fn should_apply_writes(hk: &HouseKeeperArc, ch_len: usize, now: Instant) -> bool {
+        hk.should_apply_writes(ch_len, now)
+    }
+}
+
+impl<K, V, S> BaseCache<K, V, S> {
+    #[inline]
+    fn new_value_entry(
+        &self,
+        key: &Arc<K>,
+        hash: u64,
+        value: V,
+        timestamp: Instant,
+        policy_weight: u32,
+    ) -> (MiniArc<ValueEntry<K, V>>, u16) {
+        let key_hash = KeyHash::new(Arc::clone(key), hash);
+        let info = MiniArc::new(EntryInfo::new(key_hash, timestamp, policy_weight));
+        let gen: u16 = info.entry_gen();
+        (MiniArc::new(ValueEntry::new(value, info)), gen)
+    }
+
+    #[inline]
+    fn new_value_entry_from(
+        &self,
+        value: V,
+        timestamp: Instant,
+        policy_weight: u32,
+        other: &ValueEntry<K, V>,
+    ) -> (MiniArc<ValueEntry<K, V>>, u16) {
+        let info = MiniArc::clone(other.entry_info());
+        // To prevent this updated ValueEntry from being evicted by an expiration
+        // policy, increment the entry generation.
+        let gen = info.incr_entry_gen();
+        info.set_last_accessed(timestamp);
+        info.set_last_modified(timestamp);
+        info.set_policy_weight(policy_weight);
+        (MiniArc::new(ValueEntry::new_from(value, info, other)), gen)
+    }
+
+    fn expire_after_create(
+        expiry: &Arc<dyn Expiry<K, V> + Send + Sync + 'static>,
+        key: &K,
+        value_entry: &ValueEntry<K, V>,
+        ts: Instant,
+        clock: &Clock,
+    ) {
+        let duration =
+            expiry.expire_after_create(key, &value_entry.value, clock.to_std_instant(ts));
+        let expiration_time = duration.map(|duration| ts.saturating_add(duration));
+        value_entry
+            .entry_info()
+            .set_expiration_time(expiration_time);
+    }
+
+    fn expire_after_read_or_update(
+        expiry: impl FnOnce(&K, &V, StdInstant, Option<Duration>) -> Option<Duration>,
+        key: &K,
+        value_entry: &ValueEntry<K, V>,
+        ttl: Option<Duration>,
+        tti: Option<Duration>,
+        ts: Instant,
+        clock: &Clock,
+    ) -> bool {
+        let current_time = clock.to_std_instant(ts);
+        let ei = &value_entry.entry_info();
+
+        let exp_time = IntoIterator::into_iter([
+            ei.expiration_time(),
+            ttl.and_then(|dur| ei.last_modified().map(|ts| ts.saturating_add(dur))),
+            tti.and_then(|dur| ei.last_accessed().map(|ts| ts.saturating_add(dur))),
+        ])
+        .flatten()
+        .min();
+
+        let current_duration = exp_time.and_then(|time| {
+            let std_time = clock.to_std_instant(time);
+            std_time.checked_duration_since(current_time)
+        });
+
+        let duration = expiry(key, &value_entry.value, current_time, current_duration);
+
+        if duration != current_duration {
+            let expiration_time = duration.map(|duration| ts.saturating_add(duration));
+            value_entry
+                .entry_info()
+                .set_expiration_time(expiration_time);
+            // The `expiration_time` has changed from `None` to `Some` or vice versa.
+            true
+        } else {
+            false
+        }
+    }
+}
+
+//
+// for testing
+use equivalent::Equivalent;
+
+use crate::{ops::compute, Entry};
+
+use super::Cache;
+
+use std::{
+    future::Future,
+    hash::{BuildHasher, Hash},
+    sync::Arc,
+};
+
+/// Provides advanced methods to select or insert an entry of the cache.
+///
+/// Many methods here return an [`Entry`], a snapshot of a single key-value pair in
+/// the cache, carrying additional information like `is_fresh`.
+///
+/// `OwnedKeyEntrySelector` is constructed from the [`entry`][entry-method] method on
+/// the cache.
+///
+/// [`Entry`]: ../struct.Entry.html
+/// [entry-method]: ./struct.Cache.html#method.entry
+pub struct OwnedKeyEntrySelector<'a, K, V, S> {
+    owned_key: K,
+    hash: u64,
+    cache: &'a Cache<K, V, S>,
+}
+
+impl<'a, K, V, S> OwnedKeyEntrySelector<'a, K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn new(owned_key: K, hash: u64, cache: &'a Cache<K, V, S>) -> Self {
+        Self {
+            owned_key,
+            hash,
+            cache,
+        }
+    }
+
+    /// Performs a compute operation on a cached entry by using the given closure
+    /// `f`. A compute operation is either put, remove or no-operation (nop).
+    ///
+    /// The closure `f` should take the current entry of `Option<Entry<K, V>>` for
+    /// the key, and return a `Future` that resolves to an `ops::compute::Op<V>`
+    /// enum.
+    ///
+    /// This method works as the followings:
+    ///
+    /// 1. Apply the closure `f` to the current cached `Entry`, and get a `Future`.
+    /// 2. Resolve the `Future`, and get an `ops::compute::Op<V>`.
+    /// 3. Execute the op on the cache:
+    ///    - `Op::Put(V)`: Put the new value `V` to the cache.
+    ///    - `Op::Remove`: Remove the current cached entry.
+    ///    - `Op::Nop`: Do nothing.
+    /// 4. Return an `ops::compute::CompResult<K, V>` as the followings:
+    ///
+    /// | [`Op<V>`] | [`Entry<K, V>`] already exists? | [`CompResult<K, V>`] | Notes |
+    /// |:--------- |:--- |:--------------------------- |:------------------------------- |
+    /// | `Put(V)`  | no  | `Inserted(Entry<K, V>)`     | The new entry is returned.      |
+    /// | `Put(V)`  | yes | `ReplacedWith(Entry<K, V>)` | The new entry is returned.      |
+    /// | `Remove`  | no  | `StillNone(Arc<K>)`         |                                 |
+    /// | `Remove`  | yes | `Removed(Entry<K, V>)`      | The removed entry is returned.  |
+    /// | `Nop`     | no  | `StillNone(Arc<K>)`         |                                 |
+    /// | `Nop`     | yes | `Unchanged(Entry<K, V>)`    | The existing entry is returned. |
+    ///
+    /// # See Also
+    ///
+    /// - If you want the `Future` resolve to `Result<Op<V>>` instead of `Op<V>`, and
+    ///   modify entry only when resolved to `Ok(V)`, use the
+    ///   [`and_try_compute_with`] method.
+    /// - If you only want to update or insert, use the [`and_upsert_with`] method.
+    ///
+    /// [`Entry<K, V>`]: ../struct.Entry.html
+    /// [`Op<V>`]: ../ops/compute/enum.Op.html
+    /// [`CompResult<K, V>`]: ../ops/compute/enum.CompResult.html
+    /// [`and_upsert_with`]: #method.and_upsert_with
+    /// [`and_try_compute_with`]: #method.and_try_compute_with
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// // Cargo.toml
+    /// //
+    /// // [dependencies]
+    /// // moka = { version = "0.12.8", features = ["future"] }
+    /// // tokio = { version = "1", features = ["rt-multi-thread", "macros" ] }
+    ///
+    /// use moka::{
+    ///     future::Cache,
+    ///     ops::compute::{CompResult, Op},
+    /// };
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let cache: Cache<String, u64> = Cache::new(100);
+    ///     let key = "key1".to_string();
+    ///
+    ///     /// Increment a cached `u64` counter. If the counter is greater than or
+    ///     /// equal to 2, remove it.
+    ///     async fn inclement_or_remove_counter(
+    ///         cache: &Cache<String, u64>,
+    ///         key: &str,
+    ///     ) -> CompResult<String, u64> {
+    ///         cache
+    ///             .entry(key.to_string())
+    ///             .and_compute_with(|maybe_entry| {
+    ///                 let op = if let Some(entry) = maybe_entry {
+    ///                     let counter = entry.into_value();
+    ///                     if counter < 2 {
+    ///                         Op::Put(counter.saturating_add(1)) // Update
+    ///                     } else {
+    ///                         Op::Remove
+    ///                     }
+    ///                 } else {
+    ///                       Op::Put(1) // Insert
+    ///                 };
+    ///                 // Return a Future that is resolved to `op` immediately.
+    ///                 std::future::ready(op)
+    ///             })
+    ///             .await
+    ///     }
+    ///
+    ///     // This should insert a new counter value 1 to the cache, and return the
+    ///     // value with the kind of the operation performed.
+    ///     let result = inclement_or_remove_counter(&cache, &key).await;
+    ///     let CompResult::Inserted(entry) = result else {
+    ///         panic!("`Inserted` should be returned: {result:?}");
+    ///     };
+    ///     assert_eq!(entry.into_value(), 1);
+    ///
+    ///     // This should increment the cached counter value by 1.
+    ///     let result = inclement_or_remove_counter(&cache, &key).await;
+    ///     let CompResult::ReplacedWith(entry) = result else {
+    ///         panic!("`ReplacedWith` should be returned: {result:?}");
+    ///     };
+    ///     assert_eq!(entry.into_value(), 2);
+    ///
+    ///     // This should remove the cached counter from the cache, and returns the
+    ///     // _removed_ value.
+    ///     let result = inclement_or_remove_counter(&cache, &key).await;
+    ///     let CompResult::Removed(entry) = result else {
+    ///         panic!("`Removed` should be returned: {result:?}");
+    ///     };
+    ///     assert_eq!(entry.into_value(), 2);
+    ///
+    ///     // The key should not exist.
+    ///     assert!(!cache.contains_key(&key));
+    ///
+    ///     // This should start over; insert a new counter value 1 to the cache.
+    ///     let result = inclement_or_remove_counter(&cache, &key).await;
+    ///     let CompResult::Inserted(entry) = result else {
+    ///         panic!("`Inserted` should be returned: {result:?}");
+    ///     };
+    ///     assert_eq!(entry.into_value(), 1);
+    /// }
+    /// ```
+    ///
+    /// # Concurrent calls on the same key
+    ///
+    /// This method guarantees that concurrent calls on the same key are executed
+    /// serially. That is, `and_compute_with` calls on the same key never run
+    /// concurrently. The calls are serialized by the order of their invocation. It
+    /// uses a key-level lock to achieve this.
+    pub async fn and_compute_with<F, Fut>(self, f: F) -> compute::CompResult<K, V>
+    where
+        F: FnOnce(Option<Entry<K, V>>) -> Fut,
+        Fut: Future<Output = compute::Op<V>>,
+    {
+        let key = Arc::new(self.owned_key);
+        self.cache
+            .compute_with_hash_and_fun(key, self.hash, f)
+            .await
+    }
+
+    /// Performs a compute operation on a cached entry by using the given closure
+    /// `f`. A compute operation is either put, remove or no-operation (nop).
+    ///
+    /// The closure `f` should take the current entry of `Option<Entry<K, V>>` for
+    /// the key, and return a `Future` that resolves to a
+    /// `Result<ops::compute::Op<V>, E>`.
+    ///
+    /// This method works as the followings:
+    ///
+    /// 1. Apply the closure `f` to the current cached `Entry`, and get a `Future`.
+    /// 2. Resolve the `Future`, and get a `Result<ops::compute::Op<V>, E>`.
+    /// 3. If resolved to `Err(E)`, return it.
+    /// 4. Else, execute the op on the cache:
+    ///    - `Ok(Op::Put(V))`: Put the new value `V` to the cache.
+    ///    - `Ok(Op::Remove)`: Remove the current cached entry.
+    ///    - `Ok(Op::Nop)`: Do nothing.
+    /// 5. Return an `Ok(ops::compute::CompResult<K, V>)` as the followings:
+    ///
+    /// | [`Op<V>`] | [`Entry<K, V>`] already exists? | [`CompResult<K, V>`] | Notes |
+    /// |:--------- |:--- |:--------------------------- |:------------------------------- |
+    /// | `Put(V)`  | no  | `Inserted(Entry<K, V>)`     | The new entry is returned.      |
+    /// | `Put(V)`  | yes | `ReplacedWith(Entry<K, V>)` | The new entry is returned.      |
+    /// | `Remove`  | no  | `StillNone(Arc<K>)`         |                                 |
+    /// | `Remove`  | yes | `Removed(Entry<K, V>)`      | The removed entry is returned.  |
+    /// | `Nop`     | no  | `StillNone(Arc<K>)`         |                                 |
+    /// | `Nop`     | yes | `Unchanged(Entry<K, V>)`    | The existing entry is returned. |
+    ///
+    /// # See Also
+    ///
+    /// - If you want the `Future` resolve to `Op<V>` instead of `Result<Op<V>>`, use
+    ///   the [`and_compute_with`] method.
+    /// - If you only want to update or insert, use the [`and_upsert_with`] method.
+    ///
+    /// [`Entry<K, V>`]: ../struct.Entry.html
+    /// [`Op<V>`]: ../ops/compute/enum.Op.html
+    /// [`CompResult<K, V>`]: ../ops/compute/enum.CompResult.html
+    /// [`and_upsert_with`]: #method.and_upsert_with
+    /// [`and_compute_with`]: #method.and_compute_with
+    ///
+    /// # Example
+    ///
+    /// See [`try_append_value_async.rs`] in the `examples` directory.
+    ///
+    /// [`try_append_value_async.rs`]:
+    ///     https://github.com/moka-rs/moka/tree/main/examples/try_append_value_async.rs
+    ///
+    /// # Concurrent calls on the same key
+    ///
+    /// This method guarantees that concurrent calls on the same key are executed
+    /// serially. That is, `and_try_compute_with` calls on the same key never run
+    /// concurrently. The calls are serialized by the order of their invocation. It
+    /// uses a key-level lock to achieve this.
+    pub async fn and_try_compute_with<F, Fut, E>(self, f: F) -> Result<compute::CompResult<K, V>, E>
+    where
+        F: FnOnce(Option<Entry<K, V>>) -> Fut,
+        Fut: Future<Output = Result<compute::Op<V>, E>>,
+        E: Send + Sync + 'static,
+    {
+        let key = Arc::new(self.owned_key);
+        self.cache
+            .try_compute_with_hash_and_fun(key, self.hash, f)
+            .await
+    }
+
+    pub async fn and_try_compute_if_nobody_else<F, Fut, E>(
+        self,
+        f: F,
+    ) -> Result<compute::CompResult<K, V>, E>
+    where
+        F: FnOnce(Option<Entry<K, V>>) -> Fut,
+        Fut: Future<Output = Result<compute::Op<V>, E>>,
+        E: Send + Sync + 'static,
+    {
+        let key = Arc::new(self.owned_key);
+        self.cache
+            .try_compute_if_nobody_else_with_hash_and_fun(key, self.hash, f)
+            .await
+    }
+
+    /// Performs an upsert of an [`Entry`] by using the given closure `f`. The word
+    /// "upsert" here means "update" or "insert".
+    ///
+    /// The closure `f` should take the current entry of `Option<Entry<K, V>>` for
+    /// the key, and return a `Future` that resolves to a new value `V`.
+    ///
+    /// This method works as the followings:
+    ///
+    /// 1. Apply the closure `f` to the current cached `Entry`, and get a `Future`.
+    /// 2. Resolve the `Future`, and get a new value `V`.
+    /// 3. Upsert the new value to the cache.
+    /// 4. Return the `Entry` having the upserted value.
+    ///
+    /// # See Also
+    ///
+    /// - If you want to optionally upsert, that is to upsert only when certain
+    ///   conditions meet, use the [`and_compute_with`] method.
+    /// - If you try to upsert, that is to make the `Future` resolve to `Result<V>`
+    ///   instead of `V`, and upsert only when resolved to `Ok(V)`, use the
+    ///   [`and_try_compute_with`] method.
+    ///
+    /// [`Entry`]: ../struct.Entry.html
+    /// [`and_compute_with`]: #method.and_compute_with
+    /// [`and_try_compute_with`]: #method.and_try_compute_with
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// // Cargo.toml
+    /// //
+    /// // [dependencies]
+    /// // moka = { version = "0.12.8", features = ["future"] }
+    /// // tokio = { version = "1", features = ["rt-multi-thread", "macros" ] }
+    ///
+    /// use moka::future::Cache;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let cache: Cache<String, u64> = Cache::new(100);
+    ///     let key = "key1".to_string();
+    ///
+    ///     let entry = cache
+    ///         .entry(key.clone())
+    ///         .and_upsert_with(|maybe_entry| {
+    ///             let counter = if let Some(entry) = maybe_entry {
+    ///                 entry.into_value().saturating_add(1) // Update
+    ///             } else {
+    ///                 1 // Insert
+    ///             };
+    ///             // Return a Future that is resolved to `counter` immediately.
+    ///             std::future::ready(counter)
+    ///         })
+    ///         .await;
+    ///     // It was not an update.
+    ///     assert!(!entry.is_old_value_replaced());
+    ///     assert_eq!(entry.key(), &key);
+    ///     assert_eq!(entry.into_value(), 1);
+    ///
+    ///     let entry = cache
+638:    schedule_write_op_should_block: AtomicBool,
+669:            schedule_write_op_should_block: AtomicBool::new(
+670:                self.schedule_write_op_should_block.load(Ordering::Acquire),
+846:            schedule_write_op_should_block: Default::default(), // false
+1570:    async fn insert_with_hash_and_fun(
+1810:    pub(crate) async fn insert_with_hash(&self, key: Arc<K>, hash: u64, value: V) {
+1826:            should_block = self.schedule_write_op_should_block.load(Ordering::Acquire);
+1832:        BaseCache::<K, V, S>::schedule_write_op(
+1859:            .try_compute(key, hash, self, f, post_init, true)
+1880:            .try_compute(key, hash, self, f, post_init, true)
+1884:    pub(crate) async fn try_compute_if_nobody_else_with_hash_and_fun<F, Fut, E>(
+1897:            .try_compute_if_nobody_else(key, hash, self, f, post_init, true)
+1914:            .try_compute(key, hash, self, f, post_init, false)
+1922:    pub(crate) async fn invalidate_with_hash<Q>(
+1989:                        .notify_invalidate(&kv.key, &kv.entry)
+2014:                    should_block = self.schedule_write_op_should_block.load(Ordering::Acquire);
+2020:                BaseCache::<K, V, S>::schedule_write_op(
+5522:        // Interrupt `insert` while blocking in `schedule_write_op`
+5526:            .schedule_write_op_should_block
+5530:        // it is cancelled) because schedule_write_op should be awaiting for a lock.
+5538:            .schedule_write_op_should_block
+5548:        // Interrupt `invalidate` while blocking in `schedule_write_op`
+5552:            .schedule_write_op_should_block
+5556:        // it is cancelled) because schedule_write_op should be awaiting for a lock.
+5564:            .schedule_write_op_should_block
+impl<K, V, S> Cache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    pub(crate) async fn get_or_insert_with_hash_and_fun(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        init: Pin<&mut impl Future<Output = V>>,
+        mut replace_if: Option<impl FnMut(&V) -> bool + Send>,
+        need_key: bool,
+    ) -> Entry<K, V> {
+        let maybe_entry = self
+            .base
+            .get_with_hash(&*key, hash, replace_if.as_mut(), need_key, true)
+            .await;
+        if let Some(entry) = maybe_entry {
+            entry
+        } else {
+            self.insert_with_hash_and_fun(key, hash, init, replace_if, need_key)
+                .await
+        }
+    }
+
+    pub(crate) async fn get_or_insert_with_hash_by_ref_and_fun<Q>(
+        &self,
+        key: &Q,
+        hash: u64,
+        init: Pin<&mut impl Future<Output = V>>,
+        mut replace_if: Option<impl FnMut(&V) -> bool + Send>,
+        need_key: bool,
+    ) -> Entry<K, V>
+    where
+        Q: Equivalent<K> + ToOwned<Owned = K> + Hash + ?Sized,
+    {
+        let maybe_entry = self
+            .base
+            .get_with_hash(key, hash, replace_if.as_mut(), need_key, true)
+            .await;
+        if let Some(entry) = maybe_entry {
+            entry
+        } else {
+            let key = Arc::new(key.to_owned());
+            self.insert_with_hash_and_fun(key, hash, init, replace_if, need_key)
+                .await
+        }
+    }
+
+    async fn insert_with_hash_and_fun(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        init: Pin<&mut impl Future<Output = V>>,
+        replace_if: Option<impl FnMut(&V) -> bool + Send>,
+        need_key: bool,
+    ) -> Entry<K, V> {
+        let k = if need_key {
+            Some(Arc::clone(&key))
+        } else {
+            None
+        };
+
+        let type_id = ValueInitializer::<K, V, S>::type_id_for_get_with();
+        let post_init = ValueInitializer::<K, V, S>::post_init_for_get_with;
+
+        match self
+            .value_initializer
+            .try_init_or_read(&key, hash, type_id, self, replace_if, init, post_init)
+            .await
+        {
+            InitResult::Initialized(v) => {
+                crossbeam_epoch::pin().flush();
+                Entry::new(k, v, true, false)
+            }
+            InitResult::ReadExisting(v) => Entry::new(k, v, false, false),
+            InitResult::InitErr(_) => unreachable!(),
+        }
+    }
+
+    pub(crate) async fn get_or_insert_with_hash(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        init: impl FnOnce() -> V,
+    ) -> Entry<K, V> {
+        match self
+            .base
+            .get_with_hash(&*key, hash, never_ignore(), true, true)
+            .await
+        {
+            Some(entry) => entry,
+            None => {
+                let value = init();
+                self.insert_with_hash(Arc::clone(&key), hash, value.clone())
+                    .await;
+                Entry::new(Some(key), value, true, false)
+            }
+        }
+    }
+
+    pub(crate) async fn get_or_insert_with_hash_by_ref<Q>(
+        &self,
+        key: &Q,
+        hash: u64,
+        init: impl FnOnce() -> V,
+    ) -> Entry<K, V>
+    where
+        Q: Equivalent<K> + ToOwned<Owned = K> + Hash + ?Sized,
+    {
+        match self
+            .base
+            .get_with_hash(key, hash, never_ignore(), true, true)
+            .await
+        {
+            Some(entry) => entry,
+            None => {
+                let key = Arc::new(key.to_owned());
+                let value = init();
+                self.insert_with_hash(Arc::clone(&key), hash, value.clone())
+                    .await;
+                Entry::new(Some(key), value, true, false)
+            }
+        }
+    }
+
+    pub(crate) async fn get_or_optionally_insert_with_hash_and_fun<F>(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        init: Pin<&mut F>,
+        need_key: bool,
+    ) -> Option<Entry<K, V>>
+    where
+        F: Future<Output = Option<V>>,
+    {
+        let entry = self
+            .base
+            .get_with_hash(&*key, hash, never_ignore(), need_key, true)
+            .await;
+        if entry.is_some() {
+            return entry;
+        }
+
+        self.optionally_insert_with_hash_and_fun(key, hash, init, need_key)
+            .await
+    }
+
+    pub(crate) async fn get_or_optionally_insert_with_hash_by_ref_and_fun<F, Q>(
+        &self,
+        key: &Q,
+        hash: u64,
+        init: Pin<&mut F>,
+        need_key: bool,
+    ) -> Option<Entry<K, V>>
+    where
+        F: Future<Output = Option<V>>,
+        Q: Equivalent<K> + ToOwned<Owned = K> + Hash + ?Sized,
+    {
+        let entry = self
+            .base
+            .get_with_hash(key, hash, never_ignore(), need_key, true)
+            .await;
+        if entry.is_some() {
+            return entry;
+        }
+
+        let key = Arc::new(key.to_owned());
+        self.optionally_insert_with_hash_and_fun(key, hash, init, need_key)
+            .await
+    }
+
+    async fn optionally_insert_with_hash_and_fun<F>(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        init: Pin<&mut F>,
+        need_key: bool,
+    ) -> Option<Entry<K, V>>
+    where
+        F: Future<Output = Option<V>>,
+    {
+        let k = if need_key {
+            Some(Arc::clone(&key))
+        } else {
+            None
+        };
+
+        let type_id = ValueInitializer::<K, V, S>::type_id_for_optionally_get_with();
+        let post_init = ValueInitializer::<K, V, S>::post_init_for_optionally_get_with;
+
+        match self
+            .value_initializer
+            .try_init_or_read(&key, hash, type_id, self, never_ignore(), init, post_init)
+            .await
+        {
+            InitResult::Initialized(v) => {
+                crossbeam_epoch::pin().flush();
+                Some(Entry::new(k, v, true, false))
+            }
+            InitResult::ReadExisting(v) => Some(Entry::new(k, v, false, false)),
+            InitResult::InitErr(_) => None,
+        }
+    }
+
+    pub(super) async fn get_or_try_insert_with_hash_and_fun<F, E>(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        init: Pin<&mut F>,
+        need_key: bool,
+    ) -> Result<Entry<K, V>, Arc<E>>
+    where
+        F: Future<Output = Result<V, E>>,
+        E: Send + Sync + 'static,
+    {
+        if let Some(entry) = self
+            .base
+            .get_with_hash(&*key, hash, never_ignore(), need_key, true)
+            .await
+54:    num_segments: Option<usize>,
+55:    weigher: Option<Weigher<K, V>>,
+75:            num_segments: None,
+76:            weigher: None,
+102:    /// Sets the number of segments of the cache.
+106:    /// Panics if `num_segments` is zero.
+107:    pub fn segments(
+109:        num_segments: usize,
+111:        assert!(num_segments != 0);
+117:            num_segments: Some(num_segments),
+118:            weigher: self.weigher,
+131:    /// If you want to build a `SegmentedCache<K, V>`, call `segments` method before
+142:        builder_utils::ensure_expirations_or_panic(exp.time_to_live(), exp.time_to_idle());
+148:            self.weigher,
+231:        builder_utils::ensure_expirations_or_panic(exp.time_to_live(), exp.time_to_idle());
+237:            self.weigher,
+255:    /// If you want to build a `Cache<K, V>`, do not call `segments` method before
+266:        builder_utils::ensure_expirations_or_panic(exp.time_to_live(), exp.time_to_idle());
+271:            self.num_segments.unwrap(),
+273:            self.weigher,
+357:        builder_utils::ensure_expirations_or_panic(exp.time_to_live(), exp.time_to_idle());
+362:            self.num_segments.unwrap(),
+364:            self.weigher,
+414:    /// Sets the weigher closure to the cache.
+418:    pub fn weigher(self, weigher: impl Fn(&K, &V) -> u32 + Send + Sync + 'static) -> Self {
+420:            weigher: Some(Arc::new(weigher)),
+432:    /// It is very important to make the listener closure not to panic. Otherwise,
+433:    /// the cache will stop calling the listener after a panic. This is an intended
+435:    /// call the panicked listener again.
+455:    /// `CacheBuilder::build*` methods will panic if the given `duration` is longer
+471:    /// `CacheBuilder::build*` methods will panic if the given `duration` is longer
+480:    /// Sets the given `expiry` to the cache.
+487:    pub fn expire_after(self, expiry: impl Expiry<K, V> + Send + Sync + 'static) -> Self {
+489:        builder.expiration_policy.set_expiry(Arc::new(expiry));
+536:        assert_eq!(policy.num_segments(), 1);
+550:        assert_eq!(config.num_segments(), 1);
+559:        let cache = CacheBuilder::new(100).segments(15).build();
+565:        assert_eq!(policy.num_segments(), 16_usize.next_power_of_two());
+577:            // Call segments() at the end to check all field values in the current
+580:            .segments(24);
+590:        assert_eq!(policy.num_segments(), 24_usize.next_power_of_two());
+598:    #[should_panic(expected = "time_to_live is longer than 1000 years")]
+609:    #[should_panic(expected = "time_to_idle is longer than 1000 years")]

@@ -1,0 +1,735 @@
+use std::fmt;
+use std::io;
+
+use crate::codec::UserError;
+use crate::frame::{self, Reason, StreamId};
+use crate::proto::{self, Error, Initiator, PollReset};
+
+use self::Inner::*;
+use self::Peer::*;
+
+/// Represents the state of an H2 stream
+///
+/// ```not_rust
+///                              +--------+
+///                      send PP |        | recv PP
+///                     ,--------|  idle  |--------.
+///                    /         |        |         \
+///                   v          +--------+          v
+///            +----------+          |           +----------+
+///            |          |          | send H /  |          |
+///     ,------| reserved |          | recv H    | reserved |------.
+///     |      | (local)  |          |           | (remote) |      |
+///     |      +----------+          v           +----------+      |
+///     |          |             +--------+             |          |
+///     |          |     recv ES |        | send ES     |          |
+///     |   send H |     ,-------|  open  |-------.     | recv H   |
+///     |          |    /        |        |        \    |          |
+///     |          v   v         +--------+         v   v          |
+///     |      +----------+          |           +----------+      |
+///     |      |   half   |          |           |   half   |      |
+///     |      |  closed  |          | send R /  |  closed  |      |
+///     |      | (remote) |          | recv R    | (local)  |      |
+///     |      +----------+          |           +----------+      |
+///     |           |                |                 |           |
+///     |           | send ES /      |       recv ES / |           |
+///     |           | send R /       v        send R / |           |
+///     |           | recv R     +--------+   recv R   |           |
+///     | send R /  `----------->|        |<-----------'  send R / |
+///     | recv R                 | closed |               recv R   |
+///     `----------------------->|        |<----------------------'
+///                              +--------+
+///
+///        send:   endpoint sends this frame
+///        recv:   endpoint receives this frame
+///
+///        H:  HEADERS frame (with implied CONTINUATIONs)
+///        PP: PUSH_PROMISE frame (with implied CONTINUATIONs)
+///        ES: END_STREAM flag
+///        R:  RST_STREAM frame
+/// ```
+#[derive(Clone)]
+pub struct State {
+    inner: Inner,
+}
+
+#[derive(Debug, Clone)]
+enum Inner {
+    Idle,
+    // TODO: these states shouldn't count against concurrency limits:
+    ReservedLocal,
+    ReservedRemote,
+    Open { local: Peer, remote: Peer },
+    HalfClosedLocal(Peer), // TODO: explicitly name this value
+    HalfClosedRemote(Peer),
+    Closed(Cause),
+}
+
+#[derive(Debug, Copy, Clone, Default)]
+enum Peer {
+    #[default]
+    AwaitingHeaders,
+    Streaming,
+}
+
+#[derive(Debug, Clone)]
+enum Cause {
+    EndStream,
+    Error(Error),
+
+    /// This indicates to the connection that a reset frame must be sent out
+    /// once the send queue has been flushed.
+    ///
+    /// Examples of when this could happen:
+    /// - User drops all references to a stream, so we want to CANCEL the it.
+    /// - Header block size was too large, so we want to REFUSE, possibly
+    ///   after sending a 431 response frame.
+    ScheduledLibraryReset(Reason),
+}
+
+impl State {
+    /// Opens the send-half of a stream if it is not already open.
+    pub fn send_open(&mut self, eos: bool) -> Result<(), UserError> {
+        let local = Streaming;
+
+        self.inner = match self.inner {
+            Idle => {
+                if eos {
+                    HalfClosedLocal(AwaitingHeaders)
+                } else {
+                    Open {
+                        local,
+                        remote: AwaitingHeaders,
+                    }
+                }
+            }
+            Open {
+                local: AwaitingHeaders,
+                remote,
+            } => {
+                if eos {
+                    HalfClosedLocal(remote)
+                } else {
+                    Open { local, remote }
+                }
+            }
+            HalfClosedRemote(AwaitingHeaders) | ReservedLocal => {
+                if eos {
+                    Closed(Cause::EndStream)
+                } else {
+                    HalfClosedRemote(local)
+                }
+            }
+            _ => {
+                // All other transitions result in a protocol error
+                return Err(UserError::UnexpectedFrameType);
+            }
+        };
+
+        Ok(())
+    }
+
+    /// Opens the receive-half of the stream when a HEADERS frame is received.
+    ///
+    /// Returns true if this transitions the state to Open.
+    pub fn recv_open(&mut self, frame: &frame::Headers) -> Result<bool, Error> {
+        let mut initial = false;
+        let eos = frame.is_end_stream();
+
+        self.inner = match self.inner {
+            Idle => {
+                initial = true;
+
+                if eos {
+                    HalfClosedRemote(AwaitingHeaders)
+                } else {
+                    Open {
+                        local: AwaitingHeaders,
+                        remote: if frame.is_informational() {
+                            tracing::trace!("skipping 1xx response headers");
+                            AwaitingHeaders
+                        } else {
+                            Streaming
+                        },
+                    }
+                }
+            }
+            ReservedRemote => {
+                initial = true;
+
+                if eos {
+                    Closed(Cause::EndStream)
+                } else if frame.is_informational() {
+                    tracing::trace!("skipping 1xx response headers");
+                    ReservedRemote
+                } else {
+                    HalfClosedLocal(Streaming)
+                }
+            }
+            Open {
+                local,
+                remote: AwaitingHeaders,
+            } => {
+                if eos {
+                    HalfClosedRemote(local)
+                } else {
+                    Open {
+                        local,
+                        remote: if frame.is_informational() {
+                            tracing::trace!("skipping 1xx response headers");
+                            AwaitingHeaders
+                        } else {
+                            Streaming
+                        },
+                    }
+                }
+            }
+            HalfClosedLocal(AwaitingHeaders) => {
+                if eos {
+                    Closed(Cause::EndStream)
+                } else if frame.is_informational() {
+                    tracing::trace!("skipping 1xx response headers");
+                    HalfClosedLocal(AwaitingHeaders)
+                } else {
+                    HalfClosedLocal(Streaming)
+                }
+            }
+            ref state => {
+                // All other transitions result in a protocol error
+                proto_err!(conn: "recv_open: in unexpected state {:?}", state);
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+            }
+        };
+
+        Ok(initial)
+    }
+
+    /// Transition from Idle -> ReservedRemote
+    pub fn reserve_remote(&mut self) -> Result<(), Error> {
+        match self.inner {
+            Idle => {
+                self.inner = ReservedRemote;
+                Ok(())
+            }
+            ref state => {
+                proto_err!(conn: "reserve_remote: in unexpected state {:?}", state);
+                Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
+            }
+        }
+    }
+
+    /// Transition from Idle -> ReservedLocal
+    pub fn reserve_local(&mut self) -> Result<(), UserError> {
+        match self.inner {
+            Idle => {
+                self.inner = ReservedLocal;
+                Ok(())
+            }
+            _ => Err(UserError::UnexpectedFrameType),
+        }
+    }
+
+    /// Indicates that the remote side will not send more data to the local.
+    pub fn recv_close(&mut self) -> Result<(), Error> {
+        match self.inner {
+            Open { local, .. } => {
+                // The remote side will continue to receive data.
+                tracing::trace!("recv_close: Open => HalfClosedRemote({:?})", local);
+                self.inner = HalfClosedRemote(local);
+                Ok(())
+            }
+            HalfClosedLocal(..) => {
+                tracing::trace!("recv_close: HalfClosedLocal => Closed");
+                self.inner = Closed(Cause::EndStream);
+                Ok(())
+            }
+            ref state => {
+                proto_err!(conn: "recv_close: in unexpected state {:?}", state);
+                Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
+            }
+        }
+    }
+
+    /// The remote explicitly sent a RST_STREAM.
+    ///
+    /// # Arguments
+    /// - `frame`: the received RST_STREAM frame.
+    /// - `queued`: true if this stream has frames in the pending send queue.
+    pub fn recv_reset(&mut self, frame: frame::Reset, queued: bool) {
+        match self.inner {
+            // If the stream is already in a `Closed` state, do nothing,
+            // If the stream is already in a `Closed` state, do nothing,
+            // provided that there are no frames still in the send queue.
+            Closed(..) if !queued => {}
+            // A notionally `Closed` stream may still have queued frames in
+            // the following cases:
+            //
+            // - if the cause is `Cause::Scheduled(..)` (i.e. we have not
+            //   actually closed the stream yet).
+            // - if the cause is `Cause::EndStream`: we transition to this
+            //   state when an EOS frame is *enqueued* (so that it's invalid
+            //   to enqueue more frames), not when the EOS frame is *sent*;
+            //   therefore, there may still be frames ahead of the EOS frame
+            //   in the send queue.
+            //
+            // In either of these cases, we want to overwrite the stream's
+            // previous state with the received RST_STREAM, so that the queue
+            // will be cleared by `Prioritize::pop_frame`.
+            ref state => {
+                tracing::trace!(
+                    "recv_reset; frame={:?}; state={:?}; queued={:?}",
+                    frame,
+                    state,
+                    queued
+                );
+                self.inner = Closed(Cause::Error(Error::remote_reset(
+                    frame.stream_id(),
+                    frame.reason(),
+                )));
+            }
+        }
+    }
+
+    /// Handle a connection-level error.
+    pub fn handle_error(&mut self, err: &proto::Error) {
+        match self.inner {
+            Closed(..) => {}
+            _ => {
+                tracing::trace!("handle_error; err={:?}", err);
+                self.inner = Closed(Cause::Error(err.clone()));
+            }
+        }
+    }
+
+    pub fn recv_eof(&mut self) {
+        match self.inner {
+            Closed(..) => {}
+            ref state => {
+                tracing::trace!("recv_eof; state={:?}", state);
+                self.inner = Closed(Cause::Error(
+                    io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "stream closed because of a broken pipe",
+                    )
+                    .into(),
+                ));
+            }
+        }
+    }
+
+    /// Indicates that the local side will not send more data to the local.
+    pub fn send_close(&mut self) {
+        match self.inner {
+            Open { remote, .. } => {
+                // The remote side will continue to receive data.
+                tracing::trace!("send_close: Open => HalfClosedLocal({:?})", remote);
+                self.inner = HalfClosedLocal(remote);
+            }
+            HalfClosedRemote(..) => {
+                tracing::trace!("send_close: HalfClosedRemote => Closed");
+                self.inner = Closed(Cause::EndStream);
+            }
+            ref state => panic!("send_close: unexpected state {:?}", state),
+        }
+    }
+
+    /// Set the stream state to reset locally.
+    pub fn set_reset(&mut self, stream_id: StreamId, reason: Reason, initiator: Initiator) {
+        self.inner = Closed(Cause::Error(Error::Reset(stream_id, reason, initiator)));
+    }
+
+    /// Set the stream state to a scheduled reset.
+    pub fn set_scheduled_reset(&mut self, reason: Reason) {
+        debug_assert!(!self.is_closed());
+        self.inner = Closed(Cause::ScheduledLibraryReset(reason));
+    }
+
+    pub fn get_scheduled_reset(&self) -> Option<Reason> {
+        match self.inner {
+            Closed(Cause::ScheduledLibraryReset(reason)) => Some(reason),
+            _ => None,
+        }
+    }
+
+    pub fn is_scheduled_reset(&self) -> bool {
+        matches!(self.inner, Closed(Cause::ScheduledLibraryReset(..)))
+    }
+
+    pub fn is_local_error(&self) -> bool {
+        match self.inner {
+            Closed(Cause::Error(ref e)) => e.is_local(),
+            Closed(Cause::ScheduledLibraryReset(..)) => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_remote_reset(&self) -> bool {
+        matches!(
+            self.inner,
+            Closed(Cause::Error(Error::Reset(_, _, Initiator::Remote)))
+        )
+    }
+
+    /// Returns true if the stream is already reset.
+    pub fn is_reset(&self) -> bool {
+        match self.inner {
+            Closed(Cause::EndStream) => false,
+            Closed(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_send_streaming(&self) -> bool {
+        matches!(
+            self.inner,
+            Open {
+                local: Streaming,
+                ..
+            } | HalfClosedRemote(Streaming)
+        )
+    }
+
+    /// Returns true when the stream is in a state to receive headers
+    pub fn is_recv_headers(&self) -> bool {
+        matches!(
+            self.inner,
+            Idle | Open {
+                remote: AwaitingHeaders,
+                ..
+            } | HalfClosedLocal(AwaitingHeaders)
+                | ReservedRemote
+        )
+    }
+
+    pub fn is_recv_streaming(&self) -> bool {
+        matches!(
+            self.inner,
+            Open {
+                remote: Streaming,
+                ..
+            } | HalfClosedLocal(Streaming)
+        )
+    }
+
+    pub fn is_recv_end_stream(&self) -> bool {
+        // In either case END_STREAM has been received
+        matches!(self.inner, Closed(Cause::EndStream) | HalfClosedRemote(..))
+    }
+
+    pub fn is_closed(&self) -> bool {
+        matches!(self.inner, Closed(_))
+    }
+
+    pub fn is_send_closed(&self) -> bool {
+        matches!(
+            self.inner,
+            Closed(..) | HalfClosedLocal(..) | ReservedRemote
+        )
+    }
+
+    pub fn is_idle(&self) -> bool {
+        matches!(self.inner, Idle)
+    }
+
+    pub fn ensure_recv_open(&self) -> Result<bool, proto::Error> {
+        // TODO: Is this correct?
+        match self.inner {
+            Closed(Cause::Error(ref e)) => Err(e.clone()),
+            Closed(Cause::ScheduledLibraryReset(reason)) => {
+                Err(proto::Error::library_go_away(reason))
+            }
+            Closed(Cause::EndStream) | HalfClosedRemote(..) | ReservedLocal => Ok(false),
+            _ => Ok(true),
+        }
+    }
+
+    /// Returns a reason if the stream has been reset.
+    pub(super) fn ensure_reason(&self, mode: PollReset) -> Result<Option<Reason>, crate::Error> {
+        match self.inner {
+            Closed(Cause::Error(Error::Reset(_, reason, _)))
+            | Closed(Cause::Error(Error::GoAway(_, reason, _)))
+            | Closed(Cause::ScheduledLibraryReset(reason)) => Ok(Some(reason)),
+            Closed(Cause::Error(ref e)) => Err(e.clone().into()),
+            Open {
+                local: Streaming, ..
+            }
+            | HalfClosedRemote(Streaming) => match mode {
+                PollReset::AwaitingHeaders => Err(UserError::PollResetAfterSendResponse.into()),
+                PollReset::Streaming => Ok(None),
+            },
+            _ => Ok(None),
+        }
+    }
+}
+
+impl Default for State {
+    fn default() -> State {
+        State { inner: Inner::Idle }
+    }
+}
+
+// remove some noise for debug output
+impl fmt::Debug for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+impl<T, B> fmt::Debug for Connection<T, B>
+where
+    T: AsyncRead + AsyncWrite,
+    T: fmt::Debug,
+    B: fmt::Debug + Buf,
+{
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Debug::fmt(&self.inner, fmt)
+    }
+}
+
+// ===== impl ResponseFuture =====
+
+impl Future for ResponseFuture {
+    type Output = Result<Response<RecvStream>, crate::Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let (parts, _) = ready!(self.inner.poll_response(cx))?.into_parts();
+        let body = RecvStream::new(FlowControl::new(self.inner.clone()));
+
+        Poll::Ready(Ok(Response::from_parts(parts, body)))
+    }
+}
+
+impl ResponseFuture {
+    /// Returns the stream ID of the response stream.
+    ///
+    /// # Panics
+    ///
+    /// If the lock on the stream store has been poisoned.
+    pub fn stream_id(&self) -> crate::StreamId {
+        crate::StreamId::from_internal(self.inner.stream_id())
+    }
+    /// Returns a stream of PushPromises
+    ///
+    /// # Panics
+    ///
+    /// If this method has been called before
+    /// or the stream was itself was pushed
+    pub fn push_promises(&mut self) -> PushPromises {
+        if self.push_promise_consumed {
+            panic!("Reference to push promises stream taken!");
+        }
+        self.push_promise_consumed = true;
+        PushPromises {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+// ===== impl PushPromises =====
+
+impl PushPromises {
+    /// Get the next `PushPromise`.
+    pub async fn push_promise(&mut self) -> Option<Result<PushPromise, crate::Error>> {
+        crate::poll_fn(move |cx| self.poll_push_promise(cx)).await
+    }
+
+    #[doc(hidden)]
+    pub fn poll_push_promise(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<PushPromise, crate::Error>>> {
+        match self.inner.poll_pushed(cx) {
+            Poll::Ready(Some(Ok((request, response)))) => {
+                let response = PushedResponseFuture {
+                    inner: ResponseFuture {
+                        inner: response,
+                        push_promise_consumed: false,
+                    },
+                };
+                Poll::Ready(Some(Ok(PushPromise { request, response })))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+                me.refs += 1;
+                let opaque_ref =
+                    OpaqueStreamRef::new(self.inner.clone(), &mut me.store.resolve(key));
+                (h, opaque_ref)
+            })
+    }
+
+    pub fn is_end_stream(&self) -> bool {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let stream = me.store.resolve(self.key);
+
+        me.actions.recv.is_end_stream(&stream)
+    }
+
+    pub fn poll_data(&mut self, cx: &Context) -> Poll<Option<Result<Bytes, proto::Error>>> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.key);
+
+        me.actions.recv.poll_data(cx, &mut stream)
+    }
+
+    pub fn poll_trailers(&mut self, cx: &Context) -> Poll<Option<Result<HeaderMap, proto::Error>>> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.key);
+
+        me.actions.recv.poll_trailers(cx, &mut stream)
+    }
+
+    pub(crate) fn available_recv_capacity(&self) -> isize {
+        let me = self.inner.lock().unwrap();
+        let me = &*me;
+
+        let stream = &me.store[self.key];
+        stream.recv_flow.available().into()
+    }
+
+    pub(crate) fn used_recv_capacity(&self) -> WindowSize {
+        let me = self.inner.lock().unwrap();
+        let me = &*me;
+
+        let stream = &me.store[self.key];
+        stream.in_flight_recv_data
+    }
+
+    /// Releases recv capacity back to the peer. This may result in sending
+    /// WINDOW_UPDATE frames on both the stream and connection.
+    pub fn release_capacity(&mut self, capacity: WindowSize) -> Result<(), UserError> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.key);
+
+        me.actions
+            .recv
+            .release_capacity(capacity, &mut stream, &mut me.actions.task)
+    }
+
+    /// Clear the receive queue and set the status to no longer receive data frames.
+    pub(crate) fn clear_recv_buffer(&mut self) {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.key);
+        stream.is_recv = false;
+        me.actions.recv.clear_recv_buffer(&mut stream);
+    }
+
+    pub fn stream_id(&self) -> StreamId {
+        self.inner.lock().unwrap().store[self.key].id
+    }
+}
+
+impl fmt::Debug for OpaqueStreamRef {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        use std::sync::TryLockError::*;
+
+        match self.inner.try_lock() {
+            Ok(me) => {
+                let stream = &me.store[self.key];
+                fmt.debug_struct("OpaqueStreamRef")
+                    .field("stream_id", &stream.id)
+                    .field("ref_count", &stream.ref_count)
+                    .finish()
+            }
+            Err(Poisoned(_)) => fmt
+                .debug_struct("OpaqueStreamRef")
+                .field("inner", &"<Poisoned>")
+                .finish(),
+            Err(WouldBlock) => fmt
+                .debug_struct("OpaqueStreamRef")
+            }
+        }
+
+        true
+    }
+
+    pub fn pop<'a, R>(&mut self, store: &'a mut R) -> Option<store::Ptr<'a>>
+    where
+        R: Resolve,
+    {
+        if let Some(mut idxs) = self.indices {
+            let mut stream = store.resolve(idxs.head);
+
+            if idxs.head == idxs.tail {
+                assert!(N::next(&stream).is_none());
+                self.indices = None;
+            } else {
+                idxs.head = N::take_next(&mut stream).unwrap();
+                self.indices = Some(idxs);
+            }
+
+            debug_assert!(N::is_queued(&stream));
+            N::set_queued(&mut stream, false);
+
+            return Some(stream);
+        }
+
+        None
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_none()
+    }
+
+    pub fn pop_if<'a, R, F>(&mut self, store: &'a mut R, f: F) -> Option<store::Ptr<'a>>
+    where
+        R: Resolve,
+        F: Fn(&Stream) -> bool,
+    {
+        if let Some(idxs) = self.indices {
+            let should_pop = f(&store.resolve(idxs.head));
+            if should_pop {
+                return self.pop(store);
+            }
+        }
+
+        None
+    }
+}
+
+impl<N> fmt::Debug for Queue<N> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Queue")
+            .field("indices", &self.indices)
+            // skip phantom data
+            .finish()
+    }
+}
+
+// ===== impl Ptr =====
+
+impl<'a> Ptr<'a> {
+    /// Returns the Key associated with the stream
+    pub fn key(&self) -> Key {
+        self.key
+    }
+
+    pub fn store_mut(&mut self) -> &mut Store {
+        self.store
+    }
+
+    /// Remove the stream from the store
+    pub fn remove(self) -> StreamId {
+        // The stream must have been unlinked before this point
+        debug_assert!(!self.store.ids.contains_key(&self.key.stream_id));
+
+        // Remove the stream state
+        let stream = self.store.slab.remove(self.key.index.0 as usize);
+        assert_eq!(stream.id, self.key.stream_id);
+        stream.id
+    }
+
+    /// Remove the StreamId -> stream state association.
+    ///
+    /// This will effectively remove the stream as far as the H2 protocol is
+    /// concerned.
+9.104933333333333 minutes used of 45.0

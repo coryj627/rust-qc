@@ -1,0 +1,826 @@
+use std::any::TypeId;
+use std::cell::{Cell, UnsafeCell};
+use std::ffi::CStr;
+use std::mem;
+use std::os::raw::{c_char, c_int, c_void};
+use std::panic::resume_unwind;
+use std::ptr::{self, NonNull};
+use std::sync::Arc;
+
+use crate::chunk::ChunkMode;
+use crate::error::{Error, Result};
+use crate::function::Function;
+use crate::memory::{MemoryState, ALLOCATOR};
+use crate::state::util::callback_error_ext;
+use crate::stdlib::StdLib;
+use crate::string::String;
+use crate::table::Table;
+use crate::thread::Thread;
+use crate::traits::IntoLua;
+use crate::types::{
+    AppDataRef, AppDataRefMut, Callback, CallbackUpvalue, DestructedUserdata, Integer, LightUserData,
+    MaybeSend, ReentrantMutex, RegistryKey, ValueRef, XRc,
+};
+use crate::userdata::{
+    init_userdata_metatable, AnyUserData, MetaMethod, RawUserDataRegistry, UserData, UserDataRegistry,
+    UserDataStorage,
+};
+use crate::util::{
+    assert_stack, check_stack, get_destructed_userdata_metatable, get_internal_userdata, get_main_state,
+    get_metatable_ptr, get_userdata, init_error_registry, init_internal_metatable, pop_error,
+    push_internal_userdata, push_string, push_table, push_userdata, rawset_field, safe_pcall, safe_xpcall,
+    short_type_name, StackGuard, WrappedFailure,
+};
+use crate::value::{Nil, Value};
+
+use super::extra::ExtraData;
+use super::{Lua, LuaOptions, WeakLua};
+
+#[cfg(not(feature = "luau"))]
+use crate::{
+    debug::Debug,
+    types::{HookCallback, HookKind, VmState},
+};
+
+#[cfg(feature = "async")]
+use {
+    crate::multi::MultiValue,
+    crate::traits::FromLuaMulti,
+    crate::types::{AsyncCallback, AsyncCallbackUpvalue, AsyncPollUpvalue},
+    std::task::{Context, Poll, Waker},
+};
+
+/// An inner Lua struct which holds a raw Lua state.
+#[doc(hidden)]
+pub struct RawLua {
+    // The state is dynamic and depends on context
+    pub(super) state: Cell<*mut ffi::lua_State>,
+    pub(super) main_state: Option<NonNull<ffi::lua_State>>,
+    pub(super) extra: XRc<UnsafeCell<ExtraData>>,
+    owned: bool,
+}
+
+impl Drop for RawLua {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.owned {
+                return;
+            }
+
+            let mem_state = MemoryState::get(self.main_state());
+
+            #[cfg(feature = "luau")]
+            {
+                // Reset any callbacks
+                (*ffi::lua_callbacks(self.main_state())).interrupt = None;
+                (*ffi::lua_callbacks(self.main_state())).userthread = None;
+            }
+
+            ffi::lua_close(self.main_state());
+
+            // Deallocate `MemoryState`
+            if !mem_state.is_null() {
+                drop(Box::from_raw(mem_state));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "send")]
+unsafe impl Send for RawLua {}
+
+impl RawLua {
+    #[inline(always)]
+    pub(crate) fn lua(&self) -> &Lua {
+        unsafe { (*self.extra.get()).lua() }
+    }
+
+    #[inline(always)]
+    pub(crate) fn weak(&self) -> &WeakLua {
+        unsafe { (*self.extra.get()).weak() }
+    }
+
+    /// Returns a pointer to the current Lua state.
+    ///
+    /// The pointer refers to the active Lua coroutine and depends on the context.
+    #[inline(always)]
+    pub fn state(&self) -> *mut ffi::lua_State {
+        self.state.get()
+    }
+
+    #[inline(always)]
+    pub(crate) fn main_state(&self) -> *mut ffi::lua_State {
+        self.main_state
+            .map(|state| state.as_ptr())
+            .unwrap_or_else(|| self.state())
+    }
+
+    #[inline(always)]
+    pub(crate) fn ref_thread(&self) -> *mut ffi::lua_State {
+        unsafe { (*self.extra.get()).ref_thread }
+    }
+
+    pub(super) unsafe fn new(libs: StdLib, options: &LuaOptions) -> XRc<ReentrantMutex<Self>> {
+        let mem_state: *mut MemoryState = Box::into_raw(Box::default());
+        let mut state = ffi::lua_newstate(ALLOCATOR, mem_state as *mut c_void);
+        // If state is null then switch to Lua internal allocator
+        if state.is_null() {
+            drop(Box::from_raw(mem_state));
+            state = ffi::luaL_newstate();
+        }
+        assert!(!state.is_null(), "Failed to create a Lua VM");
+
+        ffi::luaL_requiref(state, cstr!("_G"), ffi::luaopen_base, 1);
+        ffi::lua_pop(state, 1);
+
+        // Init Luau code generator (jit)
+        #[cfg(feature = "luau-jit")]
+        if ffi::luau_codegen_supported() != 0 {
+            ffi::luau_codegen_create(state);
+        }
+
+        let rawlua = Self::init_from_ptr(state, true);
+        let extra = rawlua.lock().extra.get();
+
+        mlua_expect!(
+            load_std_libs(state, libs),
+            "Error during loading standard libraries"
+        );
+        (*extra).libs |= libs;
+
+        if !options.catch_rust_panics {
+            mlua_expect!(
+                (|| -> Result<()> {
+                    let _sg = StackGuard::new(state);
+
+                    #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
+                    ffi::lua_rawgeti(state, ffi::LUA_REGISTRYINDEX, ffi::LUA_RIDX_GLOBALS);
+                    #[cfg(any(feature = "lua51", feature = "luajit", feature = "luau"))]
+                    ffi::lua_pushvalue(state, ffi::LUA_GLOBALSINDEX);
+
+                    ffi::lua_pushcfunction(state, safe_pcall);
+                    rawset_field(state, -2, "pcall")?;
+
+                    ffi::lua_pushcfunction(state, safe_xpcall);
+                    rawset_field(state, -2, "xpcall")?;
+
+                    Ok(())
+                })(),
+                "Error during applying option `catch_rust_panics`"
+            )
+        }
+
+        #[cfg(feature = "async")]
+        if options.thread_pool_size > 0 {
+            (*extra).thread_pool.reserve_exact(options.thread_pool_size);
+        }
+
+        rawlua
+    }
+
+    pub(super) unsafe fn init_from_ptr(state: *mut ffi::lua_State, owned: bool) -> XRc<ReentrantMutex<Self>> {
+        assert!(!state.is_null(), "Lua state is NULL");
+        if let Some(lua) = Self::try_from_ptr(state) {
+            return lua;
+        }
+
+        let main_state = get_main_state(state).unwrap_or(state);
+        let main_state_top = ffi::lua_gettop(main_state);
+
+        mlua_expect!(
+            (|state| {
+                init_error_registry(state)?;
+
+                // Create the internal metatables and store them in the registry
+                // to prevent from being garbage collected.
+
+                init_internal_metatable::<XRc<UnsafeCell<ExtraData>>>(state, None)?;
+                init_internal_metatable::<Callback>(state, None)?;
+                init_internal_metatable::<CallbackUpvalue>(state, None)?;
+                #[cfg(not(feature = "luau"))]
+                init_internal_metatable::<HookCallback>(state, None)?;
+                #[cfg(feature = "async")]
+                {
+                    init_internal_metatable::<AsyncCallback>(state, None)?;
+                    init_internal_metatable::<AsyncCallbackUpvalue>(state, None)?;
+                    init_internal_metatable::<AsyncPollUpvalue>(state, None)?;
+                    init_internal_metatable::<Option<Waker>>(state, None)?;
+                }
+
+                // Init serde metatables
+                #[cfg(feature = "serde")]
+                crate::serde::init_metatables(state)?;
+
+                Ok::<_, Error>(())
+            })(main_state),
+            "Error during Lua initialization",
+        );
+
+        // Init ExtraData
+        let extra = ExtraData::init(main_state, owned);
+
+        // Register `DestructedUserdata` type
+        get_destructed_userdata_metatable(main_state);
+        let destructed_mt_ptr = ffi::lua_topointer(main_state, -1);
+        let destructed_ud_typeid = TypeId::of::<DestructedUserdata>();
+        (*extra.get())
+            .registered_userdata_mt
+            .insert(destructed_mt_ptr, Some(destructed_ud_typeid));
+        ffi::lua_pop(main_state, 1);
+
+        mlua_debug_assert!(
+            ffi::lua_gettop(main_state) == main_state_top,
+            "stack leak during creation"
+        );
+        assert_stack(main_state, ffi::LUA_MINSTACK);
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let rawlua = XRc::new(ReentrantMutex::new(RawLua {
+            state: Cell::new(state),
+            // Make sure that we don't store current state as main state (if it's not available)
+            main_state: get_main_state(state).and_then(NonNull::new),
+            extra: XRc::clone(&extra),
+            owned,
+        }));
+        (*extra.get()).set_lua(&rawlua);
+        if owned {
+            // If Lua state is managed by us, then make internal `RawLua` reference "weak"
+            XRc::decrement_strong_count(XRc::as_ptr(&rawlua));
+        } else {
+            // If Lua state is not managed by us, then keep internal `RawLua` reference "strong"
+            // but `Extra` reference weak (it will be collected from registry at lua_close time)
+            XRc::decrement_strong_count(XRc::as_ptr(&extra));
+        }
+
+        rawlua
+    }
+
+    unsafe fn try_from_ptr(state: *mut ffi::lua_State) -> Option<XRc<ReentrantMutex<Self>>> {
+        match ExtraData::get(state) {
+            extra if extra.is_null() => None,
+            extra => Some(XRc::clone(&(*extra).lua().raw)),
+        }
+    }
+
+    /// Marks the Lua state as safe.
+    }
+
+    /// See [`Lua::create_string`]
+    pub(crate) unsafe fn create_string(&self, s: impl AsRef<[u8]>) -> Result<String> {
+        let state = self.state();
+        if self.unlikely_memory_error() {
+            push_string(state, s.as_ref(), false)?;
+            return Ok(String(self.pop_ref()));
+        }
+
+        let _sg = StackGuard::new(state);
+        check_stack(state, 3)?;
+        push_string(state, s.as_ref(), true)?;
+        Ok(String(self.pop_ref()))
+    }
+
+    #[cfg(feature = "luau")]
+    pub(crate) unsafe fn create_buffer_with_capacity(&self, size: usize) -> Result<(*mut u8, crate::Buffer)> {
+        let state = self.state();
+        if self.unlikely_memory_error() {
+            let ptr = crate::util::push_buffer(state, size, false)?;
+            return Ok((ptr, crate::Buffer(self.pop_ref())));
+        }
+
+        let _sg = StackGuard::new(state);
+        check_stack(state, 3)?;
+        let ptr = crate::util::push_buffer(state, size, true)?;
+        Ok((ptr, crate::Buffer(self.pop_ref())))
+    }
+
+    /// See [`Lua::create_table_with_capacity`]
+    pub(crate) unsafe fn create_table_with_capacity(&self, narr: usize, nrec: usize) -> Result<Table> {
+        let state = self.state();
+        if self.unlikely_memory_error() {
+            push_table(state, narr, nrec, false)?;
+            return Ok(Table(self.pop_ref()));
+        }
+
+        let _sg = StackGuard::new(state);
+        check_stack(state, 3)?;
+        push_table(state, narr, nrec, true)?;
+        Ok(Table(self.pop_ref()))
+    }
+
+    /// See [`Lua::create_table_from`]
+    pub(crate) unsafe fn create_table_from<I, K, V>(&self, iter: I) -> Result<Table>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: IntoLua,
+        V: IntoLua,
+    {
+        let state = self.state();
+        let _sg = StackGuard::new(state);
+        check_stack(state, 6)?;
+
+        let iter = iter.into_iter();
+        let lower_bound = iter.size_hint().0;
+        let protect = !self.unlikely_memory_error();
+        push_table(state, 0, lower_bound, protect)?;
+        for (k, v) in iter {
+            self.push(k)?;
+            self.push(v)?;
+            if protect {
+                protect_lua!(state, 3, 1, fn(state) ffi::lua_rawset(state, -3))?;
+            } else {
+                ffi::lua_rawset(state, -3);
+            }
+        }
+
+        Ok(Table(self.pop_ref()))
+    }
+
+    /// See [`Lua::create_sequence_from`]
+    pub(crate) unsafe fn create_sequence_from<T, I>(&self, iter: I) -> Result<Table>
+    where
+        T: IntoLua,
+        I: IntoIterator<Item = T>,
+    {
+        let state = self.state();
+        let _sg = StackGuard::new(state);
+        check_stack(state, 5)?;
+
+        let iter = iter.into_iter();
+        let lower_bound = iter.size_hint().0;
+        let protect = !self.unlikely_memory_error();
+        push_table(state, lower_bound, 0, protect)?;
+        for (i, v) in iter.enumerate() {
+            self.push(v)?;
+            if protect {
+                protect_lua!(state, 2, 1, |state| {
+                    ffi::lua_rawseti(state, -2, (i + 1) as Integer);
+                })?;
+            } else {
+                ffi::lua_rawseti(state, -2, (i + 1) as Integer);
+            }
+        }
+
+        Ok(Table(self.pop_ref()))
+    }
+
+    /// Wraps a Lua function into a new thread (or coroutine).
+    ///
+    /// Takes function by reference.
+    pub(crate) unsafe fn create_thread(&self, func: &Function) -> Result<Thread> {
+        let state = self.state();
+        let _sg = StackGuard::new(state);
+use std::any::TypeId;
+use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
+use std::os::raw::{c_int, c_void};
+use std::ptr;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
+
+use crate::error::Result;
+use crate::state::RawLua;
+use crate::stdlib::StdLib;
+use crate::types::{AppData, ReentrantMutex, XRc};
+use crate::userdata::RawUserDataRegistry;
+use crate::util::{get_internal_metatable, push_internal_userdata, TypeKey, WrappedFailure};
+
+#[cfg(any(feature = "luau", doc))]
+use crate::chunk::Compiler;
+
+#[cfg(feature = "async")]
+use {futures_util::task::noop_waker_ref, std::ptr::NonNull, std::task::Waker};
+
+use super::{Lua, WeakLua};
+
+// Unique key to store `ExtraData` in the registry
+static EXTRA_REGISTRY_KEY: u8 = 0;
+
+const WRAPPED_FAILURE_POOL_DEFAULT_CAPACITY: usize = 64;
+const REF_STACK_RESERVE: c_int = 3;
+
+/// Data associated with the Lua state.
+pub(crate) struct ExtraData {
+    pub(super) lua: MaybeUninit<Lua>,
+    pub(super) weak: MaybeUninit<WeakLua>,
+    pub(super) owned: bool,
+
+    pub(super) pending_userdata_reg: FxHashMap<TypeId, RawUserDataRegistry>,
+    pub(super) registered_userdata_t: FxHashMap<TypeId, c_int>,
+    pub(super) registered_userdata_mt: FxHashMap<*const c_void, Option<TypeId>>,
+    pub(super) last_checked_userdata_mt: (*const c_void, Option<TypeId>),
+
+    // When Lua instance dropped, setting `None` would prevent collecting `RegistryKey`s
+    pub(super) registry_unref_list: Arc<Mutex<Option<Vec<c_int>>>>,
+
+    // Containers to store arbitrary data (extensions)
+    pub(super) app_data: AppData,
+    pub(super) app_data_priv: AppData,
+
+    pub(super) safe: bool,
+    pub(super) libs: StdLib,
+    // Used in module mode
+    pub(super) skip_memory_check: bool,
+
+    // Auxiliary thread to store references
+    pub(super) ref_thread: *mut ffi::lua_State,
+    pub(super) ref_stack_size: c_int,
+    pub(super) ref_stack_top: c_int,
+    pub(super) ref_free: Vec<c_int>,
+
+    // Pool of `WrappedFailure` enums in the ref thread (as userdata)
+    pub(super) wrapped_failure_pool: Vec<c_int>,
+    pub(super) wrapped_failure_top: usize,
+    // Pool of `Thread`s (coroutines) for async execution
+    #[cfg(feature = "async")]
+    pub(super) thread_pool: Vec<crate::types::ValueRefIndex>,
+
+    // Address of `WrappedFailure` metatable
+    pub(super) wrapped_failure_mt_ptr: *const c_void,
+
+    // Waker for polling futures
+    #[cfg(feature = "async")]
+    pub(super) waker: NonNull<Waker>,
+
+    #[cfg(not(feature = "luau"))]
+    pub(super) hook_callback: Option<crate::types::HookCallback>,
+    #[cfg(not(feature = "luau"))]
+    pub(super) hook_triggers: crate::debug::HookTriggers,
+    #[cfg(feature = "lua54")]
+    pub(super) warn_callback: Option<crate::types::WarnCallback>,
+    #[cfg(feature = "luau")]
+    pub(super) interrupt_callback: Option<crate::types::InterruptCallback>,
+    #[cfg(feature = "luau")]
+    pub(super) thread_creation_callback: Option<crate::types::ThreadCreationCallback>,
+    #[cfg(feature = "luau")]
+    pub(super) thread_collection_callback: Option<crate::types::ThreadCollectionCallback>,
+
+    #[cfg(feature = "luau")]
+    pub(crate) running_gc: bool,
+    #[cfg(feature = "luau")]
+    pub(crate) sandboxed: bool,
+    #[cfg(feature = "luau")]
+    pub(super) compiler: Option<Compiler>,
+    #[cfg(feature = "luau-jit")]
+    pub(super) enable_jit: bool,
+}
+
+impl Drop for ExtraData {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.owned {
+                self.lua.assume_init_drop();
+            }
+
+            self.weak.assume_init_drop();
+        }
+        *self.registry_unref_list.lock() = None;
+    }
+}
+
+static EXTRA_TYPE_KEY: u8 = 0;
+
+impl TypeKey for XRc<UnsafeCell<ExtraData>> {
+    #[inline(always)]
+    fn type_key() -> *const c_void {
+        &EXTRA_TYPE_KEY as *const u8 as *const c_void
+    }
+}
+
+impl ExtraData {
+    // Index of `error_traceback` function in auxiliary thread stack
+    #[cfg(any(feature = "lua51", feature = "luajit", feature = "luau"))]
+    pub(super) const ERROR_TRACEBACK_IDX: c_int = 1;
+
+    pub(super) unsafe fn init(state: *mut ffi::lua_State, owned: bool) -> XRc<UnsafeCell<Self>> {
+        // Create ref stack thread and place it in the registry to prevent it
+        // from being garbage collected.
+        let ref_thread = mlua_expect!(
+            protect_lua!(state, 0, 0, |state| {
+                let thread = ffi::lua_newthread(state);
+                ffi::luaL_ref(state, ffi::LUA_REGISTRYINDEX);
+                thread
+            }),
+            "Error while creating ref thread",
+        );
+
+        let wrapped_failure_mt_ptr = {
+            get_internal_metatable::<WrappedFailure>(state);
+            let ptr = ffi::lua_topointer(state, -1);
+            ffi::lua_pop(state, 1);
+            ptr
+        };
+
+        // Store `error_traceback` function on the ref stack
+        #[cfg(any(feature = "lua51", feature = "luajit", feature = "luau"))]
+        {
+            ffi::lua_pushcfunction(ref_thread, crate::util::error_traceback);
+            assert_eq!(ffi::lua_gettop(ref_thread), Self::ERROR_TRACEBACK_IDX);
+        }
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let extra = XRc::new(UnsafeCell::new(ExtraData {
+            lua: MaybeUninit::uninit(),
+            weak: MaybeUninit::uninit(),
+            owned,
+            pending_userdata_reg: FxHashMap::default(),
+            registered_userdata_t: FxHashMap::default(),
+            registered_userdata_mt: FxHashMap::default(),
+            last_checked_userdata_mt: (ptr::null(), None),
+            registry_unref_list: Arc::new(Mutex::new(Some(Vec::new()))),
+            app_data: AppData::default(),
+            app_data_priv: AppData::default(),
+            safe: false,
+            libs: StdLib::NONE,
+            skip_memory_check: false,
+            ref_thread,
+            // We need some reserved stack space to move values in and out of the ref stack.
+            ref_stack_size: ffi::LUA_MINSTACK - REF_STACK_RESERVE,
+            ref_stack_top: ffi::lua_gettop(ref_thread),
+            ref_free: Vec::new(),
+            wrapped_failure_pool: Vec::with_capacity(WRAPPED_FAILURE_POOL_DEFAULT_CAPACITY),
+            wrapped_failure_top: 0,
+            #[cfg(feature = "async")]
+            thread_pool: Vec::new(),
+            wrapped_failure_mt_ptr,
+            #[cfg(feature = "async")]
+            waker: NonNull::from(noop_waker_ref()),
+            #[cfg(not(feature = "luau"))]
+            hook_callback: None,
+            #[cfg(not(feature = "luau"))]
+            hook_triggers: Default::default(),
+            #[cfg(feature = "lua54")]
+            warn_callback: None,
+            #[cfg(feature = "luau")]
+            interrupt_callback: None,
+            #[cfg(feature = "luau")]
+            thread_creation_callback: None,
+            #[cfg(feature = "luau")]
+            thread_collection_callback: None,
+            #[cfg(feature = "luau")]
+            sandboxed: false,
+            #[cfg(feature = "luau")]
+            compiler: None,
+            #[cfg(feature = "luau-jit")]
+            enable_jit: true,
+            #[cfg(feature = "luau")]
+            running_gc: false,
+        }));
+
+        // Store it in the registry
+        mlua_expect!(Self::store(&extra, state), "Error while storing extra data");
+
+        extra
+    }
+
+    pub(super) unsafe fn set_lua(&mut self, raw: &XRc<ReentrantMutex<RawLua>>) {
+        self.lua.write(Lua {
+            raw: XRc::clone(raw),
+            collect_garbage: false,
+        });
+        self.weak.write(WeakLua(XRc::downgrade(raw)));
+    }
+
+    pub(crate) unsafe fn get(state: *mut ffi::lua_State) -> *mut Self {
+        #[cfg(feature = "luau")]
+        if cfg!(not(feature = "module")) {
+            // In the main app we can use `lua_callbacks` to access ExtraData
+            return (*ffi::lua_callbacks(state)).userdata as *mut _;
+        }
+
+        let extra_key = &EXTRA_REGISTRY_KEY as *const u8 as *const c_void;
+        if ffi::lua_rawgetp(state, ffi::LUA_REGISTRYINDEX, extra_key) != ffi::LUA_TUSERDATA {
+            // `ExtraData` can be null only when Lua state is foreign.
+            // This case in used in `Lua::try_from_ptr()`.
+            ffi::lua_pop(state, 1);
+            return ptr::null_mut();
+        }
+        let extra_ptr = ffi::lua_touserdata(state, -1) as *mut Rc<UnsafeCell<ExtraData>>;
+        ffi::lua_pop(state, 1);
+        (*extra_ptr).get()
+    }
+
+    unsafe fn store(extra: &XRc<UnsafeCell<Self>>, state: *mut ffi::lua_State) -> Result<()> {
+        #[cfg(feature = "luau")]
+        if cfg!(not(feature = "module")) {
+            (*ffi::lua_callbacks(state)).userdata = extra.get() as *mut _;
+            return Ok(());
+        }
+
+        push_internal_userdata(state, XRc::clone(extra), true)?;
+        protect_lua!(state, 1, 0, fn(state) {
+            let extra_key = &EXTRA_REGISTRY_KEY as *const u8 as *const c_void;
+            ffi::lua_rawsetp(state, ffi::LUA_REGISTRYINDEX, extra_key);
+        })
+use std::borrow::Cow;
+use std::ffi::CStr;
+use std::os::raw::{c_char, c_int, c_void};
+use std::{ptr, slice, str};
+
+use crate::error::{Error, Result};
+
+pub(crate) use error::{
+    error_traceback, error_traceback_thread, init_error_registry, pop_error, protect_lua_call,
+    protect_lua_closure, WrappedFailure,
+};
+pub(crate) use path::parse_path as parse_lookup_path;
+pub(crate) use short_names::short_type_name;
+pub(crate) use types::TypeKey;
+pub(crate) use userdata::{
+    get_destructed_userdata_metatable, get_internal_metatable, get_internal_userdata, get_userdata,
+    init_internal_metatable, push_internal_userdata, push_userdata, take_userdata,
+    DESTRUCTED_USERDATA_METATABLE,
+};
+
+#[cfg(not(feature = "luau"))]
+pub(crate) use userdata::push_uninit_userdata;
+
+// Checks that Lua has enough free stack space for future stack operations. On failure, this will
+// panic with an internal error message.
+#[inline]
+pub(crate) unsafe fn assert_stack(state: *mut ffi::lua_State, amount: c_int) {
+    // TODO: This should only be triggered when there is a logic error in `mlua`. In the future,
+    // when there is a way to be confident about stack safety and test it, this could be enabled
+    // only when `cfg!(debug_assertions)` is true.
+    mlua_assert!(ffi::lua_checkstack(state, amount) != 0, "out of stack space");
+}
+
+// Checks that Lua has enough free stack space and returns `Error::StackError` on failure.
+#[inline]
+pub(crate) unsafe fn check_stack(state: *mut ffi::lua_State, amount: c_int) -> Result<()> {
+    if ffi::lua_checkstack(state, amount) == 0 {
+        Err(Error::StackError)
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) struct StackGuard {
+    state: *mut ffi::lua_State,
+    top: c_int,
+}
+
+impl StackGuard {
+    // Creates a StackGuard instance with record of the stack size, and on Drop will check the
+    // stack size and drop any extra elements. If the stack size at the end is *smaller* than at
+    // the beginning, this is considered a fatal logic error and will result in a panic.
+    #[inline]
+    pub(crate) unsafe fn new(state: *mut ffi::lua_State) -> StackGuard {
+        StackGuard {
+            state,
+            top: ffi::lua_gettop(state),
+        }
+    }
+
+    // Same as `new()`, but allows specifying the expected stack size at the end of the scope.
+    #[inline]
+    pub(crate) fn with_top(state: *mut ffi::lua_State, top: c_int) -> StackGuard {
+        StackGuard { state, top }
+    }
+
+    #[inline]
+    pub(crate) fn keep(&mut self, n: c_int) {
+        self.top += n;
+    }
+}
+
+impl Drop for StackGuard {
+    #[track_caller]
+    fn drop(&mut self) {
+        unsafe {
+            let top = ffi::lua_gettop(self.state);
+            if top < self.top {
+                mlua_panic!("{} too many stack values popped", self.top - top)
+            }
+            if top > self.top {
+                ffi::lua_settop(self.state, self.top);
+            }
+        }
+    }
+}
+
+// Uses 3 (or 1 if unprotected) stack spaces, does not call checkstack.
+#[inline(always)]
+pub(crate) unsafe fn push_string(state: *mut ffi::lua_State, s: &[u8], protect: bool) -> Result<()> {
+    // Always use protected mode if the string is too long
+    if protect || s.len() >= const { 1 << 30 } {
+        protect_lua!(state, 0, 1, |state| {
+            ffi::lua_pushlstring(state, s.as_ptr() as *const c_char, s.len());
+        })
+    } else {
+        ffi::lua_pushlstring(state, s.as_ptr() as *const c_char, s.len());
+        Ok(())
+    }
+}
+
+// Uses 3 stack spaces (when protect), does not call checkstack.
+#[cfg(feature = "luau")]
+#[inline(always)]
+pub(crate) unsafe fn push_buffer(state: *mut ffi::lua_State, size: usize, protect: bool) -> Result<*mut u8> {
+    let data = if protect || size > const { 1024 * 1024 * 1024 } {
+        protect_lua!(state, 0, 1, |state| ffi::lua_newbuffer(state, size))?
+    } else {
+        ffi::lua_newbuffer(state, size)
+    };
+    Ok(data as *mut u8)
+}
+
+// Uses 3 stack spaces, does not call checkstack.
+#[inline]
+pub(crate) unsafe fn push_table(
+    state: *mut ffi::lua_State,
+    narr: usize,
+    nrec: usize,
+    protect: bool,
+) -> Result<()> {
+    let narr: c_int = narr.try_into().unwrap_or(c_int::MAX);
+    let nrec: c_int = nrec.try_into().unwrap_or(c_int::MAX);
+    if protect || narr >= const { 1 << 26 } || nrec >= const { 1 << 26 } {
+        protect_lua!(state, 0, 1, |state| ffi::lua_createtable(state, narr, nrec))
+    } else {
+        ffi::lua_createtable(state, narr, nrec);
+        Ok(())
+    }
+}
+
+// Uses 4 stack spaces, does not call checkstack.
+pub(crate) unsafe fn rawget_field(state: *mut ffi::lua_State, table: c_int, field: &str) -> Result<c_int> {
+    ffi::lua_pushvalue(state, table);
+    protect_lua!(state, 1, 1, |state| {
+        ffi::lua_pushlstring(state, field.as_ptr() as *const c_char, field.len());
+        ffi::lua_rawget(state, -2)
+    })
+}
+
+// Uses 4 stack spaces, does not call checkstack.
+pub(crate) unsafe fn rawset_field(state: *mut ffi::lua_State, table: c_int, field: &str) -> Result<()> {
+    ffi::lua_pushvalue(state, table);
+    protect_lua!(state, 2, 0, |state| {
+        ffi::lua_pushlstring(state, field.as_ptr() as *const c_char, field.len());
+        ffi::lua_rotate(state, -3, 2);
+        ffi::lua_rawset(state, -3);
+    })
+}
+
+// A variant of `pcall` that does not allow Lua to catch Rust panics from `callback_error`.
+pub(crate) unsafe extern "C-unwind" fn safe_pcall(state: *mut ffi::lua_State) -> c_int {
+    ffi::luaL_checkstack(state, 2, ptr::null());
+
+    let top = ffi::lua_gettop(state);
+    if top == 0 {
+        ffi::lua_pushstring(state, cstr!("not enough arguments to pcall"));
+        ffi::lua_error(state);
+    }
+
+    if ffi::lua_pcall(state, top - 1, ffi::LUA_MULTRET, 0) == ffi::LUA_OK {
+        ffi::lua_pushboolean(state, 1);
+        ffi::lua_insert(state, 1);
+        ffi::lua_gettop(state)
+    } else {
+        let wf_ud = get_internal_userdata::<WrappedFailure>(state, -1, ptr::null());
+        if let Some(WrappedFailure::Panic(_)) = wf_ud.as_ref() {
+            ffi::lua_error(state);
+        }
+        ffi::lua_pushboolean(state, 0);
+        ffi::lua_insert(state, -2);
+        2
+    }
+}
+
+// A variant of `xpcall` that does not allow Lua to catch Rust panics from `callback_error`.
+pub(crate) unsafe extern "C-unwind" fn safe_xpcall(state: *mut ffi::lua_State) -> c_int {
+    unsafe extern "C-unwind" fn xpcall_msgh(state: *mut ffi::lua_State) -> c_int {
+        ffi::luaL_checkstack(state, 2, ptr::null());
+
+        let wf_ud = get_internal_userdata::<WrappedFailure>(state, -1, ptr::null());
+        if let Some(WrappedFailure::Panic(_)) = wf_ud.as_ref() {
+            1
+        } else {
+            ffi::lua_pushvalue(state, ffi::lua_upvalueindex(1));
+            ffi::lua_insert(state, 1);
+            ffi::lua_call(state, ffi::lua_gettop(state) - 1, ffi::LUA_MULTRET);
+            ffi::lua_gettop(state)
+        }
+    }
+
+    ffi::luaL_checkstack(state, 2, ptr::null());
+
+    let top = ffi::lua_gettop(state);
+    if top < 2 {
+        ffi::lua_pushstring(state, cstr!("not enough arguments to xpcall"));
+        ffi::lua_error(state);
+    }
+
+    ffi::lua_pushvalue(state, 2);
+    ffi::lua_pushcclosure(state, xpcall_msgh, 1);
+    ffi::lua_copy(state, 1, 2);
+    ffi::lua_replace(state, 1);
+
+    if ffi::lua_pcall(state, ffi::lua_gettop(state) - 2, ffi::LUA_MULTRET, 1) == ffi::LUA_OK {
+        ffi::lua_pushboolean(state, 1);
+        ffi::lua_insert(state, 2);
+        ffi::lua_gettop(state) - 1
+    } else {
+        let wf_ud = get_internal_userdata::<WrappedFailure>(state, -1, ptr::null());

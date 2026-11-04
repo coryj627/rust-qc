@@ -1,0 +1,240 @@
+pub(crate) const DEFAULT_MAX_LOG_SYNC_REPEATS: usize = 4;
+pub(crate) const LOG_SYNC_INTERVAL_MILLIS: u64 = 300;
+
+pub(crate) const READ_LOG_FLUSH_POINT: usize = 64;
+pub(crate) const WRITE_LOG_FLUSH_POINT: usize = 64;
+
+// 384 elements
+pub(crate) const READ_LOG_CH_SIZE: usize =
+    READ_LOG_FLUSH_POINT * (DEFAULT_MAX_LOG_SYNC_REPEATS + 2);
+
+// 384 elements
+pub(crate) const WRITE_LOG_CH_SIZE: usize =
+    WRITE_LOG_FLUSH_POINT * (DEFAULT_MAX_LOG_SYNC_REPEATS + 2);
+
+// TODO: Calculate the batch size based on the number of entries in the cache (or an
+// estimated number of entries to evict)
+pub(crate) const DEFAULT_EVICTION_BATCH_SIZE: u32 = WRITE_LOG_CH_SIZE as u32;
+
+/// The default timeout duration for the `run_pending_tasks` method.
+pub(crate) const DEFAULT_MAINTENANCE_TASK_TIMEOUT_MILLIS: u64 = 100;
+
+#[cfg(feature = "sync")]
+pub(crate) const WRITE_RETRY_INTERVAL_MICROS: u64 = 50;
+    pub(crate) async fn apply_reads_writes_if_needed(
+        inner: &Arc<Inner<K, V, S>>,
+        ch: &Sender<WriteOp<K, V>>,
+        now: Instant,
+        housekeeper: Option<&HouseKeeperArc>,
+    ) {
+        let w_len = ch.len();
+
+        if let Some(hk) = housekeeper {
+            if Self::should_apply_writes(hk, w_len, now) {
+                hk.try_run_pending_tasks(inner).await;
+            }
+        }
+    }
+
+    pub(crate) fn invalidate_all(&self) {
+
+        if len == 0 {
+            return;
+        }
+
+        let is_truncated = len == batch_size && has_next;
+        let (invalidated, is_done) = invalidator
+            .scan_and_invalidate(self, candidates, is_truncated)
+            .await;
+
+        for KvEntry { key: _key, entry } in invalidated {
+            Self::handle_remove(deqs, timer_wheel, entry, None, &mut eviction_state.counters);
+        }
+        if is_done {
+            deqs.write_order.reset_cursor();
+        }
+        if !invalidator.is_empty() {
+            eviction_state.more_entries_to_evict = true;
+        }
+    }
+
+    async fn evict_lru_entries(
+        &self,
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        batch_size: u32,
+        weights_to_evict: u64,
+        eviction_state: &mut EvictionState<'_, K, V>,
+    ) where
+        V: Clone,
+    {
+        const CACHE_REGION: CacheRegion = CacheRegion::MainProbation;
+        let deq_name = CACHE_REGION.name();
+        let mut evicted = 0u64;
+        let mut more_to_evict = true;
+
+        for _ in 0..batch_size {
+            if evicted >= weights_to_evict {
+                more_to_evict = false;
+                break;
+            }
+
+            let maybe_key_hash_ts = deqs.select_mut(CACHE_REGION).0.peek_front().map(|node| {
+                let entry_info = node.element.entry_info();
+                (
+                    Arc::clone(node.element.key()),
+                    node.element.hash(),
+                    entry_info.is_dirty(),
+                    entry_info.last_accessed(),
+                )
+            });
+
+            let (key, hash, ts) = match maybe_key_hash_ts {
+                Some((key, hash, false, Some(ts))) => (key, hash, ts),
+                // TODO: Remove the second pattern `Some((_key, false, None))` once
+                // we change `last_modified` and `last_accessed` in `EntryInfo` from
+                // `Option<Instant>` to `Instant`.
+                Some((key, hash, true, _) | (key, hash, false, None)) => {
+                    // `is_dirty` is true or `last_modified` is None. Skip this entry
+                    // as it may have been updated by this or other async task but
+                    // its `WriteOp` is not processed yet.
+                    let (ao_deq, wo_deq) = deqs.select_mut(CACHE_REGION);
+                    self.skip_updated_entry_ao(&key, hash, deq_name, ao_deq, wo_deq);
+                    // Set `more_to_evict` to `false` to make `run_pending_tasks` to
+                    // return early. This will help that `schedule_write_op` to send
+                    // the `WriteOp` to the write op channel.
+                    more_to_evict = false;
+                    continue;
+                }
+                None => {
+                    more_to_evict = false;
+                    break;
+                }
+            };
+
+            // Lock the key for removal if blocking removal notification is enabled.
+            let kl = self.maybe_key_lock(&key);
+            let _klg = if let Some(lock) = &kl {
+                Some(lock.lock().await)
+            } else {
+                None
+            };
+
+            let maybe_entry = self.cache.remove_if(
+                hash,
+                |k| k == &key,
+                |_, v| {
+                    if let Some(la) = v.last_accessed() {
+                        la == ts
+                    } else {
+                        false
+                    }
+                },
+            );
+
+            if let Some(entry) = maybe_entry {
+                if eviction_state.is_notifier_enabled() {
+                    eviction_state
+                        .notify_entry_removal(key, &entry, RemovalCause::Size)
+                        .await;
+                }
+                eviction_state.counters.incr_eviction_count();
+                let weight = entry.policy_weight();
+                let (deq, write_order_deq) = deqs.select_mut(CacheRegion::MainProbation);
+                Self::handle_remove_with_deques(
+                    deq_name,
+                    deq,
+                    write_order_deq,
+                    timer_wheel,
+                    entry,
+                    &mut eviction_state.counters,
+                );
+                evicted = evicted.saturating_add(weight as u64);
+            } else {
+                let (ao_deq, wo_deq) = deqs.select_mut(CacheRegion::MainProbation);
+                self.skip_updated_entry_ao(&key, hash, deq_name, ao_deq, wo_deq);
+                more_to_evict = false;
+            }
+        }
+
+        if more_to_evict {
+            eviction_state.more_entries_to_evict = true;
+        }
+    }
+}
+
+impl<K, V, S> Inner<K, V, S>
+where
+    K: Send + Sync + 'static,
+//! Cache operations.
+
+/// Operations used by the `and_compute_with` and similar methods.
+pub mod compute {
+    use std::sync::Arc;
+
+    use crate::Entry;
+
+    /// Instructs the `and_compute_with` and similar methods how to modify the cached
+    /// entry.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Op<V> {
+        /// No-operation. Do not modify the cached entry.
+        Nop,
+        /// Insert or update the value of the cached entry.
+        Put(V),
+        /// Remove the cached entry.
+        Remove,
+    }
+
+    /// The result of the `and_compute_with` and similar methods.
+    #[derive(Debug)]
+    pub enum CompResult<K, V> {
+        /// The entry did not exist and still does not exist.
+        StillNone(Arc<K>),
+        /// The entry already existed and was not modified. The returned entry
+        /// contains the existing value.
+        Unchanged(Entry<K, V>),
+        /// The entry did not exist and was inserted. The returned entry contains
+        /// the inserted value.
+        Inserted(Entry<K, V>),
+        /// The entry already existed and its value was replaced with a new one. The
+        /// returned entry contains the new value (not the replaced value).
+        ReplacedWith(Entry<K, V>),
+        /// The entry already existed and was removed. The returned entry contains
+        /// the removed value.
+        ///
+        /// Note: `StillNone` is returned instead of `Removed` if `Op::Remove` was
+        /// requested but the entry did not exist.
+        Removed(Entry<K, V>),
+    }
+
+    impl<K, V> CompResult<K, V> {
+        /// Returns the contained `Some(Entry)` if any. Otherwise returns `None`.
+        /// Consumes the `self` value.
+        pub fn into_entry(self) -> Option<Entry<K, V>> {
+            match self {
+                CompResult::StillNone(_) => None,
+                CompResult::Unchanged(entry) => Some(entry),
+                CompResult::Inserted(entry) => Some(entry),
+                CompResult::ReplacedWith(entry) => Some(entry),
+                CompResult::Removed(entry) => Some(entry),
+            }
+        }
+
+        /// Unwraps the contained `Entry`, consuming the `self` value.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the `self` value is `StillNone`.
+        pub fn unwrap(self) -> Entry<K, V> {
+            match self {
+                CompResult::StillNone(_) => panic!("`CompResult::unwrap` called on `StillNone`"),
+                CompResult::Unchanged(entry) => entry,
+                CompResult::Inserted(entry) => entry,
+                CompResult::ReplacedWith(entry) => entry,
+                CompResult::Removed(entry) => entry,
+            }
+        }
+    }
+}
+9.12735 minutes used of 45.0

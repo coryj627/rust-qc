@@ -1,0 +1,983 @@
+                    // invalidated by other thread.
+                }
+            }
+        }
+    }
+
+    fn evict_expired_entries_using_deqs(
+        &self,
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        batch_size: u32,
+        state: &mut EvictionState<'_, K, V>,
+    ) where
+        V: Clone,
+    {
+        use CacheRegion::{MainProbation as Probation, MainProtected as Protected, Window};
+
+        let now = self.current_time();
+
+        if self.is_write_order_queue_enabled() {
+            self.remove_expired_wo(deqs, timer_wheel, batch_size, now, state);
+        }
+
+        if self.expiration_policy.time_to_idle().is_some() || self.has_valid_after() {
+            self.remove_expired_ao(Window, deqs, timer_wheel, batch_size, now, state);
+            self.remove_expired_ao(Probation, deqs, timer_wheel, batch_size, now, state);
+            self.remove_expired_ao(Protected, deqs, timer_wheel, batch_size, now, state);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn remove_expired_ao(
+        &self,
+        cache_region: CacheRegion,
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        batch_size: u32,
+        now: Instant,
+        eviction_state: &mut EvictionState<'_, K, V>,
+    ) where
+        V: Clone,
+    {
+        let tti = &self.expiration_policy.time_to_idle();
+        let va = &self.valid_after();
+        let deq_name = cache_region.name();
+        let (ao_deq, wo_deq) = deqs.select_mut(cache_region);
+        let mut more_to_evict = true;
+
+        for _ in 0..batch_size {
+            let maybe_key_hash_ts = ao_deq.peek_front().map(|node| {
+                let elem = &node.element;
+                (
+                    Arc::clone(elem.key()),
+                    elem.hash(),
+                    elem.is_dirty(),
+                    elem.last_accessed(),
+                )
+            });
+
+            let (key, hash, cause) = match maybe_key_hash_ts {
+                Some((key, hash, false, Some(ts))) => {
+                    let cause = match is_entry_expired_ao_or_invalid(tti, va, ts, now) {
+                        (true, _) => RemovalCause::Expired,
+                        (false, true) => RemovalCause::Explicit,
+                        (false, false) => {
+                            more_to_evict = false;
+                            break;
+                        }
+                    };
+                    (key, hash, cause)
+                }
+                // TODO: Remove the second pattern `Some((_key, false, None))` once
+                // we change `last_modified` and `last_accessed` in `EntryInfo` from
+                // `Option<Instant>` to `Instant`.
+                Some((key, hash, true, _) | (key, hash, false, None)) => {
+                    // `is_dirty` is true or `last_modified` is None. Skip this entry
+                    // as it may have been updated by this or other async task but
+                    // its `WriteOp` is not processed yet.
+                    self.skip_updated_entry_ao(&key, hash, deq_name, ao_deq, wo_deq);
+                    // Set `more_to_evict` to `false` to make `run_pending_tasks` to
+                    // return early. This will help that `schedule_write_op` to send
+                    // the `WriteOp` to the write op channel.
+                    more_to_evict = false;
+                    continue;
+                }
+                None => {
+                    more_to_evict = false;
+                    break;
+                }
+            };
+
+            // Lock the key for removal if blocking removal notification is enabled.
+            let kl = self.maybe_key_lock(&key);
+            let _klg = &kl.as_ref().map(|kl| kl.lock());
+
+            // Remove the key from the map only when the entry is really
+            // expired. This check is needed because it is possible that the entry in
+            // the map has been updated or deleted but its deque node we checked
+            // above has not been updated yet.
+            let maybe_entry = self.cache.remove_if(
+                hash,
+                |k| k == &key,
+                |_, v| is_expired_entry_ao(tti, va, v, now),
+            );
+
+            if let Some(entry) = maybe_entry {
+                if eviction_state.is_notifier_enabled() {
+                    eviction_state.notify_entry_removal(key, &entry, cause);
+                }
+                eviction_state.counters.incr_eviction_count();
+                Self::handle_remove_with_deques(
+                    deq_name,
+                    ao_deq,
+                    wo_deq,
+                    timer_wheel,
+                    entry,
+                    &mut eviction_state.counters,
+                );
+            } else {
+                self.skip_updated_entry_ao(&key, hash, deq_name, ao_deq, wo_deq);
+                more_to_evict = false;
+            }
+        }
+
+        if more_to_evict {
+            eviction_state.more_entries_to_evict = true;
+        }
+    }
+
+    #[inline]
+    fn skip_updated_entry_ao(
+        &self,
+        key: &K,
+        hash: u64,
+        deq_name: &str,
+        deq: &mut Deque<KeyHashDate<K>>,
+        write_order_deq: &mut Deque<KeyHashDate<K>>,
+    ) {
+        if let Some(entry) = self.cache.get(hash, |k| (k.borrow() as &K) == key) {
+            // The key exists and the entry may have been read or updated by other
+            // thread.
+            Deques::move_to_back_ao_in_deque(deq_name, deq, &entry);
+            if entry.is_dirty() {
+                Deques::move_to_back_wo_in_deque(write_order_deq, &entry);
+            }
+        } else {
+            // Skip this entry as the key may have been invalidated by other thread.
+            // Since the invalidated ValueEntry (which should be still in the write
+            // op queue) has a pointer to this node, move the node to the back of the
+            // deque instead of popping (dropping) it.
+            deq.move_front_to_back();
+        }
+    }
+
+    #[inline]
+    fn skip_updated_entry_wo(&self, key: &K, hash: u64, deqs: &mut Deques<K>) {
+        if let Some(entry) = self.cache.get(hash, |k| (k.borrow() as &K) == key) {
+            // The key exists and the entry may have been read or updated by other
+            // thread.
+            deqs.move_to_back_ao(&entry);
+            deqs.move_to_back_wo(&entry);
+        } else {
+            // Skip this entry as the key may have been invalidated by other thread.
+            // Since the invalidated `ValueEntry` (which should be still in the write
+            // op queue) has a pointer to this node, move the node to the back of the
+            // deque instead of popping (dropping) it.
+            deqs.write_order.move_front_to_back();
+        }
+    }
+
+    #[inline]
+    fn remove_expired_wo(
+        &self,
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        batch_size: u32,
+        now: Instant,
+        eviction_state: &mut EvictionState<'_, K, V>,
+    ) where
+        V: Clone,
+    {
+        let ttl = &self.expiration_policy.time_to_live();
+        let va = &self.valid_after();
+        let mut more_to_evict = true;
+
+        for _ in 0..batch_size {
+            let maybe_key_hash_ts = deqs.write_order.peek_front().map(|node| {
+                let elem = &node.element;
+                (
+                    Arc::clone(elem.key()),
+                    elem.hash(),
+                    elem.is_dirty(),
+                    elem.last_modified(),
+                )
+            });
+
+            let (key, hash, cause) = match maybe_key_hash_ts {
+                Some((key, hash, false, Some(ts))) => {
+                    let cause = match is_entry_expired_wo_or_invalid(ttl, va, ts, now) {
+                        (true, _) => RemovalCause::Expired,
+                        (false, true) => RemovalCause::Explicit,
+                        (false, false) => {
+                            more_to_evict = false;
+                            break;
+                        }
+                    };
+                    (key, hash, cause)
+                }
+                // TODO: Remove the second pattern `Some((_key, false, None))` once
+                // we change `last_modified` and `last_accessed` in `EntryInfo` from
+                // `Option<Instant>` to `Instant`.
+                Some((key, hash, true, _) | (key, hash, false, None)) => {
+                    self.skip_updated_entry_wo(&key, hash, deqs);
+                    more_to_evict = false;
+                    continue;
+                }
+                None => {
+                    more_to_evict = false;
+                    break;
+                }
+            };
+
+            // Lock the key for removal if blocking removal notification is enabled.
+            let kl = self.maybe_key_lock(&key);
+            let _klg = &kl.as_ref().map(|kl| kl.lock());
+
+            let maybe_entry = self.cache.remove_if(
+                hash,
+                |k| k == &key,
+                |_, v| is_expired_entry_wo(ttl, va, v, now),
+            );
+
+            if let Some(entry) = maybe_entry {
+                if eviction_state.is_notifier_enabled() {
+                    eviction_state.notify_entry_removal(key, &entry, cause);
+                }
+                eviction_state.counters.incr_eviction_count();
+                Self::handle_remove(deqs, timer_wheel, entry, None, &mut eviction_state.counters);
+            } else {
+                self.skip_updated_entry_wo(&key, hash, deqs);
+                more_to_evict = false;
+            }
+        }
+
+        if more_to_evict {
+            eviction_state.more_entries_to_evict = true;
+        }
+    }
+
+    fn invalidate_entries(
+        &self,
+        invalidator: &Invalidator<K, V, S>,
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        batch_size: u32,
+        eviction_state: &mut EvictionState<'_, K, V>,
+    ) where
+        V: Clone,
+    {
+        let now = self.current_time();
+
+        // If the write order queue is empty, we are done and can remove the predicates
+        // that have been registered by now.
+        if deqs.write_order.len() == 0 {
+            invalidator.remove_predicates_registered_before(now);
+            return;
+        }
+
+        let mut candidates = Vec::new();
+        let mut len = 0;
+        let has_next;
+        {
+            let iter = &mut deqs.write_order.peekable();
+
+            while len < batch_size {
+                if let Some(kd) = iter.next() {
+                    if !kd.is_dirty() {
+                        if let Some(ts) = kd.last_modified() {
+                            let key = kd.key();
+                            let hash = self.hash(&**key);
+                            candidates.push(KeyDateLite::new(key, hash, ts));
+                            len += 1;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            has_next = iter.peek().is_some();
+        }
+
+        if len == 0 {
+            return;
+        }
+
+        let is_truncated = len == batch_size && has_next;
+        let (invalidated, is_done) =
+            invalidator.scan_and_invalidate(self, candidates, is_truncated);
+
+        for KvEntry { key: _key, entry } in invalidated {
+            Self::handle_remove(deqs, timer_wheel, entry, None, &mut eviction_state.counters);
+        }
+        if is_done {
+            deqs.write_order.reset_cursor();
+        }
+        if !invalidator.is_empty() {
+            eviction_state.more_entries_to_evict = true;
+        }
+    }
+
+    fn evict_lru_entries(
+        &self,
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        batch_size: u32,
+        weights_to_evict: u64,
+        eviction_state: &mut EvictionState<'_, K, V>,
+    ) where
+        V: Clone,
+    {
+        const CACHE_REGION: CacheRegion = CacheRegion::MainProbation;
+        let deq_name = CACHE_REGION.name();
+        let (ao_deq, wo_deq) = deqs.select_mut(CACHE_REGION);
+        let mut evicted = 0u64;
+        let mut more_to_evict = true;
+
+        for _ in 0..batch_size {
+            if evicted >= weights_to_evict {
+                more_to_evict = false;
+                break;
+            }
+
+            let maybe_key_hash_ts = ao_deq.peek_front().map(|node| {
+                let entry_info = node.element.entry_info();
+                (
+                    Arc::clone(node.element.key()),
+                    node.element.hash(),
+                    entry_info.is_dirty(),
+                    entry_info.last_accessed(),
+                )
+            });
+
+            let (key, hash, ts) = match maybe_key_hash_ts {
+                Some((key, hash, false, Some(ts))) => (key, hash, ts),
+                // TODO: Remove the second pattern `Some((_key, false, None))` once we change
+                // `last_modified` and `last_accessed` in `EntryInfo` from `Option<Instant>` to
+                // `Instant`.
+                Some((key, hash, true, _) | (key, hash, false, None)) => {
+                    // `is_dirty` is true or `last_modified` is None. Skip this entry
+                    // as it may have been updated by this or other async task but
+                    // its `WriteOp` is not processed yet.
+                    self.skip_updated_entry_ao(&key, hash, deq_name, ao_deq, wo_deq);
+                    // Set `more_to_evict` to `false` to make `run_pending_tasks` to
+                    // return early. This will help that `schedule_write_op` to send
+                    // the `WriteOp` to the write op channel.
+                    more_to_evict = false;
+                    continue;
+                }
+                None => {
+                    more_to_evict = false;
+                    break;
+                }
+            };
+
+            // Lock the key for removal if blocking removal notification is enabled.
+            let kl = self.maybe_key_lock(&key);
+            let _klg = &kl.as_ref().map(|kl| kl.lock());
+
+            let maybe_entry = self.cache.remove_if(
+                hash,
+                |k| k == &key,
+                |_, v| {
+                    if let Some(la) = v.last_accessed() {
+                        la == ts
+                    } else {
+                        false
+                    }
+                },
+            );
+            .max_capacity(10)
+            .time_to_idle(Duration::from_secs(5))
+            .clock(clock)
+            .build();
+        cache.reconfigure_for_testing();
+
+        // Make the cache exterior immutable.
+        let cache = cache;
+
+        cache.insert(1, 1);
+
+        mock.increment(Duration::from_secs(4));
+        assert_eq!(cache.get(&1), Some(1));
+
+        mock.increment(Duration::from_secs(2));
+        assert_eq!(cache.get(&1), Some(1));
+        cache.run_pending_tasks();
+        assert_eq!(cache.get(&1), Some(1));
+    }
+
+    #[test]
+    fn time_to_live_by_expiry_type() {
+        // Define an expiry type.
+        struct MyExpiry {
+            counters: Arc<ExpiryCallCounters>,
+        }
+
+        impl MyExpiry {
+            fn new(counters: Arc<ExpiryCallCounters>) -> Self {
+                Self { counters }
+            }
+        }
+
+        impl Expiry<&str, &str> for MyExpiry {
+            fn expire_after_create(
+                &self,
+                _key: &&str,
+                _value: &&str,
+                _current_time: StdInstant,
+            ) -> Option<Duration> {
+                self.counters.incl_actual_creations();
+                Some(Duration::from_secs(10))
+            }
+
+            fn expire_after_update(
+                &self,
+                _key: &&str,
+                _value: &&str,
+                _current_time: StdInstant,
+                _current_duration: Option<Duration>,
+            ) -> Option<Duration> {
+                self.counters.incl_actual_updates();
+                Some(Duration::from_secs(10))
+            }
+        }
+
+        // The following `Vec`s will hold actual and expected notifications.
+        let actual = Arc::new(Mutex::new(Vec::new()));
+        let mut expected = Vec::new();
+
+        // Create expiry counters and the expiry.
+        let expiry_counters = Arc::new(ExpiryCallCounters::default());
+        let expiry = MyExpiry::new(Arc::clone(&expiry_counters));
+
+        // Create an eviction listener.
+        let a1 = Arc::clone(&actual);
+        let listener = move |k, v, cause| a1.lock().push((k, v, cause));
+
+        let (clock, mock) = Clock::mock();
+
+        // Create a cache with the eviction listener.
+        let mut cache = Cache::builder()
+            .max_capacity(100)
+            .expire_after(expiry)
+            .eviction_listener(listener)
+            .clock(clock)
+            .build();
+        cache.reconfigure_for_testing();
+
+        // Make the cache exterior immutable.
+        let cache = cache;
+
+        cache.insert("a", "alice");
+        expiry_counters.incl_expected_creations();
+        cache.run_pending_tasks();
+
+        mock.increment(Duration::from_secs(5)); // 5 secs from the start.
+        cache.run_pending_tasks();
+
+        assert_eq!(cache.get(&"a"), Some("alice"));
+        assert!(cache.contains_key(&"a"));
+
+        mock.increment(Duration::from_secs(5)); // 10 secs.
+        expected.push((Arc::new("a"), "alice", RemovalCause::Expired));
+        assert_eq!(cache.get(&"a"), None);
+        assert!(!cache.contains_key(&"a"));
+
+        assert_eq!(cache.iter().count(), 0);
+
+        cache.run_pending_tasks();
+        assert!(cache.is_table_empty());
+
+        cache.insert("b", "bob");
+        expiry_counters.incl_expected_creations();
+        cache.run_pending_tasks();
+
+        assert_eq!(cache.entry_count(), 1);
+
+        mock.increment(Duration::from_secs(5)); // 15 secs.
+        cache.run_pending_tasks();
+
+        assert_eq!(cache.get(&"b"), Some("bob"));
+        assert!(cache.contains_key(&"b"));
+        assert_eq!(cache.entry_count(), 1);
+
+        cache.insert("b", "bill");
+        expected.push((Arc::new("b"), "bob", RemovalCause::Replaced));
+        expiry_counters.incl_expected_updates();
+        cache.run_pending_tasks();
+
+        mock.increment(Duration::from_secs(5)); // 20 secs
+        cache.run_pending_tasks();
+
+        assert_eq!(cache.get(&"b"), Some("bill"));
+        assert!(cache.contains_key(&"b"));
+        assert_eq!(cache.entry_count(), 1);
+
+        mock.increment(Duration::from_secs(5)); // 25 secs
+        expected.push((Arc::new("b"), "bill", RemovalCause::Expired));
+
+        assert_eq!(cache.get(&"a"), None);
+        assert_eq!(cache.get(&"b"), None);
+        assert!(!cache.contains_key(&"a"));
+        assert!(!cache.contains_key(&"b"));
+
+        assert_eq!(cache.iter().count(), 0);
+
+        cache.run_pending_tasks();
+        assert!(cache.is_table_empty());
+
+        expiry_counters.verify();
+        verify_notification_vec(&cache, actual, &expected);
+    }
+
+    #[test]
+    fn time_to_idle_by_expiry_type() {
+        // Define an expiry type.
+        struct MyExpiry {
+            counters: Arc<ExpiryCallCounters>,
+        }
+
+        impl MyExpiry {
+            fn new(counters: Arc<ExpiryCallCounters>) -> Self {
+                Self { counters }
+            }
+        }
+
+        impl Expiry<&str, &str> for MyExpiry {
+            fn expire_after_read(
+                &self,
+                _key: &&str,
+                _value: &&str,
+                _current_time: StdInstant,
+                _current_duration: Option<Duration>,
+                _last_modified_at: StdInstant,
+            ) -> Option<Duration> {
+                self.counters.incl_actual_reads();
+                Some(Duration::from_secs(10))
+            }
+        }
+
+        // The following `Vec`s will hold actual and expected notifications.
+        let actual = Arc::new(Mutex::new(Vec::new()));
+        let mut expected = Vec::new();
+
+        // Create expiry counters and the expiry.
+        let expiry_counters = Arc::new(ExpiryCallCounters::default());
+        let expiry = MyExpiry::new(Arc::clone(&expiry_counters));
+
+        // Create an eviction listener.
+        let a1 = Arc::clone(&actual);
+        let listener = move |k, v, cause| a1.lock().push((k, v, cause));
+
+        let (clock, mock) = Clock::mock();
+
+        // Create a cache with the eviction listener.
+        let mut cache = Cache::builder()
+            .max_capacity(100)
+            .expire_after(expiry)
+            .eviction_listener(listener)
+            .clock(clock)
+            .build();
+        cache.reconfigure_for_testing();
+
+        // Make the cache exterior immutable.
+        let cache = cache;
+
+        cache.insert("a", "alice");
+        cache.run_pending_tasks();
+
+        mock.increment(Duration::from_secs(5)); // 5 secs from the start.
+        cache.run_pending_tasks();
+
+        assert_eq!(cache.get(&"a"), Some("alice"));
+        expiry_counters.incl_expected_reads();
+
+        mock.increment(Duration::from_secs(5)); // 10 secs.
+        cache.run_pending_tasks();
+
+        cache.insert("b", "bob");
+        cache.run_pending_tasks();
+
+        assert_eq!(cache.entry_count(), 2);
+
+        mock.increment(Duration::from_secs(2)); // 12 secs.
+        cache.run_pending_tasks();
+
+        // contains_key does not reset the idle timer for the key.
+        assert!(cache.contains_key(&"a"));
+        assert!(cache.contains_key(&"b"));
+        cache.run_pending_tasks();
+
+        assert_eq!(cache.entry_count(), 2);
+
+        mock.increment(Duration::from_secs(3)); // 15 secs.
+        expected.push((Arc::new("a"), "alice", RemovalCause::Expired));
+
+        assert_eq!(cache.get(&"a"), None);
+        assert_eq!(cache.get(&"b"), Some("bob"));
+        expiry_counters.incl_expected_reads();
+        assert!(!cache.contains_key(&"a"));
+        assert!(cache.contains_key(&"b"));
+
+        assert_eq!(cache.iter().count(), 1);
+
+        cache.run_pending_tasks();
+        assert_eq!(cache.entry_count(), 1);
+
+        mock.increment(Duration::from_secs(10)); // 25 secs
+        expected.push((Arc::new("b"), "bob", RemovalCause::Expired));
+
+        assert_eq!(cache.get(&"a"), None);
+        assert_eq!(cache.get(&"b"), None);
+        assert!(!cache.contains_key(&"a"));
+        assert!(!cache.contains_key(&"b"));
+
+        assert_eq!(cache.iter().count(), 0);
+
+        cache.run_pending_tasks();
+        assert!(cache.is_table_empty());
+
+        expiry_counters.verify();
+        verify_notification_vec(&cache, actual, &expected);
+    }
+
+    /// Verify that the `Expiry::expire_after_read()` method is called in `get_with`
+    /// only when the key was already present in the cache.
+    #[test]
+    fn test_expiry_using_get_with() {
+        // Define an expiry type, which always return `None`.
+        struct NoExpiry {
+            .max_capacity(100)
+            .expire_after(expiry)
+            .build();
+        cache.reconfigure_for_testing();
+
+        // Make the cache exterior immutable.
+        let cache = cache;
+
+        // The key is not present.
+        cache.get_with("a", || "alice");
+        expiry_counters.incl_expected_creations();
+        cache.run_pending_tasks();
+
+        // The key is present.
+        cache.get_with("a", || "alex");
+        expiry_counters.incl_expected_reads();
+        cache.run_pending_tasks();
+
+        // The key is not present.
+        cache.invalidate("a");
+        cache.get_with("a", || "amanda");
+        expiry_counters.incl_expected_creations();
+        cache.run_pending_tasks();
+
+        expiry_counters.verify();
+    }
+
+    // https://github.com/moka-rs/moka/issues/345
+    #[test]
+    fn test_race_between_updating_entry_and_processing_its_write_ops() {
+        let (clock, mock) = Clock::mock();
+        let cache = Cache::builder()
+            .max_capacity(2)
+            .time_to_idle(Duration::from_secs(1))
+            .clock(clock)
+            .build();
+
+        cache.insert("a", "alice");
+        cache.insert("b", "bob");
+        cache.insert("c", "cathy"); // c1
+        mock.increment(Duration::from_secs(2));
+
+        // The following `insert` will do the followings:
+        // 1. Replaces current "c" (c1) in the concurrent hash table (cht).
+        // 2. Runs the pending tasks implicitly.
+        //    (1) "a" will be admitted.
+        //    (2) "b" will be admitted.
+        //    (3) c1 will be evicted by size constraint.
+        //    (4) "a" will be evicted due to expiration.
+        //    (5) "b" will be evicted due to expiration.
+        // 3. Send its `WriteOp` log to the channel.
+        cache.insert("c", "cindy"); // c2
+
+        // Remove "c" (c2) from the cht.
+        assert_eq!(cache.remove(&"c"), Some("cindy")); // c-remove
+
+        mock.increment(Duration::from_secs(2));
+
+        // The following `run_pending_tasks` will do the followings:
+        // 1. Admits "c" (c2) to the cache. (Create a node in the LRU deque)
+        // 2. Because of c-remove, removes c2's node from the LRU deque.
+        cache.run_pending_tasks();
+        assert_eq!(cache.entry_count(), 0);
+    }
+
+    #[test]
+    fn test_race_between_recreating_entry_and_processing_its_write_ops() {
+        let cache = Cache::builder().max_capacity(2).build();
+
+        cache.insert('a', "a");
+        cache.insert('b', "b");
+        cache.run_pending_tasks();
+
+        cache.insert('c', "c1"); // (a) `EntryInfo` 1, gen: 1
+        assert!(cache.remove(&'a').is_some()); // (b)
+        assert!(cache.remove(&'b').is_some()); // (c)
+        assert!(cache.remove(&'c').is_some()); // (d) `EntryInfo` 1, gen: 2
+        cache.insert('c', "c2"); // (e) `EntryInfo` 2, gen: 1
+
+        // Now the `write_op_ch` channel contains the following `WriteOp`s:
+        //
+        // - 0: (a) insert "c1" (`EntryInfo` 1, gen: 1)
+        // - 1: (b) remove "a"
+        // - 2: (c) remove "b"
+        // - 3: (d) remove "c1" (`EntryInfo` 1, gen: 2)
+        // - 4: (e) insert "c2" (`EntryInfo` 2, gen: 1)
+        //
+        // 0 for "c1" is going to be rejected because the cache is full. Let's ensure
+        // processing 0 must not remove "c2" from the concurrent hash table. (Their
+        // gen are the same, but `EntryInfo`s are different)
+        cache.run_pending_tasks();
+        assert_eq!(cache.get(&'c'), Some("c2"));
+    }
+
+    #[test]
+    fn test_iter() {
+        const NUM_KEYS: usize = 50;
+
+        fn make_value(key: usize) -> String {
+            format!("val: {key}")
+        }
+use parking_lot::RwLock;
+use std::{
+    any::{Any, TypeId},
+    fmt,
+    hash::{BuildHasher, Hash},
+    sync::Arc,
+};
+
+use crate::{
+    common::concurrent::arc::MiniArc,
+    ops::compute::{CompResult, Op},
+    Entry,
+};
+
+use super::{Cache, ComputeNone, OptionallyNone};
+
+const WAITER_MAP_NUM_SEGMENTS: usize = 64;
+
+type ErrorObject = Arc<dyn Any + Send + Sync + 'static>;
+
+// type WaiterValue<V> = Option<Result<V, ErrorObject>>;
+enum WaiterValue<V> {
+    Computing,
+    Ready(Result<V, ErrorObject>),
+    ReadyNone,
+    // https://github.com/moka-rs/moka/issues/43
+    InitClosurePanicked,
+}
+
+impl<V> fmt::Debug for WaiterValue<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WaiterValue::Computing => write!(f, "Computing"),
+            WaiterValue::Ready(_) => write!(f, "Ready"),
+            WaiterValue::ReadyNone => write!(f, "ReadyNone"),
+            WaiterValue::InitClosurePanicked => write!(f, "InitFuturePanicked"),
+        }
+    }
+}
+
+type Waiter<V> = MiniArc<RwLock<WaiterValue<V>>>;
+
+pub(crate) enum InitResult<V, E> {
+    Initialized(V),
+    ReadExisting(V),
+    InitErr(Arc<E>),
+}
+
+pub(crate) struct ValueInitializer<K, V, S> {
+    // TypeId is the type ID of the concrete error type of generic type E in the
+    // try_get_with method. We use the type ID as a part of the key to ensure that
+    // we can always downcast the trait object ErrorObject (in Waiter<V>) into
+    // its concrete type.
+    waiters: crate::cht::SegmentedHashMap<(Arc<K>, TypeId), Waiter<V>, S>,
+}
+
+impl<K, V, S> ValueInitializer<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn with_hasher(hasher: S) -> Self {
+        Self {
+            waiters: crate::cht::SegmentedHashMap::with_num_segments_and_hasher(
+                WAITER_MAP_NUM_SEGMENTS,
+                hasher,
+            ),
+        }
+    }
+
+    /// # Panics
+    /// Panics if the `init` closure has been panicked.
+    pub(crate) fn try_init_or_read<O, E>(
+        &self,
+        key: &Arc<K>,
+        type_id: TypeId,
+        // Closure to get an existing value from cache.
+        mut get: impl FnMut() -> Option<V>,
+        // Closure to initialize a new value.
+        init: impl FnOnce() -> O,
+        // Closure to insert a new value into cache.
+        mut insert: impl FnMut(V),
+        // Function to convert a value O, returned from the init future, into
+        // Result<V, E>.
+        post_init: fn(O) -> Result<V, E>,
+    ) -> InitResult<V, E>
+    where
+        E: Send + Sync + 'static,
+    {
+        use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+        use InitResult::{InitErr, ReadExisting};
+
+        const MAX_RETRIES: usize = 200;
+        let mut retries = 0;
+
+        let (w_key, w_hash) = self.waiter_key_hash(key, type_id);
+
+        let waiter = MiniArc::new(RwLock::new(WaiterValue::Computing));
+        let mut lock = waiter.write();
+
+        loop {
+            let Some(existing_waiter) = self.try_insert_waiter(w_key.clone(), w_hash, &waiter)
+            else {
+                // Inserted.
+                break;
+            };
+
+            // Somebody else's waiter already exists, so wait for its result to become available.
+            let waiter_result = existing_waiter.read();
+            match &*waiter_result {
+                WaiterValue::Ready(Ok(value)) => return ReadExisting(value.clone()),
+                WaiterValue::Ready(Err(e)) => return InitErr(Arc::clone(e).downcast().unwrap()),
+                // Somebody else's init closure has been panicked.
+                WaiterValue::InitClosurePanicked => {
+                    retries += 1;
+                    assert!(
+                        retries < MAX_RETRIES,
+                        "Too many retries. Tried to read the return value from the `init` \
+                        closure but failed {retries} times. Maybe the `init` kept panicking?"
+                    );
+
+                    // Retry from the beginning.
+                    continue;
+                }
+                // Unexpected state.
+                s @ (WaiterValue::Computing | WaiterValue::ReadyNone) => panic!(
+                    "Got unexpected state `{s:?}` after resolving `init` future. \
+                    This might be a bug in Moka"
+                ),
+            }
+        }
+
+        // Our waiter was inserted.
+
+        // Check if the value has already been inserted by other thread.
+        if let Some(value) = get() {
+            // Yes. Set the waiter value, remove our waiter, and return
+            // the existing value.
+            *lock = WaiterValue::Ready(Ok(value.clone()));
+            self.remove_waiter(w_key, w_hash);
+            return InitResult::ReadExisting(value);
+        }
+
+        // The value still does note exist. Let's evaluate the init
+        // closure. Catching panic is safe here as we do not try to
+        // evaluate the closure again.
+        match catch_unwind(AssertUnwindSafe(init)) {
+            // Evaluated.
+            Ok(value) => {
+                let init_res = match post_init(value) {
+                    Ok(value) => {
+                        insert(value.clone());
+                        *lock = WaiterValue::Ready(Ok(value.clone()));
+                        InitResult::Initialized(value)
+                    }
+                    Err(e) => {
+                        let err: ErrorObject = Arc::new(e);
+                        *lock = WaiterValue::Ready(Err(Arc::clone(&err)));
+                        InitResult::InitErr(err.downcast().unwrap())
+                    }
+                };
+                self.remove_waiter(w_key, w_hash);
+                init_res
+            }
+            // Panicked.
+            Err(payload) => {
+                *lock = WaiterValue::InitClosurePanicked;
+                // Remove the waiter so that others can retry.
+                self.remove_waiter(w_key, w_hash);
+                resume_unwind(payload);
+            }
+        }
+        // The write lock will be unlocked here.
+    }
+
+    /// # Panics
+    /// Panics if the `init` closure has been panicked.
+    pub(crate) fn try_compute<F, O, E>(
+        &self,
+        c_key: Arc<K>,
+        c_hash: u64,
+        cache: &Cache<K, V, S>,
+        f: F,
+        post_init: fn(O) -> Result<Op<V>, E>,
+        allow_nop: bool,
+    ) -> Result<CompResult<K, V>, E>
+    where
+        V: 'static,
+        F: FnOnce(Option<Entry<K, V>>) -> O,
+        E: Send + Sync + 'static,
+    {
+        use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+
+        let type_id = TypeId::of::<ComputeNone>();
+        let (w_key, w_hash) = self.waiter_key_hash(&c_key, type_id);
+        let waiter = MiniArc::new(RwLock::new(WaiterValue::Computing));
+        // NOTE: We have to acquire a write lock before `try_insert_waiter`,
+        // so that any concurrent attempt will get our lock and wait on it.
+        let mut lock = waiter.write();
+
+        loop {
+            let Some(existing_waiter) = self.try_insert_waiter(w_key.clone(), w_hash, &waiter)
+            else {
+                // Inserted.
+                break;
+            };
+
+            // Somebody else's waiter already exists, so wait for it to finish
+            // (wait for it to release the write lock).
+            let waiter_result = existing_waiter.read();
+            match &*waiter_result {
+                // Unexpected state.
+                WaiterValue::Computing => panic!(
+                    "Got unexpected state `Computing` after resolving `init` future. \
+                    This might be a bug in Moka"
+                ),
+                _ => {
+                    // Try to insert our waiter again.
+                    continue;
+                }
+            }
+        }
+
+        // Our waiter was inserted.
+
+        // Get the current value.
+        let ignore_if = None as Option<&mut fn(&V) -> bool>;
+        let maybe_entry = cache
+            .base
+            .get_with_hash_and_ignore_if(&*c_key, c_hash, ignore_if, true);
+        let maybe_value = if allow_nop {
+            maybe_entry.as_ref().map(|ent| ent.value().clone())
+        } else {
+            None
+        };
+        let entry_existed = maybe_entry.is_some();
+
+        // Evaluate the `f` closure. Catching panic is safe here as we will not
+        // evaluate the closure again.

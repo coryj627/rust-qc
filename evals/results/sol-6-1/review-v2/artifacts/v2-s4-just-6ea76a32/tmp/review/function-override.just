@@ -1,0 +1,4 @@
+set unstable
+x := 'original'
+f() := x
+a := f()

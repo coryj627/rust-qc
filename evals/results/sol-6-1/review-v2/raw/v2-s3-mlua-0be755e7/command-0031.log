@@ -1,0 +1,312 @@
+use std::any::TypeId;
+use std::cell::{BorrowError, BorrowMutError, RefCell};
+use std::marker::PhantomData;
+use std::ops::Deref;
+use std::os::raw::{c_char, c_int};
+use std::panic::Location;
+use std::result::Result as StdResult;
+use std::{fmt, mem, ptr};
+
+use crate::chunk::{AsChunk, Chunk};
+use crate::debug::Debug;
+use crate::error::{Error, Result};
+use crate::function::Function;
+use crate::memory::MemoryState;
+use crate::multi::MultiValue;
+use crate::scope::Scope;
+use crate::stdlib::StdLib;
+use crate::string::String;
+use crate::table::Table;
+use crate::thread::Thread;
+use crate::traits::{FromLua, FromLuaMulti, IntoLua, IntoLuaMulti};
+use crate::types::{
+    AppDataRef, AppDataRefMut, ArcReentrantMutexGuard, Integer, LuaType, MaybeSend, Number, ReentrantMutex,
+    ReentrantMutexGuard, RegistryKey, VmState, XRc, XWeak,
+};
+use crate::userdata::{AnyUserData, UserData, UserDataProxy, UserDataRegistry, UserDataStorage};
+use crate::util::{assert_stack, check_stack, protect_lua_closure, push_string, rawset_field, StackGuard};
+use crate::value::{Nil, Value};
+
+#[cfg(not(feature = "luau"))]
+use crate::{debug::HookTriggers, types::HookKind};
+
+#[cfg(any(feature = "luau", doc))]
+use crate::{buffer::Buffer, chunk::Compiler};
+
+#[cfg(feature = "async")]
+use {
+    crate::types::LightUserData,
+    std::future::{self, Future},
+    std::task::Poll,
+};
+
+#[cfg(feature = "serde")]
+use serde::Serialize;
+
+pub(crate) use extra::ExtraData;
+pub use raw::RawLua;
+pub(crate) use util::callback_error_ext;
+
+/// Top level Lua struct which represents an instance of Lua VM.
+pub struct Lua {
+    pub(self) raw: XRc<ReentrantMutex<RawLua>>,
+    // Controls whether garbage collection should be run on drop
+    pub(self) collect_garbage: bool,
+}
+
+/// Weak reference to Lua instance.
+///
+/// This can used to prevent circular references between Lua and Rust objects.
+#[derive(Clone)]
+pub struct WeakLua(XWeak<ReentrantMutex<RawLua>>);
+
+pub(crate) struct LuaGuard(ArcReentrantMutexGuard<RawLua>);
+
+/// Mode of the Lua garbage collector (GC).
+///
+/// In Lua 5.4 GC can work in two modes: incremental and generational.
+/// Previous Lua versions support only incremental GC.
+///
+/// More information can be found in the Lua [documentation].
+///
+/// [documentation]: https://www.lua.org/manual/5.4/manual.html#2.5
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GCMode {
+    Incremental,
+    #[cfg(feature = "lua54")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "lua54")))]
+    Generational,
+}
+
+/// Controls Lua interpreter behavior such as Rust panics handling.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct LuaOptions {
+    /// Catch Rust panics when using [`pcall`]/[`xpcall`].
+    ///
+    /// If disabled, wraps these functions and automatically resumes panic if found.
+    /// Also in Lua 5.1 adds ability to provide arguments to [`xpcall`] similar to Lua >= 5.2.
+    ///
+    /// If enabled, keeps [`pcall`]/[`xpcall`] unmodified.
+    /// Panics are still automatically resumed if returned to the Rust side.
+    ///
+    /// Default: **true**
+    ///
+    /// [`pcall`]: https://www.lua.org/manual/5.4/manual.html#pdf-pcall
+    /// [`xpcall`]: https://www.lua.org/manual/5.4/manual.html#pdf-xpcall
+    pub catch_rust_panics: bool,
+
+    /// Max size of thread (coroutine) object pool used to execute asynchronous functions.
+    ///
+        let lua = self.lock();
+        unsafe {
+            (*lua.extra.get()).warn_callback = Some(XRc::new(callback));
+            ffi::lua_setwarnf(lua.state(), Some(warn_proc), lua.extra.get() as *mut c_void);
+        }
+    }
+
+    /// Removes warning function previously set by `set_warning_function`.
+    ///
+    /// This function has no effect if a warning function was not previously set.
+    #[cfg(feature = "lua54")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "lua54")))]
+    pub fn remove_warning_function(&self) {
+        let lua = self.lock();
+        unsafe {
+            (*lua.extra.get()).warn_callback = None;
+            ffi::lua_setwarnf(lua.state(), None, ptr::null_mut());
+        }
+    }
+
+    /// Emits a warning with the given message.
+    ///
+    /// A message in a call with `incomplete` set to `true` should be continued in
+    /// another call to this function.
+    #[cfg(feature = "lua54")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "lua54")))]
+    pub fn warning(&self, msg: impl AsRef<str>, incomplete: bool) {
+        let msg = msg.as_ref();
+        let mut bytes = vec![0; msg.len() + 1];
+        bytes[..msg.len()].copy_from_slice(msg.as_bytes());
+        let real_len = bytes.iter().position(|&c| c == 0).unwrap();
+        bytes.truncate(real_len);
+        let lua = self.lock();
+        unsafe {
+            ffi::lua_warning(lua.state(), bytes.as_ptr() as *const _, incomplete as c_int);
+        }
+    }
+
+    /// Gets information about the interpreter runtime stack at a given level.
+    ///
+    /// This function calls callback `f`, passing the [`Debug`] structure that can be used to get
+    /// information about the function executing at a given level.
+    /// Level `0` is the current running function, whereas level `n+1` is the function that has
+    /// called level `n` (except for tail calls, which do not count in the stack).
+    pub fn inspect_stack<R>(&self, level: usize, f: impl FnOnce(&Debug) -> R) -> Option<R> {
+        let lua = self.lock();
+        unsafe {
+            let mut ar = mem::zeroed::<ffi::lua_Debug>();
+            let level = level as c_int;
+            #[cfg(not(feature = "luau"))]
+            if ffi::lua_getstack(lua.state(), level, &mut ar) == 0 {
+                return None;
+            }
+            #[cfg(feature = "luau")]
+            if ffi::lua_getinfo(lua.state(), level, cstr!(""), &mut ar) == 0 {
+                return None;
+            }
+
+            Some(f(&Debug::new(&lua, level, &mut ar)))
+        }
+    }
+
+    /// Returns the amount of memory (in bytes) currently used inside this Lua state.
+    pub fn used_memory(&self) -> usize {
+        let lua = self.lock();
+        let state = lua.main_state();
+        if status == ffi::LUA_OK {
+            if (*self.extra.get()).enable_jit && ffi::luau_codegen_supported() != 0 {
+                ffi::luau_codegen_compile(state, -1);
+            }
+        }
+        status
+    }
+
+    /// Sets a hook for a thread (coroutine).
+    #[cfg(not(feature = "luau"))]
+    pub(crate) unsafe fn set_thread_hook(
+        &self,
+        thread_state: *mut ffi::lua_State,
+        hook: HookKind,
+    ) -> Result<()> {
+        // Key to store hooks in the registry
+        const HOOKS_KEY: *const c_char = cstr!("__mlua_hooks");
+
+        unsafe fn process_status(state: *mut ffi::lua_State, event: c_int, status: VmState) {
+            match status {
+                VmState::Continue => {}
+                VmState::Yield => {
+                    // Only count and line events can yield
+                    if event == ffi::LUA_HOOKCOUNT || event == ffi::LUA_HOOKLINE {
+                        #[cfg(any(feature = "lua54", feature = "lua53"))]
+                        if ffi::lua_isyieldable(state) != 0 {
+                            ffi::lua_yield(state, 0);
+                        }
+                        #[cfg(any(feature = "lua52", feature = "lua51", feature = "luajit"))]
+                        {
+                            ffi::lua_pushliteral(state, c"attempt to yield from a hook");
+                            ffi::lua_error(state);
+                        }
+                    }
+                }
+            }
+        }
+
+        unsafe extern "C-unwind" fn global_hook_proc(state: *mut ffi::lua_State, ar: *mut ffi::lua_Debug) {
+            let status = callback_error_ext(state, ptr::null_mut(), false, move |extra, _| {
+                match (*extra).hook_callback.clone() {
+                    Some(hook_callback) => {
+                        let rawlua = (*extra).raw_lua();
+                        let debug = Debug::new(rawlua, 0, ar);
+                        hook_callback((*extra).lua(), &debug)
+                    }
+                    None => {
+                        ffi::lua_sethook(state, None, 0, 0);
+                        Ok(VmState::Continue)
+                    }
+                }
+            });
+            process_status(state, (*ar).event, status);
+        }
+
+        unsafe extern "C-unwind" fn hook_proc(state: *mut ffi::lua_State, ar: *mut ffi::lua_Debug) {
+            let top = ffi::lua_gettop(state);
+            let mut hook_callback_ptr = ptr::null();
+            ffi::luaL_checkstack(state, 3, ptr::null());
+            if ffi::lua_getfield(state, ffi::LUA_REGISTRYINDEX, HOOKS_KEY) == ffi::LUA_TTABLE {
+                ffi::lua_pushthread(state);
+                if ffi::lua_rawget(state, -2) == ffi::LUA_TUSERDATA {
+                    hook_callback_ptr = get_internal_userdata::<HookCallback>(state, -1, ptr::null());
+                }
+            }
+            ffi::lua_settop(state, top);
+            if hook_callback_ptr.is_null() {
+                ffi::lua_sethook(state, None, 0, 0);
+                return;
+            }
+
+            let status = callback_error_ext(state, ptr::null_mut(), false, |extra, _| {
+                let rawlua = (*extra).raw_lua();
+                let debug = Debug::new(rawlua, 0, ar);
+                let hook_callback = (*hook_callback_ptr).clone();
+                hook_callback((*extra).lua(), &debug)
+            });
+            process_status(state, (*ar).event, status)
+        }
+
+        let (triggers, callback) = match hook {
+            HookKind::Global if (*self.extra.get()).hook_callback.is_none() => {
+                return Ok(());
+            }
+            HookKind::Global => {
+                let triggers = (*self.extra.get()).hook_triggers;
+                let (mask, count) = (triggers.mask(), triggers.count());
+                ffi::lua_sethook(thread_state, Some(global_hook_proc), mask, count);
+                return Ok(());
+            }
+            HookKind::Thread(triggers, callback) => (triggers, callback),
+        };
+
+        // Hooks for threads stored in the registry (in a weak table)
+        let state = self.state();
+        let _sg = StackGuard::new(state);
+        check_stack(state, 3)?;
+        protect_lua!(state, 0, 0, |state| {
+            if ffi::luaL_getsubtable(state, ffi::LUA_REGISTRYINDEX, HOOKS_KEY) == 0 {
+                // Table just created, initialize it
+                ffi::lua_pushliteral(state, c"k");
+                ffi::lua_setfield(state, -2, cstr!("__mode")); // hooktable.__mode = "k"
+                ffi::lua_pushvalue(state, -1);
+                ffi::lua_setmetatable(state, -2); // metatable(hooktable) = hooktable
+            }
+
+            ffi::lua_pushthread(thread_state);
+            ffi::lua_xmove(thread_state, state, 1); // key (thread)
+            let _ = push_internal_userdata(state, callback, false); // value (hook callback)
+            ffi::lua_rawset(state, -3); // hooktable[thread] = hook callback
+        })?;
+
+        ffi::lua_sethook(thread_state, Some(hook_proc), triggers.mask(), triggers.count());
+
+        Ok(())
+    }
+
+    /// See [`Lua::create_string`]
+    pub(crate) unsafe fn create_string(&self, s: impl AsRef<[u8]>) -> Result<String> {
+        let state = self.state();
+        if self.unlikely_memory_error() {
+#[test]
+#[ignore]
+fn test_compilation() {
+    let t = trybuild::TestCases::new();
+
+    t.compile_fail("tests/compile/function_borrow.rs");
+    t.compile_fail("tests/compile/lua_norefunwindsafe.rs");
+    t.compile_fail("tests/compile/ref_nounwindsafe.rs");
+    t.compile_fail("tests/compile/scope_callback_capture.rs");
+    t.compile_fail("tests/compile/scope_invariance.rs");
+    t.compile_fail("tests/compile/scope_mutable_aliasing.rs");
+    t.compile_fail("tests/compile/scope_userdata_borrow.rs");
+
+    #[cfg(feature = "async")]
+    {
+        t.compile_fail("tests/compile/async_any_userdata_method.rs");
+        t.compile_fail("tests/compile/async_nonstatic_userdata.rs");
+    }
+
+    #[cfg(feature = "send")]
+    t.compile_fail("tests/compile/non_send.rs");
+    #[cfg(not(feature = "send"))]
+    t.pass("tests/compile/non_send.rs");
+}
+cat: .rustfmt.toml: No such file or directory

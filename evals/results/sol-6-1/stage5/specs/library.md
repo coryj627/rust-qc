@@ -1,0 +1,39 @@
+# Create a byte-span library
+
+Implement a small Rust library named `byte_span` in `/work/crate` with public
+types `ByteSpan` and `SpanError` and these methods:
+
+```rust
+impl ByteSpan {
+    pub fn new(start: usize, end: usize) -> Result<Self, SpanError>;
+    pub fn start(&self) -> usize;
+    pub fn end(&self) -> usize;
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn contains(&self, offset: usize) -> bool;
+    pub fn intersection(&self, other: &Self) -> Option<Self>;
+    pub fn slice<'a>(&self, text: &'a str) -> Result<&'a str, SpanError>;
+}
+```
+
+A span denotes the half-open byte interval `[start, end)`. Construction rejects
+`start > end`; zero-length spans are valid. Its public API must prevent callers
+from constructing reversed spans. All methods must handle the full `usize`
+range without overflow or panics.
+
+`contains` includes the start and excludes the end. An intersection is `Some`
+only when the overlap has positive length; touching or empty spans yield `None`.
+`slice` borrows the indicated UTF-8 substring. It rejects an end beyond the input
+length and either endpoint falling inside a UTF-8 code point. An empty span at
+the input's byte length produces an empty slice. For an out-of-bounds span,
+report the bounds failure before checking UTF-8 boundaries.
+
+Expose errors so downstream callers can distinguish reversed construction,
+out-of-bounds slicing and invalid UTF-8 boundaries without parsing display text.
+You may choose the concrete error API. Both public types must implement `Debug`,
+and `SpanError` must implement `Display` and `std::error::Error`. Document byte
+units, invariants and error behavior, with usable examples.
+
+Add meaningful tests and keep the design appropriate for a small library.
+Dependencies are available only from the preloaded cache; explain any dependency
+you add. Complete the implementation and verify it.

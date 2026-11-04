@@ -1,0 +1,7 @@
+exec(open('/work/tmp/regressions.py').read().split("case('private-module'")[0])
+case('lazy-assert',"set lazy\nunused := assert('a' == 'b', 'unused assertion')\n@show:\n  echo hello\n", ['show'])
+case('eval-unrelated-assert',"good := 'ok'\nbad := assert('a' == 'b', 'unused assertion')\n", ['--evaluate','good'])
+case('list-unrelated-assert',"bad := assert('a' == 'b', 'unused assertion')\nshow:\n", ['--list'])
+case('lazy-regex',"set lazy\nunused := if 'x' =~ '[' {'yes'} else {'no'}\nshow:\n", ['show'])
+case('fmt-suppress-doc',"# hidden docs\n[doc]\nmod foo\n", ['--list'], {'foo.just':'bar:\n'},True)
+case('fmt-multiline-comment',"# first\n# second\nmod foo\n", ['--list'], {'foo.just':'bar:\n'},True)

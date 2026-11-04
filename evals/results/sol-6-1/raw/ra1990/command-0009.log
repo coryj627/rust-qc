@@ -1,0 +1,802 @@
+            }
+            _ => break,
+        }
+    }
+    if let Some(previous_list_item) = previous_list_item {
+        tree.truncate_to_parent(previous_list_item);
+    }
+}
+
+/// Determines whether the delimiter run starting at given index is
+/// left-flanking, as defined by the commonmark spec (and isn't intraword
+/// for _ delims).
+/// suffix is &s[ix..], which is passed in as an optimization, since taking
+/// a string subslice is O(n).
+fn delim_run_can_open(
+    s: &str,
+    suffix: &str,
+    run_len: usize,
+    ix: usize,
+    mode: TableParseMode,
+) -> bool {
+    let next_char = if let Some(c) = suffix[run_len..].chars().next() {
+        c
+    } else {
+        return false;
+    };
+    if next_char.is_whitespace() {
+        return false;
+    }
+    if ix == 0 {
+        return true;
+    }
+    if mode == TableParseMode::Active {
+        if s.as_bytes()[..ix].ends_with(b"|") && !s.as_bytes()[..ix].ends_with(br"\|") {
+            return true;
+        }
+        if next_char == '|' {
+            return false;
+        }
+    }
+    let delim = suffix.bytes().next().unwrap();
+    // `*` and `~~` can be intraword, `_` and `~` cannot
+    if delim == b'*' && !is_punctuation(next_char) {
+        return true;
+    }
+    if delim == b'~' && run_len > 1 {
+        return true;
+    }
+    let prev_char = s[..ix].chars().last().unwrap();
+    if delim == b'~' && prev_char == '~' && !is_punctuation(next_char) {
+        return true;
+    }
+
+    prev_char.is_whitespace()
+        || is_punctuation(prev_char) && (delim != b'\'' || ![']', ')'].contains(&prev_char))
+}
+
+/// Determines whether the delimiter run starting at given index is
+/// right-flanking, as defined by the commonmark spec (and isn't intraword
+/// for _ delims)
+fn delim_run_can_close(
+    s: &str,
+    suffix: &str,
+    run_len: usize,
+    ix: usize,
+    mode: TableParseMode,
+) -> bool {
+    if ix == 0 {
+        return false;
+    }
+    let prev_char = s[..ix].chars().last().unwrap();
+    if prev_char.is_whitespace() {
+        return false;
+    }
+    let next_char = if let Some(c) = suffix[run_len..].chars().next() {
+        c
+    } else {
+        return true;
+    };
+    if mode == TableParseMode::Active {
+        if s.as_bytes()[..ix].ends_with(b"|") && !s.as_bytes()[..ix].ends_with(br"\|") {
+            return false;
+        }
+        if next_char == '|' {
+            return true;
+        }
+    }
+    let delim = suffix.bytes().next().unwrap();
+    // `*` and `~~` can be intraword, `_` and `~` cannot
+    if (delim == b'*' || (delim == b'~' && run_len > 1)) && !is_punctuation(prev_char) {
+        return true;
+    }
+    if delim == b'~' && prev_char == '~' {
+        return true;
+    }
+
+    next_char.is_whitespace() || is_punctuation(next_char)
+}
+
+fn create_lut(options: &Options) -> LookupTable {
+    #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+    {
+        LookupTable {
+            simd: simd::compute_lookup(options),
+            scalar: special_bytes(options),
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "simd")))]
+    {
+        special_bytes(options)
+    }
+}
+
+fn special_bytes(options: &Options) -> [bool; 256] {
+    let mut bytes = [false; 256];
+    let standard_bytes = [
+        b'\n', b'\r', b'*', b'_', b'&', b'\\', b'[', b']', b'<', b'!', b'`',
+    ];
+
+    for &byte in &standard_bytes {
+        bytes[byte as usize] = true;
+    }
+    if options.contains(Options::ENABLE_TABLES) {
+        bytes[b'|' as usize] = true;
+    }
+    if options.contains(Options::ENABLE_STRIKETHROUGH)
+        || options.contains(Options::ENABLE_SUBSCRIPT)
+    {
+        bytes[b'~' as usize] = true;
+    }
+    if options.contains(Options::ENABLE_SUPERSCRIPT) {
+        bytes[b'^' as usize] = true;
+    }
+    if options.contains(Options::ENABLE_MATH) {
+        bytes[b'$' as usize] = true;
+        bytes[b'{' as usize] = true;
+        bytes[b'}' as usize] = true;
+    }
+    if options.contains(Options::ENABLE_SMART_PUNCTUATION) {
+        for &byte in &[b'.', b'-', b'"', b'\''] {
+            bytes[byte as usize] = true;
+        }
+    }
+
+    bytes
+}
+
+enum LoopInstruction<T> {
+    /// Continue looking for more special bytes, but skip next few bytes.
+    ContinueAndSkip(usize),
+    /// Break looping immediately, returning with the given index and value.
+    BreakAtWith(usize, T),
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "simd"))]
+struct LookupTable {
+    simd: [u8; 16],
+    scalar: [bool; 256],
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "simd")))]
+type LookupTable = [bool; 256];
+
+/// This function walks the byte slices from the given index and
+/// calls the callback function on all bytes (and their indices) that are in the following set:
+/// `` ` ``, `\`, `&`, `*`, `_`, `~`, `!`, `<`, `[`, `]`, `|`, `\r`, `\n`
+/// It is guaranteed not call the callback on other bytes.
+/// Whenever `callback(ix, byte)` returns a `ContinueAndSkip(n)` value, the callback
+/// will not be called with an index that is less than `ix + n + 1`.
+/// When the callback returns a `BreakAtWith(end_ix, opt+val)`, no more callbacks will be
+/// called and the function returns immediately with the return value `(end_ix, opt_val)`.
+/// If `BreakAtWith(..)` is never returned, this function will return the first
+/// index that is outside the byteslice bound and a `None` value.
+fn iterate_special_bytes<F, T>(
+    lut: &LookupTable,
+    bytes: &[u8],
+    ix: usize,
+    callback: F,
+) -> (usize, Option<T>)
+where
+    F: FnMut(usize, u8) -> LoopInstruction<Option<T>>,
+{
+    #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+    {
+        simd::iterate_special_bytes(lut, bytes, ix, callback)
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "simd")))]
+    {
+        scalar_iterate_special_bytes(lut, bytes, ix, callback)
+    }
+}
+
+fn scalar_iterate_special_bytes<F, T>(
+    lut: &[bool; 256],
+    bytes: &[u8],
+    mut ix: usize,
+    mut callback: F,
+) -> (usize, Option<T>)
+where
+    F: FnMut(usize, u8) -> LoopInstruction<Option<T>>,
+{
+    while ix < bytes.len() {
+        let b = bytes[ix];
+        if lut[b as usize] {
+            match callback(ix, b) {
+                LoopInstruction::ContinueAndSkip(skip) => {
+                    ix += skip;
+                }
+                LoopInstruction::BreakAtWith(ix, val) => {
+                    return (ix, val);
+                }
+            }
+        }
+        ix += 1;
+    }
+
+    (ix, None)
+}
+
+/// Split the usual heading content range and the content inside the trailing attribute block.
+///
+/// Returns `(leading_content_len, Option<trailing_attr_block_range>)`.
+///
+/// Note that `trailing_attr_block_range` will be empty range when the block
+/// is `{}`, since the range is content inside the wrapping `{` and `}`.
+///
+/// The closing `}` of an attribute block can have trailing whitespaces.
+/// They are automatically trimmed when the attribute block is being searched.
+///
+/// However, this method does not trim the trailing whitespaces of heading content.
+/// It is callers' responsibility to trim them if necessary.
+fn extract_attribute_block_content_from_header_text(
+    heading: &[u8],
+) -> (usize, Option<Range<usize>>) {
+    let heading_len = heading.len();
+    let mut ix = heading_len;
+    ix -= scan_rev_while(heading, |b| {
+        b == b'\n' || b == b'\r' || b == b' ' || b == b'\t'
+    });
+    if ix == 0 {
+        return (heading_len, None);
+    }
+
+    let attr_block_close = ix - 1;
+    if heading.get(attr_block_close) != Some(&b'}') {
+        // The last character is not `}`. No attribute blocks found.
+        return (heading_len, None);
+    }
+    // move cursor before the closing right brace (`}`)
+    ix -= 1;
+
+    ix -= scan_rev_while(&heading[..ix], |b| {
+        // Characters to be excluded:
+        //  * `{` and `}`: special characters to open and close an attribute block.
+        //  * `\\`: a special character to escape many characters and disable some syntaxes.
+        //      + Handling of this escape character differs among markdown processors.
+        //      + Escaped characters will be separate text node from neighbors, so
+        //        it is not easy to handle unescaped string and trim the trailing block.
+        //  * `<` and `>`: special characters to start and end HTML tag.
+        //      + No known processors converts `{#<i>foo</i>}` into
+        //        `id="&lt;i&gt;foo&lt;/&gt;"` as of this writing, so hopefully
+                    let body_node = scan_nodes_to_ix(&self.tree, Some(body_node), rest);
+                    if let Some(body_node) = body_node {
+                        // break node so passes can actually format
+                        // the display text
+                        self.tree[body_node].item.start = rest;
+                        Some((true, body_node, wikitext))
+                    } else {
+                        None
+                    }
+                }
+                None => {
+                    let wikitext = &block_text[start_ix..end_ix];
+                    // bail early if the wikiname would be empty
+                    if wikitext.is_empty() {
+                        return None;
+                    }
+                    let body_node = self.tree.create_node(Item {
+                        start: start_ix,
+                        end: end_ix,
+                        body: ItemBody::Text {
+                            backslash_escaped: false,
+                        },
+                    });
+                    Some((false, body_node, wikitext))
+                }
+            };
+
+            if let Some((has_pothole, body_node, wikiname)) = wikilink {
+                let link_ix = self.allocs.allocate_link(
+                    LinkType::WikiLink { has_pothole },
+                    wikiname.into(),
+                    "".into(),
+                    "".into(),
+                );
+                if let Some(prev_ix) = prev {
+                    self.tree[prev_ix].next = None;
+                }
+                if tos.ty == LinkStackTy::Image {
+                    self.tree[tos.node].item.body = ItemBody::Image(link_ix);
+                } else {
+                    self.tree[tos.node].item.body = ItemBody::Link(link_ix);
+                }
+                self.tree[tos.node].child = Some(body_node);
+                self.tree[tos.node].next = self.tree[next_ix].next;
+                self.tree[tos.node].item.end = end_ix + 1;
+                self.disable_all_links();
+                return Some(tos.node);
+            }
+        }
+
+        None
+    }
+
+    fn handle_emphasis_and_hard_break(&mut self) {
+        let mut prev = None;
+        let mut prev_ix: TreeIndex;
+        let mut cur = self.tree.cur();
+
+        let mut single_quote_open: Option<TreeIndex> = None;
+        let mut double_quote_open: bool = false;
+
+        while let Some(mut cur_ix) = cur {
+            match self.tree[cur_ix].item.body {
+                ItemBody::MaybeEmphasis(mut count, can_open, can_close) => {
+                    let run_length = count;
+                    let c = self.text.as_bytes()[self.tree[cur_ix].item.start];
+                    let both = can_open && can_close;
+                    if can_close {
+                        while let Some(el) =
+                            self.inline_stack
+                                .find_match(&mut self.tree, c, run_length, both)
+                        {
+                            // have a match!
+                            if let Some(prev_ix) = prev {
+                                self.tree[prev_ix].next = None;
+                            }
+                            let match_count = min(count, el.count);
+                            // start, end are tree node indices
+                            let mut end = cur_ix - 1;
+                            let mut start = el.start + el.count;
+
+                            // work from the inside out
+                            while start > el.start + el.count - match_count {
+                                let inc = if start > el.start + el.count - match_count + 1 {
+                                    2
+                                } else {
+                                    1
+                                };
+                                let ty = if c == b'~' {
+                                    if inc == 2 {
+                                        if self.options.contains(Options::ENABLE_STRIKETHROUGH) {
+                                            ItemBody::Strikethrough
+                                        } else {
+                                            ItemBody::Text {
+                                                backslash_escaped: false,
+                                            }
+                                        }
+                                    } else {
+                                        if self.options.contains(Options::ENABLE_SUBSCRIPT) {
+                                            ItemBody::Subscript
+                                        } else if self
+                                            .options
+                                            .contains(Options::ENABLE_STRIKETHROUGH)
+                                        {
+                                            ItemBody::Strikethrough
+                                        } else {
+                                            ItemBody::Text {
+                                                backslash_escaped: false,
+                                            }
+                                        }
+                                    }
+                                } else if c == b'^' {
+                                    if self.options.contains(Options::ENABLE_SUPERSCRIPT) {
+                                        ItemBody::Superscript
+                                    } else {
+                                        ItemBody::Text {
+                                            backslash_escaped: false,
+                                        }
+                                    }
+                                } else if inc == 2 {
+                                    ItemBody::Strong
+                                } else {
+                                    ItemBody::Emphasis
+                                };
+
+                                let root = start - inc;
+                                end = end + inc;
+                                self.tree[root].item.body = ty;
+                                self.tree[root].item.end = self.tree[end].item.end;
+                                self.tree[root].child = Some(start);
+                                self.tree[root].next = None;
+                                start = root;
+                            }
+
+                            // set next for top most emph level
+                            prev_ix = el.start + el.count - match_count;
+                            prev = Some(prev_ix);
+                            cur = self.tree[cur_ix + match_count - 1].next;
+                            self.tree[prev_ix].next = cur;
+
+                            if el.count > match_count {
+                                self.inline_stack.push(InlineEl {
+                                    start: el.start,
+                                    count: el.count - match_count,
+                                    run_length: el.run_length,
+                                    c: el.c,
+                                    both: el.both,
+                                })
+                            }
+                            count -= match_count;
+                            if count > 0 {
+                                cur_ix = cur.unwrap();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    if count > 0 {
+                        if can_open {
+                            self.inline_stack.push(InlineEl {
+                                start: cur_ix,
+                                run_length,
+                                count,
+                                c,
+                                both,
+                            });
+                        } else {
+                            for i in 0..count {
+                                self.tree[cur_ix + i].item.body = ItemBody::Text {
+                                    backslash_escaped: false,
+                                };
+                            }
+                        }
+                        prev_ix = cur_ix + count - 1;
+                        prev = Some(prev_ix);
+                        cur = self.tree[prev_ix].next;
+                    }
+                }
+                ItemBody::MaybeSmartQuote(c, can_open, can_close) => {
+                    self.tree[cur_ix].item.body = match c {
+                        b'\'' => {
+                            if let (Some(open_ix), true) = (single_quote_open, can_close) {
+                                self.tree[open_ix].item.body = ItemBody::SynthesizeChar('‘');
+                                single_quote_open = None;
+                            } else if can_open {
+                                single_quote_open = Some(cur_ix);
+                            }
+                            ItemBody::SynthesizeChar('’')
+                        }
+                        _ /* double quote */ => {
+                            if can_close && double_quote_open {
+                                double_quote_open = false;
+                                ItemBody::SynthesizeChar('”')
+                            } else {
+                                if can_open && !double_quote_open {
+                                    double_quote_open = true;
+                                }
+                                ItemBody::SynthesizeChar('“')
+                            }
+                        }
+                    };
+                    prev = cur;
+                    cur = self.tree[cur_ix].next;
+                }
+                ItemBody::HardBreak(true) => {
+                    if self.tree[cur_ix].next.is_none() {
+                        self.tree[cur_ix].item.body = ItemBody::SynthesizeChar('\\');
+                    }
+                    prev = cur;
+                    cur = self.tree[cur_ix].next;
+                }
+                _ => {
+                    prev = cur;
+                    cur = self.tree[cur_ix].next;
+                }
+            }
+        }
+        self.inline_stack.pop_all(&mut self.tree);
+    }
+
+    fn disable_all_links(&mut self) {
+        self.link_stack.disable_all_links();
+        self.wikilink_stack.disable_all_links();
+    }
+
+    /// Returns next byte index, url and title.
+    fn scan_inline_link(
+        &self,
+        underlying: &'input str,
+        mut ix: usize,
+        node: Option<TreeIndex>,
+    ) -> Option<(usize, CowStr<'input>, CowStr<'input>)> {
+        if underlying.as_bytes().get(ix) != Some(&b'(') {
+            return None;
+        }
+        ix += 1;
+
+        let scan_separator = |ix: &mut usize| {
+            *ix += scan_while(&underlying.as_bytes()[*ix..], is_ascii_whitespace_no_nl);
+            if let Some(bl) = scan_eol(&underlying.as_bytes()[*ix..]) {
+                *ix += bl;
+                *ix += skip_container_prefixes(
+                    &self.tree,
+                    &underlying.as_bytes()[*ix..],
+                    self.options,
+                );
+            }
+            *ix += scan_while(&underlying.as_bytes()[*ix..], is_ascii_whitespace_no_nl);
+        };
+
+        scan_separator(&mut ix);
+
+        let (dest_length, dest) = scan_link_dest(underlying, ix, LINK_MAX_NESTED_PARENS)?;
+        let dest = unescape(dest, self.tree.is_in_table());
+        ix += dest_length;
+
+        scan_separator(&mut ix);
+
+        let title = if let Some((bytes_scanned, t)) = self.scan_link_title(underlying, ix, node) {
+            ix += bytes_scanned;
+            scan_separator(&mut ix);
+            t
+        } else {
+            "".into()
+        };
+        if underlying.as_bytes().get(ix) != Some(&b')') {
+            return None;
+        }
+        ix += 1;
+
+        Some((ix, dest, title))
+    }
+
+    // returns (bytes scanned, title cow)
+    fn scan_link_title(
+        &self,
+        text: &'input str,
+        start_ix: usize,
+        node: Option<TreeIndex>,
+    ) -> Option<(usize, CowStr<'input>)> {
+        let bytes = text.as_bytes();
+        let open = match bytes.get(start_ix) {
+            Some(b @ b'\'') | Some(b @ b'\"') | Some(b @ b'(') => *b,
+            _ => return None,
+        };
+        let close = if open == b'(' { b')' } else { open };
+
+        let mut title = String::new();
+        let mut mark = start_ix + 1;
+        let mut i = start_ix + 1;
+
+// Copyright 2018 Google LLC
+//
+// Use of this source code is governed by an MIT-style
+// license that can be found in the LICENSE file or at
+// https://opensource.org/licenses/MIT.
+
+//! A Vec-based container for a tree structure.
+
+use std::num::NonZeroUsize;
+use std::ops::{Add, Sub};
+
+use crate::parse::{Item, ItemBody};
+
+#[derive(Debug, Eq, PartialEq, Copy, Clone, PartialOrd)]
+pub(crate) struct TreeIndex(NonZeroUsize);
+
+impl TreeIndex {
+    fn new(i: usize) -> Self {
+        TreeIndex(NonZeroUsize::new(i).unwrap())
+    }
+
+    pub fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+impl Add<usize> for TreeIndex {
+    type Output = TreeIndex;
+
+    fn add(self, rhs: usize) -> Self {
+        let inner = self.0.get() + rhs;
+        TreeIndex::new(inner)
+    }
+}
+
+impl Sub<usize> for TreeIndex {
+    type Output = TreeIndex;
+
+    fn sub(self, rhs: usize) -> Self {
+        let inner = self.0.get().checked_sub(rhs).unwrap();
+        TreeIndex::new(inner)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Node<T> {
+    pub child: Option<TreeIndex>,
+    pub next: Option<TreeIndex>,
+    pub item: T,
+}
+
+/// A tree abstraction, intended for fast building as a preorder traversal.
+#[derive(Clone)]
+pub(crate) struct Tree<T> {
+    nodes: Vec<Node<T>>,
+    spine: Vec<TreeIndex>, // indices of nodes on path to current node
+    cur: Option<TreeIndex>,
+}
+
+impl<T: Default> Tree<T> {
+    // Indices start at one, so we place a dummy value at index zero.
+    // The alternative would be subtracting one from every TreeIndex
+    // every time we convert it to usize to index our nodes.
+    pub(crate) fn with_capacity(cap: usize) -> Tree<T> {
+        let mut nodes = Vec::with_capacity(cap);
+        nodes.push(Node {
+            child: None,
+            next: None,
+            item: <T as Default>::default(),
+        });
+        Tree {
+            nodes,
+            spine: Vec::new(),
+            cur: None,
+        }
+    }
+
+    /// Returns the index of the element currently in focus.
+    pub(crate) fn cur(&self) -> Option<TreeIndex> {
+        self.cur
+    }
+
+    /// Append one item to the current position in the tree.
+    pub(crate) fn append(&mut self, item: T) -> TreeIndex {
+        let ix = self.create_node(item);
+        let this = Some(ix);
+
+        if let Some(ix) = self.cur {
+            self[ix].next = this;
+        } else if let Some(&parent) = self.spine.last() {
+            self[parent].child = this;
+        }
+        self.cur = this;
+        ix
+    }
+
+    /// Create an isolated node.
+    pub(crate) fn create_node(&mut self, item: T) -> TreeIndex {
+        let this = self.nodes.len();
+        self.nodes.push(Node {
+            child: None,
+            next: None,
+            item,
+        });
+        TreeIndex::new(this)
+    }
+
+    /// Push down one level, so that new items become children of the current node.
+    /// The new focus index is returned.
+    pub(crate) fn push(&mut self) -> TreeIndex {
+        let cur_ix = self.cur.unwrap();
+        self.spine.push(cur_ix);
+        self.cur = self[cur_ix].child;
+        cur_ix
+    }
+
+    /// Pop back up a level.
+    pub(crate) fn pop(&mut self) -> Option<TreeIndex> {
+        let ix = Some(self.spine.pop()?);
+        self.cur = ix;
+        ix
+    }
+
+    /// Remove the last node, as `pop` but removing it.
+    pub(crate) fn remove_node(&mut self) -> Option<TreeIndex> {
+        let ix = self.spine.pop()?;
+        self.cur = Some(ix);
+        self.nodes.pop()?;
+        self[ix].child = None;
+        Some(ix)
+    }
+
+    /// Look at the parent node.
+    pub(crate) fn peek_up(&self) -> Option<TreeIndex> {
+        self.spine.last().copied()
+    }
+
+    /// Look at grandparent node.
+    pub(crate) fn peek_grandparent(&self) -> Option<TreeIndex> {
+        if self.spine.len() >= 2 {
+            Some(self.spine[self.spine.len() - 2])
+        } else {
+            None
+        }
+    }
+
+    /// Returns true when there are no nodes other than the root node
+    /// in the tree, false otherwise.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.nodes.len() <= 1
+    }
+
+    /// Returns the length of the spine.
+    pub(crate) fn spine_len(&self) -> usize {
+        self.spine.len()
+    }
+
+    /// Resets the focus to the first node added to the tree, if it exists.
+    pub(crate) fn reset(&mut self) {
+        self.cur = if self.is_empty() {
+            None
+        } else {
+            Some(TreeIndex::new(1))
+        };
+        self.spine.clear();
+    }
+
+    /// Walks the spine from a root node up to, but not including, the current node.
+    pub(crate) fn walk_spine(&self) -> impl std::iter::DoubleEndedIterator<Item = &TreeIndex> {
+        self.spine.iter()
+    }
+
+    /// Moves focus to the next sibling of the given node.
+    pub(crate) fn next_sibling(&mut self, cur_ix: TreeIndex) -> Option<TreeIndex> {
+        self.cur = self[cur_ix].next;
+        self.cur
+    }
+
+    pub(crate) fn truncate_to_parent(&mut self, child_ix: TreeIndex) {
+        let next = self[child_ix].next;
+        self[child_ix].next = None;
+        if let Some(cur) = self.cur {
+            self[cur].next = next;
+        } else if let Some(&parent) = self.spine.last() {
+            self[parent].child = next;
+        }
+        if next.is_some() {
+            self.cur = next;
+        }
+    }
+}
+
+impl Tree<Item> {
+    /// Truncates the preceding siblings to the given end position,
+    /// and returns the new current node.
+    pub(crate) fn truncate_siblings(&mut self, end_byte_ix: usize) {
+        let parent_ix = self.peek_up().unwrap();
+        let mut next_child_ix = self[parent_ix].child;
+        let mut prev_child_ix = None;
+
+        // drop or truncate children based on its range
+        while let Some(child_ix) = next_child_ix {
+            let child_end = self[child_ix].item.end;
+            if child_end < end_byte_ix {
+                // preserve this node, and go to the next
+                prev_child_ix = Some(child_ix);
+                next_child_ix = self[child_ix].next;
+                continue;
+            } else if child_end == end_byte_ix {
+                // this will be the last node
+                self[child_ix].next = None;
+                // focus to the new last child (this node)
+                self.cur = Some(child_ix);
+            } else if self[child_ix].item.start == end_byte_ix {
+                // check whether the previous character is a backslash
+                let is_previous_char_backslash_escape = match self[child_ix].item.body {
+                    ItemBody::Text { backslash_escaped } => backslash_escaped,
+                    _ => false,
+                };
+                if is_previous_char_backslash_escape {
+                    // rescue the backslash as a plain text content
+                    let last_byte_ix = end_byte_ix - 1;
+                    self[child_ix].item.start = last_byte_ix;
+                    self[child_ix].item.end = end_byte_ix;
+                    self.cur = Some(child_ix);
+                } else if let Some(prev_child_ix) = prev_child_ix {
+                    // the node will become empty. drop the node
+                    // a preceding sibling exists
+                    self[prev_child_ix].next = None;
+                    self.cur = Some(prev_child_ix);
+                } else {
+                    // no preceding siblings. remove the node from the parent
+                    self[parent_ix].child = None;
+                    self.cur = None;
+                }
+            } else {
+                debug_assert!(self[child_ix].item.start < end_byte_ix);
+                debug_assert!(end_byte_ix < child_end);
+                // truncate the node
+                self[child_ix].item.end = end_byte_ix;
+                self[child_ix].next = None;
+                // focus to the new last child
+                self.cur = Some(child_ix);
+            }
+            break;
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for Tree<T>

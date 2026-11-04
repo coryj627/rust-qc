@@ -1,0 +1,596 @@
+format_code_in_doc_comments = true
+//! A fixed-capacity hash table where the iteration order is independent of the hash of the keys.
+use core::{
+    borrow::Borrow,
+    fmt,
+    hash::{BuildHasher, Hash},
+    mem,
+    num::NonZeroU32,
+    ops, slice,
+};
+
+use hash32::{BuildHasherDefault, FnvHasher};
+
+use crate::Vec;
+
+/// An [`IndexMap`] using the default FNV hasher.
+///
+/// A list of all Methods and Traits available for `FnvIndexMap` can be found in
+/// the [`IndexMap`] documentation.
+///
+/// # Examples
+/// ```
+/// use heapless::index_map::FnvIndexMap;
+///
+/// // A hash map with a capacity of 16 key-value pairs allocated on the stack
+/// let mut book_reviews = FnvIndexMap::<_, _, 16>::new();
+///
+/// // review some books.
+/// book_reviews
+///     .insert("Adventures of Huckleberry Finn", "My favorite book.")
+///     .unwrap();
+/// book_reviews
+///     .insert("Grimms' Fairy Tales", "Masterpiece.")
+///     .unwrap();
+/// book_reviews
+///     .insert("Pride and Prejudice", "Very enjoyable.")
+///     .unwrap();
+/// book_reviews
+///     .insert("The Adventures of Sherlock Holmes", "Eye lyked it alot.")
+///     .unwrap();
+///
+/// // check for a specific one.
+/// if !book_reviews.contains_key("Les Misérables") {
+///     println!(
+///         "We've got {} reviews, but Les Misérables ain't one.",
+///         book_reviews.len()
+///     );
+/// }
+///
+/// // oops, this review has a lot of spelling mistakes, let's delete it.
+/// book_reviews.remove("The Adventures of Sherlock Holmes");
+///
+/// // look up the values associated with some keys.
+/// let to_find = ["Pride and Prejudice", "Alice's Adventure in Wonderland"];
+/// for book in &to_find {
+///     match book_reviews.get(book) {
+///         Some(review) => println!("{}: {}", book, review),
+///         None => println!("{} is unreviewed.", book),
+///     }
+/// }
+///
+/// // iterate over everything.
+/// for (book, review) in &book_reviews {
+///     println!("{}: \"{}\"", book, review);
+/// }
+/// ```
+pub type FnvIndexMap<K, V, const N: usize> = IndexMap<K, V, BuildHasherDefault<FnvHasher>, N>;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct HashValue(u16);
+
+impl HashValue {
+    fn desired_pos(&self, mask: usize) -> usize {
+        usize::from(self.0) & mask
+    }
+
+    fn probe_distance(&self, mask: usize, current: usize) -> usize {
+        current.wrapping_sub(self.desired_pos(mask)) & mask
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct Bucket<K, V> {
+    hash: HashValue,
+    key: K,
+    value: V,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq)]
+pub struct Pos {
+    // compact representation of `{ hash_value: u16, index: u16 }`
+    // To get the most from `NonZero` we store the *value minus 1*. This way `None::Option<Pos>`
+    // is equivalent to the very unlikely value of  `{ hash_value: 0xffff, index: 0xffff }` instead
+    // the more likely of `{ hash_value: 0x00, index: 0x00 }`
+    nz: NonZeroU32,
+}
+
+impl Pos {
+    fn new(index: usize, hash: HashValue) -> Self {
+        Self {
+            nz: unsafe {
+                NonZeroU32::new_unchecked(
+                    ((u32::from(hash.0) << 16) + index as u32).wrapping_add(1),
+                )
+            },
+        }
+    }
+
+    fn hash(&self) -> HashValue {
+        HashValue((self.nz.get().wrapping_sub(1) >> 16) as u16)
+    }
+
+    fn index(&self) -> usize {
+        self.nz.get().wrapping_sub(1) as u16 as usize
+    }
+}
+
+enum Insert<K, V> {
+    Success(Inserted<V>),
+    Full((K, V)),
+}
+struct Inserted<V> {
+    index: usize,
+    old_value: Option<V>,
+}
+
+macro_rules! probe_loop {
+    ($probe_var: ident < $len: expr, $body: expr) => {
+        loop {
+            if $probe_var < $len {
+                $body
+                    $probe_var += 1;
+            } else {
+                $probe_var = 0;
+            }
+        }
+    }
+}
+
+struct CoreMap<K, V, const N: usize> {
+    entries: Vec<Bucket<K, V>, N, usize>,
+    indices: [Option<Pos>; N],
+}
+
+impl<K, V, const N: usize> CoreMap<K, V, N> {
+    const fn new() -> Self {
+        const INIT: Option<Pos> = None;
+
+        Self {
+            entries: Vec::new(),
+            indices: [INIT; N],
+        }
+    }
+}
+
+impl<K, V, const N: usize> CoreMap<K, V, N>
+where
+    K: Eq + Hash,
+{
+    fn capacity() -> usize {
+        N
+    }
+
+    fn mask() -> usize {
+        Self::capacity() - 1
+    }
+
+    fn find<Q>(&self, hash: HashValue, query: &Q) -> Option<(usize, usize)>
+    where
+        K: Borrow<Q>,
+        Q: ?Sized + Eq,
+    {
+        let mut probe = hash.desired_pos(Self::mask());
+        let mut dist = 0;
+
+        probe_loop!(probe < self.indices.len(), {
+            if let Some(pos) = self.indices[probe] {
+                let entry_hash = pos.hash();
+                // NOTE(i) we use unchecked indexing below
+                let i = pos.index();
+                debug_assert!(i < self.entries.len());
+
+                if dist > entry_hash.probe_distance(Self::mask(), probe) {
+                    // give up when probe distance is too long
+                    return None;
+                } else if entry_hash == hash
+                    && unsafe { self.entries.get_unchecked(i).key.borrow() == query }
+                {
+                    return Some((probe, i));
+                }
+            } else {
+                return None;
+            }
+
+            dist += 1;
+        });
+    }
+
+    fn insert(&mut self, hash: HashValue, key: K, value: V) -> Insert<K, V> {
+        let mut probe = hash.desired_pos(Self::mask());
+        let mut dist = 0;
+
+        probe_loop!(probe < self.indices.len(), {
+            let pos = &mut self.indices[probe];
+
+            if let Some(pos) = *pos {
+                let entry_hash = pos.hash();
+                // NOTE(i) we use unchecked indexing below
+                let i = pos.index();
+                debug_assert!(i < self.entries.len());
+
+                let their_dist = entry_hash.probe_distance(Self::mask(), probe);
+
+                if their_dist < dist {
+                    if self.entries.is_full() {
+                        return Insert::Full((key, value));
+                    }
+                    // robin hood: steal the spot if it's better for us
+                    let index = self.entries.len();
+                    unsafe { self.entries.push_unchecked(Bucket { hash, key, value }) };
+                    Self::insert_phase_2(&mut self.indices, probe, Pos::new(index, hash));
+                    return Insert::Success(Inserted {
+                        index,
+                        old_value: None,
+                    });
+                } else if entry_hash == hash && unsafe { self.entries.get_unchecked(i).key == key }
+                {
+                    return Insert::Success(Inserted {
+                        index: i,
+                        old_value: Some(mem::replace(
+                            unsafe { &mut self.entries.get_unchecked_mut(i).value },
+                            value,
+                        )),
+                    });
+                }
+            } else {
+                if self.entries.is_full() {
+                    return Insert::Full((key, value));
+                }
+                // empty bucket, insert here
+                let index = self.entries.len();
+                *pos = Some(Pos::new(index, hash));
+                unsafe { self.entries.push_unchecked(Bucket { hash, key, value }) };
+                return Insert::Success(Inserted {
+                    index,
+                    old_value: None,
+                });
+            }
+            dist += 1;
+        });
+    }
+
+    // phase 2 is post-insert where we forward-shift `Pos` in the indices.
+    fn insert_phase_2(indices: &mut [Option<Pos>; N], mut probe: usize, mut old_pos: Pos) -> usize {
+        probe_loop!(probe < indices.len(), {
+            let pos = unsafe { indices.get_unchecked_mut(probe) };
+
+            let mut is_none = true; // work around lack of NLL
+            if let Some(pos) = pos.as_mut() {
+                old_pos = mem::replace(pos, old_pos);
+                is_none = false;
+            }
+
+            if is_none {
+                *pos = Some(old_pos);
+                return probe;
+            }
+        });
+    }
+
+    fn remove_found(&mut self, probe: usize, found: usize) -> (K, V) {
+        // index `probe` and entry `found` is to be removed
+        // use swap_remove, but then we need to update the index that points
+        // to the other entry that has to move
+        self.indices[probe] = None;
+        let entry = unsafe { self.entries.swap_remove_unchecked(found) };
+
+        // correct index that points to the entry that had to swap places
+        if let Some(entry) = self.entries.get(found) {
+            // was not last element
+            // examine new element in `found` and find it in indices
+            let mut probe = entry.hash.desired_pos(Self::mask());
+
+            probe_loop!(probe < self.indices.len(), {
+                if let Some(pos) = self.indices[probe] {
+                    if pos.index() >= self.entries.len() {
+                        // found it
+                        self.indices[probe] = Some(Pos::new(found, entry.hash));
+                        break;
+                    }
+                }
+            });
+        }
+
+        self.backward_shift_after_removal(probe);
+
+        (entry.key, entry.value)
+    }
+
+    fn retain_in_order<F>(&mut self, mut keep: F)
+    where
+        F: FnMut(&mut K, &mut V) -> bool,
+    {
+        const INIT: Option<Pos> = None;
+
+        self.entries
+            .retain_mut(|entry| keep(&mut entry.key, &mut entry.value));
+
+        if self.entries.len() < self.indices.len() {
+            for index in self.indices.iter_mut() {
+                *index = INIT;
+            }
+
+            for (index, entry) in self.entries.iter().enumerate() {
+                let mut probe = entry.hash.desired_pos(Self::mask());
+                let mut dist = 0;
+
+                probe_loop!(probe < self.indices.len(), {
+                    let pos = &mut self.indices[probe];
+
+                    if let Some(pos) = *pos {
+                        let entry_hash = pos.hash();
+
+                        // robin hood: steal the spot if it's better for us
+                        let their_dist = entry_hash.probe_distance(Self::mask(), probe);
+                        if their_dist < dist {
+                            Self::insert_phase_2(
+                                &mut self.indices,
+                                probe,
+                                Pos::new(index, entry.hash),
+                            );
+                            break;
+                        }
+                    } else {
+                        *pos = Some(Pos::new(index, entry.hash));
+                        break;
+                    }
+                    dist += 1;
+                });
+            }
+        }
+    }
+
+    fn backward_shift_after_removal(&mut self, probe_at_remove: usize) {
+        // backward shift deletion in self.indices
+        // after probe, shift all non-ideally placed indices backward
+        let mut last_probe = probe_at_remove;
+        let mut probe = probe_at_remove + 1;
+
+        probe_loop!(probe < self.indices.len(), {
+            if let Some(pos) = self.indices[probe] {
+                let entry_hash = pos.hash();
+
+                if entry_hash.probe_distance(Self::mask(), probe) > 0 {
+                    unsafe { *self.indices.get_unchecked_mut(last_probe) = self.indices[probe] }
+                    self.indices[probe] = None;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+            last_probe = probe;
+        });
+    }
+}
+
+impl<K, V, const N: usize> Clone for CoreMap<K, V, N>
+where
+    K: Clone,
+    V: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            indices: self.indices,
+        }
+    }
+}
+
+/// A view into an entry in the map
+pub enum Entry<'a, K, V, const N: usize> {
+    /// The entry corresponding to the key `K` exists in the map
+    Occupied(OccupiedEntry<'a, K, V, N>),
+    /// The entry corresponding to the key `K` does not exist in the map
+    Vacant(VacantEntry<'a, K, V, N>),
+}
+
+impl<'a, K, V, const N: usize> Entry<'a, K, V, N>
+where
+    K: Eq + Hash,
+{
+    /// Ensures a value is in the entry by inserting the default if empty, and
+    /// returns a mutable reference to the value in the entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::index_map::FnvIndexMap;
+1://! A fixed-capacity hash table where the iteration order is independent of the hash of the keys.
+5:    hash::{BuildHasher, Hash},
+11:use hash32::{BuildHasherDefault, FnvHasher};
+15:/// An [`IndexMap`] using the default FNV hasher.
+24:/// // A hash map with a capacity of 16 key-value pairs allocated on the stack
+66:pub type FnvIndexMap<K, V, const N: usize> = IndexMap<K, V, BuildHasherDefault<FnvHasher>, N>;
+84:    hash: HashValue,
+92:    // compact representation of `{ hash_value: u16, index: u16 }`
+94:    // is equivalent to the very unlikely value of  `{ hash_value: 0xffff, index: 0xffff }` instead
+95:    // the more likely of `{ hash_value: 0x00, index: 0x00 }`
+100:    fn new(index: usize, hash: HashValue) -> Self {
+104:                    ((u32::from(hash.0) << 16) + index as u32).wrapping_add(1),
+110:    fn hash(&self) -> HashValue {
+169:    fn find<Q>(&self, hash: HashValue, query: &Q) -> Option<(usize, usize)>
+174:        let mut probe = hash.desired_pos(Self::mask());
+179:                let entry_hash = pos.hash();
+184:                if dist > entry_hash.probe_distance(Self::mask(), probe) {
+187:                } else if entry_hash == hash
+200:    fn insert(&mut self, hash: HashValue, key: K, value: V) -> Insert<K, V> {
+201:        let mut probe = hash.desired_pos(Self::mask());
+208:                let entry_hash = pos.hash();
+213:                let their_dist = entry_hash.probe_distance(Self::mask(), probe);
+221:                    unsafe { self.entries.push_unchecked(Bucket { hash, key, value }) };
+222:                    Self::insert_phase_2(&mut self.indices, probe, Pos::new(index, hash));
+227:                } else if entry_hash == hash && unsafe { self.entries.get_unchecked(i).key == key }
+243:                *pos = Some(Pos::new(index, hash));
+244:                unsafe { self.entries.push_unchecked(Bucket { hash, key, value }) };
+272:    fn remove_found(&mut self, probe: usize, found: usize) -> (K, V) {
+283:            let mut probe = entry.hash.desired_pos(Self::mask());
+289:                        self.indices[probe] = Some(Pos::new(found, entry.hash));
+301:    fn retain_in_order<F>(&mut self, mut keep: F)
+316:                let mut probe = entry.hash.desired_pos(Self::mask());
+323:                        let entry_hash = pos.hash();
+326:                        let their_dist = entry_hash.probe_distance(Self::mask(), probe);
+331:                                Pos::new(index, entry.hash),
+336:                        *pos = Some(Pos::new(index, entry.hash));
+353:                let entry_hash = pos.hash();
+355:                if entry_hash.probe_distance(Self::mask(), probe) > 0 {
+402:    /// // A hash map with a capacity of 16 key-value pairs allocated on the stack
+430:    /// // A hash map with a capacity of 16 key-value pairs allocated on the stack
+463:    /// // A hash map with a capacity of 16 key-value pairs allocated on the stack
+489:    /// // A hash map with a capacity of 16 key-value pairs allocated on the stack
+513:    /// // A hash map with a capacity of 16 key-value pairs allocated on the stack
+584:    pub fn remove_entry(self) -> (K, V) {
+622:    pub fn remove(self) -> V {
+630:    hash_val: HashValue,
+653:            match self.core.insert(self.hash_val, self.key, value) {
+669:/// Note that you cannot use `IndexMap` directly, since it is generic around the hashing algorithm
+683:/// // A hash map with a capacity of 16 key-value pairs allocated on the stack
+727:    build_hasher: S,
+730:impl<K, V, S, const N: usize> IndexMap<K, V, BuildHasherDefault<S>, N> {
+739:            build_hasher: BuildHasherDefault::new(),
+962:    pub fn clear(&mut self) {
+973:    S: BuildHasher,
+992:        let hash_val = hash_with(&key, &self.build_hasher);
+993:        if let Some((probe, pos)) = self.core.find(hash_val, &key) {
+1003:                hash_val,
+1188:        let hash = hash_with(&key, &self.build_hasher);
+1189:        match self.core.insert(hash, key, value) {
+1209:    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
+1237:    pub fn retain<F>(&mut self, mut f: F)
+1259:    /// map.truncate(2);
+1268:    pub fn truncate(&mut self, len: usize) {
+1269:        self.core.entries.truncate(len);
+1291:        let h = hash_with(key, &self.build_hasher);
+1300:    S: BuildHasher,
+1313:    S: BuildHasher,
+1329:            build_hasher: self.build_hasher.clone(),
+1355:            build_hasher: <_>::default(),
+1366:    S1: BuildHasher,
+1367:    S2: BuildHasher,
+1381:    S: BuildHasher,
+1388:    S: BuildHasher,
+1404:    S: BuildHasher,
+1417:    S: BuildHasher + Default,
+1578:fn hash_with<K, S>(key: &K, build_hasher: &S) -> HashValue
+1581:    S: BuildHasher,
+1583:    HashValue(build_hasher.hash_one(key) as u16)
+1587:mod tests {
+1592:    use super::{BuildHasherDefault, Entry, FnvIndexMap, IndexMap};
+1595:    assert_not_impl_any!(IndexMap<*const (), (), BuildHasherDefault<()>, 4>: Send);
+1597:    assert_not_impl_any!(IndexMap<(), *const (), BuildHasherDefault<()>, 4>: Send);
+1607:                     mem::size_of::<u16>() // hash
+1864:    fn retain() {
+total 12
+drwxr-xr-x  8 audit audit  256 Nov  3 16:50 .
+drwxr-xr-x  1 root  root  4096 Nov  3 16:50 ..
+-rw-r--r--  1 audit audit   77 Nov  3 16:50 .budget.json
+drwxr-xr-x  6 audit audit  192 Nov  3 16:10 .cargo-home
+-rwxr-xr-x  1 audit audit  168 Nov  3 16:10 clock
+drwxr-xr-x 18 audit audit  576 Nov  3 16:10 crate
+drwxr-xr-x  5 audit audit  160 Nov  3 03:03 skill
+drwxr-xr-x  2 audit audit   64 Nov  3 16:10 tmp
+nightly-2026-10-01-aarch64-unknown-linux-gnu
+1.99.1-aarch64-unknown-linux-gnu (active, default)
+   --> /work/.cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/portable-atomic-1.15.0/src/lib.rs:470:1
+    |
+470 | / compile_error!(
+471 | |     "`portable_atomic_unsafe_assume_single_core` cfg (`unsafe-assume-single-core` feature) \
+472 | |      is not supported yet on this architecture;\n\
+473 | |      if you need unsafe-assume-{single-core,privileged} support for this target,\n\
+474 | |      please submit an issue at <https://github.com/taiki-e/portable-atomic/issues/new>"
+475 | | );
+    | |_^
+
+error: you may not enable `critical-section` feature and `portable_atomic_unsafe_assume_{single_core,privileged}` cfg (`unsafe-assume-{single-core,privileged}` feature) at the same time
+   --> /work/.cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/portable-atomic-1.15.0/src/lib.rs:582:1
+    |
+582 | / compile_error!(
+583 | |     "you may not enable `critical-section` feature and `portable_atomic_unsafe_assume_{single_core,privileged}` cfg (`unsafe-assu...
+584 | | );
+    | |_^
+
+    Checking hash32 v0.3.1
+error: could not compile `portable-atomic` (lib) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+
+== rustdoc
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling thiserror v2.0.21
+   Compiling syn v1.0.109
+   Compiling defmt-macros v1.2.0
+   Compiling defmt v1.2.0
+   Compiling serde_core v1.0.229
+   Compiling portable-atomic v1.15.0
+   Compiling serde v1.0.229
+   Compiling heapless v0.9.1 (/work/crate)
+    Checking critical-section v1.2.0
+error: `portable_atomic_unsafe_assume_single_core` cfg (`unsafe-assume-single-core` feature) is not supported yet on this architecture;
+       if you need unsafe-assume-{single-core,privileged} support for this target,
+       please submit an issue at <https://github.com/taiki-e/portable-atomic/issues/new>
+   --> /work/.cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/portable-atomic-1.15.0/src/lib.rs:470:1
+    |
+470 | / compile_error!(
+471 | |     "`portable_atomic_unsafe_assume_single_core` cfg (`unsafe-assume-single-core` feature) \
+472 | |      is not supported yet on this architecture;\n\
+473 | |      if you need unsafe-assume-{single-core,privileged} support for this target,\n\
+474 | |      please submit an issue at <https://github.com/taiki-e/portable-atomic/issues/new>"
+475 | | );
+    | |_^
+
+error: you may not enable `critical-section` feature and `portable_atomic_unsafe_assume_{single_core,privileged}` cfg (`unsafe-assume-{single-core,privileged}` feature) at the same time
+   --> /work/.cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/portable-atomic-1.15.0/src/lib.rs:582:1
+    |
+582 | / compile_error!(
+583 | |     "you may not enable `critical-section` feature and `portable_atomic_unsafe_assume_{single_core,privileged}` cfg (`unsafe-assu...
+584 | | );
+    | |_^
+
+error: could not compile `portable-atomic` (lib) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+
+== tests
+   Compiling quote v1.0.47
+   Compiling serde_core v1.0.229
+   Compiling ufmt-write v0.1.0
+   Compiling critical-section v1.2.0
+   Compiling byteorder v1.5.0
+   Compiling bitflags v1.3.2
+   Compiling syn v3.0.9
+   Compiling syn v1.0.109
+   Compiling hash32 v0.3.1
+   Compiling portable-atomic v1.15.0
+error: `portable_atomic_unsafe_assume_single_core` cfg (`unsafe-assume-single-core` feature) is not supported yet on this architecture;
+       if you need unsafe-assume-{single-core,privileged} support for this target,
+       please submit an issue at <https://github.com/taiki-e/portable-atomic/issues/new>
+   --> /work/.cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/portable-atomic-1.15.0/src/lib.rs:470:1
+    |
+470 | / compile_error!(
+471 | |     "`portable_atomic_unsafe_assume_single_core` cfg (`unsafe-assume-single-core` feature) \
+472 | |      is not supported yet on this architecture;\n\
+473 | |      if you need unsafe-assume-{single-core,privileged} support for this target,\n\
+474 | |      please submit an issue at <https://github.com/taiki-e/portable-atomic/issues/new>"
+475 | | );
+    | |_^
+
+error: you may not enable `critical-section` feature and `portable_atomic_unsafe_assume_{single_core,privileged}` cfg (`unsafe-assume-{single-core,privileged}` feature) at the same time
+   --> /work/.cargo-home/registry/src/index.crates.io-1949cf8c6b5b557f/portable-atomic-1.15.0/src/lib.rs:582:1
+    |
+582 | / compile_error!(
+583 | |     "you may not enable `critical-section` feature and `portable_atomic_unsafe_assume_{single_core,privileged}` cfg (`unsafe-assu...
+584 | | );
+    | |_^
+
+error: could not compile `portable-atomic` (lib) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+
+== Summary
+skip  format (rustfmt.toml uses nightly-only options and nightly rustfmt is not installed)
+FAIL  clippy
+FAIL  rustdoc
+FAIL  tests
+
+note: unsafe code present; also run 'cargo +nightly miri test'.

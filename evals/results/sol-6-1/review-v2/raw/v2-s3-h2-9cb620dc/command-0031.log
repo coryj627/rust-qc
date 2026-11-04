@@ -1,0 +1,418 @@
+   160	                if eos {
+   161	                    Closed(Cause::EndStream)
+   162	                } else if frame.is_informational() {
+   163	                    tracing::trace!("skipping 1xx response headers");
+   164	                    ReservedRemote
+   165	                } else {
+   166	                    HalfClosedLocal(Streaming)
+   167	                }
+   168	            }
+   169	            Open {
+   170	                local,
+   171	                remote: AwaitingHeaders,
+   172	            } => {
+   173	                if eos {
+   174	                    HalfClosedRemote(local)
+   175	                } else {
+   176	                    Open {
+   177	                        local,
+   178	                        remote: if frame.is_informational() {
+   179	                            tracing::trace!("skipping 1xx response headers");
+   180	                            AwaitingHeaders
+   181	                        } else {
+   182	                            Streaming
+   158	        stream: &mut store::Ptr,
+   159	        counts: &mut Counts,
+   160	    ) -> Result<(), RecvHeaderBlockError<Option<frame::Headers>>> {
+   161	        tracing::trace!("opening stream; init_window={}", self.init_window_sz);
+   162	        let is_initial = stream.state.recv_open(&frame)?;
+   163	
+   164	        if is_initial {
+   165	            // TODO: be smarter about this logic
+   166	            if frame.stream_id() > self.last_processed_id {
+   167	                self.last_processed_id = frame.stream_id();
+   168	            }
+   169	
+   170	            // Increment the number of concurrent streams
+   171	            counts.inc_num_recv_streams(stream);
+   172	        }
+   173	
+   174	        if !stream.content_length.is_head() {
+   175	            use super::stream::ContentLength;
+   176	            use http::header;
+   177	
+   178	            if let Some(content_length) = frame.fields().get(header::CONTENT_LENGTH) {
+   179	                let content_length = match frame::parse_u64(content_length.as_bytes()) {
+   180	                    Ok(v) => v,
+   181	                    Err(_) => {
+   182	                        proto_err!(stream: "could not parse content-length; stream={:?}", stream.id);
+   183	                        return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+   184	                    }
+   185	                };
+   186	
+   187	                stream.content_length = ContentLength::Remaining(content_length);
+   188	                // END_STREAM on headers frame with non-zero content-length is malformed.
+   189	                // https://datatracker.ietf.org/doc/html/rfc9113#section-8.1.1
+   190	                if frame.is_end_stream()
+   191	                    && content_length > 0
+   192	                    && frame
+   193	                        .pseudo()
+   194	                        .status
+   195	                        .map_or(true, |status| status != 204 && status != 304)
+   196	                {
+   197	                    proto_err!(stream: "recv_headers with END_STREAM: content-length is not zero; stream={:?};", stream.id);
+   198	                    return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+   199	                }
+   200	            }
+   201	        }
+   202	
+   203	        if frame.is_over_size() {
+   204	            // A frame is over size if the decoded header block was bigger than
+   205	            // SETTINGS_MAX_HEADER_LIST_SIZE.
+   206	            //
+   207	            // > A server that receives a larger header block than it is willing
+   208	            // > to handle can send an HTTP 431 (Request Header Fields Too
+   209	            // > Large) status code [RFC6585]. A client can discard responses
+   210	            // > that it cannot process.
+   211	            //
+   212	            // So, if peer is a server, we'll send a 431. In either case,
+   565	            }
+   566	        }
+   567	
+   568	        Ok(())
+   569	    }
+   570	
+   571	    pub fn is_end_stream(&self, stream: &store::Ptr) -> bool {
+   572	        if !stream.state.is_recv_end_stream() {
+   573	            return false;
+   574	        }
+   575	
+   576	        stream.pending_recv.is_empty()
+   577	    }
+   578	
+   579	    pub fn recv_data(&mut self, frame: frame::Data, stream: &mut store::Ptr) -> Result<(), Error> {
+   580	        let sz = frame.payload().len();
+   581	
+   582	        // This should have been enforced at the codec::FramedRead layer, so
+   583	        // this is just a sanity check.
+   584	        assert!(sz <= MAX_WINDOW_SIZE as usize);
+   585	
+   586	        let sz = sz as WindowSize;
+   587	
+   588	        let is_ignoring_frame = stream.state.is_local_error();
+   589	
+   590	        if !is_ignoring_frame && !stream.state.is_recv_streaming() {
+   591	            // TODO: There are cases where this can be a stream error of
+   592	            // STREAM_CLOSED instead...
+   593	
+   594	            // Receiving a DATA frame when not expecting one is a protocol
+   595	            // error.
+   596	            proto_err!(conn: "unexpected DATA frame; stream={:?}", stream.id);
+   597	            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+   598	        }
+   599	
+   600	        tracing::trace!(
+   601	            "recv_data; size={}; connection={}; stream={}",
+   602	            sz,
+   603	            self.flow.window_size(),
+   604	            stream.recv_flow.window_size()
+   605	        );
+   606	
+   607	        if is_ignoring_frame {
+   608	            tracing::trace!(
+   609	                "recv_data; frame ignored on locally reset {:?} for some time",
+   610	                stream.id,
+   611	            );
+   612	            return self.ignore_data(sz);
+   613	        }
+   614	
+   615	        // Ensure that there is enough capacity on the connection before acting
+   616	        // on the stream.
+   617	        self.consume_connection_window(sz)?;
+   618	
+   619	        if stream.recv_flow.window_size() < sz {
+   620	            // http://httpwg.org/specs/rfc7540.html#WINDOW_UPDATE
+   621	            // > A receiver MAY respond with a stream error (Section 5.4.2) or
+   622	            // > connection error (Section 5.4.1) of type FLOW_CONTROL_ERROR if
+   623	            // > it is unable to accept a frame.
+   624	            //
+   625	            // So, for violating the **stream** window, we can send either a
+   626	            // stream or connection error. We've opted to send a stream
+   627	            // error.
+   628	            return Err(Error::library_reset(stream.id, Reason::FLOW_CONTROL_ERROR));
+   629	        }
+   630	
+   631	        if stream.dec_content_length(frame.payload().len()).is_err() {
+   632	            proto_err!(stream:
+   633	                "recv_data: content-length overflow; stream={:?}; len={:?}",
+   634	                stream.id,
+   635	                frame.payload().len(),
+   636	            );
+   637	            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
+   638	        }
+   639	
+   640	        if frame.is_end_stream() {
+   641	            if stream.ensure_content_length_zero().is_err() {
+   642	                proto_err!(stream:
+   643	                    "recv_data: content-length underflow; stream={:?}; len={:?}",
+   644	                    stream.id,
+   645	                    frame.payload().len(),
+   646	                );
+   647	                return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
+   648	            }
+   649	
+   650	            if stream.state.recv_close().is_err() {
+   651	                proto_err!(conn: "recv_data: failed to transition to closed state; stream={:?}", stream.id);
+   652	                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+   653	            }
+   654	        }
+   655	
+  1180	    ) -> Result<StreamRef<B>, UserError> {
+  1181	        // Clear before taking lock, incase extensions contain a StreamRef.
+  1182	        request.extensions_mut().clear();
+  1183	        let mut me = self.opaque.inner.lock().unwrap();
+  1184	        let me = &mut *me;
+  1185	
+  1186	        let mut send_buffer = self.send_buffer.inner.lock().unwrap();
+  1187	        let send_buffer = &mut *send_buffer;
+  1188	
+  1189	        let actions = &mut me.actions;
+  1190	        let promised_id = actions.send.reserve_local()?;
+  1191	
+  1192	        let child_key = {
+  1193	            let mut child_stream = me.store.insert(
+  1194	                promised_id,
+  1195	                Stream::new(
+  1196	                    promised_id,
+  1197	                    actions.send.init_window_sz(),
+  1198	                    actions.recv.init_window_sz(),
+  1199	                ),
+  1200	            );
+  1201	            child_stream.state.reserve_local()?;
+  1202	            child_stream.is_pending_push = true;
+  1203	            child_stream.key()
+  1204	        };
+  1205	
+  1206	        let pushed = {
+  1207	            let mut stream = me.store.resolve(self.opaque.key);
+  1208	
+  1209	            let frame = crate::server::Peer::convert_push_message(stream.id, promised_id, request)?;
+  1210	
+  1211	            actions
+  1212	                .send
+  1213	                .send_push_promise(frame, send_buffer, &mut stream, &mut actions.task)
+  1214	        };
+  1215	
+  1216	        if let Err(err) = pushed {
+  1217	            let mut child_stream = me.store.resolve(child_key);
+  1218	            child_stream.unlink();
+  1219	            child_stream.remove();
+  1220	            return Err(err);
+  1221	        }
+  1222	
+  1223	        me.refs += 1;
+  1224	        let opaque =
+  1225	            OpaqueStreamRef::new(self.opaque.inner.clone(), &mut me.store.resolve(child_key));
+  1226	
+  1227	        Ok(StreamRef {
+  1228	            opaque,
+  1229	            send_buffer: self.send_buffer.clone(),
+  1230	        })
+  1231	    }
+  1232	
+  1233	    /// Called by the server after the stream is accepted. Given that clients
+  1234	    /// initialize streams by sending HEADERS, the request will always be
+   280	    /// # }
+   281	    /// ```
+   282	    ///
+   283	    /// See [Flow control](struct.SendStream.html#flow-control) for an overview
+   284	    /// of how send flow control works.
+   285	    pub fn reserve_capacity(&mut self, capacity: usize) {
+   286	        // TODO: Check for overflow
+   287	        self.inner.reserve_capacity(capacity as WindowSize)
+   288	    }
+   289	
+   290	    /// Returns the stream's current send capacity.
+   291	    ///
+   292	    /// This allows the caller to check the current amount of available capacity
+   293	    /// before sending data.
+   294	    pub fn capacity(&self) -> usize {
+   128	        self.encoder.buffer(item)
+   129	    }
+   130	
+   131	    /// Flush buffered data to the wire
+   132	    pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+   133	        let span = tracing::trace_span!("FramedWrite::flush");
+   134	        let _e = span.enter();
+   135	
+   136	        loop {
+   137	            while !self.encoder.is_empty() {
+   138	                match self.encoder.next {
+   139	                    Some(Next::Data(ref mut frame)) => {
+   140	                        tracing::trace!(queued_data_frame = true);
+   141	                        let mut buf = (&mut self.encoder.buf).chain(frame.payload_mut());
+   142	                        ready!(poll_write_buf(Pin::new(&mut self.inner), cx, &mut buf))?
+   143	                    }
+   144	                    _ => {
+   145	                        tracing::trace!(queued_data_frame = false);
+   146	                        ready!(poll_write_buf(
+   147	                            Pin::new(&mut self.inner),
+   148	                            cx,
+   149	                            &mut self.encoder.buf
+   150	                        ))?
+   151	                    }
+   152	                };
+   153	            }
+   154	
+   155	            match self.encoder.unset_frame() {
+   156	                ControlFlow::Continue => (),
+   157	                ControlFlow::Break => break,
+   158	            }
+   159	        }
+   160	
+    78	//! [`server::handshake`]: server/fn.handshake.html
+    79	//! [`client::handshake`]: client/fn.handshake.html
+    80	
+    81	#![deny(
+    82	    missing_debug_implementations,
+    83	    missing_docs,
+    84	    clippy::missing_safety_doc,
+    85	    clippy::undocumented_unsafe_blocks
+    86	)]
+    87	#![allow(clippy::type_complexity, clippy::manual_range_contains)]
+    88	#![cfg_attr(test, deny(warnings))]
+    89	
+    90	macro_rules! proto_err {
+    91	    (conn: $($msg:tt)+) => {
+    92	        tracing::debug!("connection error PROTOCOL_ERROR -- {};", format_args!($($msg)+))
+   100	    pub fn can_inc_num_recv_streams(&self) -> bool {
+   101	        self.max_recv_streams > self.num_recv_streams
+   102	    }
+   103	
+   104	    /// Increments the number of concurrent receive streams.
+   105	    ///
+   106	    /// # Panics
+   107	    ///
+   108	    /// Panics on failure as this should have been validated before hand.
+   109	    pub fn inc_num_recv_streams(&mut self, stream: &mut store::Ptr) {
+   110	        assert!(self.can_inc_num_recv_streams());
+   111	        assert!(!stream.is_counted);
+   112	
+   113	        // Increment the number of remote initiated streams
+   114	        self.num_recv_streams += 1;
+   115	        stream.is_counted = true;
+   116	    }
+   117	
+   118	    /// Returns true if the send stream concurrency can be incremented
+   119	    pub fn can_inc_num_send_streams(&self) -> bool {
+use std::io::{self, IoSlice};
+use std::ops::DerefMut;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+/// Writes bytes asynchronously.
+///
+/// This trait is analogous to the [`std::io::Write`] trait, but integrates with
+/// the asynchronous task system. In particular, the [`poll_write`] method,
+/// unlike [`Write::write`], will automatically queue the current task for wakeup
+/// and return if data is not yet available, rather than blocking the calling
+/// thread.
+///
+/// Specifically, this means that the [`poll_write`] function will return one of
+/// the following:
+///
+/// * `Poll::Ready(Ok(n))` means that `n` bytes of data was immediately
+///   written.
+///
+/// * `Poll::Pending` means that no data was written from the buffer
+///   provided. The I/O object is not currently writable but may become writable
+///   in the future. Most importantly, **the current future's task is scheduled
+///   to get unparked when the object is writable**. This means that like
+///   `Future::poll` you'll receive a notification when the I/O object is
+///   writable again.
+///
+/// * `Poll::Ready(Err(e))` for other errors are standard I/O errors coming from the
+///   underlying object.
+///
+/// Utilities for working with `AsyncWrite` values are provided by
+/// [`AsyncWriteExt`]. Most users will interact with `AsyncWrite` types through
+/// these extension methods, which provide ergonomic async functions such as
+/// `write_all` and `flush`.
+///
+/// [`std::io::Write`]: std::io::Write
+/// [`Write::write`]: std::io::Write::write()
+/// [`poll_write`]: AsyncWrite::poll_write()
+/// [`AsyncWriteExt`]: crate::io::AsyncWriteExt
+pub trait AsyncWrite {
+    /// Attempt to write bytes from `buf` into the object.
+    ///
+    /// On success, returns `Poll::Ready(Ok(num_bytes_written))`. If successful,
+    /// then it must be guaranteed that `n <= buf.len()`. A return value of `0`
+    /// typically means that the underlying object is no longer able to accept
+    /// bytes and will likely not be able to in the future as well, or that the
+    /// buffer provided is empty.
+    ///
+    /// If the object is not ready for writing, the method returns
+    /// `Poll::Pending` and arranges for the current task (via
+    /// `cx.waker()`) to receive a notification when the object becomes
+    /// writable or is closed.
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>>;
+
+    /// Attempts to flush the object, ensuring that any buffered data reach
+    /// their destination.
+    ///
+    /// On success, returns `Poll::Ready(Ok(()))`.
+    ///
+    /// If flushing cannot immediately complete, this method returns
+    /// `Poll::Pending` and arranges for the current task (via
+    /// `cx.waker()`) to receive a notification when the object can make
+    /// progress towards flushing.
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
+
+    /// Initiates or attempts to shut down this writer, returning success when
+    /// the I/O connection has completely shut down.
+    ///
+    /// This method is intended to be used for asynchronous shutdown of I/O
+    /// connections. For example this is suitable for implementing shutdown of a
+    /// TLS connection or calling `TcpStream::shutdown` on a proxied connection.
+    /// Protocols sometimes need to flush out final pieces of data or otherwise
+    /// perform a graceful shutdown handshake, reading/writing more data as
+    /// appropriate. This method is the hook for such protocols to implement the
+    /// graceful shutdown logic.
+    ///
+    /// This `shutdown` method is required by implementers of the
+    /// `AsyncWrite` trait. Wrappers typically just want to proxy this call
+    /// through to the wrapped type, and base types will typically implement
+    /// shutdown logic here or just return `Ok(().into())`. Note that if you're
+    /// wrapping an underlying `AsyncWrite` a call to `shutdown` implies that
+    /// transitively the entire stream has been shut down. After your wrapper's
+    /// shutdown logic has been executed you should shut down the underlying
+    /// stream.
+    ///
+    /// Invocation of a `shutdown` implies an invocation of `flush`. Once this
+    /// method returns `Ready` it implies that a flush successfully happened
+    /// before the shutdown happened. That is, callers don't need to call
+    /// `flush` before calling `shutdown`. They can rely that by calling
+    /// `shutdown` any pending buffered data will be written out.
+    ///
+    /// # Return value
+    ///
+    /// This function returns a `Poll<io::Result<()>>` classified as such:
+    ///
+    /// * `Poll::Ready(Ok(()))` - indicates that the connection was
+    ///   successfully shut down and is now safe to deallocate/drop/close
+    ///   resources associated with it. This method means that the current task
+    ///   will no longer receive any notifications due to this method and the
+    ///   I/O object itself is likely no longer usable.
+    ///
+    /// * `Poll::Pending` - indicates that shutdown is initiated but could
+    ///   not complete just yet. This may mean that more I/O needs to happen to
+    ///   continue this shutdown operation. The current task is scheduled to
+    ///   receive a notification when it's otherwise ready to continue the
+    ///   shutdown operation. When woken up this method should be called again.
+    ///
+11.545983333333334 minutes used of 45.0

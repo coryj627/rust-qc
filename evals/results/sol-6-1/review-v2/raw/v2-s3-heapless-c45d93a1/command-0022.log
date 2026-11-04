@@ -1,0 +1,809 @@
+use core::mem::ManuallyDrop;
+
+#[cfg_attr(not(arm_llsc), path = "treiber/cas.rs")]
+#[cfg_attr(arm_llsc, path = "treiber/llsc.rs")]
+mod impl_;
+
+pub use impl_::{AtomicPtr, NonNullPtr};
+
+pub struct Stack<N>
+where
+    N: Node,
+{
+    top: AtomicPtr<N>,
+}
+
+impl<N> Stack<N>
+where
+    N: Node,
+{
+    pub const fn new() -> Self {
+        Self {
+            top: AtomicPtr::null(),
+        }
+    }
+
+    /// # Safety
+    /// - `node` must be a valid pointer
+    /// - aliasing rules must be enforced by the caller. e.g, the same `node` may not be pushed more than once
+    pub unsafe fn push(&self, node: NonNullPtr<N>) {
+        impl_::push(self, node);
+    }
+
+    pub fn try_pop(&self) -> Option<NonNullPtr<N>> {
+        impl_::try_pop(self)
+    }
+}
+
+pub trait Node: Sized {
+    type Data;
+
+    fn next(&self) -> &AtomicPtr<Self>;
+
+    #[allow(dead_code)] // used conditionally
+    fn next_mut(&mut self) -> &mut AtomicPtr<Self>;
+}
+
+pub union UnionNode<T> {
+    next: ManuallyDrop<AtomicPtr<UnionNode<T>>>,
+    pub data: ManuallyDrop<T>,
+}
+
+impl<T> Node for UnionNode<T> {
+    type Data = T;
+
+    fn next(&self) -> &AtomicPtr<Self> {
+        unsafe { &self.next }
+    }
+
+    fn next_mut(&mut self) -> &mut AtomicPtr<Self> {
+        unsafe { &mut self.next }
+    }
+}
+
+pub struct StructNode<T> {
+    pub next: ManuallyDrop<AtomicPtr<StructNode<T>>>,
+    pub data: ManuallyDrop<T>,
+}
+
+impl<T> Node for StructNode<T> {
+    type Data = T;
+
+    fn next(&self) -> &AtomicPtr<Self> {
+        &self.next
+    }
+
+    fn next_mut(&mut self) -> &mut AtomicPtr<Self> {
+        &mut self.next
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::mem;
+
+    use super::*;
+
+    #[test]
+    fn node_is_never_zero_sized() {
+        struct Zst;
+
+        assert_ne!(mem::size_of::<UnionNode<Zst>>(), 0);
+    }
+}
+use core::{marker::PhantomData, ptr::NonNull};
+
+#[cfg(not(feature = "portable-atomic"))]
+use core::sync::atomic;
+#[cfg(feature = "portable-atomic")]
+use portable_atomic as atomic;
+
+use atomic::Ordering;
+
+use super::{Node, Stack};
+
+#[cfg(target_pointer_width = "32")]
+mod types {
+    use super::atomic;
+
+    pub type Inner = u64;
+    pub type InnerAtomic = atomic::AtomicU64;
+    pub type InnerNonZero = core::num::NonZeroU64;
+
+    pub type Tag = core::num::NonZeroU32;
+    pub type Address = u32;
+}
+
+#[cfg(target_pointer_width = "64")]
+mod types {
+    use super::atomic;
+
+    pub type Inner = u128;
+    pub type InnerAtomic = atomic::AtomicU128;
+    pub type InnerNonZero = core::num::NonZeroU128;
+
+    pub type Tag = core::num::NonZeroU64;
+    pub type Address = u64;
+}
+
+use types::*;
+
+pub struct AtomicPtr<N>
+where
+    N: Node,
+{
+    inner: InnerAtomic,
+    _marker: PhantomData<*mut N>,
+}
+
+impl<N> AtomicPtr<N>
+where
+    N: Node,
+{
+    #[inline]
+    pub const fn null() -> Self {
+        Self {
+            inner: InnerAtomic::new(0),
+            _marker: PhantomData,
+        }
+    }
+
+    fn compare_and_exchange_weak(
+        &self,
+        current: Option<NonNullPtr<N>>,
+        new: Option<NonNullPtr<N>>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<(), Option<NonNullPtr<N>>> {
+        self.inner
+            .compare_exchange_weak(
+                current.map(NonNullPtr::into_inner).unwrap_or_default(),
+                new.map(NonNullPtr::into_inner).unwrap_or_default(),
+                success,
+                failure,
+            )
+            .map(drop)
+            .map_err(|value| {
+                // SAFETY: `value` cam from a `NonNullPtr::into_inner` call.
+                unsafe { NonNullPtr::from_inner(value) }
+            })
+    }
+
+    #[inline]
+    fn load(&self, order: Ordering) -> Option<NonNullPtr<N>> {
+        Some(NonNullPtr {
+            inner: InnerNonZero::new(self.inner.load(order))?,
+            _marker: PhantomData,
+        })
+    }
+
+    #[inline]
+    fn store(&self, value: Option<NonNullPtr<N>>, order: Ordering) {
+        self.inner
+            .store(value.map(NonNullPtr::into_inner).unwrap_or_default(), order);
+    }
+}
+
+pub struct NonNullPtr<N>
+where
+    N: Node,
+{
+    inner: InnerNonZero,
+    _marker: PhantomData<*mut N>,
+}
+
+impl<N> Clone for NonNullPtr<N>
+where
+    N: Node,
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<N> Copy for NonNullPtr<N> where N: Node {}
+
+impl<N> NonNullPtr<N>
+where
+    N: Node,
+{
+    #[inline]
+    pub fn as_ptr(&self) -> *mut N {
+        self.inner.get() as *mut N
+    }
+
+    #[inline]
+    pub fn from_static_mut_ref(reference: &'static mut N) -> Self {
+        // SAFETY: `reference` is a static mutable reference, i.e. a valid pointer.
+        unsafe { Self::new_unchecked(initial_tag(), NonNull::from(reference)) }
+    }
+
+    /// # Safety
+    ///
+    /// - `ptr` must be a valid pointer.
+    #[inline]
+    unsafe fn new_unchecked(tag: Tag, ptr: NonNull<N>) -> Self {
+        let value =
+            (Inner::from(tag.get()) << Address::BITS) | Inner::from(ptr.as_ptr() as Address);
+
+        Self {
+            // SAFETY: `value` is constructed from a `Tag` which is non-zero and half the
+            //         size of the `InnerNonZero` type, and a `NonNull<N>` pointer.
+            inner: unsafe { InnerNonZero::new_unchecked(value) },
+            _marker: PhantomData,
+        }
+    }
+
+    /// # Safety
+    ///
+    /// - `value` must come from a `Self::into_inner` call.
+    #[inline]
+    unsafe fn from_inner(value: Inner) -> Option<Self> {
+        Some(Self {
+            inner: InnerNonZero::new(value)?,
+            _marker: PhantomData,
+        })
+    }
+
+    #[inline]
+    fn non_null(&self) -> NonNull<N> {
+        // SAFETY: `Self` can only be constructed using a `NonNull<N>`.
+        unsafe { NonNull::new_unchecked(self.as_ptr()) }
+    }
+
+    #[inline]
+    fn into_inner(self) -> Inner {
+        self.inner.get()
+    }
+
+    #[inline]
+    fn tag(&self) -> Tag {
+        // SAFETY: `self.inner` was constructed from a non-zero `Tag`.
+        unsafe { Tag::new_unchecked((self.inner.get() >> Address::BITS) as Address) }
+    }
+
+    fn increment_tag(&mut self) {
+        let new_tag = self.tag().checked_add(1).unwrap_or_else(initial_tag);
+
+        // SAFETY: `self.non_null()` is a valid pointer.
+        *self = unsafe { Self::new_unchecked(new_tag, self.non_null()) };
+    }
+}
+
+#[inline]
+const fn initial_tag() -> Tag {
+    Tag::MIN
+}
+
+pub unsafe fn push<N>(stack: &Stack<N>, new_top: NonNullPtr<N>)
+where
+    N: Node,
+{
+    let mut top = stack.top.load(Ordering::Relaxed);
+
+    loop {
+        new_top
+            .non_null()
+            .as_ref()
+            .next()
+            .store(top, Ordering::Relaxed);
+
+        if let Err(p) = stack.top.compare_and_exchange_weak(
+            top,
+            Some(new_top),
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            top = p;
+        } else {
+            return;
+        }
+    }
+}
+
+pub fn try_pop<N>(stack: &Stack<N>) -> Option<NonNullPtr<N>>
+where
+    N: Node,
+{
+    loop {
+        if let Some(mut top) = stack.top.load(Ordering::Acquire) {
+            let next = unsafe { top.non_null().as_ref().next().load(Ordering::Relaxed) };
+
+            if stack
+                .top
+                .compare_and_exchange_weak(Some(top), next, Ordering::Release, Ordering::Relaxed)
+                .is_ok()
+            {
+                // Prevent the ABA problem (https://en.wikipedia.org/wiki/Treiber_stack#Correctness).
+                //
+                // Without this, the following would be possible:
+                //
+                // | Thread 1                      | Thread 2                | Stack                        |
+                // |-------------------------------|-------------------------|------------------------------|
+                // | push((1, 1))                  |                         | (1, 1)                       |
+                // | push((1, 2))                  |                         | (1, 2) -> (1, 1)             |
+                // | p = try_pop()::load // (1, 2) |                         | (1, 2) -> (1, 1)             |
+                // |                               | p = try_pop() // (1, 2) | (1, 1)                       |
+                // |                               | push((1, 3))            | (1, 3) -> (1, 1)             |
+                // |                               | push(p)                 | (1, 2) -> (1, 3) -> (1, 1)   |
+                // | try_pop()::cas(p, p.next)     |                         | (1, 1)                       |
+                //
+                // As can be seen, the `cas` operation succeeds, wrongly removing pointer `3` from the stack.
+                //
+                // By incrementing the tag before returning the pointer, it cannot be pushed again with the,
+                // same tag, preventing the `try_pop()::cas(p, p.next)` operation from succeeding.
+                //
+                // With this fix, `try_pop()` in thread 2 returns `(2, 2)` and the comparison between
+                // `(1, 2)` and `(2, 2)` fails, restarting the loop and correctly removing the new top:
+                //
+                // | Thread 1                      | Thread 2                | Stack                        |
+                // |-------------------------------|-------------------------|------------------------------|
+                // | push((1, 1))                  |                         | (1, 1)                       |
+                // | push((1, 2))                  |                         | (1, 2) -> (1, 1)             |
+                // | p = try_pop()::load // (1, 2) |                         | (1, 2) -> (1, 1)             |
+                // |                               | p = try_pop() // (2, 2) | (1, 1)                       |
+                // |                               | push((1, 3))            | (1, 3) -> (1, 1)             |
+                // |                               | push(p)                 | (2, 2) -> (1, 3) -> (1, 1)   |
+                // | try_pop()::cas(p, p.next)     |                         | (2, 2) -> (1, 3) -> (1, 1)   |
+                // | p = try_pop()::load // (2, 2) |                         | (2, 2) -> (1, 3) -> (1, 1)   |
+                // | try_pop()::cas(p, p.next)     |                         | (1, 3) -> (1, 1)             |
+                top.increment_tag();
+
+                return Some(top);
+            }
+        } else {
+            // stack observed as empty
+            return None;
+        }
+    }
+}
+            type Data = $data_type;
+
+            fn singleton() -> &'static $crate::pool::object::ObjectPoolImpl<$data_type> {
+                // Even though the static variable is not exposed to user code, it is
+                // still useful to have a descriptive symbol name for debugging.
+                #[allow(non_upper_case_globals)]
+                static $name: $crate::pool::object::ObjectPoolImpl<$data_type> =
+                    $crate::pool::object::ObjectPoolImpl::new();
+
+                &$name
+            }
+        }
+
+        impl $name {
+            /// Inherent method version of `ObjectPool::request`
+            #[allow(dead_code)]
+            pub fn request(&self) -> Option<$crate::pool::object::Object<$name>> {
+                <$name as $crate::pool::object::ObjectPool>::request()
+            }
+
+            /// Inherent method version of `ObjectPool::manage`
+            #[allow(dead_code)]
+            pub fn manage(
+                &self,
+                block: &'static mut $crate::pool::object::ObjectBlock<$data_type>,
+            ) {
+                <$name as $crate::pool::object::ObjectPool>::manage(block)
+            }
+        }
+    };
+}
+
+/// A singleton that manages `pool::object::Object`s
+pub trait ObjectPool: Sized {
+    /// The data type of the objects managed by the object pool
+    type Data: 'static;
+
+    /// `object_pool!` implementation detail
+    #[doc(hidden)]
+    fn singleton() -> &'static ObjectPoolImpl<Self::Data>;
+
+    /// Request a new object from the pool
+    fn request() -> Option<Object<Self>> {
+        Self::singleton()
+            .request()
+            .map(|node_ptr| Object { node_ptr })
+    }
+
+    /// Adds a statically allocate object to the pool
+    fn manage(block: &'static mut ObjectBlock<Self::Data>) {
+        Self::singleton().manage(block);
+    }
+}
+
+/// `object_pool!` implementation detail
+#[doc(hidden)]
+pub struct ObjectPoolImpl<T> {
+    stack: Stack<StructNode<T>>,
+}
+
+impl<T> ObjectPoolImpl<T> {
+    /// `object_pool!` implementation detail
+    #[doc(hidden)]
+    pub const fn new() -> Self {
+        Self {
+            stack: Stack::new(),
+        }
+    }
+
+    fn request(&self) -> Option<NonNullPtr<StructNode<T>>> {
+        self.stack.try_pop()
+    }
+
+    fn manage(&self, block: &'static mut ObjectBlock<T>) {
+        let node: &'static mut _ = &mut block.node;
+
+        unsafe { self.stack.push(NonNullPtr::from_static_mut_ref(node)) }
+    }
+}
+
+// `T needs` to be Send because returning an object from a thread and then
+// requesting it from another is effectively a cross-thread 'send' operation
+unsafe impl<T> Sync for ObjectPoolImpl<T> where T: Send {}
+
+/// An object managed by object pool `P`
+pub struct Object<P>
+where
+    P: ObjectPool,
+{
+    node_ptr: NonNullPtr<StructNode<P::Data>>,
+}
+
+impl<A, T, const N: usize> AsMut<[T]> for Object<A>
+where
+    A: ObjectPool<Data = [T; N]>,
+{
+    fn as_mut(&mut self) -> &mut [T] {
+        &mut **self
+    }
+}
+
+impl<A, T, const N: usize> AsRef<[T]> for Object<A>
+where
+    A: ObjectPool<Data = [T; N]>,
+{
+    fn as_ref(&self) -> &[T] {
+        &**self
+    }
+}
+
+impl<A> fmt::Debug for Object<A>
+where
+    A: ObjectPool,
+    A::Data: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        A::Data::fmt(self, f)
+    }
+}
+
+impl<A> ops::Deref for Object<A>
+where
+    A: ObjectPool,
+{
+    type Target = A::Data;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*ptr::addr_of!((*self.node_ptr.as_ptr()).data) }
+    }
+}
+
+impl<A> ops::DerefMut for Object<A>
+where
+    A: ObjectPool,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *ptr::addr_of_mut!((*self.node_ptr.as_ptr()).data) }
+    }
+}
+
+unsafe impl<A> StableDeref for Object<A> where A: ObjectPool {}
+
+impl<A> fmt::Display for Object<A>
+where
+    A: ObjectPool,
+    A::Data: fmt::Display,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        A::Data::fmt(self, f)
+    }
+}
+
+impl<P> Drop for Object<P>
+where
+    P: ObjectPool,
+{
+    fn drop(&mut self) {
+        unsafe { P::singleton().stack.push(self.node_ptr) }
+    }
+}
+
+impl<A> Eq for Object<A>
+where
+    A: ObjectPool,
+    A::Data: Eq,
+{
+}
+
+impl<A> Hash for Object<A>
+where
+    A: ObjectPool,
+    A::Data: Hash,
+{
+    fn hash<H>(&self, state: &mut H)
+    where
+        H: Hasher,
+    {
+        (**self).hash(state);
+    }
+}
+
+impl<A> Ord for Object<A>
+where
+    A: ObjectPool,
+    A::Data: Ord,
+{
+    fn cmp(&self, other: &Self) -> Ordering {
+        A::Data::cmp(self, other)
+    }
+}
+
+impl<A, B> PartialEq<Object<B>> for Object<A>
+where
+    A: ObjectPool,
+    B: ObjectPool,
+    A::Data: PartialEq<B::Data>,
+{
+    fn eq(&self, other: &Object<B>) -> bool {
+        A::Data::eq(self, other)
+    }
+}
+
+impl<A, B> PartialOrd<Object<B>> for Object<A>
+where
+    A: ObjectPool,
+    B: ObjectPool,
+    A::Data: PartialOrd<B::Data>,
+{
+    fn partial_cmp(&self, other: &Object<B>) -> Option<Ordering> {
+        A::Data::partial_cmp(self, other)
+    }
+}
+
+unsafe impl<P> Send for Object<P>
+where
+    P: ObjectPool,
+    P::Data: Send,
+{
+}
+
+unsafe impl<P> Sync for Object<P>
+where
+    P: ObjectPool,
+    P::Data: Sync,
+{
+}
+
+/// An object "block" of data type `T` that has not yet been associated to an `ObjectPool`
+pub struct ObjectBlock<T> {
+    node: StructNode<T>,
+}
+
+impl<T> ObjectBlock<T> {
+    /// Creates a new object block with the given `initial_value`
+    pub const fn new(initial_value: T) -> Self {
+        Self {
+            node: StructNode {
+                next: ManuallyDrop::new(AtomicPtr::null()),
+                data: ManuallyDrop::new(initial_value),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+//! Implementations of `bytes` traits for `heapless` types.
+
+use crate::{
+    len_type::LenType,
+    vec::{VecInner, VecStorage},
+};
+use bytes::{buf::UninitSlice, BufMut};
+
+unsafe impl<S: VecStorage<u8> + ?Sized, LenT: LenType> BufMut for VecInner<u8, LenT, S> {
+    #[inline]
+    fn remaining_mut(&self) -> usize {
+        self.capacity() - self.len()
+    }
+
+    #[inline]
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        let len = self.len();
+        let pos = len + cnt;
+        if pos >= self.capacity() {
+            panic!("Advance out of range");
+        }
+        self.set_len(pos);
+    }
+
+    #[inline]
+    fn chunk_mut(&mut self) -> &mut UninitSlice {
+        let len = self.len();
+        let ptr = self.as_mut_ptr();
+        unsafe { &mut UninitSlice::from_raw_parts_mut(ptr, self.capacity())[len..] }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Vec, VecView};
+    use bytes::BufMut;
+
+    #[test]
+    #[should_panic]
+    fn buf_mut_advance_mut_out_of_bounds() {
+        let mut vec: Vec<u8, 8> = Vec::new();
+        unsafe { vec.advance_mut(9) };
+    }
+
+    #[test]
+    fn buf_mut_remaining_mut() {
+        let mut vec: Vec<u8, 8> = Vec::new();
+        assert_eq!(vec.remaining_mut(), 8);
+        vec.push(42).unwrap();
+        assert_eq!(vec.remaining_mut(), 7);
+    }
+
+    #[test]
+    fn buf_mut_chunk_mut() {
+        let mut vec: Vec<u8, 8> = Vec::new();
+        assert_eq!(vec.chunk_mut().len(), 8);
+        unsafe { vec.advance_mut(1) };
+        assert_eq!(vec.chunk_mut().len(), 7);
+    }
+
+    #[test]
+    #[should_panic]
+    fn buf_mut_advance_mut_out_of_bounds_view() {
+        let vec: &mut VecView<u8, u8> = &mut Vec::<u8, 8, u8>::new();
+        unsafe { vec.advance_mut(9) };
+    }
+
+    #[test]
+    fn buf_mut_remaining_mut_view() {
+        let vec: &mut VecView<u8, u8> = &mut Vec::<u8, 8, u8>::new();
+        assert_eq!(vec.remaining_mut(), 8);
+        vec.push(42).unwrap();
+        assert_eq!(vec.remaining_mut(), 7);
+    }
+
+    #[test]
+    fn buf_mut_chunk_mut_view() {
+        let vec: &mut VecView<u8, u8> = &mut Vec::<u8, 8, u8>::new();
+        assert_eq!(vec.chunk_mut().len(), 8);
+        unsafe { vec.advance_mut(1) };
+        assert_eq!(vec.chunk_mut().len(), 7);
+    }
+}
+//! Defmt implementations for heapless types
+
+use crate::{
+    len_type::LenType,
+    string::{StringInner, StringStorage},
+    vec::{VecInner, VecStorage},
+};
+use defmt::Formatter;
+
+impl<T, LenT: LenType, S: VecStorage<T> + ?Sized> defmt::Format for VecInner<T, LenT, S>
+where
+    T: defmt::Format,
+{
+    fn format(&self, fmt: Formatter<'_>) {
+        defmt::write!(fmt, "{=[?]}", self.as_slice());
+    }
+}
+
+impl<LenT: LenType, S: StringStorage + ?Sized> defmt::Format for StringInner<LenT, S> {
+    fn format(&self, fmt: Formatter<'_>) {
+        defmt::write!(fmt, "{=str}", self.as_str());
+    }
+}
+use crate::{
+    c_string::{self, CString},
+    len_type::LenType,
+    string::{StringInner, StringStorage},
+    vec::{VecInner, VecStorage},
+    CapacityError,
+};
+use ufmt::uDisplay;
+use ufmt_write::uWrite;
+
+impl<LenT: LenType, S: StringStorage + ?Sized> uDisplay for StringInner<LenT, S> {
+    #[inline]
+    fn fmt<W>(&self, f: &mut ufmt::Formatter<'_, W>) -> Result<(), W::Error>
+    where
+        W: uWrite + ?Sized,
+    {
+        f.write_str(self.as_str())
+    }
+}
+
+impl<LenT: LenType, S: StringStorage + ?Sized> uWrite for StringInner<LenT, S> {
+    type Error = CapacityError;
+
+    #[inline]
+    fn write_str(&mut self, s: &str) -> Result<(), Self::Error> {
+        self.push_str(s)
+    }
+}
+
+impl<LenT: LenType, S: VecStorage<u8> + ?Sized> uWrite for VecInner<u8, LenT, S> {
+    type Error = CapacityError;
+
+    #[inline]
+    fn write_str(&mut self, s: &str) -> Result<(), Self::Error> {
+        self.extend_from_slice(s.as_bytes())
+    }
+}
+
+impl<const N: usize, LenT: LenType> uWrite for CString<N, LenT> {
+    type Error = c_string::ExtendError;
+
+    #[inline]
+    fn write_str(&mut self, s: &str) -> Result<(), Self::Error> {
+        self.extend_from_bytes(s.as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{String, Vec};
+
+    use ufmt::{derive::uDebug, uwrite};
+
+    #[derive(uDebug)]
+    struct Pair {
+        x: u32,
+        y: u32,
+    }
+
+    #[test]
+    fn test_udisplay_string() {
+        let str_a = String::<32>::try_from("world").unwrap();
+        let mut str_b = String::<32>::new();
+        uwrite!(str_b, "Hello {}!", str_a).unwrap();
+
+        assert_eq!(str_b, "Hello world!");
+    }
+
+    #[test]
+    fn test_uwrite_string() {
+        let a = 123;
+        let b = Pair { x: 0, y: 1234 };
+
+        let mut s = String::<32>::new();
+        uwrite!(s, "{} -> {:?}", a, b).unwrap();
+
+        assert_eq!(s, "123 -> Pair { x: 0, y: 1234 }");
+    }
+
+    #[test]
+    fn test_uwrite_string_err() {
+        let p = Pair { x: 0, y: 1234 };
+        let mut s = String::<4>::new();
+        assert!(uwrite!(s, "{:?}", p).is_err());
+    }
+
+    #[test]
+    fn test_uwrite_vec() {
+        let a = 123;
+        let b = Pair { x: 0, y: 1234 };
+
+        let mut v = Vec::<u8, 32>::new();
+        uwrite!(v, "{} -> {:?}", a, b).unwrap();
+
+        assert_eq!(v, b"123 -> Pair { x: 0, y: 1234 }");
+    }
+}
+3.2131333333333334 minutes used of 45.0

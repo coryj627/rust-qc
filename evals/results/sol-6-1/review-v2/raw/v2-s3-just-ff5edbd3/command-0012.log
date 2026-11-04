@@ -1,0 +1,1386 @@
+use {super::*, std::path::Component};
+
+const DEFAULT_JUSTFILE_NAME: &str = JUSTFILE_NAMES[0];
+pub(crate) const JUSTFILE_NAMES: [&str; 2] = ["justfile", ".justfile"];
+const PROJECT_ROOT_CHILDREN: &[&str] = &[".bzr", ".git", ".hg", ".svn", "_darcs"];
+
+#[derive(Debug)]
+pub(crate) struct Search {
+  pub(crate) justfile: PathBuf,
+  pub(crate) working_directory: PathBuf,
+}
+
+impl Search {
+  fn global_justfile_paths() -> Vec<(PathBuf, &'static str)> {
+    let mut paths = Vec::new();
+
+    if let Some(config_dir) = dirs::config_dir() {
+      paths.push((config_dir.join("just"), DEFAULT_JUSTFILE_NAME));
+    }
+
+    if let Some(home_dir) = dirs::home_dir() {
+      paths.push((home_dir.join(".config").join("just"), DEFAULT_JUSTFILE_NAME));
+
+      for justfile_name in JUSTFILE_NAMES {
+        paths.push((home_dir.clone(), justfile_name));
+      }
+    }
+
+    paths
+  }
+
+  /// Find justfile given search configuration and invocation directory
+  pub(crate) fn search(config: &Config) -> SearchResult<Self> {
+    match &config.search_config {
+      SearchConfig::FromInvocationDirectory => {
+        Self::find_in_directory(config, &config.invocation_directory)
+      }
+      SearchConfig::FromSearchDirectory { search_directory } => {
+        let search_directory = Self::clean(&config.invocation_directory, search_directory);
+        let justfile = Self::justfile(config, &search_directory)?;
+        let working_directory = Self::working_directory_from_justfile(&justfile)?;
+        Ok(Self {
+          justfile,
+          working_directory,
+        })
+      }
+      SearchConfig::GlobalJustfile => Ok(Self {
+        justfile: Self::find_global_justfile()?,
+        working_directory: Self::project_root(config, &config.invocation_directory)?,
+      }),
+      SearchConfig::WithJustfile { justfile } => {
+        let justfile = Self::clean(&config.invocation_directory, justfile);
+        let working_directory = Self::working_directory_from_justfile(&justfile)?;
+        Ok(Self {
+          justfile,
+          working_directory,
+        })
+      }
+      SearchConfig::WithJustfileAndWorkingDirectory {
+        justfile,
+        working_directory,
+      } => Ok(Self {
+        justfile: Self::clean(&config.invocation_directory, justfile),
+        working_directory: Self::clean(&config.invocation_directory, working_directory),
+      }),
+    }
+  }
+
+  fn find_global_justfile() -> SearchResult<PathBuf> {
+    for (directory, filename) in Self::global_justfile_paths() {
+      if let Ok(read_dir) = fs::read_dir(&directory) {
+        for entry in read_dir {
+          let entry = entry.map_err(|io_error| SearchError::Io {
+            io_error,
+            directory: directory.clone(),
+          })?;
+          if let Some(candidate) = entry.file_name().to_str() {
+            if candidate.eq_ignore_ascii_case(filename) {
+              return Ok(entry.path());
+            }
+          }
+        }
+      }
+    }
+
+    Err(SearchError::GlobalJustfileNotFound)
+  }
+
+  /// Find justfile starting from parent directory of current justfile
+  pub(crate) fn search_parent_directory(&self, config: &Config) -> SearchResult<Self> {
+    let parent = self
+      .justfile
+      .parent()
+      .and_then(|path| path.parent())
+      .ok_or_else(|| SearchError::JustfileHadNoParent {
+        path: self.justfile.clone(),
+      })?;
+    Self::find_in_directory(config, parent)
+  }
+
+  /// Find justfile starting in given directory searching upwards in directory tree
+  fn find_in_directory(config: &Config, starting_dir: &Path) -> SearchResult<Self> {
+    let justfile = Self::justfile(config, starting_dir)?;
+    let working_directory = Self::working_directory_from_justfile(&justfile)?;
+    Ok(Self {
+      justfile,
+      working_directory,
+    })
+  }
+
+  /// Get working directory and justfile path for newly-initialized justfile
+  pub(crate) fn init(config: &Config) -> SearchResult<Self> {
+    let default_justfile_name = || {
+      config
+        .justfile_names
+        .as_ref()
+        .and_then(|names| names.first().map(String::as_str))
+        .unwrap_or(DEFAULT_JUSTFILE_NAME)
+    };
+
+    match &config.search_config {
+      SearchConfig::FromInvocationDirectory => {
+        let working_directory = Self::project_root(config, &config.invocation_directory)?;
+        let justfile = working_directory.join(default_justfile_name());
+        Ok(Self {
+          justfile,
+          working_directory,
+        })
+      }
+      SearchConfig::FromSearchDirectory { search_directory } => {
+        let search_directory = Self::clean(&config.invocation_directory, search_directory);
+        let working_directory = Self::project_root(config, &search_directory)?;
+        let justfile = working_directory.join(default_justfile_name());
+        Ok(Self {
+          justfile,
+          working_directory,
+        })
+      }
+      SearchConfig::GlobalJustfile => Err(SearchError::GlobalJustfileInit),
+      SearchConfig::WithJustfile { justfile } => {
+        let justfile = Self::clean(&config.invocation_directory, justfile);
+        let working_directory = Self::working_directory_from_justfile(&justfile)?;
+        Ok(Self {
+          justfile,
+          working_directory,
+        })
+      }
+      SearchConfig::WithJustfileAndWorkingDirectory {
+        justfile,
+        working_directory,
+      } => Ok(Self {
+        justfile: Self::clean(&config.invocation_directory, justfile),
+        working_directory: Self::clean(&config.invocation_directory, working_directory),
+      }),
+    }
+  }
+
+  /// Search upwards from `directory` for a file whose name matches one of
+  /// `JUSTFILE_NAMES`
+  fn justfile(config: &Config, directory: &Path) -> SearchResult<PathBuf> {
+    for directory in directory.ancestors() {
+      let mut candidates = BTreeSet::new();
+
+      let entries = fs::read_dir(directory).map_err(|io_error| SearchError::Io {
+        io_error,
+        directory: directory.to_owned(),
+      })?;
+
+      for entry in entries {
+        let entry = entry.map_err(|io_error| SearchError::Io {
+          io_error,
+          directory: directory.to_owned(),
+        })?;
+        if let Some(name) = entry.file_name().to_str() {
+          let justfile_names: Box<dyn Iterator<Item = &str>> =
+            if let Some(justfile_names) = &config.justfile_names {
+              Box::new(justfile_names.iter().map(String::as_str))
+            } else {
+              Box::new(JUSTFILE_NAMES.into_iter())
+            };
+
+          for justfile_name in justfile_names {
+            if name.eq_ignore_ascii_case(justfile_name) {
+              candidates.insert(entry.path());
+            }
+          }
+        }
+      }
+
+      match candidates.len() {
+        0 => {}
+        1 => return Ok(candidates.into_iter().next().unwrap()),
+        _ => return Err(SearchError::MultipleCandidates { candidates }),
+      }
+
+      if let Some(ceiling) = &config.ceiling {
+        if directory == ceiling {
+          break;
+        }
+      }
+    }
+
+    Err(SearchError::NotFound)
+  }
+
+  fn clean(invocation_directory: &Path, path: &Path) -> PathBuf {
+    let path = invocation_directory.join(path);
+
+    let mut clean = Vec::new();
+
+    for component in path.components() {
+      if component == Component::ParentDir {
+        if let Some(Component::Normal(_)) = clean.last() {
+          clean.pop();
+        }
+      } else {
+        clean.push(component);
+      }
+    }
+
+    clean.into_iter().collect()
+  }
+
+  /// Search upwards from `directory` for the root directory of a software
+  /// project, as determined by the presence of one of the version control
+  /// system directories given in `PROJECT_ROOT_CHILDREN`
+  fn project_root(config: &Config, directory: &Path) -> SearchResult<PathBuf> {
+    for directory in directory.ancestors() {
+      let entries = fs::read_dir(directory).map_err(|io_error| SearchError::Io {
+        io_error,
+        directory: directory.to_owned(),
+      })?;
+
+      for entry in entries {
+        let entry = entry.map_err(|io_error| SearchError::Io {
+          io_error,
+          directory: directory.to_owned(),
+        })?;
+        for project_root_child in PROJECT_ROOT_CHILDREN.iter().copied() {
+          if entry.file_name() == project_root_child {
+            return Ok(directory.to_owned());
+          }
+        }
+      }
+
+      if let Some(ceiling) = &config.ceiling {
+        if directory == ceiling {
+          break;
+        }
+      }
+    }
+
+    Ok(directory.to_owned())
+  }
+
+  fn working_directory_from_justfile(justfile: &Path) -> SearchResult<PathBuf> {
+    Ok(
+      justfile
+        .parent()
+        .ok_or_else(|| SearchError::JustfileHadNoParent {
+          path: justfile.to_path_buf(),
+        })?
+        .to_owned(),
+    )
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn clean() {
+    let cases = &[
+      ("/", "foo", "/foo"),
+      ("/bar", "/foo", "/foo"),
+      if cfg!(windows) {
+        ("//foo", "bar//baz", "//foo\\bar\\baz")
+      } else {
+        ("/", "..", "/")
+      },
+      ("/", "/..", "/"),
+      ("/..", "", "/"),
+      ("/../../../..", "../../../", "/"),
+      ("/.", "./", "/"),
+      ("/foo/../", "bar", "/bar"),
+      ("/foo/bar", "..", "/foo"),
+      ("/foo/bar/", "..", "/foo"),
+    ];
+
+    for (prefix, suffix, want) in cases {
+      let have = Search::clean(Path::new(prefix), Path::new(suffix));
+      assert_eq!(have, Path::new(want));
+    }
+  }
+}
+use super::*;
+
+pub(crate) fn load_dotenv(
+  config: &Config,
+  settings: &Settings,
+  working_directory: &Path,
+) -> RunResult<'static, BTreeMap<String, String>> {
+  let dotenv_filename = config
+    .dotenv_filename
+    .as_ref()
+    .or(settings.dotenv_filename.as_ref());
+
+  let dotenv_path = config
+    .dotenv_path
+    .as_ref()
+    .or(settings.dotenv_path.as_ref());
+
+  if !settings.dotenv_load
+    && !settings.dotenv_override
+    && !settings.dotenv_required
+    && dotenv_filename.is_none()
+    && dotenv_path.is_none()
+  {
+    return Ok(BTreeMap::new());
+  }
+
+  if let Some(path) = dotenv_path {
+    let path = working_directory.join(path);
+    if let Some(map) = load_from_file(&path, settings)? {
+      return Ok(map);
+    }
+  }
+
+  let filename = dotenv_filename.map_or(".env", |s| s.as_str());
+
+  for directory in working_directory.ancestors() {
+    let path = directory.join(filename);
+    if let Some(map) = load_from_file(&path, settings)? {
+      return Ok(map);
+    }
+  }
+
+  if settings.dotenv_required {
+    Err(Error::DotenvRequired)
+  } else {
+    Ok(BTreeMap::new())
+  }
+}
+
+fn load_from_file(
+  path: &Path,
+  settings: &Settings,
+) -> RunResult<'static, Option<BTreeMap<String, String>>> {
+  if path.is_dir() {
+    return Ok(None);
+  }
+
+  let file = match File::open(path) {
+    Ok(file) => file,
+    Err(source) => {
+      if source.kind() == io::ErrorKind::NotFound {
+        return Ok(None);
+      }
+      return Err(Error::FilesystemIo {
+        path: path.into(),
+        source,
+      });
+    }
+  };
+
+  let mut dotenv = BTreeMap::new();
+
+  for result in dotenvy::from_read_iter(file) {
+    let (key, value) = result.map_err(|dotenv_error| Error::Dotenv {
+      dotenv_error,
+      path: path.into(),
+    })?;
+
+    if settings.dotenv_override || env::var_os(&key).is_none() {
+      dotenv.insert(key, value);
+    }
+  }
+
+  Ok(Some(dotenv))
+}
+use super::*;
+
+pub(crate) struct Compiler;
+
+impl Compiler {
+  pub(crate) fn compile<'src>(
+    config: &Config,
+    loader: &'src Loader,
+    root: &Path,
+  ) -> RunResult<'src, Compilation<'src>> {
+    let mut asts = HashMap::<PathBuf, Ast>::new();
+    let mut loaded = Vec::new();
+    let mut numerator = Numerator::new();
+    let mut paths = HashMap::<PathBuf, PathBuf>::new();
+    let mut stack = Vec::new();
+    stack.push(Source::root(root));
+
+    while let Some(current) = stack.pop() {
+      if paths.contains_key(&current.path) {
+        continue;
+      }
+
+      let (relative, src) = loader.load(config, root, &current.path)?;
+      loaded.push(relative.into());
+      let mut ast = Parser::parse_source(&mut numerator, relative, &current, src)?;
+
+      paths.insert(current.path.clone(), relative.into());
+
+      for item in &mut ast.items {
+        match item {
+          Item::Module {
+            absolute,
+            name,
+            optional,
+            relative,
+            ..
+          } => {
+            let parent = current.path.parent().unwrap();
+
+            let relative = relative
+              .as_ref()
+              .map(|relative| Self::expand_tilde(&relative.cooked))
+              .transpose()?;
+
+            let import = Self::find_module_file(parent, *name, relative.as_deref())?;
+
+            if let Some(import) = import {
+              if current.file_path.contains(&import) {
+                return Err(Error::CircularImport {
+                  current: current.path,
+                  import,
+                });
+              }
+              *absolute = Some(import.clone());
+              stack.push(current.module(*name, import));
+            } else if !*optional {
+              return Err(Error::MissingModuleFile { module: *name });
+            }
+          }
+          Item::Import {
+            relative,
+            absolute,
+            optional,
+          } => {
+            let import = current
+              .path
+              .parent()
+              .unwrap()
+              .join(Self::expand_tilde(&relative.cooked)?)
+              .lexiclean();
+
+            if filesystem::is_file(&import)? {
+              if current.file_path.contains(&import) {
+                return Err(Error::CircularImport {
+                  current: current.path,
+                  import,
+                });
+              }
+              *absolute = Some(import.clone());
+              stack.push(current.import(import, relative.token.offset));
+            } else if !*optional {
+              return Err(Error::MissingImportFile {
+                path: relative.token,
+              });
+            }
+          }
+          _ => {}
+        }
+      }
+
+      asts.insert(current.path, ast.clone());
+    }
+
+    let mut overrides = HashMap::new();
+
+    let justfile = Analyzer::analyze(
+      &asts,
+      config,
+      None,
+      &[],
+      &loaded,
+      None,
+      &mut overrides,
+      &paths,
+      false,
+      root,
+    )?;
+
+    Ok(Compilation {
+      asts,
+      justfile,
+      overrides,
+      root: root.into(),
+    })
+  }
+
+  fn find_module_file<'src>(
+    parent: &Path,
+    module: Name<'src>,
+    path: Option<&Path>,
+  ) -> RunResult<'src, Option<PathBuf>> {
+    let mut candidates = Vec::new();
+
+    if let Some(path) = path {
+      let full = parent.join(path);
+
+      if filesystem::is_file(&full)? {
+        return Ok(Some(full));
+      }
+
+      candidates.push((path.join("mod.just"), true));
+
+      for name in search::JUSTFILE_NAMES {
+        candidates.push((path.join(name), false));
+      }
+    } else {
+      candidates.push((format!("{module}.just").into(), true));
+      candidates.push((format!("{module}/mod.just").into(), true));
+
+      for name in search::JUSTFILE_NAMES {
+        candidates.push((format!("{module}/{name}").into(), false));
+      }
+    }
+
+    let mut grouped = BTreeMap::<PathBuf, Vec<(PathBuf, bool)>>::new();
+
+    for (candidate, case_sensitive) in candidates {
+      let candidate = parent.join(candidate).lexiclean();
+      grouped
+        .entry(candidate.parent().unwrap().into())
+        .or_default()
+        .push((candidate, case_sensitive));
+    }
+
+    let mut found = Vec::new();
+
+    for (directory, candidates) in grouped {
+      let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(io_error) => {
+          if io_error.kind() == io::ErrorKind::NotFound {
+            continue;
+          }
+
+          return Err(
+            SearchError::Io {
+              io_error,
+              directory,
+            }
+            .into(),
+          );
+        }
+      };
+
+      for entry in entries {
+        let entry = entry.map_err(|io_error| SearchError::Io {
+          io_error,
+          directory: directory.clone(),
+        })?;
+
+        if let Some(name) = entry.file_name().to_str() {
+          for (candidate, case_sensitive) in &candidates {
+            let candidate_name = candidate.file_name().unwrap().to_str().unwrap();
+
+            let eq = if *case_sensitive {
+              name == candidate_name
+            } else {
+              name.eq_ignore_ascii_case(candidate_name)
+            };
+
+            if eq {
+              found.push(candidate.parent().unwrap().join(name));
+            }
+          }
+        }
+      }
+    }
+
+    if found.len() > 1 {
+      found.sort();
+      Err(Error::AmbiguousModuleFile {
+        found: found
+          .into_iter()
+          .map(|found| found.strip_prefix(parent).unwrap().into())
+          .collect(),
+        module,
+      })
+    } else {
+      Ok(found.into_iter().next())
+    }
+  }
+
+  fn expand_tilde(path: &str) -> RunResult<'static, PathBuf> {
+    Ok(if let Some(path) = path.strip_prefix("~/") {
+      dirs::home_dir()
+        .ok_or(Error::Homedir)?
+        .join(path.trim_start_matches('/'))
+    } else {
+      PathBuf::from(path)
+    })
+  }
+
+  #[cfg(test)]
+  pub(crate) fn test_compile(src: &str) -> RunResult<Justfile> {
+    let tokens = Lexer::test_lex(src)?;
+    let ast = Parser::parse_tokens(&mut Numerator::new(), &tokens)?;
+    let root = PathBuf::from("justfile");
+    let mut asts: HashMap<PathBuf, Ast> = HashMap::new();
+    asts.insert(root.clone(), ast);
+    let mut paths: HashMap<PathBuf, PathBuf> = HashMap::new();
+    paths.insert(root.clone(), root.clone());
+    Analyzer::analyze(
+      &asts,
+      &Config::new().unwrap(),
+      None,
+      &[],
+      &[],
+      None,
+      &mut HashMap::new(),
+      &paths,
+      false,
+      &root,
+    )
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use {super::*, temptree::temptree};
+
+  #[test]
+  fn recursive_includes_fail() {
+    let tmp = temptree! {
+      justfile: "import './subdir/b'\na: b",
+      subdir: {
+        b: "import '../justfile'\nb:"
+      }
+    };
+
+    let loader = Loader::new();
+
+    let justfile_a_path = tmp.path().join("justfile");
+    let loader_output =
+      Compiler::compile(&Config::new().unwrap(), &loader, &justfile_a_path).unwrap_err();
+
+    assert_matches!(loader_output, Error::CircularImport { current, import }
+      if current == tmp.path().join("subdir").join("b").lexiclean() &&
+      import == tmp.path().join("justfile").lexiclean()
+    );
+  }
+
+  #[test]
+  fn find_module_file() {
+    #[track_caller]
+    fn case(path: Option<&str>, files: &[&str], expected: Result<Option<&str>, &[&str]>) {
+      let module = Name {
+        token: Token {
+          column: 0,
+          kind: TokenKind::Identifier,
+          length: 3,
+          line: 0,
+          offset: 0,
+          path: Path::new(""),
+          src: "foo",
+        },
+      };
+
+      let tempdir = tempfile::tempdir().unwrap();
+
+      for file in files {
+        if let Some(parent) = Path::new(file).parent() {
+          fs::create_dir_all(tempdir.path().join(parent)).unwrap();
+        }
+
+        fs::write(tempdir.path().join(file), "").unwrap();
+      }
+
+      let actual = Compiler::find_module_file(tempdir.path(), module, path.map(Path::new));
+
+      match expected {
+        Err(expected) => match actual.unwrap_err() {
+          Error::AmbiguousModuleFile { found, .. } => {
+            assert_eq!(
+              found,
+              expected
+                .iter()
+                .map(|expected| expected.replace('/', std::path::MAIN_SEPARATOR_STR).into())
+                .collect::<Vec<PathBuf>>()
+            );
+          }
+          _ => panic!("unexpected error"),
+        },
+        Ok(Some(expected)) => assert_eq!(
+          actual.unwrap().unwrap(),
+          tempdir
+            .path()
+            .join(expected.replace('/', std::path::MAIN_SEPARATOR_STR))
+        ),
+        Ok(None) => assert_eq!(actual.unwrap(), None),
+      }
+    }
+
+    case(None, &["foo.just"], Ok(Some("foo.just")));
+    case(None, &["FOO.just"], Ok(None));
+    case(None, &["foo/mod.just"], Ok(Some("foo/mod.just")));
+    case(None, &["foo/MOD.just"], Ok(None));
+    case(None, &["foo/justfile"], Ok(Some("foo/justfile")));
+    case(None, &["foo/JUSTFILE"], Ok(Some("foo/JUSTFILE")));
+    case(None, &["foo/.justfile"], Ok(Some("foo/.justfile")));
+    case(None, &["foo/.JUSTFILE"], Ok(Some("foo/.JUSTFILE")));
+use super::*;
+
+#[test]
+fn unused_assignments_are_evaluated_without_lazy() {
+  Test::new()
+    .justfile(
+      "
+        x := `exit 1`
+
+        foo:
+      ",
+    )
+    .stderr(
+      "
+        error: Backtick failed with exit code 1
+         ——▶ justfile:1:6
+          │
+        1 │ x := `exit 1`
+          │      ^^^^^^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn unused_assignment_not_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        x := `exit 1`
+
+        foo:
+          @echo foo
+      ",
+    )
+    .stdout("foo\n")
+    .success();
+}
+
+#[test]
+fn used_assignment_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        x := `exit 1`
+
+        foo:
+          @echo {{x}}
+      ",
+    )
+    .stderr(
+      "
+        error: Backtick failed with exit code 1
+         ——▶ justfile:3:6
+          │
+        3 │ x := `exit 1`
+          │      ^^^^^^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn transitively_used_assignment_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        x := `exit 1`
+        y := x
+
+        foo:
+          @echo {{y}}
+      ",
+    )
+    .stderr(
+      "
+        error: Backtick failed with exit code 1
+         ——▶ justfile:3:6
+          │
+        3 │ x := `exit 1`
+          │      ^^^^^^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn assignment_used_in_parameter_default_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        x := `exit 1`
+
+        foo val=x:
+      ",
+    )
+    .stderr(
+      "
+        error: Backtick failed with exit code 1
+         ——▶ justfile:3:6
+          │
+        3 │ x := `exit 1`
+          │      ^^^^^^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn assignment_used_in_dependency_argument_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        x := `exit 1`
+
+        foo: (bar x)
+
+        bar val:
+      ",
+    )
+    .stderr(
+      "
+        error: Backtick failed with exit code 1
+         ——▶ justfile:3:6
+          │
+        3 │ x := `exit 1`
+          │      ^^^^^^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn assignment_in_body_interpolation_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        x := `exit 1`
+
+        foo:
+          @echo {{x}}
+      ",
+    )
+    .stderr(
+      "
+        error: Backtick failed with exit code 1
+         ——▶ justfile:3:6
+          │
+        3 │ x := `exit 1`
+          │      ^^^^^^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn multiple_invocations_evaluate_union() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        x := 'foo'
+        y := 'bar'
+        z := `exit 1`
+
+        a:
+          @echo {{x}}
+
+        b:
+          @echo {{y}}
+      ",
+    )
+    .args(["a", "b"])
+    .stdout("foo\nbar\n")
+    .success();
+}
+
+#[test]
+fn assignment_used_in_dependency_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        x := `exit 1`
+
+        foo: bar
+
+        bar:
+          @echo {{x}}
+      ",
+    )
+    .stderr(
+      "
+        error: Backtick failed with exit code 1
+         ——▶ justfile:3:6
+          │
+        3 │ x := `exit 1`
+          │      ^^^^^^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn assignment_used_in_transitive_dependency_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        x := `exit 1`
+
+        foo: bar
+
+        bar: baz
+
+        baz:
+          @echo {{x}}
+      ",
+    )
+    .stderr(
+      "
+        error: Backtick failed with exit code 1
+         ——▶ justfile:3:6
+          │
+        3 │ x := `exit 1`
+//! Justfile summary creation, for testing purposes only.
+//!
+//! The contents of this module are not bound by any stability guarantees.
+//! Breaking changes may be introduced at any time.
+//!
+//! The main entry point into this module is the `summary` function, which
+//! parses a justfile at a given path and produces a `Summary` object, which
+//! broadly captures the functionality of the parsed justfile, or an error
+//! message.
+//!
+//! This functionality is intended to be used with `janus`, a tool for ensuring
+//! that changes to just do not inadvertently break or change the interpretation
+//! of existing justfiles.
+
+use {
+  crate::{compiler::Compiler, config::Config, error::Error, loader::Loader},
+  std::{collections::BTreeMap, io, path::Path},
+};
+
+mod full {
+  pub(crate) use crate::{
+    assignment::Assignment, condition::Condition, conditional_operator::ConditionalOperator,
+    dependency::Dependency, expression::Expression, fragment::Fragment, justfile::Justfile,
+    line::Line, parameter::Parameter, parameter_kind::ParameterKind, recipe::Recipe,
+  };
+}
+
+pub fn summary(path: &Path) -> io::Result<Result<Summary, String>> {
+  let loader = Loader::new();
+
+  match Compiler::compile(&Config::new().unwrap(), &loader, path) {
+    Ok(compilation) => Ok(Ok(Summary::new(&compilation.justfile))),
+    Err(error) => Ok(Err(if let Error::Compile { compile_error } = error {
+      compile_error.to_string()
+    } else {
+      format!("{error:?}")
+    })),
+  }
+}
+
+#[derive(Eq, PartialEq, Hash, Ord, PartialOrd, Debug, Clone)]
+pub struct Summary {
+  pub assignments: BTreeMap<String, Assignment>,
+  pub recipes: BTreeMap<String, Recipe>,
+}
+
+impl Summary {
+  fn new(justfile: &full::Justfile) -> Self {
+    let mut aliases = BTreeMap::new();
+
+    for alias in justfile.aliases.values() {
+      aliases
+        .entry(alias.target.name())
+        .or_insert_with(Vec::new)
+        .push(alias.name.to_string());
+    }
+
+    Self {
+      recipes: justfile
+        .recipes
+        .iter()
+        .map(|(name, recipe)| {
+          (
+            (*name).to_string(),
+            Recipe::new(recipe, aliases.remove(name).unwrap_or_default()),
+          )
+        })
+        .collect(),
+      assignments: justfile
+        .assignments
+        .iter()
+        .map(|(name, assignment)| ((*name).to_owned(), Assignment::new(assignment)))
+        .collect(),
+    }
+  }
+}
+
+#[derive(Eq, PartialEq, Hash, Ord, PartialOrd, Debug, Clone)]
+pub struct Recipe {
+  pub aliases: Vec<String>,
+  pub dependencies: Vec<Dependency>,
+  pub lines: Vec<Line>,
+  pub parameters: Vec<Parameter>,
+  pub private: bool,
+  pub quiet: bool,
+  pub shebang: bool,
+}
+
+impl Recipe {
+  fn new(recipe: &full::Recipe, aliases: Vec<String>) -> Self {
+    Self {
+      aliases,
+      dependencies: recipe.dependencies.iter().map(Dependency::new).collect(),
+      lines: recipe.body.iter().map(Line::new).collect(),
+      parameters: recipe.parameters.iter().map(Parameter::new).collect(),
+      private: recipe.private,
+      quiet: recipe.quiet,
+      shebang: recipe.shebang,
+    }
+  }
+}
+
+#[derive(Eq, PartialEq, Hash, Ord, PartialOrd, Debug, Clone)]
+pub struct Parameter {
+  pub default: Option<Expression>,
+  pub kind: ParameterKind,
+  pub name: String,
+}
+
+impl Parameter {
+  fn new(parameter: &full::Parameter) -> Self {
+    Self {
+      kind: ParameterKind::new(parameter.kind),
+      name: parameter.name.lexeme().to_owned(),
+      default: parameter.default.as_ref().map(Expression::new),
+    }
+  }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub enum ParameterKind {
+  Plus,
+  Singular,
+  Star,
+}
+
+impl ParameterKind {
+  fn new(parameter_kind: full::ParameterKind) -> Self {
+    match parameter_kind {
+      full::ParameterKind::Singular => Self::Singular,
+      full::ParameterKind::Plus => Self::Plus,
+      full::ParameterKind::Star => Self::Star,
+    }
+  }
+}
+
+#[derive(Eq, PartialEq, Hash, Ord, PartialOrd, Debug, Clone)]
+pub struct Line {
+  pub fragments: Vec<Fragment>,
+}
+
+impl Line {
+  fn new(line: &full::Line) -> Self {
+    Self {
+      fragments: line.fragments.iter().map(Fragment::new).collect(),
+    }
+  }
+}
+
+#[derive(Eq, PartialEq, Hash, Ord, PartialOrd, Debug, Clone)]
+pub enum Fragment {
+  Expression { expression: Expression },
+  Text { text: String },
+}
+
+impl Fragment {
+  fn new(fragment: &full::Fragment) -> Self {
+    match fragment {
+      full::Fragment::Text { token } => Self::Text {
+        text: token.lexeme().to_owned(),
+      },
+      full::Fragment::Interpolation { expression } => Self::Expression {
+        expression: Expression::new(expression),
+      },
+    }
+  }
+}
+
+#[derive(Eq, PartialEq, Hash, Ord, PartialOrd, Debug, Clone)]
+pub struct Assignment {
+  pub exported: bool,
+  pub expression: Expression,
+}
+
+impl Assignment {
+  fn new(assignment: &full::Assignment) -> Self {
+    Self {
+      exported: assignment.export,
+      expression: Expression::new(&assignment.value),
+    }
+  }
+}
+
+#[derive(Eq, PartialEq, Hash, Ord, PartialOrd, Debug, Clone)]
+pub enum Expression {
+  And {
+    lhs: Box<Self>,
+    rhs: Box<Self>,
+  },
+  Assert {
+    condition: Condition,
+    error: Box<Self>,
+  },
+  Backtick {
+    command: String,
+  },
+  Call {
+    name: String,
+    arguments: Vec<Self>,
+  },
+  Concatenation {
+    lhs: Box<Self>,
+    rhs: Box<Self>,
+  },
+  Conditional {
+    lhs: Box<Self>,
+    rhs: Box<Self>,
+    then: Box<Self>,
+    otherwise: Box<Self>,
+    operator: ConditionalOperator,
+src/indentation.rs:61:        s.parse::<Indentation>().unwrap(),
+src/shebang.rs:114:        .unwrap()
+src/shebang.rs:124:        .unwrap()
+src/shebang.rs:132:    assert!(!Shebang::new("#!cmd").unwrap().include_shebang_line());
+src/shebang.rs:137:    assert!(!Shebang::new("#!cmd.exe /C").unwrap().include_shebang_line());
+src/shebang.rs:143:      Shebang::new("#!foo -c").unwrap().include_shebang_line(),
+src/unindent.rs:122:    assert!(blank("       \n"));
+src/unindent.rs:123:    assert!(!blank("       foo\n"));
+src/unindent.rs:124:    assert!(blank("\t\t\n"));
+src/numerator.rs:7:    Self(constants().len().try_into().unwrap())
+src/numerator.rs:17:    assert!(i < constants().len());
+src/numerator.rs:18:    Number(i.try_into().unwrap())
+src/analyzer.rs:51:    let ast = asts.get(root).unwrap();
+src/analyzer.rs:73:                stack.push(asts.get(absolute).unwrap());
+src/analyzer.rs:244:            let Fragment::Text { token } = line.fragments.first().unwrap() else {
+src/analyzer.rs:245:              unreachable!();
+src/analyzer.rs:272:    let root = paths.get(root).unwrap();
+src/constants.rs:77:    let readme = fs::read_to_string("README.md").unwrap();
+src/constants.rs:79:    assert!(
+src/search_error.rs:23:    candidates.iter().next().unwrap().parent().unwrap().display(),
+src/search_error.rs:27:        .map(|candidate| candidate.file_name().unwrap().to_string_lossy())
+src/error.rs:866:      let path = Modulepath::try_from([recipe.name()].as_slice()).unwrap();
+src/list.rs:73:        _ => unreachable!("Iterator was fused, but returned Some after None"),
+src/compiler.rs:38:            let parent = current.path.parent().unwrap();
+src/compiler.rs:68:              .unwrap()
+src/compiler.rs:150:        .entry(candidate.parent().unwrap().into())
+src/compiler.rs:183:            let candidate_name = candidate.file_name().unwrap().to_str().unwrap();
+src/compiler.rs:192:              found.push(candidate.parent().unwrap().join(name));
+src/compiler.rs:204:          .map(|found| found.strip_prefix(parent).unwrap().into())
+src/compiler.rs:234:      &Config::new().unwrap(),
+src/compiler.rs:264:      Compiler::compile(&Config::new().unwrap(), &loader, &justfile_a_path).unwrap_err();
+src/compiler.rs:288:      let tempdir = tempfile::tempdir().unwrap();
+src/compiler.rs:292:          fs::create_dir_all(tempdir.path().join(parent)).unwrap();
+src/compiler.rs:295:        fs::write(tempdir.path().join(file), "").unwrap();
+src/compiler.rs:311:          _ => panic!("unexpected error"),
+src/compiler.rs:314:          actual.unwrap().unwrap(),
+src/compiler.rs:319:        Ok(None) => assert_eq!(actual.unwrap(), None),
+src/signal.rs:40:    128i32.checked_add(self.number()).unwrap()
+src/signal.rs:139:      assert!(signal.number() <= i32::from(u8::MAX));
+src/signal.rs:169:      assert_eq!(signal as i32, n);
+src/signal.rs:171:      assert_eq!(Signal::try_from(u8::try_from(n).unwrap()).unwrap(), signal);
+src/config.rs:149:    let name = path.components.pop().unwrap();
+src/config.rs:426:    let arguments = Arguments::try_parse_from(arguments).expect("argument parsing failed");
+src/config.rs:427:    let have = Config::from_arguments(arguments).expect("config parsing failed");
+src/config.rs:460:          Arguments::try_parse_from(arguments).expect("Matching fails");
+src/config.rs:464:          other => panic!("Unexpected config error: {other}"),
+src/config.rs:486:          other => panic!("Unexpected result from get matches: {other:?}")
+src/config.rs:875:      path: Modulepath::try_from(["foo"].as_slice()).unwrap(),
+src/config.rs:894:    subcommand: Subcommand::List { path: Modulepath::try_from(["bar"].as_slice()).unwrap() },
+src/config.rs:900:    subcommand: Subcommand::Show { path: Modulepath::try_from(["build"].as_slice()).unwrap() },
+src/config.rs:906:    subcommand: Subcommand::Show { path: Modulepath::try_from(["build"].as_slice()).unwrap() },
+src/config.rs:913:      path: Modulepath::try_from(["foo", "bar"].as_slice()).unwrap(),
+src/config.rs:1230:      Config::new().unwrap(),
+src/config.rs:1231:      Config::from_arguments(Arguments::try_parse_from(["just"]).unwrap()).unwrap()
+src/token.rs:29:    let line = self.src.lines().nth(self.line).unwrap();
+src/attribute.rs:153:        let arg = arguments.into_iter().next().unwrap();
+src/attribute.rs:211:      AttributeDiscriminant::Confirm => unreachable!(),
+src/attribute.rs:216:        let [key, value]: [StringLiteral; 2] = arguments.try_into().unwrap();
+src/attribute.rs:220:      AttributeDiscriminant::Extension => Self::Extension(arguments.into_iter().next().unwrap()),
+src/attribute.rs:222:      AttributeDiscriminant::Group => Self::Group(arguments.into_iter().next().unwrap()),
+src/attribute.rs:244:        Self::WorkingDirectory(arguments.into_iter().next().unwrap())
+src/alias.rs:17:    assert!(self.target.last().lexeme() == target.name());
+src/modulepath.rs:108:      let actual = Modulepath::try_from(path).unwrap();
+src/modulepath.rs:124:      assert!(Modulepath::try_from(path).is_err());
+src/ran.rs:11:      .unwrap()
+src/run.rs:43:    fs::write(tmp.path().join("justfile"), "foo:").unwrap();
+src/run.rs:44:    let search_directory = format!("{}/", tmp.path().to_str().unwrap());
+src/run.rs:45:    run(["just", &search_directory].iter()).unwrap();
+src/run.rs:46:    run(["just", &search_directory].iter()).unwrap();
+src/signals.rs:102:      panic!("signal iterator cannot be initialized twice");
+src/range_ext.rs:32:    assert!(!(1..1).contains(&1));
+src/range_ext.rs:33:    assert!((1..1).is_empty());
+src/range_ext.rs:34:    assert!((5..5).is_empty());
+src/evaluator.rs:207:    Ok(self.scope.value(name).unwrap())
+src/evaluator.rs:224:    let context = *self.context.as_ref().unwrap();
+src/evaluator.rs:262:      Function::Nullary(f) => f(self.function_context(name).unwrap()),
+src/evaluator.rs:265:        f(self.function_context(name).unwrap(), &a)
+src/evaluator.rs:274:        f(self.function_context(name).unwrap(), &a, b.as_deref())
+src/evaluator.rs:282:        f(self.function_context(name).unwrap(), &a, &rest)
+src/evaluator.rs:287:        f(self.function_context(name).unwrap(), &a, &b)
+src/evaluator.rs:296:        f(self.function_context(name).unwrap(), &a, &b, &rest)
+src/evaluator.rs:302:        f(self.function_context(name).unwrap(), &a, &b, &c)
+src/evaluator.rs:358:          unreachable!();
+src/source.rs:21:      working_directory: path.parent().unwrap().into(),
+src/source.rs:63:      working_directory: path.parent().unwrap().into(),
+src/executor.rs:135:        Executor::Shebang(Shebang::new(&format!("#!{interpreter}")).unwrap())
+src/function.rs:226:  Ok(Path::new(path).lexiclean().to_str().unwrap().to_owned())
+src/function.rs:448:  let module_directory = context.execution_context.module.source.parent().unwrap();
+src/function.rs:577:    .unwrap()
+src/function.rs:580:    .unwrap()
+src/function.rs:597:    .unwrap()
+src/recipe.rs:72:    self.module_path.as_ref().unwrap()
+src/recipe.rs:76:    self.recipe_path.as_ref().unwrap()
+src/recipe.rs:101:        debug_assert!(parameter.default.is_some());
+src/recipe.rs:290:        let line = lines.next().unwrap();
+src/subcommand.rs:10:static BACKTICK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new("(`.*?`)|(`[^`]*$)").unwrap());
+src/subcommand.rs:121:        unreachable!()
+src/subcommand.rs:146:    let starting_parent = search.justfile.parent().as_ref().unwrap().lexiclean();
+src/subcommand.rs:166:                .strip_prefix(search.justfile.parent().unwrap())
+src/subcommand.rs:167:                .unwrap()
+src/subcommand.rs:171:                .join(search.justfile.file_name().unwrap())
+src/subcommand.rs:271:    let stdin = child.stdin.as_mut().unwrap();
+src/subcommand.rs:352:    let root = search.justfile.parent().unwrap();
+src/subcommand.rs:435:      .expect("writing to buffer cannot fail");
+src/subcommand.rs:457:        sigset.thread_block().unwrap();
+src/subcommand.rs:459:        let received = sigset.wait().unwrap();
+src/subcommand.rs:852:    let name = path.components.last().unwrap();
+src/invocation_parser.rs:115:          .unwrap();
+src/invocation_parser.rs:132:          Switch::Short(name.chars().next().unwrap())
+src/invocation_parser.rs:320:      fs::create_dir_all(path.parent().unwrap()).unwrap();
+src/invocation_parser.rs:321:      fs::write(path, content).unwrap();
+src/invocation_parser.rs:329:    let invocations = InvocationParser::parse_invocations(&justfile, &["foo"]).unwrap();
+src/invocation_parser.rs:333:    assert!(invocations[0].arguments.is_empty());
+src/invocation_parser.rs:340:    let invocations = InvocationParser::parse_invocations(&justfile, &["foo", "baz"]).unwrap();
+src/invocation_parser.rs:392:    let tempdir = tempfile::tempdir().unwrap();
+src/invocation_parser.rs:394:    fs::write(&path, "mod foo").unwrap();
+src/invocation_parser.rs:395:    fs::create_dir(tempdir.path().join("foo")).unwrap();
+src/invocation_parser.rs:396:    fs::write(tempdir.path().join("foo/mod.just"), "bar:").unwrap();
+src/invocation_parser.rs:397:    let compilation = Compiler::compile(&Config::new().unwrap(), &loader, &path).unwrap();
+src/invocation_parser.rs:400:      InvocationParser::parse_invocations(&compilation.justfile, &["foo", "bar"]).unwrap();
+src/invocation_parser.rs:404:    assert!(invocations[0].arguments.is_empty());
+src/invocation_parser.rs:410:    let tempdir = tempfile::tempdir().unwrap();
+src/invocation_parser.rs:412:    fs::write(&path, "mod foo").unwrap();
+src/invocation_parser.rs:413:    fs::create_dir(tempdir.path().join("foo")).unwrap();
+src/invocation_parser.rs:414:    fs::write(tempdir.path().join("foo/mod.just"), "bar:").unwrap();
+src/invocation_parser.rs:415:    let compilation = Compiler::compile(&Config::new().unwrap(), &loader, &path).unwrap();
+src/invocation_parser.rs:428:    let tempdir = tempfile::tempdir().unwrap();
+src/invocation_parser.rs:434:      &Config::new().unwrap(),
+src/invocation_parser.rs:438:    .unwrap();
+src/invocation_parser.rs:451:    let tempdir = tempfile::tempdir().unwrap();
+src/invocation_parser.rs:457:      &Config::new().unwrap(),
+src/invocation_parser.rs:461:    .unwrap();
+src/invocation_parser.rs:473:    let tempdir = tempfile::tempdir().unwrap();
+src/invocation_parser.rs:478:      &Config::new().unwrap(),
+src/invocation_parser.rs:482:    .unwrap();
+src/invocation_parser.rs:492:    let tempdir = tempfile::tempdir().unwrap();
+src/invocation_parser.rs:497:      &Config::new().unwrap(),
+src/invocation_parser.rs:501:    .unwrap();
+src/invocation_parser.rs:514:    let tempdir = tempfile::tempdir().unwrap();
+src/invocation_parser.rs:520:      &Config::new().unwrap(),
+src/invocation_parser.rs:524:    .unwrap();
+src/invocation_parser.rs:551:    .unwrap();
+src/invocation_parser.rs:582:      InvocationParser::parse_invocations(&justfile, &["foo", "--bar", "baz"]).unwrap();
+src/invocation_parser.rs:599:      InvocationParser::parse_invocations(&justfile, &["foo", "qux", "--bar", "baz"]).unwrap();
+src/invocation_parser.rs:619:      InvocationParser::parse_invocations(&justfile, &["foo", "--", "--bar"]).unwrap();
+src/invocation_parser.rs:631:    let tempdir = tempfile::tempdir().unwrap();
+src/invocation_parser.rs:637:      &Config::new().unwrap(),
+src/invocation_parser.rs:641:    .unwrap();
+src/invocation_parser.rs:644:      InvocationParser::parse_invocations(&compilation.justfile, &["foo::"]).unwrap();
+src/invocation_parser.rs:648:    assert!(invocations[0].arguments.is_empty());
+src/invocation_parser.rs:653:    let tempdir = tempfile::tempdir().unwrap();
+src/invocation_parser.rs:659:      &Config::new().unwrap(),
+src/invocation_parser.rs:663:    .unwrap();
+src/table.rs:77:    self.map.get(key).expect("no entry found for key")
+src/justfile.rs:262:        let (_module, scope, dotenv) = scopes.get(&self.module_path).unwrap();
+src/justfile.rs:304:        let scope = scopes.get(&module.module_path).unwrap().1;
+src/justfile.rs:307:          print!("{}", scope.value(variable).unwrap());
+src/justfile.rs:337:      _ => unreachable!(),
+src/justfile.rs:373:      HashSet::from([current.assignments.get(variable).unwrap().number])
+src/justfile.rs:429:    let mut guard = mutex.lock().unwrap();
+PANIC-6 src/subcommand.rs:317
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:319
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:387
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:400
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:424
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:504
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:513
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:528
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:533
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:535
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:541
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:549
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:616
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:679
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:684
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:712
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:721
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:745
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:747
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:751
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:772
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:775
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:785
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:787
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:789
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:792
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:823
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:826
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:874
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:876
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:878
+  print macro in library code; return data or use logging.
+
+Totals: Major: 0, Minor: 60, Note: 0
+Confirm each finding by reading the code; discard false positives.

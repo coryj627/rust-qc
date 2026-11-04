@@ -1,0 +1,919 @@
+// Copyright 2017 Google Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+
+//! Tree-based two pass parser.
+
+use std::cmp::{max, min};
+use std::collections::{HashMap, VecDeque};
+use std::iter::FusedIterator;
+use std::num::NonZeroUsize;
+use std::ops::{Index, Range};
+
+use unicase::UniCase;
+
+use crate::firstpass::run_first_pass;
+use crate::linklabel::{scan_link_label_rest, FootnoteLabel, LinkLabel, ReferenceLabel};
+use crate::scanners::*;
+use crate::strings::CowStr;
+use crate::tree::{Tree, TreeIndex};
+use crate::{
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, LinkType, MetadataBlockKind,
+    Options, Tag, TagEnd,
+};
+
+// Allowing arbitrary depth nested parentheses inside link destinations
+// can create denial of service vulnerabilities if we're not careful.
+// The simplest countermeasure is to limit their depth, which is
+// explicitly allowed by the spec as long as the limit is at least 3:
+// https://spec.commonmark.org/0.29/#link-destination
+pub(crate) const LINK_MAX_NESTED_PARENS: usize = 32;
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Item {
+    pub start: usize,
+    pub end: usize,
+    pub body: ItemBody,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy, Default)]
+pub(crate) enum ItemBody {
+    // These are possible inline items, need to be resolved in second pass.
+
+    // repeats, can_open, can_close
+    MaybeEmphasis(usize, bool, bool),
+    // can_open, can_close, brace context
+    MaybeMath(bool, bool, u8),
+    // quote byte, can_open, can_close
+    MaybeSmartQuote(u8, bool, bool),
+    MaybeCode(usize, bool), // number of backticks, preceded by backslash
+    MaybeHtml,
+    MaybeLinkOpen,
+    // bool indicates whether or not the preceding section could be a reference
+    MaybeLinkClose(bool),
+    MaybeImage,
+
+    // These are inline items after resolution.
+    Emphasis,
+    Strong,
+    Strikethrough,
+    Superscript,
+    Subscript,
+    Math(CowIndex, bool), // true for display math
+    Code(CowIndex),
+    Link(LinkIndex),
+    Image(LinkIndex),
+    FootnoteReference(CowIndex),
+    TaskListMarker(bool), // true for checked
+
+    // These are also inline items.
+    InlineHtml,
+    OwnedInlineHtml(CowIndex),
+    SynthesizeText(CowIndex),
+    SynthesizeChar(char),
+    Html,
+    Text {
+        backslash_escaped: bool,
+    },
+    SoftBreak,
+    // true = is backlash
+    HardBreak(bool),
+
+    // Dummy node at the top of the tree - should not be used otherwise!
+    #[default]
+    Root,
+
+    // These are block items.
+    Paragraph,
+    TightParagraph,
+    Rule,
+    Heading(HeadingLevel, Option<HeadingIndex>), // heading level
+    FencedCodeBlock(CowIndex),
+    IndentCodeBlock,
+    HtmlBlock,
+    BlockQuote(Option<BlockQuoteKind>),
+    List(bool, u8, u64), // is_tight, list character, list start index
+    ListItem(usize),     // indent level
+    FootnoteDefinition(CowIndex),
+    MetadataBlock(MetadataBlockKind),
+
+    // Definition lists
+    DefinitionList(bool), // is_tight
+    // gets turned into either a paragraph or a definition list title,
+    // depending on whether there's a definition after it
+    MaybeDefinitionListTitle,
+    DefinitionListTitle,
+    DefinitionListDefinition(usize),
+
+    // Tables
+    Table(AlignmentIndex),
+    TableHead,
+    TableRow,
+    TableCell,
+}
+
+impl ItemBody {
+    fn is_maybe_inline(&self) -> bool {
+        use ItemBody::*;
+        matches!(
+            *self,
+            MaybeEmphasis(..)
+                | MaybeMath(..)
+                | MaybeSmartQuote(..)
+                | MaybeCode(..)
+                | MaybeHtml
+                | MaybeLinkOpen
+                | MaybeLinkClose(..)
+                | MaybeImage
+        )
+    }
+    fn is_inline(&self) -> bool {
+        use ItemBody::*;
+        matches!(
+            *self,
+            MaybeEmphasis(..)
+                | MaybeMath(..)
+                | MaybeSmartQuote(..)
+                | MaybeCode(..)
+                | MaybeHtml
+                | MaybeLinkOpen
+                | MaybeLinkClose(..)
+                | MaybeImage
+                | Emphasis
+                | Strong
+                | Strikethrough
+                | Math(..)
+                | Code(..)
+                | Link(..)
+                | Image(..)
+                | FootnoteReference(..)
+                | TaskListMarker(..)
+                | InlineHtml
+                | OwnedInlineHtml(..)
+                | SynthesizeText(..)
+                | SynthesizeChar(..)
+                | Html
+                | Text { .. }
+                | SoftBreak
+                | HardBreak(..)
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct BrokenLink<'a> {
+    pub span: std::ops::Range<usize>,
+    pub link_type: LinkType,
+    pub reference: CowStr<'a>,
+}
+
+/// Markdown event iterator.
+pub struct Parser<'input, F = DefaultBrokenLinkCallback> {
+    text: &'input str,
+    options: Options,
+    tree: Tree<Item>,
+    allocs: Allocations<'input>,
+    broken_link_callback: Option<F>,
+    html_scan_guard: HtmlScanGuard,
+
+    // https://github.com/pulldown-cmark/pulldown-cmark/issues/844
+    // Consider this example:
+    //
+    //     [x]: xxx...
+    //     [x]
+    //     [x]
+    //     [x]
+    //
+    // Which expands to this HTML:
+    //
+    //     <a href="xxx...">x</a>
+    //     <a href="xxx...">x</a>
+    //     <a href="xxx...">x</a>
+    //
+    // This is quadratic growth, because it's filling in the area of a square.
+    // To prevent this, track how much it's expanded and limit it.
+    link_ref_expansion_limit: usize,
+
+    // used by inline passes. store them here for reuse
+    inline_stack: InlineStack,
+    link_stack: LinkStack,
+    wikilink_stack: LinkStack,
+    code_delims: CodeDelims,
+    math_delims: MathDelims,
+}
+
+impl<'input, F> std::fmt::Debug for Parser<'input, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Only print the fields that have public types.
+        f.debug_struct("Parser")
+            .field("text", &self.text)
+            .field("options", &self.options)
+            .field(
+                "broken_link_callback",
+                &self.broken_link_callback.as_ref().map(|_| ..),
+            )
+            .finish()
+    }
+}
+
+impl<'a> BrokenLink<'a> {
+    /// Moves the link into version with a static lifetime.
+    ///
+    /// The `reference` member is cloned to a Boxed or Inline version.
+    pub fn into_static(self) -> BrokenLink<'static> {
+        BrokenLink {
+            span: self.span.clone(),
+            link_type: self.link_type,
+            reference: self.reference.into_string().into(),
+        }
+    }
+}
+
+impl<'input> Parser<'input, DefaultBrokenLinkCallback> {
+    /// Creates a new event iterator for a markdown string without any options enabled.
+    pub fn new(text: &'input str) -> Self {
+        Self::new_ext(text, Options::empty())
+    }
+
+    /// Creates a new event iterator for a markdown string with given options.
+    pub fn new_ext(text: &'input str, options: Options) -> Self {
+        Self::new_with_broken_link_callback(text, options, None)
+    }
+}
+
+impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
+    /// In case the parser encounters any potential links that have a broken
+    /// reference (e.g `[foo]` when there is no `[foo]: ` entry at the bottom)
+    /// the provided callback will be called with the reference name,
+    /// and the returned pair will be used as the link URL and title if it is not
+    /// `None`.
+    pub fn new_with_broken_link_callback(
+        text: &'input str,
+        options: Options,
+        broken_link_callback: Option<F>,
+    ) -> Self {
+        let (mut tree, allocs) = run_first_pass(text, options);
+        tree.reset();
+        let inline_stack = Default::default();
+        let link_stack = Default::default();
+        let wikilink_stack = Default::default();
+        let html_scan_guard = Default::default();
+        Parser {
+            text,
+            options,
+            tree,
+            allocs,
+            broken_link_callback,
+            inline_stack,
+            link_stack,
+            wikilink_stack,
+            html_scan_guard,
+            // always allow 100KiB
+            link_ref_expansion_limit: text.len().max(100_000),
+            code_delims: CodeDelims::new(),
+            math_delims: MathDelims::new(),
+        }
+    }
+
+    /// Returns a reference to the internal `RefDefs` object, which provides access
+    /// to the internal map of reference definitions.
+    pub fn reference_definitions(&self) -> &RefDefs<'_> {
+        &self.allocs.refdefs
+    }
+
+    /// Use a link label to fetch a type, url, and title.
+    ///
+    /// This function enforces the [`link_ref_expansion_limit`].
+    /// If it returns Some, it also consumes some of the fuel.
+    /// If we're out of fuel, it immediately returns None.
+    ///
+    /// The URL and title are found in the [`RefDefs`] map.
+    /// If they're not there, and a callback was provided by the user,
+    /// the [`broken_link_callback`] will be invoked and given the opportunity
+    /// to provide a fallback.
+    ///
+    /// The link type (that's "link" or "image") depends on the usage site, and
+    /// is provided by the caller of this function.
+    /// This function returns a new one because, if it has to invoke a callback
+    /// to find the information, the link type is [mapped to an unknown type].
+    ///
+    /// [mapped to an unknown type]: crate::LinkType::to_unknown
+    /// [`link_ref_expansion_limit`]: Self::link_ref_expansion_limit
+    /// [`broken_link_callback`]: Self::broken_link_callback
+    fn fetch_link_type_url_title(
+        &mut self,
+        link_label: CowStr<'input>,
+        span: Range<usize>,
+        link_type: LinkType,
+    ) -> Option<(LinkType, CowStr<'input>, CowStr<'input>)> {
+        if self.link_ref_expansion_limit == 0 {
+            return None;
+        }
+
+        let (link_type, url, title) = self
+            .allocs
+            .refdefs
+            .get(link_label.as_ref())
+            .map(|matching_def| {
+                // found a matching definition!
+                let title = matching_def
+                    .title
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| "".into());
+                let url = matching_def.dest.clone();
+                (link_type, url, title)
+            })
+            .or_else(|| {
+                match self.broken_link_callback.as_mut() {
+                    Some(callback) => {
+                        // Construct a BrokenLink struct, which will be passed to the callback
+                        let broken_link = BrokenLink {
+                            span,
+                            link_type,
+                            reference: link_label,
+                        };
+
+                        callback
+                            .handle_broken_link(broken_link)
+                            .map(|(url, title)| (link_type.to_unknown(), url, title))
+                    }
+                    None => None,
+                }
+            })?;
+
+        // Limit expansion from link references.
+        // This isn't a problem for footnotes, because multiple references to the same one
+        // reuse the same node, but links/images get their HREF/SRC copied.
+        self.link_ref_expansion_limit = self
+            .link_ref_expansion_limit
+            .saturating_sub(url.len() + title.len());
+
+        Some((link_type, url, title))
+    }
+
+    /// Handle inline markup.
+    ///
+    /// When the parser encounters any item indicating potential inline markup, all
+    /// inline markup passes are run on the remainder of the chain.
+    ///
+    /// Note: there's some potential for optimization here, but that's future work.
+    fn handle_inline(&mut self) {
+        self.handle_inline_pass1();
+        self.handle_emphasis_and_hard_break();
+    }
+
+    /// Handle inline HTML, code spans, and links.
+    ///
+    /// This function handles both inline HTML and code spans, because they have
+    /// the same precedence. It also handles links, even though they have lower
+    /// precedence, because the URL of links must not be processed.
+    fn handle_inline_pass1(&mut self) {
+        let mut cur = self.tree.cur();
+        let mut prev = None;
+
+        let block_end = self.tree[self.tree.peek_up().unwrap()].item.end;
+        let block_text = &self.text[..block_end];
+
+        while let Some(mut cur_ix) = cur {
+            match self.tree[cur_ix].item.body {
+                ItemBody::MaybeHtml => {
+                    let next = self.tree[cur_ix].next;
+                    let autolink = if let Some(next_ix) = next {
+                        scan_autolink(block_text, self.tree[next_ix].item.start)
+                    } else {
+                        None
+                    };
+
+                    if let Some((ix, uri, link_type)) = autolink {
+                        let node = scan_nodes_to_ix(&self.tree, next, ix);
+                        let text_node = self.tree.create_node(Item {
+                            start: self.tree[cur_ix].item.start + 1,
+                            end: ix - 1,
+                            body: ItemBody::Text {
+                                backslash_escaped: false,
+                            },
+                        });
+                        let link_ix =
+                            self.allocs
+                                .allocate_link(link_type, uri, "".into(), "".into());
+                        self.tree[cur_ix].item.body = ItemBody::Link(link_ix);
+                        self.tree[cur_ix].item.end = ix;
+                        self.tree[cur_ix].next = node;
+                        self.tree[cur_ix].child = Some(text_node);
+                        prev = cur;
+                        cur = node;
+                        if let Some(node_ix) = cur {
+                            self.tree[node_ix].item.start = max(self.tree[node_ix].item.start, ix);
+                        }
+                        continue;
+                    } else {
+                        let inline_html = next.and_then(|next_ix| {
+                            self.scan_inline_html(
+                                block_text.as_bytes(),
+                                self.tree[next_ix].item.start,
+                            )
+                        });
+                        if let Some((span, ix)) = inline_html {
+                            let node = scan_nodes_to_ix(&self.tree, next, ix);
+                            self.tree[cur_ix].item.body = if !span.is_empty() {
+                                let converted_string =
+                                    String::from_utf8(span).expect("invalid utf8");
+                                ItemBody::OwnedInlineHtml(
+                                    self.allocs.allocate_cow(converted_string.into()),
+                                )
+                            } else {
+                                ItemBody::InlineHtml
+                            };
+                            self.tree[cur_ix].item.end = ix;
+                            self.tree[cur_ix].next = node;
+                            prev = cur;
+                            cur = node;
+                            if let Some(node_ix) = cur {
+                                self.tree[node_ix].item.start =
+                                    max(self.tree[node_ix].item.start, ix);
+                            }
+                            continue;
+                        }
+                    }
+                    self.tree[cur_ix].item.body = ItemBody::Text {
+                        backslash_escaped: false,
+                    };
+                }
+                ItemBody::MaybeMath(can_open, _can_close, brace_context) => {
+                    if !can_open {
+                        self.tree[cur_ix].item.body = ItemBody::Text {
+                            backslash_escaped: false,
+                        };
+                        prev = cur;
+                        cur = self.tree[cur_ix].next;
+                        continue;
+                    }
+                    let is_display = self.tree[cur_ix].next.map_or(false, |next_ix| {
+                        matches!(
+                            self.tree[next_ix].item.body,
+                            ItemBody::MaybeMath(_can_open, _can_close, _brace_context)
+                        )
+                    });
+                    let result = if self.math_delims.is_populated() {
+                        // we have previously scanned all math environment delimiters,
+                        // so we can reuse that work
+                        self.math_delims
+                            .find(&self.tree, cur_ix, is_display, brace_context)
+                    } else {
+                        // we haven't previously scanned all math delimiters,
+                        // so walk the AST
+                        let mut scan = self.tree[cur_ix].next;
+                        if is_display {
+                            // a display delimiter, `$$`, is actually two delimiters
+                            // skip the second one
+                            scan = self.tree[scan.unwrap()].next;
+                        }
+                        let mut invalid = false;
+                        while let Some(scan_ix) = scan {
+                            if let ItemBody::MaybeMath(_can_open, can_close, delim_brace_context) =
+                                self.tree[scan_ix].item.body
+                            {
+                                let delim_is_display =
+                                    self.tree[scan_ix].next.map_or(false, |next_ix| {
+                                        matches!(
+                                            self.tree[next_ix].item.body,
+                                            ItemBody::MaybeMath(
+                                                _can_open,
+                                                _can_close,
+                                                _brace_context
+                                            )
+                                        )
+                                    });
+                                if !invalid && delim_brace_context == brace_context {
+                                    if (!is_display && can_close)
+                                        || (is_display && delim_is_display)
+                                    {
+                                        // This will skip ahead past everything we
+                                        // just inserted. Needed for correctness to
+                                        // ensure that a new scan is done after this item.
+                                        self.math_delims.clear();
+                                        break;
+                                    } else {
+                                        // Math cannot contain $, so the current item
+                                        // is invalid. Keep scanning to fill math_delims.
+                                        invalid = true;
+                                    }
+                                }
+                                self.math_delims.insert(
+                                    delim_is_display,
+                                    delim_brace_context,
+                                    scan_ix,
+                                    can_close,
+                                );
+                            }
+                            scan = self.tree[scan_ix].next;
+                        }
+                        scan
+                    };
+
+use std::borrow::{Borrow, Cow};
+use std::fmt;
+use std::hash::{Hash, Hasher};
+use std::ops::Deref;
+use std::str::from_utf8;
+
+const MAX_INLINE_STR_LEN: usize = 3 * std::mem::size_of::<isize>() - 2;
+
+/// Returned when trying to convert a `&str` into a `InlineStr`
+/// but it fails because it doesn't fit.
+#[derive(Debug)]
+pub struct StringTooLongError;
+
+/// An inline string that can contain almost three words
+/// of utf-8 text.
+#[derive(Debug, Clone, Copy, Eq)]
+pub struct InlineStr {
+    inner: [u8; MAX_INLINE_STR_LEN],
+    len: u8,
+}
+
+impl AsRef<str> for InlineStr {
+    fn as_ref(&self) -> &str {
+        self.deref()
+    }
+}
+
+impl Hash for InlineStr {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.deref().hash(state);
+    }
+}
+
+impl From<char> for InlineStr {
+    fn from(c: char) -> Self {
+        let mut inner = [0u8; MAX_INLINE_STR_LEN];
+        c.encode_utf8(&mut inner);
+        let len = c.len_utf8() as u8;
+        Self { inner, len }
+    }
+}
+
+impl std::cmp::PartialEq<InlineStr> for InlineStr {
+    fn eq(&self, other: &InlineStr) -> bool {
+        self.deref() == other.deref()
+    }
+}
+
+impl TryFrom<&str> for InlineStr {
+    type Error = StringTooLongError;
+
+    fn try_from(s: &str) -> Result<InlineStr, StringTooLongError> {
+        let len = s.len();
+        if len <= MAX_INLINE_STR_LEN {
+            let mut inner = [0u8; MAX_INLINE_STR_LEN];
+            inner[..len].copy_from_slice(s.as_bytes());
+            let len = len as u8;
+            Ok(Self { inner, len })
+        } else {
+            Err(StringTooLongError)
+        }
+    }
+}
+
+impl Deref for InlineStr {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        let len = self.len as usize;
+        from_utf8(&self.inner[..len]).unwrap()
+    }
+}
+
+impl fmt::Display for InlineStr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_ref())
+    }
+}
+
+/// A copy-on-write string that can be owned, borrowed
+/// or inlined.
+///
+/// It is three words long.
+#[derive(Debug, Eq)]
+pub enum CowStr<'a> {
+    /// An owned, immutable string.
+    Boxed(Box<str>),
+    /// A borrowed string.
+    Borrowed(&'a str),
+    /// A short inline string.
+    Inlined(InlineStr),
+}
+
+#[cfg(feature = "serde")]
+mod serde_impl {
+    use super::CowStr;
+    use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+    use std::fmt;
+
+    impl<'a> Serialize for CowStr<'a> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            serializer.serialize_str(self.as_ref())
+        }
+    }
+
+    struct CowStrVisitor;
+
+    impl<'de> de::Visitor<'de> for CowStrVisitor {
+        type Value = CowStr<'de>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a string")
+        }
+
+        fn visit_borrowed_str<E>(self, v: &'de str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(CowStr::Borrowed(v))
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            match v.try_into() {
+                Ok(it) => Ok(CowStr::Inlined(it)),
+                Err(_) => Ok(CowStr::Boxed(String::from(v).into_boxed_str())),
+            }
+        }
+
+        fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(CowStr::Boxed(v.into_boxed_str()))
+        }
+    }
+
+    impl<'a, 'de: 'a> Deserialize<'de> for CowStr<'a> {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_str(CowStrVisitor)
+        }
+    }
+}
+
+impl<'a> AsRef<str> for CowStr<'a> {
+    fn as_ref(&self) -> &str {
+        self.deref()
+    }
+}
+
+impl<'a> Hash for CowStr<'a> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.deref().hash(state);
+    }
+}
+
+impl<'a> std::clone::Clone for CowStr<'a> {
+    fn clone(&self) -> Self {
+        match self {
+            CowStr::Boxed(s) => match InlineStr::try_from(&**s) {
+                Ok(inline) => CowStr::Inlined(inline),
+                Err(..) => CowStr::Boxed(s.clone()),
+            },
+            CowStr::Borrowed(s) => CowStr::Borrowed(s),
+            CowStr::Inlined(s) => CowStr::Inlined(*s),
+        }
+    }
+}
+
+impl<'a> std::cmp::PartialEq<CowStr<'a>> for CowStr<'a> {
+    fn eq(&self, other: &CowStr<'_>) -> bool {
+        self.deref() == other.deref()
+    }
+}
+
+impl<'a> From<&'a str> for CowStr<'a> {
+    fn from(s: &'a str) -> Self {
+        CowStr::Borrowed(s)
+    }
+}
+
+impl<'a> From<String> for CowStr<'a> {
+    fn from(s: String) -> Self {
+        CowStr::Boxed(s.into_boxed_str())
+    }
+}
+
+impl<'a> From<char> for CowStr<'a> {
+    fn from(c: char) -> Self {
+        CowStr::Inlined(c.into())
+    }
+}
+
+impl<'a> From<Cow<'a, str>> for CowStr<'a> {
+    fn from(s: Cow<'a, str>) -> Self {
+        match s {
+            Cow::Borrowed(s) => CowStr::Borrowed(s),
+            Cow::Owned(s) => CowStr::Boxed(s.into_boxed_str()),
+        }
+    }
+}
+
+impl<'a> From<CowStr<'a>> for Cow<'a, str> {
+    fn from(s: CowStr<'a>) -> Self {
+        match s {
+            CowStr::Boxed(s) => Cow::Owned(s.to_string()),
+            CowStr::Inlined(s) => Cow::Owned(s.to_string()),
+            CowStr::Borrowed(s) => Cow::Borrowed(s),
+        }
+    }
+}
+
+impl<'a> From<Cow<'a, char>> for CowStr<'a> {
+    fn from(s: Cow<'a, char>) -> Self {
+        CowStr::Inlined(InlineStr::from(*s))
+    }
+}
+
+impl<'a> From<CowStr<'a>> for String {
+    fn from(s: CowStr<'a>) -> Self {
+        match s {
+            CowStr::Boxed(s) => s.into(),
+            CowStr::Inlined(s) => s.as_ref().into(),
+            CowStr::Borrowed(s) => s.into(),
+        }
+    }
+}
+
+impl<'a> Deref for CowStr<'a> {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        match self {
+            CowStr::Boxed(ref b) => b,
+            CowStr::Borrowed(b) => b,
+            CowStr::Inlined(ref s) => s.deref(),
+        }
+    }
+}
+
+impl<'a> Borrow<str> for CowStr<'a> {
+    fn borrow(&self) -> &str {
+        self.deref()
+    }
+}
+
+impl<'a> CowStr<'a> {
+    pub fn into_string(self) -> String {
+        match self {
+            CowStr::Boxed(b) => b.into(),
+            CowStr::Borrowed(b) => b.to_owned(),
+            CowStr::Inlined(s) => s.deref().to_owned(),
+        }
+    }
+
+    pub fn into_static(self) -> CowStr<'static> {
+        match self {
+            CowStr::Boxed(b) => CowStr::Boxed(b),
+            CowStr::Borrowed(b) => match InlineStr::try_from(b) {
+                Ok(inline) => CowStr::Inlined(inline),
+                Err(_) => CowStr::Boxed(b.into()),
+            },
+            CowStr::Inlined(s) => CowStr::Inlined(s),
+        }
+    }
+}
+
+impl<'a> fmt::Display for CowStr<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod test_special_string {
+    use super::*;
+
+    #[test]
+    fn inlinestr_ascii() {
+        let s: InlineStr = 'a'.into();
+        assert_eq!("a", s.deref());
+    }
+
+    #[test]
+    fn inlinestr_unicode() {
+        let s: InlineStr = '🍔'.into();
+        assert_eq!("🍔", s.deref());
+    }
+
+    #[test]
+    fn cowstr_size() {
+        let size = std::mem::size_of::<CowStr>();
+        let word_size = std::mem::size_of::<isize>();
+        assert_eq!(3 * word_size, size);
+    }
+
+    #[test]
+    fn cowstr_char_to_string() {
+        let c = '藏';
+        let smort: CowStr = c.into();
+        let owned: String = smort.to_string();
+        let expected = "藏".to_owned();
+        assert_eq!(expected, owned);
+    }
+
+    #[test]
+    fn max_inline_str_len_atleast_four() {
+        // we need 4 bytes to store a char
+        assert!(MAX_INLINE_STR_LEN >= 4);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn inlinestr_fits_twentytwo() {
+        let s = "0123456789abcdefghijkl";
+        let stack_str = InlineStr::try_from(s).unwrap();
+        assert_eq!(stack_str.deref(), s);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn inlinestr_not_fits_twentythree() {
+        let s = "0123456789abcdefghijklm";
+        let _stack_str = InlineStr::try_from(s).unwrap_err();
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn small_boxed_str_clones_to_stack() {
+        let s = "0123456789abcde".to_owned();
+        let smort: CowStr = s.into();
+        let smort_clone = smort.clone();
+
+        if let CowStr::Inlined(..) = smort_clone {
+        } else {
+            panic!("Expected a Inlined variant!");
+        }
+    }
+
+    #[test]
+    fn cow_to_cow_str() {
+        let s = "some text";
+        let cow = Cow::Borrowed(s);
+        let actual = CowStr::from(cow);
+        let expected = CowStr::Borrowed(s);
+        assert_eq!(actual, expected);
+        assert!(variant_eq(&actual, &expected));
+
+        let s = "some text".to_string();
+        let cow: Cow<str> = Cow::Owned(s.clone());
+        let actual = CowStr::from(cow);
+        let expected = CowStr::Boxed(s.into_boxed_str());
+guide/src/cheat-sheet.md
+guide/src/SUMMARY.md
+guide/src/rust-logo-151179464ae7ed46.svg
+guide/src/index.md
+guide/src/specs.md
+guide/src/examples/string-to-string.md
+guide/src/examples/index.md
+guide/src/examples/footnote-rewrite.md
+guide/src/examples/parser-map-event-print.md
+guide/src/examples/broken-link-callbacks.md
+guide/src/examples/event-filter.md
+guide/src/examples/events.md
+guide/src/examples/normalize-wikilink.md
+guide/src/examples/parser-map-tag-print.md
+guide/src/dev/extensions.md
+guide/src/dev/inline-processing.md
+guide/src/dev/block-parsing.md
+guide/src/dev/performance.md
+guide/src/dev/string-handling.md
+guide/src/dev/index.md
+guide/src/dev/html-generation.md
+13:    metadata_blocks: bool,
+14:    old_footnotes: bool,
+15:    subscript: bool,
+16:    wikilinks: bool,
+25:    if wikilinks {
+28:    if subscript {
+33:    if old_footnotes {
+38:    if metadata_blocks {

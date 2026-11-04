@@ -1,0 +1,604 @@
+[package]
+name = "moka"
+version = "0.12.11"
+edition = "2021"
+# Rust 1.70 was released on June 1, 2023.
+rust-version = "1.70"
+description = "A fast and concurrent cache library inspired by Java Caffeine"
+license = "(MIT OR Apache-2.0) AND Apache-2.0"
+# homepage = "https://"
+documentation = "https://docs.rs/moka/"
+repository = "https://github.com/moka-rs/moka"
+keywords = ["cache", "concurrent"]
+categories = ["caching", "concurrency"]
+readme = "README.md"
+exclude = [".devcontainer", ".github", ".gitpod.yml", ".vscode"]
+build = "build.rs"
+
+[features]
+default = []
+
+# Enable this feature to use `moka::sync::{Cache, SegmentedCache}`
+sync = []
+
+# Enable this feature to use `moka::future::Cache`.
+future = ["async-lock", "event-listener", "futures-util"]
+
+# Enable this feature to activate optional logging from caches.
+# Currently cache will emit log only when it encounters a panic in user provided
+# callback closure.
+logging = ["log"]
+
+# Enable this feature to use `quanta::Instant` for some performance critical
+# operations in the cache instead of `std::time::Instant`. As of v0.12.10, this
+# feature will not make any noticeable performance difference, but in the future
+# when cache metrics are added, it will be useful to have this feature enabled.
+quanta = ["dep:quanta"]
+
+# This is an old feature and has no effect in v0.12.10 or newer. It is kept for
+# backward compatibility and will be removed in v0.13.0.
+atomic64 = []
+
+# This unstable feature adds `GlobalDebugCounters::current` function, which returns
+# counters of internal object construction and destruction. It will have some
+# performance impacts and is intended for debugging.
+unstable-debug-counters = ["future", "once_cell"]
+
+[dependencies]
+crossbeam-channel = "0.5.15"
+crossbeam-epoch = "0.9.18"
+crossbeam-utils = "0.8.21"
+equivalent = "1.0"
+parking_lot = "0.12"
+portable-atomic = "1.6"
+smallvec = "1.8"
+tagptr = "0.2"
+uuid = { version = "1.1", features = ["v4"] }
+
+# Optional dependencies (quanta)
+quanta = { version = "0.12.2", optional = true }
+
+# Optional dependencies (future)
+async-lock = { version = "3.3", optional = true }
+event-listener = { version = "5.3", optional = true }
+futures-util = { version = "0.3.17", optional = true }
+
+# Optional dependencies (logging)
+log = { version = "0.4", optional = true }
+
+# Optional dependencies (unstable-debug-counters)
+once_cell = { version = "1.7", optional = true }
+
+[dev-dependencies]
+actix-rt = "2.8"
+ahash = "0.8.3"
+anyhow = "1.0.19"
+env_logger = "0.10.0"
+getrandom = "0.2"
+once_cell = "1.7"
+rand = "0.8.5"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { version = "1.19", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time" ] }
+
+# We cannot use `cfg(loom)` here because an indirect dependency `concurrent-queue`
+# uses it.
+[target.'cfg(moka_loom)'.dev-dependencies]
+loom = "0.7"
+
+[target.'cfg(trybuild)'.dev-dependencies]
+trybuild = "1.0"
+
+[target.'cfg(rustver)'.build-dependencies]
+rustc_version = "0.4.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(armv5te)",
+    "cfg(beta_clippy)",
+    "cfg(kani)",
+    "cfg(moka_loom)",
+    "cfg(mips)",
+    "cfg(rustver)",
+    "cfg(skip_large_mem_tests)",
+    "cfg(trybuild)",
+] }
+
+# https://docs.rs/about/metadata
+[package.metadata.docs.rs]
+# Build the doc at docs.rs with some features enabled.
+#
+# You can test locally with:
+# ```
+# cargo +nightly -Z unstable-options --config 'build.rustdocflags="--cfg docsrs"' \
+#    doc --no-deps --features 'future, sync'
+# ```
+features = ["future", "sync"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+# Examples
+
+[[example]]
+name = "append_value_async"
+required-features = ["future"]
+
+[[example]]
+name = "append_value_sync"
+required-features = ["sync"]
+
+[[example]]
+name = "basics_async"
+required-features = ["future"]
+
+[[example]]
+name = "basics_sync"
+required-features = ["sync"]
+
+[[example]]
+name = "bounded_counter_async"
+required-features = ["future"]
+
+[[example]]
+name = "bounded_counter_sync"
+required-features = ["sync"]
+
+[[example]]
+name = "cascading_drop_async"
+required-features = ["future"]
+
+[[example]]
+name = "counter_async"
+required-features = ["future"]
+
+[[example]]
+name = "counter_sync"
+required-features = ["sync"]
+
+[[example]]
+name = "eviction_listener_sync"
+required-features = ["sync"]
+
+[[example]]
+name = "jittered_expiry_policy_sync"
+required-features = ["sync"]
+
+[[example]]
+name = "reinsert_expired_entries_sync"
+required-features = ["sync"]
+
+[[example]]
+name = "size_aware_eviction_sync"
+required-features = ["sync"]
+
+[[example]]
+name = "try_append_value_async"
+required-features = ["future"]
+
+[[example]]
+name = "try_append_value_sync"
+required-features = ["sync"]
+use parking_lot::RwLock;
+use std::{
+    any::{Any, TypeId},
+    fmt,
+    hash::{BuildHasher, Hash},
+    sync::Arc,
+};
+
+use crate::{
+    common::concurrent::arc::MiniArc,
+    ops::compute::{CompResult, Op},
+    Entry,
+};
+
+use super::{Cache, ComputeNone, OptionallyNone};
+
+const WAITER_MAP_NUM_SEGMENTS: usize = 64;
+
+type ErrorObject = Arc<dyn Any + Send + Sync + 'static>;
+
+// type WaiterValue<V> = Option<Result<V, ErrorObject>>;
+enum WaiterValue<V> {
+    Computing,
+    Ready(Result<V, ErrorObject>),
+    ReadyNone,
+    // https://github.com/moka-rs/moka/issues/43
+    InitClosurePanicked,
+}
+
+impl<V> fmt::Debug for WaiterValue<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WaiterValue::Computing => write!(f, "Computing"),
+            WaiterValue::Ready(_) => write!(f, "Ready"),
+            WaiterValue::ReadyNone => write!(f, "ReadyNone"),
+            WaiterValue::InitClosurePanicked => write!(f, "InitFuturePanicked"),
+        }
+    }
+}
+
+type Waiter<V> = MiniArc<RwLock<WaiterValue<V>>>;
+
+pub(crate) enum InitResult<V, E> {
+    Initialized(V),
+    ReadExisting(V),
+    InitErr(Arc<E>),
+}
+
+pub(crate) struct ValueInitializer<K, V, S> {
+    // TypeId is the type ID of the concrete error type of generic type E in the
+    // try_get_with method. We use the type ID as a part of the key to ensure that
+    // we can always downcast the trait object ErrorObject (in Waiter<V>) into
+    // its concrete type.
+    waiters: crate::cht::SegmentedHashMap<(Arc<K>, TypeId), Waiter<V>, S>,
+}
+
+impl<K, V, S> ValueInitializer<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn with_hasher(hasher: S) -> Self {
+        Self {
+            waiters: crate::cht::SegmentedHashMap::with_num_segments_and_hasher(
+                WAITER_MAP_NUM_SEGMENTS,
+                hasher,
+            ),
+        }
+    }
+
+    /// # Panics
+    /// Panics if the `init` closure has been panicked.
+    pub(crate) fn try_init_or_read<O, E>(
+        &self,
+        key: &Arc<K>,
+        type_id: TypeId,
+        // Closure to get an existing value from cache.
+        mut get: impl FnMut() -> Option<V>,
+        // Closure to initialize a new value.
+        init: impl FnOnce() -> O,
+        // Closure to insert a new value into cache.
+        mut insert: impl FnMut(V),
+        // Function to convert a value O, returned from the init future, into
+        // Result<V, E>.
+        post_init: fn(O) -> Result<V, E>,
+    ) -> InitResult<V, E>
+    where
+        E: Send + Sync + 'static,
+    {
+        use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+        use InitResult::{InitErr, ReadExisting};
+
+        const MAX_RETRIES: usize = 200;
+        let mut retries = 0;
+
+        let (w_key, w_hash) = self.waiter_key_hash(key, type_id);
+
+        let waiter = MiniArc::new(RwLock::new(WaiterValue::Computing));
+        let mut lock = waiter.write();
+
+        loop {
+            let Some(existing_waiter) = self.try_insert_waiter(w_key.clone(), w_hash, &waiter)
+            else {
+                // Inserted.
+                break;
+            };
+
+            // Somebody else's waiter already exists, so wait for its result to become available.
+            let waiter_result = existing_waiter.read();
+            match &*waiter_result {
+                WaiterValue::Ready(Ok(value)) => return ReadExisting(value.clone()),
+                WaiterValue::Ready(Err(e)) => return InitErr(Arc::clone(e).downcast().unwrap()),
+                // Somebody else's init closure has been panicked.
+                WaiterValue::InitClosurePanicked => {
+                    retries += 1;
+                    assert!(
+                        retries < MAX_RETRIES,
+                        "Too many retries. Tried to read the return value from the `init` \
+                        closure but failed {retries} times. Maybe the `init` kept panicking?"
+                    );
+
+                    // Retry from the beginning.
+                    continue;
+                }
+                // Unexpected state.
+                s @ (WaiterValue::Computing | WaiterValue::ReadyNone) => panic!(
+                    "Got unexpected state `{s:?}` after resolving `init` future. \
+                    This might be a bug in Moka"
+                ),
+            }
+        }
+
+        // Our waiter was inserted.
+
+        // Check if the value has already been inserted by other thread.
+        if let Some(value) = get() {
+            // Yes. Set the waiter value, remove our waiter, and return
+            // the existing value.
+            *lock = WaiterValue::Ready(Ok(value.clone()));
+            self.remove_waiter(w_key, w_hash);
+            return InitResult::ReadExisting(value);
+        }
+
+        // The value still does note exist. Let's evaluate the init
+        // closure. Catching panic is safe here as we do not try to
+        // evaluate the closure again.
+        match catch_unwind(AssertUnwindSafe(init)) {
+            // Evaluated.
+            Ok(value) => {
+                let init_res = match post_init(value) {
+                    Ok(value) => {
+                        insert(value.clone());
+                        *lock = WaiterValue::Ready(Ok(value.clone()));
+                        InitResult::Initialized(value)
+                    }
+                    Err(e) => {
+                        let err: ErrorObject = Arc::new(e);
+                        *lock = WaiterValue::Ready(Err(Arc::clone(&err)));
+                        InitResult::InitErr(err.downcast().unwrap())
+                    }
+                };
+                self.remove_waiter(w_key, w_hash);
+                init_res
+            }
+            // Panicked.
+            Err(payload) => {
+                *lock = WaiterValue::InitClosurePanicked;
+                // Remove the waiter so that others can retry.
+                self.remove_waiter(w_key, w_hash);
+                resume_unwind(payload);
+            }
+        }
+        // The write lock will be unlocked here.
+    }
+
+    /// # Panics
+    /// Panics if the `init` closure has been panicked.
+    pub(crate) fn try_compute<F, O, E>(
+        &self,
+        c_key: Arc<K>,
+        c_hash: u64,
+        cache: &Cache<K, V, S>,
+        f: F,
+        post_init: fn(O) -> Result<Op<V>, E>,
+        allow_nop: bool,
+    ) -> Result<CompResult<K, V>, E>
+    where
+        V: 'static,
+        F: FnOnce(Option<Entry<K, V>>) -> O,
+        E: Send + Sync + 'static,
+    {
+        use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+
+        let type_id = TypeId::of::<ComputeNone>();
+        let (w_key, w_hash) = self.waiter_key_hash(&c_key, type_id);
+        let waiter = MiniArc::new(RwLock::new(WaiterValue::Computing));
+        // NOTE: We have to acquire a write lock before `try_insert_waiter`,
+        // so that any concurrent attempt will get our lock and wait on it.
+        let mut lock = waiter.write();
+
+        loop {
+            let Some(existing_waiter) = self.try_insert_waiter(w_key.clone(), w_hash, &waiter)
+            else {
+                // Inserted.
+                break;
+            };
+
+            // Somebody else's waiter already exists, so wait for it to finish
+            // (wait for it to release the write lock).
+            let waiter_result = existing_waiter.read();
+            match &*waiter_result {
+                // Unexpected state.
+                WaiterValue::Computing => panic!(
+                    "Got unexpected state `Computing` after resolving `init` future. \
+                    This might be a bug in Moka"
+                ),
+                _ => {
+                    // Try to insert our waiter again.
+                    continue;
+                }
+            }
+        }
+
+        // Our waiter was inserted.
+
+        // Get the current value.
+        let ignore_if = None as Option<&mut fn(&V) -> bool>;
+        let maybe_entry = cache
+            .base
+            .get_with_hash_and_ignore_if(&*c_key, c_hash, ignore_if, true);
+        let maybe_value = if allow_nop {
+            maybe_entry.as_ref().map(|ent| ent.value().clone())
+        } else {
+            None
+        };
+        let entry_existed = maybe_entry.is_some();
+
+        // Evaluate the `f` closure. Catching panic is safe here as we will not
+        // evaluate the closure again.
+        let output = match catch_unwind(AssertUnwindSafe(|| f(maybe_entry))) {
+            // Evaluated.
+            Ok(output) => {
+                *lock = WaiterValue::ReadyNone;
+                output
+            }
+            // Panicked.
+            Err(payload) => {
+                *lock = WaiterValue::InitClosurePanicked;
+                // Remove the waiter so that others can retry.
+                self.remove_waiter(w_key, w_hash);
+                resume_unwind(payload);
+            }
+        };
+
+        let op = match post_init(output) {
+            Ok(op) => op,
+            Err(e) => {
+                self.remove_waiter(w_key, w_hash);
+                return Err(e);
+            }
+        };
+
+        let result = match op {
+            Op::Nop => {
+                if let Some(value) = maybe_value {
+                    Ok(CompResult::Unchanged(Entry::new(
+                        Some(c_key),
+                        value,
+                        false,
+use std::{hash::Hash, sync::Arc};
+
+// This trait is implemented by `sync::BaseCache` and `sync::Cache`.
+pub(crate) trait ScanningGet<K, V> {
+    /// Returns the number of segments in the concurrent hash table.
+    fn num_cht_segments(&self) -> usize;
+
+    /// Returns a _clone_ of the value corresponding to the key.
+    ///
+    /// Unlike the `get` method of cache, this method is not considered a cache read
+    /// operation, so it does not update the historic popularity estimator or reset
+    /// the idle timer for the key.
+    fn scanning_get(&self, key: &Arc<K>) -> Option<V>;
+
+    /// Returns a vec of keys in a specified segment of the concurrent hash table.
+    fn keys(&self, cht_segment: usize) -> Option<Vec<Arc<K>>>;
+}
+
+/// Iterator visiting all key-value pairs in a cache in arbitrary order.
+///
+/// Call [`Cache::iter`](./struct.Cache.html#method.iter) method to obtain an `Iter`.
+pub struct Iter<'i, K, V> {
+    keys: Option<Vec<Arc<K>>>,
+    cache_segments: Box<[&'i dyn ScanningGet<K, V>]>,
+    num_cht_segments: usize,
+    cache_seg_index: usize,
+    cht_seg_index: usize,
+    is_done: bool,
+}
+
+impl<'i, K, V> Iter<'i, K, V> {
+    pub(crate) fn with_single_cache_segment(
+        cache: &'i dyn ScanningGet<K, V>,
+        num_cht_segments: usize,
+    ) -> Self {
+        Self {
+            keys: None,
+            cache_segments: Box::new([cache]),
+            num_cht_segments,
+            cache_seg_index: 0,
+            cht_seg_index: 0,
+            is_done: false,
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    pub(crate) fn with_multiple_cache_segments(
+        cache_segments: Box<[&'i dyn ScanningGet<K, V>]>,
+        num_cht_segments: usize,
+    ) -> Self {
+        Self {
+            keys: None,
+            cache_segments,
+            num_cht_segments,
+            cache_seg_index: 0,
+            cht_seg_index: 0,
+            is_done: false,
+        }
+    }
+}
+
+impl<K, V> Iterator for Iter<'_, K, V>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    type Item = (Arc<K>, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.is_done {
+            return None;
+        }
+
+        while let Some(key) = self.next_key() {
+            if let Some(v) = self.cache().scanning_get(&key) {
+                return Some((key, v));
+            }
+        }
+
+        self.is_done = true;
+        None
+    }
+}
+
+impl<'i, K, V> Iter<'i, K, V>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    fn cache(&self) -> &'i dyn ScanningGet<K, V> {
+        self.cache_segments[self.cache_seg_index]
+    }
+
+    fn next_key(&mut self) -> Option<Arc<K>> {
+        while let Some(keys) = self.current_keys() {
+            if let key @ Some(_) = keys.pop() {
+                return key;
+            }
+        }
+        None
+    }
+
+    fn current_keys(&mut self) -> Option<&mut Vec<Arc<K>>> {
+        // If keys is none or some but empty, try to get next keys.
+        while self.keys.as_ref().map_or(true, Vec::is_empty) {
+            // Adjust indices.
+            if self.cht_seg_index >= self.num_cht_segments {
+                self.cache_seg_index += 1;
+                self.cht_seg_index = 0;
+                if self.cache_seg_index >= self.cache_segments.len() {
+                    // No more cache segments left.
+                    return None;
+                }
+            }
+
+            let cache_segment = self.cache_segments[self.cache_seg_index];
+            self.keys = cache_segment.keys(self.cht_seg_index);
+            self.num_cht_segments = cache_segment.num_cht_segments();
+
+            self.cht_seg_index += 1;
+        }
+
+        self.keys.as_mut()
+    }
+}
+
+// Clippy beta 0.1.83 (f41c7ed9889 2024-10-31) warns about unused lifetimes on 'a.
+// This seems a false positive. The lifetimes are used in the Send and Sync impls.
+// Let's suppress the warning.
+// https://rust-lang.github.io/rust-clippy/master/index.html#extra_unused_lifetimes
+#[allow(clippy::extra_unused_lifetimes)]
+unsafe impl<'a, K, V> Send for Iter<'_, K, V>
+where
+    K: 'a + Eq + Hash + Send,
+    V: 'a + Send,
+{
+}
+
+// Clippy beta 0.1.83 (f41c7ed9889 2024-10-31) warns about unused lifetimes on 'a.
+// This seems a false positive. The lifetimes are used in the Send and Sync impls.
+// Let's suppress the warning.
+// https://rust-lang.github.io/rust-clippy/master/index.html#extra_unused_lifetimes
+#[allow(clippy::extra_unused_lifetimes)]
+unsafe impl<'a, K, V> Sync for Iter<'_, K, V>
+where
+    K: 'a + Eq + Hash + Sync,
+    V: 'a + Sync,
+{
+}
+#!/usr/bin/env python3
+import json
+d = json.load(open("/work/.budget.json"))
+print(str(d["active_seconds"] / 60) + " minutes used of " + str(d["budget_seconds"] / 60))
+total 8
+drwxr-xr-x 2 audit audit 4096 Nov  3 07:19 .
+drwxr-xr-x 1 root  root  4096 Nov  3 23:47 ..

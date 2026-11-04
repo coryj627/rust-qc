@@ -1,0 +1,1125 @@
+// A lot of this logic is a re-implementation or copy of serde_json::Value
+use crate::ErrorType;
+use crate::{Error, ObjectHasher};
+use crate::{
+    prelude::*,
+    serde::value::shared::MapKeyDeserializer,
+    value::owned::{Object, Value},
+};
+use serde_ext::{
+    de::{
+        self, Deserialize, DeserializeSeed, Deserializer, EnumAccess, IntoDeserializer, MapAccess,
+        SeqAccess, VariantAccess, Visitor,
+    },
+    forward_to_deserialize_any,
+};
+use std::fmt;
+
+impl<'de> de::Deserializer<'de> for Value {
+    type Error = Error;
+
+    // Look at the input data to decide what Serde data model type to
+    // deserialize as. Not all data formats are able to support this operation.
+    // Formats that support `deserialize_any` are known as self-describing.
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self {
+            Value::Static(StaticNode::Null) => visitor.visit_unit(),
+            Value::Static(StaticNode::Bool(b)) => visitor.visit_bool(b),
+            Value::Static(StaticNode::I64(n)) => visitor.visit_i64(n),
+            #[cfg(feature = "128bit")]
+            Value::Static(StaticNode::I128(n)) => visitor.visit_i128(n),
+            Value::Static(StaticNode::U64(n)) => visitor.visit_u64(n),
+            #[cfg(feature = "128bit")]
+            Value::Static(StaticNode::U128(n)) => visitor.visit_u128(n),
+            #[allow(clippy::useless_conversion)] // .into() required by ordered-float
+            Value::Static(StaticNode::F64(n)) => visitor.visit_f64(n.into()),
+            Value::String(s) => visitor.visit_string(s),
+            Value::Array(a) => visitor.visit_seq(Array(a.into_iter())),
+            Value::Object(o) => visitor.visit_map(ObjectAccess {
+                i: o.into_iter(),
+                v: None,
+            }),
+        }
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn deserialize_option<V>(self, visitor: V) -> Result<V::Value, Error>
+    where
+        V: Visitor<'de>,
+    {
+        if self == Value::Static(StaticNode::Null) {
+            visitor.visit_unit()
+        } else {
+            visitor.visit_some(self)
+        }
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn deserialize_enum<V>(
+        self,
+        _name: &str,
+        _variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Error>
+    where
+        V: Visitor<'de>,
+    {
+        let (variant, value) = match self {
+            Value::Object(value) => {
+                let mut iter = value.into_iter();
+                let Some((variant, value)) = iter.next() else {
+                    return Err(crate::Deserializer::error(ErrorType::Eof));
+                };
+                // enums are encoded in json as maps with a single key:value pair
+                if iter.next().is_some() {
+                    return Err(crate::Deserializer::error(ErrorType::TrailingData));
+                }
+                (variant, Some(value))
+            }
+            Value::String(variant) => (variant, None),
+            other => {
+                return Err(crate::Deserializer::error(ErrorType::Unexpected(
+                    Some(ValueType::Object),
+                    Some(other.value_type()),
+                )));
+            }
+        };
+
+        visitor.visit_enum(EnumDeserializer { variant, value })
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn deserialize_newtype_struct<V>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Error>
+    where
+        V: Visitor<'de>,
+    {
+        visitor.visit_newtype_struct(self)
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn deserialize_struct<V>(
+        self,
+        _name: &'static str,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Error>
+    where
+        V: Visitor<'de>,
+    {
+        match self {
+            // Give the visitor access to each element of the sequence.
+            Value::Array(a) => visitor.visit_seq(Array(a.into_iter())),
+            Value::Object(o) => visitor.visit_map(ObjectAccess::new(o.into_iter())),
+            other => Err(crate::Deserializer::error(ErrorType::Unexpected(
+                Some(ValueType::Object),
+                Some(other.value_type()),
+            ))),
+        }
+    }
+
+    forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf unit unit_struct seq tuple
+            tuple_struct map identifier ignored_any
+    }
+}
+
+struct Array(std::vec::IntoIter<Value>);
+
+// `SeqAccess` is provided to the `Visitor` to give it the ability to iterate
+// through elements of the sequence.
+impl<'de> SeqAccess<'de> for Array {
+    type Error = Error;
+
+    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+    where
+        T: DeserializeSeed<'de>,
+    {
+        self.0
+            .next()
+            .map_or(Ok(None), |v| seed.deserialize(v).map(Some))
+    }
+}
+
+struct ArrayRef<'de>(std::slice::Iter<'de, Value>);
+
+// `SeqAccess` is provided to the `Visitor` to give it the ability to iterate
+// through elements of the sequence.
+impl<'de> SeqAccess<'de> for ArrayRef<'de> {
+    type Error = Error;
+
+    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>, Self::Error>
+    where
+        T: DeserializeSeed<'de>,
+    {
+        self.0
+            .next()
+            .map_or(Ok(None), |v| seed.deserialize(v).map(Some))
+    }
+}
+
+struct ObjectAccess<const N: usize = 32> {
+    i: halfbrown::IntoIter<String, Value, N>,
+    v: Option<Value>,
+}
+
+impl<const N: usize> ObjectAccess<N> {
+    fn new(i: halfbrown::IntoIter<String, Value, N>) -> Self {
+        Self { i, v: None }
+    }
+}
+// `MapAccess` is provided to the `Visitor` to give it the ability to iterate
+// through entries of the map.
+impl<'de> MapAccess<'de> for ObjectAccess {
+    type Error = Error;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+    where
+        K: DeserializeSeed<'de>,
+    {
+        match self.i.next() {
+            Some((k, v)) => {
+                self.v = Some(v);
+                seed.deserialize(Value::String(k)).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+    where
+        V: DeserializeSeed<'de>,
+    {
+        match self.v.take() {
+            Some(v) => seed.deserialize(v),
+            None => Err(crate::Deserializer::error(ErrorType::Eof)),
+        }
+    }
+}
+
+struct ObjectRefAccess<'de> {
+    i: halfbrown::Iter<'de, String, Value>,
+    v: Option<&'de Value>,
+}
+
+impl<'de> ObjectRefAccess<'de> {
+    fn new(i: halfbrown::Iter<'de, String, Value>) -> Self {
+        Self { i, v: None }
+    }
+}
+
+// `MapAccess` is provided to the `Visitor` to give it the ability to iterate
+// through entries of the map.
+impl<'de> MapAccess<'de> for ObjectRefAccess<'de> {
+    type Error = Error;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+    where
+        K: DeserializeSeed<'de>,
+    {
+        if let Some((k, v)) = self.i.next() {
+            self.v = Some(v);
+            seed.deserialize(MapKeyDeserializer::borrowed(k)).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+    where
+        V: DeserializeSeed<'de>,
+    {
+        match self.v.take() {
+            Some(v) => seed.deserialize(v),
+            None => Err(crate::Deserializer::error(ErrorType::Eof)),
+use super::to_value;
+use crate::{
+    Error, ErrorType, Result,
+    cow::Cow,
+    macros::stry,
+    value::borrowed::{Object, Value},
+};
+use crate::{ObjectHasher, StaticNode};
+use serde_ext::ser::{
+    self, Serialize, SerializeMap as SerializeMapTrait, SerializeSeq as SerializeSeqTrait,
+};
+use std::marker::PhantomData;
+
+type Impossible<T> = ser::Impossible<T, Error>;
+
+impl Serialize for Value<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: ser::Serializer,
+    {
+        match self {
+            Value::Static(StaticNode::Null) => serializer.serialize_unit(),
+            Value::Static(StaticNode::Bool(b)) => serializer.serialize_bool(*b),
+            #[allow(clippy::useless_conversion)] // .into() required by ordered-float
+            Value::Static(StaticNode::F64(f)) => serializer.serialize_f64((*f).into()),
+            Value::Static(StaticNode::U64(i)) => serializer.serialize_u64(*i),
+            #[cfg(feature = "128bit")]
+            Value::Static(StaticNode::U128(i)) => serializer.serialize_u128(*i),
+            Value::Static(StaticNode::I64(i)) => serializer.serialize_i64(*i),
+            #[cfg(feature = "128bit")]
+            Value::Static(StaticNode::I128(i)) => serializer.serialize_i128(*i),
+            Value::String(s) => serializer.serialize_str(s),
+            Value::Array(v) => {
+                let mut seq = serializer.serialize_seq(Some(v.len()))?;
+                for e in v.as_ref() {
+                    seq.serialize_element(e)?;
+                }
+                seq.end()
+            }
+            Value::Object(m) => {
+                let mut map = serializer.serialize_map(Some(m.len()))?;
+                for (k, v) in m.iter() {
+                    let k: &str = k;
+                    map.serialize_entry(k, v)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+pub struct Serializer<'se> {
+    marker: PhantomData<&'se u8>,
+}
+
+impl Default for Serializer<'_> {
+    fn default() -> Self {
+        Self {
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<'se> serde::Serializer for Serializer<'se> {
+    type Ok = Value<'se>;
+    type Error = Error;
+
+    type SerializeSeq = SerializeVec<'se>;
+    type SerializeTuple = SerializeVec<'se>;
+    type SerializeTupleStruct = SerializeVec<'se>;
+    type SerializeTupleVariant = SerializeTupleVariant<'se>;
+    type SerializeMap = SerializeMap<'se>;
+    type SerializeStruct = SerializeMap<'se>;
+    type SerializeStructVariant = SerializeStructVariant<'se>;
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_bool(self, value: bool) -> Result<Value<'se>> {
+        Ok(Value::Static(StaticNode::Bool(value)))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_i8(self, value: i8) -> Result<Value<'se>> {
+        self.serialize_i64(i64::from(value))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_i16(self, value: i16) -> Result<Value<'se>> {
+        self.serialize_i64(i64::from(value))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_i32(self, value: i32) -> Result<Value<'se>> {
+        self.serialize_i64(i64::from(value))
+    }
+
+    fn serialize_i64(self, value: i64) -> Result<Value<'se>> {
+        Ok(Value::Static(StaticNode::I64(value)))
+    }
+
+    #[cfg(feature = "128bit")]
+    fn serialize_i128(self, value: i128) -> Result<Value<'se>> {
+        Ok(Value::Static(StaticNode::I128(value)))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_u8(self, value: u8) -> Result<Value<'se>> {
+        self.serialize_u64(u64::from(value))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_u16(self, value: u16) -> Result<Value<'se>> {
+        self.serialize_u64(u64::from(value))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_u32(self, value: u32) -> Result<Value<'se>> {
+        self.serialize_u64(u64::from(value))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_u64(self, value: u64) -> Result<Value<'se>> {
+        Ok(Value::Static(StaticNode::U64(value)))
+    }
+
+    #[cfg(feature = "128bit")]
+    fn serialize_u128(self, value: u128) -> Result<Value<'se>> {
+        Ok(Value::Static(StaticNode::U128(value)))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_f32(self, value: f32) -> Result<Value<'se>> {
+        self.serialize_f64(f64::from(value))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_f64(self, value: f64) -> Result<Value<'se>> {
+        Ok(Value::Static(StaticNode::from(value)))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_char(self, value: char) -> Result<Value<'se>> {
+        let mut s = String::new();
+        s.push(value);
+        self.serialize_str(&s)
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_str(self, value: &str) -> Result<Value<'se>> {
+        Ok(Value::from(value.to_owned()))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_bytes(self, value: &[u8]) -> Result<Value<'se>> {
+        Ok(value.iter().copied().collect())
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_unit(self) -> Result<Value<'se>> {
+        Ok(Value::Static(StaticNode::Null))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_unit_struct(self, _name: &'static str) -> Result<Value<'se>> {
+        self.serialize_unit()
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_unit_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        variant: &'static str,
+    ) -> Result<Value<'se>> {
+        self.serialize_str(variant)
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_newtype_struct<T>(self, _name: &'static str, value: &T) -> Result<Value<'se>>
+    where
+        T: ?Sized + Serialize,
+use super::to_value;
+use crate::{
+    Error, ErrorType, ObjectHasher, Result, StaticNode,
+    macros::stry,
+    value::owned::{Object, Value},
+};
+use serde_ext::ser::{
+    self, Serialize, SerializeMap as SerializeMapTrait, SerializeSeq as SerializeSeqTrait,
+};
+
+type Impossible<T> = ser::Impossible<T, Error>;
+
+impl Serialize for Value {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: ser::Serializer,
+    {
+        match self {
+            Value::Static(StaticNode::Null) => serializer.serialize_unit(),
+            Value::Static(StaticNode::Bool(b)) => serializer.serialize_bool(*b),
+            #[allow(clippy::useless_conversion)] // .into() required by ordered-float
+            Value::Static(StaticNode::F64(f)) => serializer.serialize_f64((*f).into()),
+            Value::Static(StaticNode::U64(i)) => serializer.serialize_u64(*i),
+            #[cfg(feature = "128bit")]
+            Value::Static(StaticNode::U128(i)) => serializer.serialize_u128(*i),
+            Value::Static(StaticNode::I64(i)) => serializer.serialize_i64(*i),
+            #[cfg(feature = "128bit")]
+            Value::Static(StaticNode::I128(i)) => serializer.serialize_i128(*i),
+            Value::String(s) => serializer.serialize_str(s),
+            Value::Array(v) => {
+                let mut seq = serializer.serialize_seq(Some(v.len()))?;
+                for e in v.as_ref() {
+                    seq.serialize_element(e)?;
+                }
+                seq.end()
+            }
+            Value::Object(m) => {
+                let mut map = serializer.serialize_map(Some(m.len()))?;
+                for (k, v) in m.iter() {
+                    map.serialize_entry(k, v)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct Serializer {}
+
+impl serde::Serializer for Serializer {
+    type Ok = Value;
+    type Error = Error;
+
+    type SerializeSeq = SerializeVec;
+    type SerializeTuple = SerializeVec;
+    type SerializeTupleStruct = SerializeVec;
+    type SerializeTupleVariant = SerializeTupleVariant;
+    type SerializeMap = SerializeMap;
+    type SerializeStruct = SerializeMap;
+    type SerializeStructVariant = SerializeStructVariant;
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_bool(self, value: bool) -> Result<Value> {
+        Ok(Value::Static(StaticNode::Bool(value)))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_i8(self, value: i8) -> Result<Value> {
+        self.serialize_i64(i64::from(value))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_i16(self, value: i16) -> Result<Value> {
+        self.serialize_i64(i64::from(value))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_i32(self, value: i32) -> Result<Value> {
+        self.serialize_i64(i64::from(value))
+    }
+
+    fn serialize_i64(self, value: i64) -> Result<Value> {
+        Ok(Value::Static(StaticNode::I64(value)))
+    }
+
+    #[cfg(feature = "128bit")]
+    fn serialize_i128(self, value: i128) -> Result<Value> {
+        Ok(Value::Static(StaticNode::I128(value)))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_u8(self, value: u8) -> Result<Value> {
+        self.serialize_u64(u64::from(value))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_u16(self, value: u16) -> Result<Value> {
+        self.serialize_u64(u64::from(value))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_u32(self, value: u32) -> Result<Value> {
+        self.serialize_u64(u64::from(value))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_u64(self, value: u64) -> Result<Value> {
+        Ok(Value::Static(StaticNode::U64(value)))
+    }
+
+    #[cfg(feature = "128bit")]
+    fn serialize_u128(self, value: u128) -> Result<Value> {
+        Ok(Value::Static(StaticNode::U128(value)))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_f32(self, value: f32) -> Result<Value> {
+        self.serialize_f64(f64::from(value))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_f64(self, value: f64) -> Result<Value> {
+        Ok(Value::Static(StaticNode::from(value)))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_char(self, value: char) -> Result<Value> {
+        let mut s = String::new();
+        s.push(value);
+        self.serialize_str(&s)
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_str(self, value: &str) -> Result<Value> {
+        Ok(Value::from(value.to_owned()))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_bytes(self, value: &[u8]) -> Result<Value> {
+        Ok(value.iter().copied().collect())
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_unit(self) -> Result<Value> {
+        Ok(Value::Static(StaticNode::Null))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_unit_struct(self, _name: &'static str) -> Result<Value> {
+        self.serialize_unit()
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_unit_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        variant: &'static str,
+    ) -> Result<Value> {
+        self.serialize_str(variant)
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_newtype_struct<T>(self, _name: &'static str, value: &T) -> Result<Value>
+    where
+        T: ?Sized + Serialize,
+    {
+        value.serialize(self)
+    }
+
+    fn serialize_newtype_variant<T>(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        variant: &'static str,
+        value: &T,
+    ) -> Result<Value>
+    where
+        T: ?Sized + Serialize,
+use crate::{Error, ErrorType, macros::stry};
+use serde_ext::ser;
+use std::io::Write;
+use std::str;
+use value_trait::generator::BaseGenerator;
+
+use super::key_must_be_a_string;
+
+macro_rules! iomap {
+    ($e:expr_2021) => {
+        ($e).map_err(|err| Error::generic(ErrorType::Io(err)))
+    };
+}
+
+/// Write a value to a vector
+/// # Errors
+/// when the data can not be written
+#[cfg_attr(not(feature = "no-inline"), inline)]
+pub fn to_vec_pretty<T>(to: &T) -> crate::Result<Vec<u8>>
+where
+    T: ser::Serialize + ?Sized,
+{
+    let v = Vec::with_capacity(512);
+    let mut s = PrettySerializer::new(v);
+    to.serialize(&mut s).map(|()| s.writer)
+}
+
+/// Write a value to a string
+///
+/// # Errors
+/// when the data can not be written
+#[cfg_attr(not(feature = "no-inline"), inline)]
+pub fn to_string_pretty<T>(to: &T) -> crate::Result<String>
+where
+    T: ser::Serialize + ?Sized,
+{
+    to_vec_pretty(to).map(|v| unsafe { String::from_utf8_unchecked(v) })
+}
+
+/// Write a value to a string
+/// # Errors
+/// when the data can not be written
+#[cfg_attr(not(feature = "no-inline"), inline)]
+pub fn to_writer_pretty<T, W>(writer: W, to: &T) -> crate::Result<()>
+where
+    T: ser::Serialize + ?Sized,
+    W: Write,
+{
+    let mut s = PrettySerializer::new(writer);
+    to.serialize(&mut s)
+}
+struct PrettySerializer<W: Write> {
+    writer: W,
+    dent: u32,
+}
+impl<W: Write> PrettySerializer<W> {
+    fn new(writer: W) -> Self {
+        Self { writer, dent: 0 }
+    }
+}
+
+impl<W> BaseGenerator for PrettySerializer<W>
+where
+    W: Write,
+{
+    type T = W;
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn get_writer(&mut self) -> &mut Self::T {
+        &mut self.writer
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn write_min(&mut self, _slice: &[u8], min: u8) -> std::io::Result<()> {
+        self.writer.write_all(&[min])
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn new_line(&mut self) -> std::io::Result<()> {
+        self.write_char(b'\n').and_then(|()| match self.dent {
+            0 => Ok(()),
+            1 => self.get_writer().write_all(b"  "),
+            2 => self.get_writer().write_all(b"    "),
+            3 => self.get_writer().write_all(b"      "),
+            4 => self.get_writer().write_all(b"        "),
+            5 => self.get_writer().write_all(b"          "),
+            6 => self.get_writer().write_all(b"            "),
+            7 => self.get_writer().write_all(b"              "),
+            8 => self.get_writer().write_all(b"                "),
+            9 => self.get_writer().write_all(b"                  "),
+            _ => {
+                for _ in 0..(self.dent * 2) {
+                    stry!(self.get_writer().write_all(b" "));
+                }
+                Ok(())
+            }
+        })
+    }
+
+    fn indent(&mut self) {
+        self.dent += 1;
+    }
+
+    fn dedent(&mut self) {
+        self.dent -= 1;
+    }
+}
+struct SerializeSeq<'serializer, W: Write + 'serializer> {
+    s: &'serializer mut PrettySerializer<W>,
+    first: bool,
+}
+impl<W> ser::SerializeSeq for SerializeSeq<'_, W>
+where
+    W: Write,
+{
+    type Ok = ();
+    type Error = Error;
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_element<T>(&mut self, value: &T) -> Result<(), Self::Error>
+    where
+        T: ?Sized + serde_ext::Serialize,
+    {
+        let SerializeSeq {
+            ref mut s,
+            ref mut first,
+            ..
+        } = *self;
+        if *first {
+            *first = false;
+            iomap!(s.new_line()).and_then(|()| value.serialize(&mut **s))
+        } else {
+            iomap!(s.write(b",").and_then(|()| s.new_line()))
+                .and_then(|()| value.serialize(&mut **s))
+        }
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        if self.first {
+            Ok(())
+        } else {
+            self.s.dedent();
+            iomap!(self.s.new_line().and_then(|()| self.s.write(b"]")))
+        }
+    }
+}
+
+impl<W> ser::SerializeTuple for SerializeSeq<'_, W>
+where
+    W: Write,
+{
+    type Ok = ();
+    type Error = Error;
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+use serde::{
+    Deserialize, Deserializer,
+    de::{Error as DeError, Visitor},
+};
+use std::fmt::{Formatter, Result as FmtResult};
+
+const JSON: &str = r#"{
+    "channels": [
+      {
+        "default_auto_archive_duration": 10080
+      }
+    ],
+    "unavailable": false
+}"#;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(untagged)]
+pub enum GuildCreate {
+    Available(Guild),
+    Unavailable(UnavailableGuild),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
+pub struct UnavailableGuild {
+    pub unavailable: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Hash)]
+pub struct Guild {
+    pub channels: Vec<Channel>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
+pub struct Channel {
+    pub default_auto_archive_duration: Option<AutoArchiveDuration>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+// Fix 1: Uncomment this and comment the handwritten deser impl.
+// #[derive(Deserialize)]
+// #[serde(from = "u16")]
+pub enum AutoArchiveDuration {
+    Hour,
+    Day,
+    ThreeDays,
+    Week,
+    Unknown { value: u16 },
+}
+
+impl From<u16> for AutoArchiveDuration {
+    fn from(value: u16) -> Self {
+        match value {
+            60 => Self::Hour,
+            1440 => Self::Day,
+            4320 => Self::ThreeDays,
+            10080 => Self::Week,
+            value => Self::Unknown { value },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AutoArchiveDuration {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_u16(U16EnumVisitor).map(u16::into)
+    }
+}
+
+pub struct U16EnumVisitor;
+
+impl Visitor<'_> for U16EnumVisitor {
+    type Value = u16;
+
+    fn expecting(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.write_str("u16")
+    }
+
+    fn visit_u16<E: DeError>(self, value: u16) -> Result<Self::Value, E> {
+        Ok(value)
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E>
+    where
+        E: DeError,
+    {
+        v.try_into().map_err(DeError::custom)
+    }
+
+    // Fix 2: Uncomment this
+    // fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E>
+    // where
+    //     E: DeError,
+    // {
+    //     v.try_into().map_err(DeError::custom)
+    // }
+}
+
+#[test]
+fn test_deser_u16() -> Result<(), Box<dyn std::error::Error>> {
+    unsafe {
+        let mut json = JSON.to_string();
+        let a = dbg!(crate::from_str::<Guild>(&mut json)?);
+        let b = dbg!(crate::from_str::<UnavailableGuild>(&mut json)?);
+        let c = dbg!(crate::from_str::<GuildCreate>(&mut json)?);
+        assert_eq!(a, serde_json::from_str::<Guild>(&json)?);
+        assert_eq!(b, serde_json::from_str::<UnavailableGuild>(&json)?);
+        assert_eq!(c, serde_json::from_str::<GuildCreate>(&json)?);
+    };
+    Ok(())
+}
+            .ok_or_else(|| Self::error(ErrorType::Eof))
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[allow(clippy::cast_sign_loss)]
+    fn parse_u8(&mut self) -> Result<u8> {
+        match unsafe { self.next_() } {
+            Node::Static(s) => s
+                .as_u8()
+                .ok_or_else(|| Self::error(ErrorType::ExpectedUnsigned)),
+            _ => Err(Self::error(ErrorType::ExpectedUnsigned)),
+        }
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[allow(clippy::cast_sign_loss)]
+    fn parse_u16(&mut self) -> Result<u16> {
+        let next = unsafe { self.next_() };
+        match next {
+            Node::Static(s) => s
+                .as_u16()
+                .ok_or_else(|| Self::error(ErrorType::ExpectedUnsigned)),
+            _ => Err(Self::error(ErrorType::ExpectedUnsigned)),
+        }
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[allow(clippy::cast_sign_loss)]
+    fn parse_u32(&mut self) -> Result<u32> {
+        match unsafe { self.next_() } {
+            Node::Static(s) => s
+                .as_u32()
+                .ok_or_else(|| Self::error(ErrorType::ExpectedUnsigned)),
+            _ => Err(Self::error(ErrorType::ExpectedUnsigned)),
+        }
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[allow(clippy::cast_sign_loss)]
+    fn parse_u64(&mut self) -> Result<u64> {
+        match unsafe { self.next_() } {
+            Node::Static(s) => s
+                .as_u64()
+                .ok_or_else(|| Self::error(ErrorType::ExpectedUnsigned)),
+            _ => Err(Self::error(ErrorType::ExpectedUnsigned)),
+        }
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[allow(clippy::cast_sign_loss)]
+    fn parse_u128(&mut self) -> Result<u128> {
+        match unsafe { self.next_() } {
+            Node::Static(s) => s
+                .as_u128()
+                .ok_or_else(|| Self::error(ErrorType::ExpectedUnsigned)),
+            _ => Err(Self::error(ErrorType::ExpectedUnsigned)),
+        }
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[allow(clippy::cast_sign_loss)]
+    fn parse_i8(&mut self) -> Result<i8> {
+        match unsafe { self.next_() } {
+            Node::Static(s) => s
+                .as_i8()
+                .ok_or_else(|| Self::error(ErrorType::ExpectedSigned)),
+            _ => Err(Self::error(ErrorType::ExpectedSigned)),
+        }
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[allow(clippy::cast_sign_loss)]
+    fn parse_i16(&mut self) -> Result<i16> {
+        match unsafe { self.next_() } {
+            Node::Static(s) => s
+                .as_i16()
+                .ok_or_else(|| Self::error(ErrorType::ExpectedSigned)),
+            _ => Err(Self::error(ErrorType::ExpectedSigned)),
+        }
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[allow(clippy::cast_sign_loss)]
+    fn parse_i32(&mut self) -> Result<i32> {
+        match unsafe { self.next_() } {
+            Node::Static(s) => s
+                .as_i32()
+                .ok_or_else(|| Self::error(ErrorType::ExpectedSigned)),
+            _ => Err(Self::error(ErrorType::ExpectedSigned)),
+        }
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[allow(clippy::cast_sign_loss)]
+    fn parse_i64(&mut self) -> Result<i64> {
+        match unsafe { self.next_() } {
+            Node::Static(s) => s
+                .as_i64()
+                .ok_or_else(|| Self::error(ErrorType::ExpectedSigned)),
+            _ => Err(Self::error(ErrorType::ExpectedSigned)),
+        }
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[allow(clippy::cast_sign_loss)]
+    fn parse_i128(&mut self) -> Result<i128> {
+        match unsafe { self.next_() } {
+            Node::Static(s) => s
+                .as_i128()
+                .ok_or_else(|| Self::error(ErrorType::ExpectedSigned)),
+            _ => Err(Self::error(ErrorType::ExpectedSigned)),
+        }
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+    fn parse_double(&mut self) -> Result<f64> {
+        match unsafe { self.next_() } {
+            #[allow(clippy::useless_conversion)] // .into() required by ordered-float
+            Node::Static(StaticNode::F64(n)) => Ok(n.into()),
+            Node::Static(StaticNode::I64(n)) => Ok(n as f64),
+            Node::Static(StaticNode::U64(n)) => Ok(n as f64),
+            _ => Err(Self::error(ErrorType::ExpectedFloat)),
+        }
+    }
+}
+
+impl TryFrom<serde_json::Value> for OwnedValue {
+    type Error = SerdeConversionError;
+    fn try_from(item: serde_json::Value) -> ConvertResult<Self> {
+        use serde_json::Value;
+        Ok(match item {
+            Value::Null => Self::Static(StaticNode::Null),
+            Value::Bool(b) => Self::Static(StaticNode::Bool(b)),
+            Value::Number(b) => {
+                if let Some(n) = b.as_i64() {
+                    Self::Static(StaticNode::I64(n))
+                } else if let Some(n) = b.as_u64() {
+                    Self::Static(StaticNode::U64(n))
+                } else if let Some(n) = b.as_f64() {
+                    Self::Static(StaticNode::from(n))
+                } else {
+                    return Err(SerdeConversionError::Oops);
+                }
+            }
+            Value::String(b) => Self::String(b),
+            Value::Array(a) => a
+                .into_iter()
+                .map(Self::try_from)
+                .collect::<ConvertResult<Self>>()?,
+            Value::Object(o) => o
+                .into_iter()
+                .map(|(k, v)| Ok((k, Self::try_from(v)?)))
+                .collect::<ConvertResult<Self>>()?,
+        })
+    }
+}
+
+impl TryInto<serde_json::Value> for OwnedValue {
+    type Error = SerdeConversionError;
+    fn try_into(self) -> ConvertResult<serde_json::Value> {
+        use serde_json::Value;
+        Ok(match self {
+            Self::Static(StaticNode::Null) => Value::Null,
+            Self::Static(StaticNode::Bool(b)) => Value::Bool(b),
+            Self::Static(StaticNode::I64(n)) => Value::Number(n.into()),
+            #[cfg(feature = "128bit")] // FIXME error for too large numbers
+            Self::Static(StaticNode::I128(n)) => Value::Number(
+                i64::try_from(n)
+                    .map_err(|_| SerdeConversionError::NumberOutOfBounds)?
+                    .into(),
+            ),
+            Self::Static(StaticNode::U64(n)) => Value::Number(n.into()),
+            #[cfg(feature = "128bit")] // FIXME error for too large numbers
+            Self::Static(StaticNode::U128(n)) => Value::Number(
+                u64::try_from(n)
+                    .map_err(|_| SerdeConversionError::NumberOutOfBounds)?
+                    .into(),
+            ),
+            Self::Static(StaticNode::F64(n)) => {
+                #[allow(clippy::useless_conversion)] // .into() required by ordered-float
+                if let Some(n) = serde_json::Number::from_f64(n.into()) {
+                    Value::Number(n)
+                } else {
+                    return Err(SerdeConversionError::NanOrInfinity);
+                }
+            }
+            Self::String(b) => Value::String(b),
+            Self::Array(a) => Value::Array(
+                a.into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<ConvertResult<Vec<Value>>>()?,
+            ),
+            Self::Object(o) => Value::Object(
+                o.into_iter()
+                    .map(|(k, v)| Ok((k, v.try_into()?)))
+                    .collect::<ConvertResult<serde_json::map::Map<String, Value>>>()?,
+            ),
+        })
+    }
+}
+
+impl TryFrom<serde_json::Value> for BorrowedValue<'_> {
+    type Error = SerdeConversionError;
+    fn try_from(item: serde_json::Value) -> ConvertResult<Self> {
+        use serde_json::Value;
+        match item {
+            Value::Null => Ok(BorrowedValue::from(())),
+            Value::Bool(b) => Ok(BorrowedValue::from(b)),
+            Value::Number(b) => match (b.as_i64(), b.as_u64(), b.as_f64()) {
+                (Some(n), _, _) => Ok(Self::from(n)),
+                (_, Some(n), _) => Ok(Self::from(n)),
+                (_, _, Some(n)) => Ok(Self::from(n)),
+                _ => Err(SerdeConversionError::Oops),
+            },
+            Value::String(b) => Ok(Self::String(b.into())),
+            Value::Array(a) => a.into_iter().map(Self::try_from).collect(),
+            Value::Object(o) => o
+                .into_iter()
+                .map(|(k, v)| Ok((k, Self::try_from(v)?)))
+                .collect(),
+        }
+    }
+}
+
+impl TryInto<serde_json::Value> for BorrowedValue<'_> {
+    type Error = SerdeConversionError;
+    fn try_into(self) -> ConvertResult<serde_json::Value> {
+        use serde_json::Value;
+        Ok(match self {
+            BorrowedValue::Static(StaticNode::Null) => Value::Null,
+            BorrowedValue::Static(StaticNode::Bool(b)) => Value::Bool(b),
+            BorrowedValue::Static(StaticNode::I64(n)) => Value::Number(n.into()),
+            #[cfg(feature = "128bit")] // FIXME error for too large numbers
+            BorrowedValue::Static(StaticNode::I128(n)) => Value::Number(
+                i64::try_from(n)
+                    .map_err(|_| SerdeConversionError::NumberOutOfBounds)?
+                    .into(),
+            ),
+            BorrowedValue::Static(StaticNode::U64(n)) => Value::Number(n.into()),
+            #[cfg(feature = "128bit")] // FIXME error for too large numbers
+            BorrowedValue::Static(StaticNode::U128(n)) => Value::Number(
+                u64::try_from(n)
+                    .map_err(|_| SerdeConversionError::NumberOutOfBounds)?
+                    .into(),
+            ),
+            BorrowedValue::Static(StaticNode::F64(n)) => {
+                #[allow(clippy::useless_conversion)] // .into() required by ordered-float
+                if let Some(n) = serde_json::Number::from_f64(n.into()) {
+                    Value::Number(n)
+                } else {
+                    return Err(SerdeConversionError::NanOrInfinity);
+                }
+            }
+            BorrowedValue::String(b) => Value::String(b.to_string()),
+            BorrowedValue::Array(a) => Value::Array(
+                a.into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<ConvertResult<Vec<Value>>>()?,
+            ),
+            BorrowedValue::Object(o) => Value::Object(
+                o.into_iter()
+                    .map(|(k, v)| Ok((k.to_string(), v.try_into()?)))
+                    .collect::<ConvertResult<serde_json::map::Map<String, Value>>>()?,
+            ),
+        })

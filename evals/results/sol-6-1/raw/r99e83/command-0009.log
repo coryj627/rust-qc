@@ -1,0 +1,1058 @@
+mod error;
+mod framed_read;
+mod framed_write;
+
+pub use self::error::{SendError, UserError};
+
+use self::framed_read::FramedRead;
+use self::framed_write::FramedWrite;
+
+use crate::frame::{self, Data, Frame};
+use crate::proto::Error;
+
+use bytes::Buf;
+use futures_core::Stream;
+use futures_sink::Sink;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_util::codec::length_delimited;
+
+use std::io;
+
+#[derive(Debug)]
+pub struct Codec<T, B> {
+    inner: FramedRead<FramedWrite<T, B>>,
+}
+
+impl<T, B> Codec<T, B>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+    B: Buf,
+{
+    /// Returns a new `Codec` with the default max frame size
+    #[inline]
+    pub fn new(io: T) -> Self {
+        Self::with_max_recv_frame_size(io, frame::DEFAULT_MAX_FRAME_SIZE as usize)
+    }
+
+    /// Returns a new `Codec` with the given maximum frame size
+    pub fn with_max_recv_frame_size(io: T, max_frame_size: usize) -> Self {
+        // Wrap with writer
+        let framed_write = FramedWrite::new(io);
+
+        // Delimit the frames
+        let delimited = length_delimited::Builder::new()
+            .big_endian()
+            .length_field_length(3)
+            .length_adjustment(9)
+            .num_skip(0) // Don't skip the header
+            .new_read(framed_write);
+
+        let mut inner = FramedRead::new(delimited);
+
+        // Use FramedRead's method since it checks the value is within range.
+        inner.set_max_frame_size(max_frame_size);
+
+        Codec { inner }
+    }
+}
+
+impl<T, B> Codec<T, B> {
+    /// Updates the max received frame size.
+    ///
+    /// The change takes effect the next time a frame is decoded. In other
+    /// words, if a frame is currently in process of being decoded with a frame
+    /// size greater than `val` but less than the max frame size in effect
+    /// before calling this function, then the frame will be allowed.
+    #[inline]
+    pub fn set_max_recv_frame_size(&mut self, val: usize) {
+        self.inner.set_max_frame_size(val)
+    }
+
+    /// Returns the current max received frame size setting.
+    ///
+    /// This is the largest size this codec will accept from the wire. Larger
+    /// frames will be rejected.
+    #[cfg(feature = "unstable")]
+    #[inline]
+    pub fn max_recv_frame_size(&self) -> usize {
+        self.inner.max_frame_size()
+    }
+
+    /// Returns the max frame size that can be sent to the peer.
+    pub fn max_send_frame_size(&self) -> usize {
+        self.inner.get_ref().max_frame_size()
+    }
+
+    /// Set the peer's max frame size.
+    pub fn set_max_send_frame_size(&mut self, val: usize) {
+        self.framed_write().set_max_frame_size(val)
+    }
+
+    /// Set the peer's header table size size.
+    pub fn set_send_header_table_size(&mut self, val: usize) {
+        self.framed_write().set_header_table_size(val)
+    }
+
+    /// Set the decoder header table size size.
+    pub fn set_recv_header_table_size(&mut self, val: usize) {
+        self.inner.set_header_table_size(val)
+    }
+
+    /// Set the max header list size that can be received.
+    pub fn set_max_recv_header_list_size(&mut self, val: usize) {
+        self.inner.set_max_header_list_size(val);
+    }
+
+    /// Get a reference to the inner stream.
+    #[cfg(feature = "unstable")]
+    pub fn get_ref(&self) -> &T {
+        self.inner.get_ref().get_ref()
+    }
+
+    /// Get a mutable reference to the inner stream.
+    pub fn get_mut(&mut self) -> &mut T {
+        self.inner.get_mut().get_mut()
+    }
+
+    /// Takes the data payload value that was fully written to the socket
+    pub(crate) fn take_last_data_frame(&mut self) -> Option<Data<B>> {
+        self.framed_write().take_last_data_frame()
+    }
+
+    fn framed_write(&mut self) -> &mut FramedWrite<T, B> {
+        self.inner.get_mut()
+    }
+}
+
+impl<T, B> Codec<T, B>
+where
+    T: AsyncWrite + Unpin,
+    B: Buf,
+{
+    /// Returns `Ready` when the codec can buffer a frame
+    pub fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.framed_write().poll_ready(cx)
+    }
+
+    /// Buffer a frame.
+    ///
+    /// `poll_ready` must be called first to ensure that a frame may be
+    /// accepted.
+    ///
+    /// TODO: Rename this to avoid conflicts with Sink::buffer
+    pub fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
+        self.framed_write().buffer(item)
+    }
+
+    /// Flush buffered data to the wire
+    pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.framed_write().flush(cx)
+    }
+
+    /// Shutdown the send half
+    pub fn shutdown(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        self.framed_write().shutdown(cx)
+    }
+}
+
+impl<T, B> Stream for Codec<T, B>
+where
+    T: AsyncRead + Unpin,
+{
+    type Item = Result<Frame, Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl<T, B> Sink<Frame<B>> for Codec<T, B>
+where
+    T: AsyncWrite + Unpin,
+    B: Buf,
+{
+    type Error = SendError;
+
+    fn start_send(mut self: Pin<&mut Self>, item: Frame<B>) -> Result<(), Self::Error> {
+        Codec::buffer(&mut self, item)?;
+        Ok(())
+    }
+    /// Returns `Ready` when the codec can buffer a frame
+    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.framed_write().poll_ready(cx).map_err(Into::into)
+    }
+
+    /// Flush buffered data to the wire
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.framed_write().flush(cx).map_err(Into::into)
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        ready!(self.shutdown(cx))?;
+        Poll::Ready(Ok(()))
+    }
+}
+
+// TODO: remove (or improve) this
+impl<T> From<T> for Codec<T, bytes::Bytes>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    fn from(src: T) -> Self {
+        Self::new(src)
+    }
+}
+use crate::frame::{util, Error, Frame, Head, Kind, StreamId};
+use bytes::{Buf, BufMut, Bytes};
+
+use std::fmt;
+
+/// Data frame
+///
+/// Data frames convey arbitrary, variable-length sequences of octets associated
+/// with a stream. One or more DATA frames are used, for instance, to carry HTTP
+/// request or response payloads.
+#[derive(Eq, PartialEq)]
+pub struct Data<T = Bytes> {
+    stream_id: StreamId,
+    data: T,
+    flags: DataFlags,
+    pad_len: Option<u8>,
+}
+
+#[derive(Copy, Clone, Default, Eq, PartialEq)]
+struct DataFlags(u8);
+
+const END_STREAM: u8 = 0x1;
+const PADDED: u8 = 0x8;
+const ALL: u8 = END_STREAM | PADDED;
+
+impl<T> Data<T> {
+    /// Creates a new DATA frame.
+    pub fn new(stream_id: StreamId, payload: T) -> Self {
+        assert!(!stream_id.is_zero());
+
+        Data {
+            stream_id,
+            data: payload,
+            flags: DataFlags::default(),
+            pad_len: None,
+        }
+    }
+
+    /// Returns the stream identifier that this frame is associated with.
+    ///
+    /// This cannot be a zero stream identifier.
+    pub fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    /// Gets the value of the `END_STREAM` flag for this frame.
+    ///
+    /// If true, this frame is the last that the endpoint will send for the
+    /// identified stream.
+    ///
+    /// Setting this flag causes the stream to enter one of the "half-closed"
+    /// states or the "closed" state (Section 5.1).
+    pub fn is_end_stream(&self) -> bool {
+        self.flags.is_end_stream()
+    }
+
+    /// Sets the value for the `END_STREAM` flag on this frame.
+    pub fn set_end_stream(&mut self, val: bool) {
+        if val {
+            self.flags.set_end_stream();
+        } else {
+            self.flags.unset_end_stream();
+        }
+    }
+
+    /// Returns whether the `PADDED` flag is set on this frame.
+    #[cfg(feature = "unstable")]
+    pub fn is_padded(&self) -> bool {
+        self.flags.is_padded()
+    }
+
+    /// Sets the value for the `PADDED` flag on this frame.
+    #[cfg(feature = "unstable")]
+    pub fn set_padded(&mut self) {
+        self.flags.set_padded();
+    }
+
+    /// Returns a reference to this frame's payload.
+    ///
+    /// This does **not** include any padding that might have been originally
+    /// included.
+    pub fn payload(&self) -> &T {
+        &self.data
+    }
+
+    /// Returns a mutable reference to this frame's payload.
+    ///
+    /// This does **not** include any padding that might have been originally
+    /// included.
+    pub fn payload_mut(&mut self) -> &mut T {
+        &mut self.data
+    }
+
+    /// Consumes `self` and returns the frame's payload.
+    ///
+    /// This does **not** include any padding that might have been originally
+    /// included.
+    pub fn into_payload(self) -> T {
+        self.data
+    }
+
+    pub(crate) fn head(&self) -> Head {
+        Head::new(Kind::Data, self.flags.into(), self.stream_id)
+    }
+
+    pub(crate) fn map<F, U>(self, f: F) -> Data<U>
+    where
+        F: FnOnce(T) -> U,
+    {
+        Data {
+            stream_id: self.stream_id,
+            data: f(self.data),
+            flags: self.flags,
+            pad_len: self.pad_len,
+        }
+    }
+}
+
+impl Data<Bytes> {
+    pub(crate) fn load(head: Head, mut payload: Bytes) -> Result<Self, Error> {
+        let flags = DataFlags::load(head.flag());
+
+        // The stream identifier must not be zero
+        if head.stream_id().is_zero() {
+            return Err(Error::InvalidStreamId);
+        }
+
+        let pad_len = if flags.is_padded() {
+            let len = util::strip_padding(&mut payload)?;
+            Some(len)
+        } else {
+            None
+        };
+
+        Ok(Data {
+            stream_id: head.stream_id(),
+            data: payload,
+            flags,
+            pad_len,
+        })
+    }
+}
+
+impl<T: Buf> Data<T> {
+    /// Encode the data frame into the `dst` buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dst` cannot contain the data frame.
+    pub(crate) fn encode_chunk<U: BufMut>(&mut self, dst: &mut U) {
+        let len = self.data.remaining();
+
+        assert!(dst.remaining_mut() >= len);
+
+        self.head().encode(len, dst);
+        dst.put(&mut self.data);
+    }
+}
+
+impl<T> From<Data<T>> for Frame<T> {
+    fn from(src: Data<T>) -> Self {
+        Frame::Data(src)
+    }
+}
+
+impl<T> fmt::Debug for Data<T> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        let mut f = fmt.debug_struct("Data");
+        f.field("stream_id", &self.stream_id);
+        if !self.flags.is_empty() {
+            f.field("flags", &self.flags);
+        }
+        if let Some(ref pad_len) = self.pad_len {
+            f.field("pad_len", pad_len);
+        }
+        // `data` bytes purposefully excluded
+        f.finish()
+    }
+}
+
+// ===== impl DataFlags =====
+
+impl DataFlags {
+    fn load(bits: u8) -> DataFlags {
+        DataFlags(bits & ALL)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.0 & END_STREAM == END_STREAM
+    }
+
+    fn set_end_stream(&mut self) {
+        self.0 |= END_STREAM
+    }
+
+    fn unset_end_stream(&mut self) {
+        self.0 &= !END_STREAM
+    }
+
+    fn is_padded(&self) -> bool {
+        self.0 & PADDED == PADDED
+    }
+
+    #[cfg(feature = "unstable")]
+    fn set_padded(&mut self) {
+        self.0 |= PADDED
+    }
+}
+
+impl From<DataFlags> for u8 {
+    fn from(src: DataFlags) -> u8 {
+        src.0
+    }
+}
+
+impl fmt::Debug for DataFlags {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        util::debug_flags(fmt, self.0)
+            .flag_if(self.is_end_stream(), "END_STREAM")
+            .flag_if(self.is_padded(), "PADDED")
+            .finish()
+    }
+}
+    /// used to stream the response body and send trailers.
+    ///
+    /// If a body or trailers will be sent on the returned [`SendStream`]
+    /// instance, then `end_of_stream` must be set to `false` when calling this
+    /// function.
+    ///
+    /// The [`SendPushedResponse`] instance is associated with a promised
+    /// request.  This function may only be called once per instance and only if
+    /// [`send_reset`] has not been previously called.
+    ///
+    /// [`SendPushedResponse`]: #
+    /// [`SendStream`]: ../struct.SendStream.html
+    /// [`send_reset`]: #method.send_reset
+    pub fn send_response(
+        &mut self,
+        response: Response<()>,
+        end_of_stream: bool,
+    ) -> Result<SendStream<B>, crate::Error> {
+        self.inner.send_response(response, end_of_stream)
+    }
+
+    /// Send a stream reset to the peer.
+    ///
+    /// This essentially cancels the stream, including any inbound or outbound
+    /// data streams.
+    ///
+    /// If this function is called before [`send_response`], a call to
+    /// [`send_response`] will result in an error.
+    ///
+    /// If this function is called while a [`SendStream`] instance is active,
+    /// any further use of the instance will result in an error.
+    ///
+    /// This function should only be called once.
+    ///
+    /// [`send_response`]: #method.send_response
+    /// [`SendStream`]: ../struct.SendStream.html
+    pub fn send_reset(&mut self, reason: Reason) {
+        self.inner.send_reset(reason)
+    }
+
+    /// Polls to be notified when the client resets this stream.
+    ///
+    /// If stream is still open, this returns `Poll::Pending`, and
+    /// registers the task to be notified if a `RST_STREAM` is received.
+    ///
+    /// If a `RST_STREAM` frame is received for this stream, calling this
+    /// method will yield the `Reason` for the reset.
+    ///
+    /// # Error
+    ///
+    /// Calling this method after having called `send_response` will return
+    /// a user error.
+    pub fn poll_reset(&mut self, cx: &mut Context) -> Poll<Result<Reason, crate::Error>> {
+        self.inner.poll_reset(cx)
+    }
+
+    /// Returns the stream ID of the response stream.
+    ///
+    /// # Panics
+    ///
+    /// If the lock on the stream store has been poisoned.
+    pub fn stream_id(&self) -> crate::StreamId {
+        self.inner.stream_id()
+    }
+}
+
+// ===== impl Flush =====
+
+impl<T, B: Buf> Flush<T, B> {
+    fn new(codec: Codec<T, B>) -> Self {
+        Flush { codec: Some(codec) }
+    }
+}
+
+impl<T, B> Future for Flush<T, B>
+where
+    T: AsyncWrite + Unpin,
+    B: Buf,
+{
+    type Output = Result<Codec<T, B>, crate::Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Flush the codec
+        ready!(self.codec.as_mut().unwrap().flush(cx)).map_err(crate::Error::from_io)?;
+
+        // Return the codec
+        Poll::Ready(Ok(self.codec.take().unwrap()))
+    }
+}
+
+impl<T, B: Buf> ReadPreface<T, B> {
+    fn new(codec: Codec<T, B>) -> Self {
+        ReadPreface {
+            codec: Some(codec),
+            pos: 0,
+        }
+    }
+
+    fn inner_mut(&mut self) -> &mut T {
+        self.codec.as_mut().unwrap().get_mut()
+    }
+}
+
+impl<T, B> Future for ReadPreface<T, B>
+where
+    T: AsyncRead + Unpin,
+    B: Buf,
+{
+    type Output = Result<Codec<T, B>, crate::Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut buf = [0; 24];
+        let mut rem = PREFACE.len() - self.pos;
+
+        while rem > 0 {
+            let mut buf = ReadBuf::new(&mut buf[..rem]);
+            ready!(Pin::new(self.inner_mut()).poll_read(cx, &mut buf))
+                .map_err(crate::Error::from_io)?;
+            let n = buf.filled().len();
+            if n == 0 {
+                return Poll::Ready(Err(crate::Error::from_io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed before reading preface",
+                ))));
+            }
+
+            if &PREFACE[self.pos..self.pos + n] != buf.filled() {
+                proto_err!(conn: "read_preface: invalid preface");
+                // TODO: Should this just write the GO_AWAY frame directly?
+                return Poll::Ready(Err(Error::library_go_away(Reason::PROTOCOL_ERROR).into()));
+            }
+
+            self.pos += n;
+            rem -= n; // TODO test
+        }
+
+        Poll::Ready(Ok(self.codec.take().unwrap()))
+    }
+}
+
+// ===== impl Handshake =====
+
+impl<T, B: Buf> Future for Handshake<T, B>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+    B: Buf,
+{
+    type Output = Result<Connection<T, B>, crate::Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let span = self.span.clone(); // XXX(eliza): T_T
+        let _e = span.enter();
+        tracing::trace!(state = ?self.state);
+
+        loop {
+            match &mut self.state {
+                Handshaking::Flushing(flush) => {
+                    // We're currently flushing a pending SETTINGS frame. Poll the
+                    // flush future, and, if it's completed, advance our state to wait
+                    // for the client preface.
+                    let codec = match Pin::new(flush).poll(cx)? {
+                        Poll::Pending => {
+                            tracing::trace!(flush.poll = %"Pending");
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(flushed) => {
+                            tracing::trace!(flush.poll = %"Ready");
+                            flushed
+                        }
+                    };
+                    self.state = Handshaking::ReadingPreface(
+                        ReadPreface::new(codec).instrument(tracing::trace_span!("read_preface")),
+                    );
+                }
+                Handshaking::ReadingPreface(read) => {
+                    let codec = ready!(Pin::new(read).poll(cx)?);
+
+                    self.state = Handshaking::Done;
+
+                    let connection = proto::Connection::new(
+                        codec,
+                        Config {
+                            next_stream_id: 2.into(),
+                            // Server does not need to locally initiate any streams
+                            initial_max_send_streams: 0,
+                            max_send_buffer_size: self.builder.max_send_buffer_size,
+                            reset_stream_duration: self.builder.reset_stream_duration,
+                            reset_stream_max: self.builder.reset_stream_max,
+                            remote_reset_stream_max: self.builder.pending_accept_reset_stream_max,
+                            local_error_reset_streams_max: self
+                                .builder
+                                .local_max_error_reset_streams,
+                            settings: self.builder.settings.clone(),
+                        },
+                    );
+
+                    tracing::trace!("connection established!");
+                    let mut c = Connection { connection };
+                    if let Some(sz) = self.builder.initial_target_connection_window_size {
+                        c.set_target_window_size(sz);
+                    }
+
+                    return Poll::Ready(Ok(c));
+                }
+                Handshaking::Done => {
+                    panic!("Handshaking::poll() called again after handshaking was complete")
+                }
+            }
+        }
+    }
+}
+
+impl<T, B> fmt::Debug for Handshake<T, B>
+where
+    T: AsyncRead + AsyncWrite + fmt::Debug,
+    B: fmt::Debug + Buf,
+{
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write!(fmt, "server::Handshake")
+    }
+}
+
+impl Peer {
+    pub fn convert_send_message(
+        id: StreamId,
+        response: Response<()>,
+        end_of_stream: bool,
+    ) -> frame::Headers {
+        use http::response::Parts;
+
+        // Extract the components of the HTTP request
+        let (
+            Parts {
+                status, headers, ..
+            },
+            _,
+        ) = response.into_parts();
+
+        // Build the set pseudo header set. All requests will include `method`
+        // and `path`.
+        let pseudo = Pseudo::response(status);
+
+        // Create the HEADERS frame
+        let mut frame = frame::Headers::new(id, pseudo, headers);
+
+        if end_of_stream {
+            frame.set_end_stream()
+        }
+
+        frame
+    }
+
+    pub fn convert_push_message(
+        stream_id: StreamId,
+        promised_id: StreamId,
+        request: Request<()>,
+    ) -> Result<frame::PushPromise, UserError> {
+        use http::request::Parts;
+
+        if let Err(e) = frame::PushPromise::validate_request(&request) {
+            use PushPromiseHeaderError::*;
+            match e {
+                NotSafeAndCacheable => tracing::debug!(
+                    ?promised_id,
+                    "convert_push_message: method {} is not safe and cacheable",
+                    request.method(),
+                ),
+                InvalidContentLength(e) => tracing::debug!(
+                    ?promised_id,
+                    "convert_push_message; promised request has invalid content-length {:?}",
+                    e,
+                ),
+            }
+            return Err(UserError::MalformedHeaders);
+        }
+
+        // Extract the components of the HTTP request
+        let (
+            Parts {
+                method,
+                uri,
+                headers,
+                ..
+            },
+            _,
+        ) = request.into_parts();
+
+        let pseudo = Pseudo::request(method, uri, None);
+
+        Ok(frame::PushPromise::new(
+            stream_id,
+            promised_id,
+            pseudo,
+            headers,
+        ))
+    }
+}
+
+impl proto::Peer for Peer {
+    type Poll = Request<()>;
+
+    const NAME: &'static str = "Server";
+
+    /*
+    fn is_server() -> bool {
+        true
+    }
+    */
+
+    fn r#dyn() -> proto::DynPeer {
+        proto::DynPeer::Server
+    }
+
+    fn convert_poll_message(
+        pseudo: Pseudo,
+        fields: HeaderMap,
+        stream_id: StreamId,
+    ) -> Result<Self::Poll, Error> {
+        use http::{uri, Version};
+
+        let mut b = Request::builder();
+
+        macro_rules! malformed {
+            ($($arg:tt)*) => {{
+                tracing::debug!($($arg)*);
+                return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
+            }}
+        }
+
+        b = b.version(Version::HTTP_2);
+
+        let is_connect;
+        if let Some(method) = pseudo.method {
+            is_connect = method == Method::CONNECT;
+            b = b.method(method);
+        } else {
+            malformed!("malformed headers: missing method");
+        }
+
+        let has_protocol = pseudo.protocol.is_some();
+        if has_protocol {
+            if is_connect {
+                // Assert that we have the right type.
+                b = b.extension::<crate::ext::Protocol>(pseudo.protocol.unwrap());
+            } else {
+                malformed!("malformed headers: :protocol on non-CONNECT request");
+            }
+        }
+
+        if pseudo.status.is_some() {
+            malformed!("malformed headers: :status field on request");
+        }
+
+        // Convert the URI
+        let mut parts = uri::Parts::default();
+
+        // A request translated from HTTP/1 must not include the :authority
+        // header
+        if let Some(authority) = pseudo.authority {
+            let maybe_authority = uri::Authority::from_maybe_shared(authority.clone().into_inner());
+            parts.authority = Some(maybe_authority.or_else(|why| {
+                malformed!(
+                    "malformed headers: malformed authority ({:?}): {}",
+                    authority,
+                    why,
+                )
+            })?);
+        }
+
+        // A :scheme is required, except CONNECT.
+        if let Some(scheme) = pseudo.scheme {
+            if is_connect && !has_protocol {
+                malformed!("malformed headers: :scheme in CONNECT");
+            }
+            let maybe_scheme = scheme.parse();
+            let scheme = maybe_scheme.or_else(|why| {
+                malformed!(
+                    "malformed headers: malformed scheme ({:?}): {}",
+                    scheme,
+                    why,
+                )
+            })?;
+
+            // It's not possible to build an `Uri` from a scheme and path. So,
+            // after validating is was a valid scheme, we just have to drop it
+            // if there isn't an :authority.
+            if parts.authority.is_some() {
+                parts.scheme = Some(scheme);
+            }
+        } else if !is_connect || has_protocol {
+            malformed!("malformed headers: missing scheme");
+        }
+
+        if let Some(path) = pseudo.path {
+            if is_connect && !has_protocol {
+                malformed!("malformed headers: :path in CONNECT");
+            }
+
+            // This cannot be empty
+            if path.is_empty() {
+                malformed!("malformed headers: missing path");
+            }
+
+            let maybe_path = uri::PathAndQuery::from_maybe_shared(path.clone().into_inner());
+            parts.path_and_query = Some(maybe_path.or_else(|why| {
+                malformed!("malformed headers: malformed path ({:?}): {}", path, why,)
+            })?);
+        } else if is_connect && has_protocol {
+            malformed!("malformed headers: missing path in extended CONNECT");
+        }
+
+        b = b.uri(parts);
+
+        let mut request = match b.body(()) {
+            Ok(request) => request,
+            Err(e) => {
+                // TODO: Should there be more specialized handling for different
+                // kinds of errors
+                proto_err!(stream: "error building request: {}; stream={:?}", e, stream_id);
+                return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
+            }
+        };
+
+        *request.headers_mut() = fields;
+
+        Ok(request)
+    }
+}
+
+// ===== impl Handshaking =====
+
+impl<T, B> fmt::Debug for Handshaking<T, B>
+where
+    B: Buf,
+{
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        match *self {
+            Handshaking::Flushing(_) => f.write_str("Flushing(_)"),
+            Handshaking::ReadingPreface(_) => f.write_str("ReadingPreface(_)"),
+            Handshaking::Done => f.write_str("Done"),
+        }
+    }
+}
+        Ok((send_request, connection))
+    }
+
+    /// Sets the target window size for the whole connection.
+    ///
+    /// If `size` is greater than the current value, then a `WINDOW_UPDATE`
+    /// frame will be immediately sent to the remote, increasing the connection
+    /// level window by `size - current_value`.
+    ///
+    /// If `size` is less than the current value, nothing will happen
+    /// immediately. However, as window capacity is released by
+    /// [`FlowControl`] instances, no `WINDOW_UPDATE` frames will be sent
+    /// out until the number of "in flight" bytes drops below `size`.
+    ///
+    /// The default value is 65,535.
+    ///
+    /// See [`FlowControl`] documentation for more details.
+    ///
+    /// [`FlowControl`]: ../struct.FlowControl.html
+    /// [library level]: ../index.html#flow-control
+    pub fn set_target_window_size(&mut self, size: u32) {
+        assert!(size <= proto::MAX_WINDOW_SIZE);
+        self.inner.set_target_window_size(size);
+    }
+
+    /// Set a new `INITIAL_WINDOW_SIZE` setting (in octets) for stream-level
+    /// flow control for received data.
+    ///
+    /// The `SETTINGS` will be sent to the remote, and only applied once the
+    /// remote acknowledges the change.
+    ///
+    /// This can be used to increase or decrease the window size for existing
+    /// streams.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a previous call is still pending acknowledgement
+    /// from the remote endpoint.
+    pub fn set_initial_window_size(&mut self, size: u32) -> Result<(), crate::Error> {
+        assert!(size <= proto::MAX_WINDOW_SIZE);
+        self.inner.set_initial_window_size(size)?;
+        Ok(())
+    }
+
+    /// Takes a `PingPong` instance from the connection.
+    ///
+    /// # Note
+    ///
+    /// This may only be called once. Calling multiple times will return `None`.
+    pub fn ping_pong(&mut self) -> Option<PingPong> {
+        self.inner.take_user_pings().map(PingPong::new)
+    }
+
+    /// Returns the maximum number of concurrent streams that may be initiated
+    /// by this client.
+    ///
+    /// This limit is configured by the server peer by sending the
+    /// [`SETTINGS_MAX_CONCURRENT_STREAMS` parameter][1] in a `SETTINGS` frame.
+    /// This method returns the currently acknowledged value received from the
+    /// remote.
+    ///
+    /// [1]: https://tools.ietf.org/html/rfc7540#section-5.1.2
+    pub fn max_concurrent_send_streams(&self) -> usize {
+        self.inner.max_send_streams()
+    }
+    /// Returns the maximum number of concurrent streams that may be initiated
+    /// by the server on this connection.
+    ///
+    /// This returns the value of the [`SETTINGS_MAX_CONCURRENT_STREAMS`
+    /// parameter][1] sent in a `SETTINGS` frame that has been
+    /// acknowledged by the remote peer. The value to be sent is configured by
+    /// the [`Builder::max_concurrent_streams`][2] method before handshaking
+    /// with the remote peer.
+    ///
+    /// [1]: https://tools.ietf.org/html/rfc7540#section-5.1.2
+    /// [2]: ../struct.Builder.html#method.max_concurrent_streams
+    pub fn max_concurrent_recv_streams(&self) -> usize {
+        self.inner.max_recv_streams()
+    }
+}
+
+impl<T, B> Future for Connection<T, B>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+    B: Buf,
+{
+    type Output = Result<(), crate::Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.inner.maybe_close_connection_if_no_streams();
+        let had_streams_or_refs = self.inner.has_streams_or_other_references();
+        let result = self.inner.poll(cx).map_err(Into::into);
+        // if we had streams/refs, and don't anymore, wake up one more time to
+        // ensure proper shutdown
+        if result.is_pending()
+            && had_streams_or_refs
+            && !self.inner.has_streams_or_other_references()
+        {
+            tracing::trace!("last stream closed during poll, wake again");
+            cx.waker().wake_by_ref();
+        }
+        result
+    }
+}
+
+impl<T, B> fmt::Debug for Connection<T, B>
+where
+    T: AsyncRead + AsyncWrite,
+    T: fmt::Debug,
+    B: fmt::Debug + Buf,
+{
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Debug::fmt(&self.inner, fmt)
+    }
+}
+
+// ===== impl ResponseFuture =====
+
+impl Future for ResponseFuture {
+    type Output = Result<Response<RecvStream>, crate::Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let (parts, _) = ready!(self.inner.poll_response(cx))?.into_parts();
+        let body = RecvStream::new(FlowControl::new(self.inner.clone()));
+
+        Poll::Ready(Ok(Response::from_parts(parts, body)))
+    }
+}
+
+impl ResponseFuture {
+    /// Returns the stream ID of the response stream.
+    ///
+    /// # Panics
+    ///
+    /// If the lock on the stream store has been poisoned.
+    pub fn stream_id(&self) -> crate::StreamId {
+        crate::StreamId::from_internal(self.inner.stream_id())
+    }
+    /// Returns a stream of PushPromises
+    ///
+    /// # Panics
+    ///
+    /// If this method has been called before
+    /// or the stream was itself was pushed
+    pub fn push_promises(&mut self) -> PushPromises {
+        if self.push_promise_consumed {
+            panic!("Reference to push promises stream taken!");
+        }
+        self.push_promise_consumed = true;
+        PushPromises {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+// ===== impl PushPromises =====
+
+impl PushPromises {
+    /// Get the next `PushPromise`.
+    pub async fn push_promise(&mut self) -> Option<Result<PushPromise, crate::Error>> {
+        crate::poll_fn(move |cx| self.poll_push_promise(cx)).await
+    }
+
+    #[doc(hidden)]
+    pub fn poll_push_promise(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<PushPromise, crate::Error>>> {
+        match self.inner.poll_pushed(cx) {
+            Poll::Ready(Some(Ok((request, response)))) => {
+                let response = PushedResponseFuture {
+                    inner: ResponseFuture {
+                        inner: response,
+                        push_promise_consumed: false,
+                    },
+                };
+                Poll::Ready(Some(Ok(PushPromise { request, response })))
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,

@@ -1,0 +1,350 @@
+use crate::{Instant, MAX_UDP_PAYLOAD, MtuDiscoveryConfig, packet::SpaceId};
+use std::cmp;
+use tracing::trace;
+
+/// Implements Datagram Packetization Layer Path Maximum Transmission Unit Discovery
+///
+/// See [`MtuDiscoveryConfig`] for details
+#[derive(Clone)]
+pub(crate) struct MtuDiscovery {
+    /// Detected MTU for the path
+    current_mtu: u16,
+    /// The state of the MTU discovery, if enabled
+    state: Option<EnabledMtuDiscovery>,
+    /// The state of the black hole detector
+    black_hole_detector: BlackHoleDetector,
+}
+
+impl MtuDiscovery {
+    pub(crate) fn new(
+        initial_plpmtu: u16,
+        min_mtu: u16,
+        peer_max_udp_payload_size: Option<u16>,
+        config: MtuDiscoveryConfig,
+    ) -> Self {
+        debug_assert!(
+            initial_plpmtu >= min_mtu,
+            "initial_max_udp_payload_size must be at least {min_mtu}"
+        );
+
+        let mut mtud = Self::with_state(
+            initial_plpmtu,
+            min_mtu,
+            Some(EnabledMtuDiscovery::new(config)),
+        );
+
+        // We might be migrating an existing connection to a new path, in which case the transport
+        // parameters have already been transmitted, and we already know the value of
+        // `peer_max_udp_payload_size`
+        if let Some(peer_max_udp_payload_size) = peer_max_udp_payload_size {
+            mtud.on_peer_max_udp_payload_size_received(peer_max_udp_payload_size);
+        }
+
+        mtud
+    }
+
+    /// MTU discovery will be disabled and the current MTU will be fixed to the provided value
+    pub(crate) fn disabled(plpmtu: u16, min_mtu: u16) -> Self {
+        Self::with_state(plpmtu, min_mtu, None)
+    }
+
+    fn with_state(current_mtu: u16, min_mtu: u16, state: Option<EnabledMtuDiscovery>) -> Self {
+        Self {
+            current_mtu,
+            state,
+            black_hole_detector: BlackHoleDetector::new(min_mtu),
+        }
+    }
+
+    pub(super) fn reset(&mut self, current_mtu: u16, min_mtu: u16) {
+        self.current_mtu = current_mtu;
+        if let Some(state) = self.state.take() {
+            self.state = Some(EnabledMtuDiscovery::new(state.config));
+            self.on_peer_max_udp_payload_size_received(state.peer_max_udp_payload_size);
+        }
+        self.black_hole_detector = BlackHoleDetector::new(min_mtu);
+    }
+
+    /// Returns the current MTU
+    pub(crate) fn current_mtu(&self) -> u16 {
+        self.current_mtu
+    }
+
+    /// Returns the amount of bytes that should be sent as an MTU probe, if any
+    pub(crate) fn poll_transmit(&mut self, now: Instant, next_pn: u64) -> Option<u16> {
+        self.state
+            .as_mut()
+            .and_then(|state| state.poll_transmit(now, self.current_mtu, next_pn))
+    }
+
+    /// Notifies the [`MtuDiscovery`] that the peer's `max_udp_payload_size` transport parameter has
+    /// been received
+    pub(crate) fn on_peer_max_udp_payload_size_received(&mut self, peer_max_udp_payload_size: u16) {
+        self.current_mtu = self.current_mtu.min(peer_max_udp_payload_size);
+
+        if let Some(state) = self.state.as_mut() {
+            // MTUD is only active after the connection has been fully established, so it is
+            // guaranteed we will receive the peer's transport parameters before we start probing
+            debug_assert!(matches!(state.phase, Phase::Initial));
+            state.peer_max_udp_payload_size = peer_max_udp_payload_size;
+        }
+    }
+
+    /// Notifies the [`MtuDiscovery`] that a packet has been ACKed
+    ///
+    /// Returns true if the packet was an MTU probe
+    pub(crate) fn on_acked(&mut self, space: SpaceId, pn: u64, len: u16) -> bool {
+        // MTU probes are only sent in application data space
+        if space != SpaceId::Data {
+            return false;
+        }
+
+        // Update the state of the MTU search
+        if let Some(new_mtu) = self
+            .state
+            .as_mut()
+            .and_then(|state| state.on_probe_acked(pn))
+        {
+            self.current_mtu = new_mtu;
+            trace!(current_mtu = self.current_mtu, "new MTU detected");
+
+            self.black_hole_detector.on_probe_acked(pn, len);
+            true
+        } else {
+            self.black_hole_detector.on_non_probe_acked(pn, len);
+            false
+        }
+    }
+
+    /// Returns the packet number of the in-flight MTU probe, if any
+    pub(crate) fn in_flight_mtu_probe(&self) -> Option<u64> {
+        match &self.state {
+            Some(EnabledMtuDiscovery {
+                phase: Phase::Searching(search_state),
+                ..
+            }) => search_state.in_flight_probe,
+            _ => None,
+        }
+    }
+
+    /// Notifies the [`MtuDiscovery`] that the in-flight MTU probe was lost
+    pub(crate) fn on_probe_lost(&mut self) {
+        if let Some(state) = &mut self.state {
+            state.on_probe_lost();
+        }
+    }
+
+    /// Notifies the [`MtuDiscovery`] that a non-probe packet was lost
+    ///
+    /// When done notifying of lost packets, [`MtuDiscovery::black_hole_detected`] must be called, to
+    /// ensure the last loss burst is properly processed and to trigger black hole recovery logic if
+    /// necessary.
+    pub(crate) fn on_non_probe_lost(&mut self, pn: u64, len: u16) {
+        self.black_hole_detector.on_non_probe_lost(pn, len);
+    }
+
+    /// Returns true if a black hole was detected
+    ///
+    /// Calling this function will close the previous loss burst. If a black hole is detected, the
+    /// current MTU will be reset to `min_mtu`.
+    pub(crate) fn black_hole_detected(&mut self, now: Instant) -> bool {
+        if !self.black_hole_detector.black_hole_detected() {
+            return false;
+        }
+
+        self.current_mtu = self.black_hole_detector.min_mtu;
+
+        if let Some(state) = &mut self.state {
+            state.on_black_hole_detected(now);
+        }
+
+        true
+    }
+}
+
+/// Additional state for enabled MTU discovery
+#[derive(Debug, Clone)]
+struct EnabledMtuDiscovery {
+    phase: Phase,
+    peer_max_udp_payload_size: u16,
+    config: MtuDiscoveryConfig,
+}
+
+impl EnabledMtuDiscovery {
+    fn new(config: MtuDiscoveryConfig) -> Self {
+        Self {
+            first_packet: None,
+            #[cfg(feature = "qlog")]
+            recovery_metrics: prev.recovery_metrics.clone(),
+            generation,
+        }
+    }
+
+    /// Resets RTT, congestion control and MTU states.
+    ///
+    /// This is useful when it is known the underlying path has changed.
+    pub(super) fn reset(&mut self, now: Instant, config: &TransportConfig) {
+        self.rtt = RttEstimator::new(config.initial_rtt);
+        self.congestion = config
+            .congestion_controller_factory
+            .clone()
+            .build(now, config.get_initial_mtu());
+        self.mtud.reset(config.get_initial_mtu(), config.min_mtu);
+    }
+
+    /// Indicates whether we're a server that hasn't validated the peer's address and hasn't
+    /// received enough data from the peer to permit sending `bytes_to_send` additional bytes
+    pub(super) fn anti_amplification_blocked(&self, bytes_to_send: u64) -> bool {
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+pub struct RecoveryParametersSet {
+    pub reordering_threshold: Option<u16>,
+    pub time_threshold: Option<f32>,
+    pub timer_granularity: Option<u16>,
+    pub initial_rtt: Option<f32>,
+
+    pub max_datagram_size: Option<u32>,
+    pub initial_congestion_window: Option<u64>,
+    pub minimum_congestion_window: Option<u32>,
+    pub loss_reduction_factor: Option<f32>,
+    pub persistent_congestion_threshold: Option<u16>,
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+pub struct MetricsUpdated {
+    pub min_rtt: Option<f32>,
+    pub smoothed_rtt: Option<f32>,
+    pub latest_rtt: Option<f32>,
+    pub rtt_variance: Option<f32>,
+
+    pub pto_count: Option<u16>,
+
+    pub congestion_window: Option<u64>,
+    pub bytes_in_flight: Option<u64>,
+
+    pub ssthresh: Option<u64>,
+
+    // qlog defined
+    pub packets_in_flight: Option<u64>,
+
+    pub pacing_rate: Option<u64>,
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+pub struct CongestionStateUpdated {
+    pub old: Option<String>,
+    pub new: String,
+
+    pub trigger: Option<CongestionStateUpdatedTrigger>,
+}
+
+#[serde_with::skip_serializing_none]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct LossTimerUpdated {
+    pub timer_type: Option<TimerType>,
+    pub packet_number_space: Option<PacketNumberSpace>,
+        }
+
+        self.writer.as_mut().write_all(b"")?;
+        serde_json::to_writer(self.writer.as_mut(), &self.qlog)
+            .map_err(|_| Error::Done)?;
+        self.writer.as_mut().write_all(b"\n")?;
+
+        self.state = StreamerState::Ready;
+
+        Ok(())
+    }
+
+    /// Finishes qlog streaming serialization.
+    ///
+    /// After this is called, no more serialization will occur.
+    pub fn finish_log(&mut self) -> Result<()> {
+        if self.state == StreamerState::Initial ||
+            self.state == StreamerState::Finished
+        {
+            return Err(Error::InvalidState);
+        }
+
+        self.state = StreamerState::Finished;
+
+        self.writer.as_mut().flush()?;
+
+        Ok(())
+    }
+
+    /// Writes a serializable to a JSON-SEQ record using
+    /// [std::time::Instant::now()].
+    pub fn add_event_now<E: Serialize + Eventable>(
+        &mut self, event: E,
+    ) -> Result<()> {
+        let now = std::time::Instant::now();
+
+        self.add_event_with_instant(event, now)
+    }
+
+    /// Writes a serializable to a pretty-printed JSON-SEQ record using
+    /// [std::time::Instant::now()].
+    pub fn add_event_now_pretty<E: Serialize + Eventable>(
+        &mut self, event: E,
+    ) -> Result<()> {
+        let now = std::time::Instant::now();
+
+        self.add_event_with_instant_pretty(event, now)
+    }
+
+    /// Writes a serializable to a JSON-SEQ record using the provided
+    /// [std::time::Instant].
+    pub fn add_event_with_instant<E: Serialize + Eventable>(
+        &mut self, event: E, now: std::time::Instant,
+    ) -> Result<()> {
+        self.event_with_instant(event, now, false)
+    }
+
+    /// Writes a serializable to a pretty-printed JSON-SEQ record using the
+    /// provided [std::time::Instant].
+    pub fn add_event_with_instant_pretty<E: Serialize + Eventable>(
+        &mut self, event: E, now: std::time::Instant,
+    ) -> Result<()> {
+        self.event_with_instant(event, now, true)
+    }
+
+    fn event_with_instant<E: Serialize + Eventable>(
+        &mut self, mut event: E, now: std::time::Instant, pretty: bool,
+    ) -> Result<()> {
+        if self.state != StreamerState::Ready {
+            return Err(Error::InvalidState);
+        }
+
+        if !event.importance().is_contained_in(&self.log_level) {
+            return Err(Error::Done);
+        }
+
+        let dur = if cfg!(test) {
+            std::time::Duration::from_secs(0)
+        } else {
+            now.duration_since(self.start_time)
+        };
+
+        let rel_time = dur.as_secs_f32() * 1000.0;
+        event.set_time(rel_time);
+
+        if pretty {
+            self.add_event_pretty(event)
+        } else {
+            self.add_event(event)
+        }
+    }
+
+        // This should generate a `Writable` event
+        assert_eq!(
+            stream.state.poll(),
+            Some(StreamEvent::Writable { id: stream_id })
+        );
+        assert_eq!(stream.state.write_limit(), smaller_send_window);
+
+        // Assert that only `smaller_send_window` bytes are accepted
+        assert_eq!(stream.write(&data), Ok(smaller_send_window as usize));
+        assert_eq!(stream.write(&data), Err(WriteError::Blocked));
+    }
+}

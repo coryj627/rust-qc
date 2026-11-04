@@ -1,0 +1,854 @@
+75:     Running tests/client_request.rs (/target/debug/deps/client_request-e2f508d2a7996211)
+122:test result: ok. 42 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.11s
+124:     Running tests/codec_read.rs (/target/debug/deps/codec_read-56473b0079082803)
+142:test result: ok. 10 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.09s
+144:     Running tests/codec_write.rs (/target/debug/deps/codec_write-fd9749404f6a62fe)
+151:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+153:     Running tests/flow_control.rs (/target/debug/deps/flow_control-1636b39760608753)
+194:test result: ok. 33 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.84s
+196:     Running tests/hammer.rs (/target/debug/deps/hammer-85e67fbc81e43a9d)
+202:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 205.82s
+204:     Running tests/ping_pong.rs (/target/debug/deps/ping_pong-6b7817e020800af8)
+213:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+215:     Running tests/prioritization.rs (/target/debug/deps/prioritization-ba0e081803439105)
+226:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+228:     Running tests/push_promise.rs (/target/debug/deps/push_promise-f4fa8435a83f127f)
+241:test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.02s
+243:     Running tests/server.rs (/target/debug/deps/server-941782c6327b1b5d)
+284:test result: ok. 36 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.25s
+286:     Running tests/stream_states.rs (/target/debug/deps/stream_states-5e4134a3d821b2a6)
+316:test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+318:     Running tests/trailers.rs (/target/debug/deps/trailers-043c50c8464cd6ba)
+325:test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+use super::{
+    store, Buffer, Codec, Config, Counts, Frame, Prioritize, Prioritized, Store, Stream, StreamId,
+    StreamIdOverflow, WindowSize,
+};
+use crate::codec::UserError;
+use crate::frame::{self, Reason};
+use crate::proto::{self, Error, Initiator};
+
+use bytes::Buf;
+use tokio::io::AsyncWrite;
+
+use std::cmp::Ordering;
+use std::io;
+use std::task::{Context, Poll, Waker};
+
+/// Manages state transitions related to outbound frames.
+#[derive(Debug)]
+pub(super) struct Send {
+    /// Stream identifier to use for next initialized stream.
+    next_stream_id: Result<StreamId, StreamIdOverflow>,
+
+    /// Any streams with a higher ID are ignored.
+    ///
+    /// This starts as MAX, but is lowered when a GOAWAY is received.
+    ///
+    /// > After sending a GOAWAY frame, the sender can discard frames for
+    /// > streams initiated by the receiver with identifiers higher than
+    /// > the identified last stream.
+    max_stream_id: StreamId,
+
+    /// Initial window size of locally initiated streams
+    init_window_sz: WindowSize,
+
+    /// Prioritization layer
+    prioritize: Prioritize,
+
+    is_push_enabled: bool,
+
+    /// If extended connect protocol is enabled.
+    is_extended_connect_protocol_enabled: bool,
+}
+
+/// A value to detect which public API has called `poll_reset`.
+#[derive(Debug)]
+pub(crate) enum PollReset {
+    AwaitingHeaders,
+    Streaming,
+}
+
+impl Send {
+    /// Create a new `Send`
+    pub fn new(config: &Config) -> Self {
+        Send {
+            init_window_sz: config.remote_init_window_sz,
+            max_stream_id: StreamId::MAX,
+            next_stream_id: Ok(config.local_next_stream_id),
+            prioritize: Prioritize::new(config),
+            is_push_enabled: true,
+            is_extended_connect_protocol_enabled: false,
+        }
+    }
+
+    /// Returns the initial send window size
+    pub fn init_window_sz(&self) -> WindowSize {
+        self.init_window_sz
+    }
+
+    pub fn open(&mut self) -> Result<StreamId, UserError> {
+        let stream_id = self.ensure_next_stream_id()?;
+        self.next_stream_id = stream_id.next_id();
+        Ok(stream_id)
+    }
+
+    pub fn reserve_local(&mut self) -> Result<StreamId, UserError> {
+        let stream_id = self.ensure_next_stream_id()?;
+        self.next_stream_id = stream_id.next_id();
+        Ok(stream_id)
+    }
+
+    fn check_headers(fields: &http::HeaderMap) -> Result<(), UserError> {
+        // 8.1.2.2. Connection-Specific Header Fields
+        if fields.contains_key(http::header::CONNECTION)
+            || fields.contains_key(http::header::TRANSFER_ENCODING)
+            || fields.contains_key(http::header::UPGRADE)
+            || fields.contains_key("keep-alive")
+            || fields.contains_key("proxy-connection")
+        {
+            tracing::debug!("illegal connection-specific headers found");
+            return Err(UserError::MalformedHeaders);
+        } else if let Some(te) = fields.get(http::header::TE) {
+            if te != "trailers" {
+                tracing::debug!("illegal connection-specific headers found");
+                return Err(UserError::MalformedHeaders);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn send_push_promise<B>(
+        &mut self,
+        frame: frame::PushPromise,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError> {
+        if !self.is_push_enabled {
+            return Err(UserError::PeerDisabledServerPush);
+        }
+
+        tracing::trace!(
+            "send_push_promise; frame={:?}; init_window={:?}",
+            frame,
+            self.init_window_sz
+        );
+
+        Self::check_headers(frame.fields())?;
+
+        // Queue the frame for sending
+        self.prioritize
+            .queue_frame(frame.into(), buffer, stream, task);
+
+        Ok(())
+    }
+
+    pub fn send_headers<B>(
+        &mut self,
+        frame: frame::Headers,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError> {
+        tracing::trace!(
+            "send_headers; frame={:?}; init_window={:?}",
+            frame,
+            self.init_window_sz
+        );
+
+        Self::check_headers(frame.fields())?;
+
+        let end_stream = frame.is_end_stream();
+
+        // Update the state
+        stream.state.send_open(end_stream)?;
+
+        let mut pending_open = false;
+        if counts.peer().is_local_init(frame.stream_id()) && !stream.is_pending_push {
+            self.prioritize.queue_open(stream);
+            pending_open = true;
+        }
+
+        // Queue the frame for sending
+        //
+        // This call expects that, since new streams are in the open queue, new
+        // streams won't be pushed on pending_send.
+        self.prioritize
+            .queue_frame(frame.into(), buffer, stream, task);
+
+        // Need to notify the connection when pushing onto pending_open since
+        // queue_frame only notifies for pending_send.
+        if pending_open {
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Send an explicit RST_STREAM frame
+    pub fn send_reset<B>(
+        &mut self,
+        reason: Reason,
+        initiator: Initiator,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) {
+        let is_reset = stream.state.is_reset();
+        let is_closed = stream.state.is_closed();
+        let is_empty = stream.pending_send.is_empty();
+        let stream_id = stream.id;
+
+        tracing::trace!(
+            "send_reset(..., reason={:?}, initiator={:?}, stream={:?}, ..., \
+             is_reset={:?}; is_closed={:?}; pending_send.is_empty={:?}; \
+             state={:?} \
+             ",
+            reason,
+            initiator,
+            stream_id,
+            is_reset,
+            is_closed,
+            is_empty,
+            stream.state
+        );
+
+        if is_reset {
+            // Don't double reset
+            tracing::trace!(
+                " -> not sending RST_STREAM ({:?} is already reset)",
+                stream_id
+            );
+            return;
+        }
+
+        // Transition the state to reset no matter what.
+        stream.set_reset(reason, initiator);
+
+        // If closed AND the send queue is flushed, then the stream cannot be
+        // reset explicitly, either. Implicit resets can still be queued.
+        if is_closed && is_empty {
+            tracing::trace!(
+                " -> not sending explicit RST_STREAM ({:?} was closed \
+                 and send queue was flushed)",
+                stream_id
+            );
+            return;
+        }
+use super::store::Resolve;
+use super::*;
+
+use crate::frame::Reason;
+
+use crate::codec::UserError;
+use crate::codec::UserError::*;
+
+use bytes::buf::Take;
+use std::{
+    cmp::{self, Ordering},
+    fmt, io, mem,
+    task::{Context, Poll, Waker},
+};
+
+/// # Warning
+///
+/// Queued streams are ordered by stream ID, as we need to ensure that
+/// lower-numbered streams are sent headers before higher-numbered ones.
+/// This is because "idle" stream IDs – those which have been initiated but
+/// have yet to receive frames – will be implicitly closed on receipt of a
+/// frame on a higher stream ID. If these queues was not ordered by stream
+/// IDs, some mechanism would be necessary to ensure that the lowest-numbered]
+/// idle stream is opened first.
+#[derive(Debug)]
+pub(super) struct Prioritize {
+    /// Queue of streams waiting for socket capacity to send a frame.
+    pending_send: store::Queue<stream::NextSend>,
+
+    /// Queue of streams waiting for window capacity to produce data.
+    pending_capacity: store::Queue<stream::NextSendCapacity>,
+
+    /// Streams waiting for capacity due to max concurrency
+    ///
+    /// The `SendRequest` handle is `Clone`. This enables initiating requests
+    /// from many tasks. However, offering this capability while supporting
+    /// backpressure at some level is tricky. If there are many `SendRequest`
+    /// handles and a single stream becomes available, which handle gets
+    /// assigned that stream? Maybe that handle is no longer ready to send a
+    /// request.
+    ///
+    /// The strategy used is to allow each `SendRequest` handle one buffered
+    /// request. A `SendRequest` handle is ready to send a request if it has no
+    /// associated buffered requests. This is the same strategy as `mpsc` in the
+    /// futures library.
+    pending_open: store::Queue<stream::NextOpen>,
+
+    /// Connection level flow control governing sent data
+    flow: FlowControl,
+
+    /// Stream ID of the last stream opened.
+    last_opened_id: StreamId,
+
+    /// What `DATA` frame is currently being sent in the codec.
+    in_flight_data_frame: InFlightData,
+
+    /// The maximum amount of bytes a stream should buffer.
+    max_buffer_size: usize,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum InFlightData {
+    /// There is no `DATA` frame in flight.
+    Nothing,
+    /// There is a `DATA` frame in flight belonging to the given stream.
+    DataFrame(store::Key),
+    /// There was a `DATA` frame, but the stream's queue was since cleared.
+    Drop,
+}
+
+pub(crate) struct Prioritized<B> {
+    // The buffer
+    inner: Take<B>,
+
+    end_of_stream: bool,
+
+    // The stream that this is associated with
+    stream: store::Key,
+}
+
+// ===== impl Prioritize =====
+
+impl Prioritize {
+    pub fn new(config: &Config) -> Prioritize {
+        let mut flow = FlowControl::new();
+
+        flow.inc_window(config.remote_init_window_sz)
+            .expect("invalid initial window size");
+
+        // TODO: proper error handling
+        let _res = flow.assign_capacity(config.remote_init_window_sz);
+        debug_assert!(_res.is_ok());
+
+        tracing::trace!("Prioritize::new; flow={:?}", flow);
+
+        Prioritize {
+            pending_send: store::Queue::new(),
+            pending_capacity: store::Queue::new(),
+            pending_open: store::Queue::new(),
+            flow,
+            last_opened_id: StreamId::ZERO,
+            in_flight_data_frame: InFlightData::Nothing,
+            max_buffer_size: config.local_max_buffer_size,
+        }
+    }
+
+    pub(crate) fn max_buffer_size(&self) -> usize {
+        self.max_buffer_size
+    }
+
+    /// Queue a frame to be sent to the remote
+    pub fn queue_frame<B>(
+        &mut self,
+        frame: Frame<B>,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        task: &mut Option<Waker>,
+    ) {
+        let span = tracing::trace_span!("Prioritize::queue_frame", ?stream.id);
+        let _e = span.enter();
+        // Queue the frame in the buffer
+        stream.pending_send.push_back(buffer, frame);
+        self.schedule_send(stream, task);
+    }
+
+    pub fn schedule_send(&mut self, stream: &mut store::Ptr, task: &mut Option<Waker>) {
+        // If the stream is waiting to be opened, nothing more to do.
+        if stream.is_send_ready() {
+            tracing::trace!(?stream.id, "schedule_send");
+            // Queue the stream
+            self.pending_send.push(stream);
+
+            // Notify the connection.
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+        }
+    }
+
+    pub fn queue_open(&mut self, stream: &mut store::Ptr) {
+        self.pending_open.push(stream);
+    }
+
+    /// Send a data frame
+    pub fn send_data<B>(
+        &mut self,
+        frame: frame::Data<B>,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError>
+    where
+        B: Buf,
+    {
+        let sz = frame.payload().remaining();
+
+        if sz > MAX_WINDOW_SIZE as usize {
+            return Err(UserError::PayloadTooBig);
+        }
+
+        let sz = sz as WindowSize;
+
+        if !stream.state.is_send_streaming() {
+            if stream.state.is_closed() {
+                return Err(InactiveStreamId);
+            } else {
+                return Err(UnexpectedFrameType);
+            }
+        }
+
+        // Update the buffered data counter
+        stream.buffered_send_data += sz as usize;
+
+        let span =
+            tracing::trace_span!("send_data", sz, requested = stream.requested_send_capacity);
+        let _e = span.enter();
+        tracing::trace!(buffered = stream.buffered_send_data);
+
+        // Implicitly request more send capacity if not enough has been
+        // requested yet.
+        if (stream.requested_send_capacity as usize) < stream.buffered_send_data {
+            // Update the target requested capacity
+            stream.requested_send_capacity =
+                cmp::min(stream.buffered_send_data, WindowSize::MAX as usize) as WindowSize;
+
+            // `try_assign_capacity` will queue the stream to `pending_capacity` if the capcaity
+            // cannot be assigned at the time it is called.
+            //
+            // Streams over the max concurrent count will still call `send_data` so we should be
+            // careful not to put it into `pending_capacity` as it will starve the connection
+            // capacity for other streams
+            if !stream.is_pending_open {
+                self.try_assign_capacity(stream);
+            }
+        }
+
+        if frame.is_end_stream() {
+            stream.state.send_close();
+            self.reserve_capacity(0, stream, counts);
+        }
+
+        tracing::trace!(
+            available = %stream.send_flow.available(),
+            buffered = stream.buffered_send_data,
+        );
+
+        // The `stream.buffered_send_data == 0` check is here so that, if a zero
+        // length data frame is queued to the front (there is no previously
+        // queued data), it gets sent out immediately even if there is no
+        // available send window.
+        //
+        // Sending out zero length data frames can be done to signal
+        // end-of-stream.
+        //
+        if stream.send_flow.available() > 0 || stream.buffered_send_data == 0 {
+            // The stream currently has capacity to send the data frame, so
+            // queue it up and notify the connection task.
+            self.queue_frame(frame.into(), buffer, stream, task);
+        } else {
+            // The stream has no capacity to send the frame now, save it but
+            // don't notify the connection task. Once additional capacity
+            // becomes available, the frame will be flushed.
+            stream.pending_send.push_back(buffer, frame.into());
+        }
+
+        Ok(())
+    }
+
+    /// Request capacity to send data
+    pub fn reserve_capacity(
+        &mut self,
+        capacity: WindowSize,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) {
+        let span = tracing::trace_span!(
+            "reserve_capacity",
+            ?stream.id,
+            requested = capacity,
+            effective = (capacity as usize) + stream.buffered_send_data,
+            curr = stream.requested_send_capacity
+        );
+        let _e = span.enter();
+
+        // Actual capacity is `capacity` + the current amount of buffered data.
+        // If it were less, then we could never send out the buffered data.
+        let capacity = (capacity as usize) + stream.buffered_send_data;
+
+        match capacity.cmp(&(stream.requested_send_capacity as usize)) {
+            Ordering::Equal => {
+                // Nothing to do
+            }
+            Ordering::Less => {
+                // Update the target requested capacity
+                stream.requested_send_capacity = capacity as WindowSize;
+
+                // Currently available capacity assigned to the stream
+                let available = stream.send_flow.available().as_size();
+
+                // If the stream has more assigned capacity than requested, reclaim
+                // some for the connection
+                if available as usize > capacity {
+                    let diff = available - capacity as WindowSize;
+
+                    // TODO: proper error handling
+                    let _res = stream.send_flow.claim_capacity(diff);
+                    debug_assert!(_res.is_ok());
+
+                    self.assign_connection_capacity(diff, stream, counts);
+tests/h2-tests/tests/client_request.rs:22:    // At this point, the connection should be closed
+tests/h2-tests/tests/client_request.rs:35:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:40:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:91:    // The connection errors
+tests/h2-tests/tests/client_request.rs:138:            frames::headers(::std::u32::MAX >> 1)
+tests/h2-tests/tests/client_request.rs:143:        srv.send_frame(frames::headers(::std::u32::MAX >> 1).response(200).eos())
+tests/h2-tests/tests/client_request.rs:164:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:169:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:204:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:209:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:210:        srv.recv_frame(frames::headers(3).request("POST", "https://example.com/"))
+tests/h2-tests/tests/client_request.rs:212:        srv.send_frame(frames::headers(3).response(200)).await;
+tests/h2-tests/tests/client_request.rs:215:        srv.recv_frame(frames::headers(5).request("POST", "https://example.com/"))
+tests/h2-tests/tests/client_request.rs:217:        srv.send_frame(frames::headers(5).response(200)).await;
+tests/h2-tests/tests/client_request.rs:224:        // we send a simple req here just to drive the connection so we can
+tests/h2-tests/tests/client_request.rs:243:        // as long as we let the connection internals tick
+tests/h2-tests/tests/client_request.rs:299:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:304:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:313:            frames::headers(3)
+tests/h2-tests/tests/client_request.rs:319:        srv.send_frame(frames::headers(3).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:322:            frames::headers(5)
+tests/h2-tests/tests/client_request.rs:327:        srv.send_frame(frames::headers(5).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:332:        // we send a simple req here just to drive the connection so we can
+tests/h2-tests/tests/client_request.rs:375:async fn send_request_poll_ready_when_connection_error() {
+tests/h2-tests/tests/client_request.rs:389:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:394:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:396:            frames::headers(3)
+tests/h2-tests/tests/client_request.rs:401:        srv.send_frame(frames::headers(8).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:406:        // we send a simple req here just to drive the connection so we can
+tests/h2-tests/tests/client_request.rs:426:        // as long as we let the connection internals tick
+tests/h2-tests/tests/client_request.rs:477:        srv.recv_frame(frames::headers(1).request("POST", "https://example.com/"))
+tests/h2-tests/tests/client_request.rs:479:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/client_request.rs:534:        srv.recv_frame(frames::headers(1).request("GET", "/").scheme("http").eos())
+tests/h2-tests/tests/client_request.rs:536:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:589:async fn http_2_connect_request_omit_scheme_and_path_fields() {
+tests/h2-tests/tests/client_request.rs:597:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:606:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:612:        // In HTTP_2 CONNECT request the ":scheme" and ":path" pseudo-header fields MUST be omitted.
+tests/h2-tests/tests/client_request.rs:632:async fn request_with_connection_headers() {
+tests/h2-tests/tests/client_request.rs:641:        // goaway is required to make sure the connection closes because
+tests/h2-tests/tests/client_request.rs:646:    let headers = vec![
+tests/h2-tests/tests/client_request.rs:647:        ("connection", "foo"),
+tests/h2-tests/tests/client_request.rs:649:        ("proxy-connection", "bar"),
+tests/h2-tests/tests/client_request.rs:658:        for (name, val) in headers {
+tests/h2-tests/tests/client_request.rs:661:                .header(name, val)
+tests/h2-tests/tests/client_request.rs:665:            assert_eq!(err.to_string(), "user error: malformed headers");
+tests/h2-tests/tests/client_request.rs:675:async fn connection_close_notifies_response_future() {
+tests/h2-tests/tests/client_request.rs:682:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:714:async fn connection_close_notifies_client_poll_ready() {
+tests/h2-tests/tests/client_request.rs:722:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:754:            "connection closed because of a broken pipe"
+tests/h2-tests/tests/client_request.rs:762:async fn sending_request_on_closed_connection() {
+tests/h2-tests/tests/client_request.rs:770:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:775:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:777:        srv.send_frame(frames::headers(0).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:809:        let msg = "connection error detected: unspecific protocol error detected";
+tests/h2-tests/tests/client_request.rs:824:async fn recv_too_big_headers() {
+tests/h2-tests/tests/client_request.rs:830:        assert_frame_eq(settings, frames::settings().max_header_list_size(10));
+tests/h2-tests/tests/client_request.rs:832:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:838:            frames::headers(3)
+tests/h2-tests/tests/client_request.rs:843:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:844:        srv.send_frame(frames::headers(3).response(200)).await;
+tests/h2-tests/tests/client_request.rs:853:            .max_header_list_size(10)
+tests/h2-tests/tests/client_request.rs:899:        srv.recv_frame(frames::headers(1).request("GET", "https://http2.akamai.com/"))
+tests/h2-tests/tests/client_request.rs:923:        // Because all active requests are finished, connection should shutdown
+tests/h2-tests/tests/client_request.rs:925:        // count towards concurrency limit), then connection will not send
+tests/h2-tests/tests/client_request.rs:970:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:975:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:1010:        srv.recv_frame(frames::headers(1).request("OPTIONS", uri_clone).eos())
+tests/h2-tests/tests/client_request.rs:1012:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:1053:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:1058:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:1060:            frames::headers(3)
+tests/h2-tests/tests/client_request.rs:1065:        srv.send_frame(frames::headers(3).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:1067:            frames::headers(5)
+tests/h2-tests/tests/client_request.rs:1072:        srv.send_frame(frames::headers(5).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:1073:        // Don't close the connection until the client is done doing its
+tests/h2-tests/tests/client_request.rs:1124:        srv.recv_frame(frames::headers(1).request("POST", "https://example.com/"))
+tests/h2-tests/tests/client_request.rs:1172:        srv.recv_frame(frames::headers(1).request("GET", "https://www.example.com/"))
+tests/h2-tests/tests/client_request.rs:1175:            frames::headers(3)
+tests/h2-tests/tests/client_request.rs:1184:        srv.send_frame(frames::headers(3).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:1186:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:1239:async fn malformed_response_headers_dont_unlink_stream() {
+tests/h2-tests/tests/client_request.rs:1240:    // This test checks that receiving malformed headers frame on a stream with
+tests/h2-tests/tests/client_request.rs:1254:        srv.recv_frame(frames::headers(1).request("GET", "http://example.com/"))
+tests/h2-tests/tests/client_request.rs:1256:        srv.recv_frame(frames::headers(3).request("GET", "http://example.com/"))
+tests/h2-tests/tests/client_request.rs:1258:        srv.recv_frame(frames::headers(5).request("GET", "http://example.com/"))
+tests/h2-tests/tests/client_request.rs:1289:        // Use up most of the connection window.
+tests/h2-tests/tests/client_request.rs:1296:            // Use up the remainder of the connection window.
+tests/h2-tests/tests/client_request.rs:1298:            // Queue up for more connection window.
+tests/h2-tests/tests/client_request.rs:1311:async fn allow_empty_data_for_head() {
+tests/h2-tests/tests/client_request.rs:1319:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:1325:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:1339:            h2.await.expect("connection failed");
+tests/h2-tests/tests/client_request.rs:1355:async fn reject_none_zero_content_length_header_with_end_stream() {
+tests/h2-tests/tests/client_request.rs:1363:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:1369:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:1383:            h2.await.expect("connection failed");
+tests/h2-tests/tests/client_request.rs:1406:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:1411:        srv.send_frame(frames::headers(1).response(103)).await;
+tests/h2-tests/tests/client_request.rs:1412:        srv.send_frame(frames::headers(1).response(200).field("content-length", 2))
+tests/h2-tests/tests/client_request.rs:1423:            h2.await.expect("connection failed");
+tests/h2-tests/tests/client_request.rs:1447:        srv.recv_frame(frames::headers(1).request("POST", "https://example.com/"))
+tests/h2-tests/tests/client_request.rs:1449:        srv.send_frame(frames::headers(1).response(103)).await;
+tests/h2-tests/tests/client_request.rs:1450:        srv.send_frame(frames::headers(1).response(200).field("content-length", 2))
+tests/h2-tests/tests/client_request.rs:1462:            h2.await.expect("connection failed");
+tests/h2-tests/tests/client_request.rs:1484:async fn extended_connect_protocol_disabled_by_default() {
+tests/h2-tests/tests/client_request.rs:1493:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:1498:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:1504:        // we send a simple req here just to drive the connection so we can
+tests/h2-tests/tests/client_request.rs:1511:        assert!(!client.is_extended_connect_protocol_enabled());
+tests/h2-tests/tests/client_request.rs:1518:async fn extended_connect_protocol_enabled_during_handshake() {
+tests/h2-tests/tests/client_request.rs:1524:            .assert_client_handshake_with_settings(frames::settings().enable_connect_protocol(1))
+tests/h2-tests/tests/client_request.rs:1529:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:1534:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:1540:        // we send a simple req here just to drive the connection so we can
+tests/h2-tests/tests/client_request.rs:1546:        assert!(client.is_extended_connect_protocol_enabled());
+tests/h2-tests/tests/client_request.rs:1553:async fn invalid_connect_protocol_enabled_setting() {
+tests/h2-tests/tests/client_request.rs:1560:        srv.send(frames::settings().enable_connect_protocol(2).into())
+tests/h2-tests/tests/client_request.rs:1582:        // we send a simple req here just to drive the connection so we can
+tests/h2-tests/tests/client_request.rs:1595:async fn extended_connect_request() {
+tests/h2-tests/tests/client_request.rs:1602:            .assert_client_handshake_with_settings(frames::settings().enable_connect_protocol(1))
+tests/h2-tests/tests/client_request.rs:1607:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:1619:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:1625:        let request = Request::connect("http://bread/baguette")
+tests/h2-tests/tests/client_request.rs:1637:async fn rogue_server_odd_headers() {
+tests/h2-tests/tests/client_request.rs:1644:        srv.send_frame(frames::headers(1)).await;
+tests/h2-tests/tests/client_request.rs:1660:async fn rogue_server_even_headers() {
+tests/h2-tests/tests/client_request.rs:1667:        srv.send_frame(frames::headers(2)).await;
+tests/h2-tests/tests/client_request.rs:1683:async fn rogue_server_reused_headers() {
+tests/h2-tests/tests/client_request.rs:1692:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:1697:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:1698:        srv.send_frame(frames::headers(1)).await;
+tests/h2-tests/tests/client_request.rs:1722:async fn client_builder_header_table_size() {
+tests/h2-tests/tests/client_request.rs:1727:    settings.set_header_table_size(Some(10000));
+tests/h2-tests/tests/client_request.rs:1734:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:1739:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/client_request.rs:1743:    builder.header_table_size(10000);
+tests/h2-tests/tests/client_request.rs:1826:        // Handle the client's connection preface
+tests/h2-tests/tests/client_request.rs:1876:        // Handle the client's connection preface
+tests/h2-tests/tests/client_request.rs:1916:// If the server has not sent a go_away message before dropping the connection
+tests/h2-tests/tests/client_request.rs:1919:async fn server_drop_connection_unexpectedly_return_unexpected_eof_err() {
+tests/h2-tests/tests/client_request.rs:1927:            frames::headers(1)
+tests/h2-tests/tests/client_request.rs:1959:async fn server_drop_connection_after_go_away() {
+tests/h2-tests/tests/client_request.rs:1967:            frames::headers(1)
+tests/h2-tests/tests/flow_control.rs:5:// In this case, the stream & connection both have capacity, but capacity is not
+tests/h2-tests/tests/flow_control.rs:66:            frames::headers(1)
+tests/h2-tests/tests/flow_control.rs:71:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:132:            frames::headers(1)
+tests/h2-tests/tests/flow_control.rs:137:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:154:            assert!(!body.is_end_stream());
+tests/h2-tests/tests/flow_control.rs:176:async fn recv_data_overflows_connection_window() {
+tests/h2-tests/tests/flow_control.rs:185:            frames::headers(1)
+tests/h2-tests/tests/flow_control.rs:190:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:200:        // connection is ended by client
+tests/h2-tests/tests/flow_control.rs:219:                "connection error detected: flow-control protocol violated"
+tests/h2-tests/tests/flow_control.rs:229:                "connection error detected: flow-control protocol violated"
+tests/h2-tests/tests/flow_control.rs:239:    // this tests for when streams have smaller windows than their connection
+tests/h2-tests/tests/flow_control.rs:247:            frames::headers(1)
+tests/h2-tests/tests/flow_control.rs:252:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:296:async fn stream_error_release_connection_capacity() {
+tests/h2-tests/tests/flow_control.rs:304:            frames::headers(1)
+tests/h2-tests/tests/flow_control.rs:311:            frames::headers(1)
+tests/h2-tests/tests/flow_control.rs:389:        // This effectively reserves the entire connection window
+tests/h2-tests/tests/flow_control.rs:390:        s1.reserve_capacity(window_size);
+tests/h2-tests/tests/flow_control.rs:406:        s2.reserve_capacity(5);
+tests/h2-tests/tests/flow_control.rs:423:        // (which will send a RST_STREAM) before the connection is closed.
+tests/h2-tests/tests/flow_control.rs:431:        srv.recv_frame(frames::headers(1).request("POST", "https://http2.akamai.com/"))
+tests/h2-tests/tests/flow_control.rs:433:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:434:        srv.recv_frame(frames::headers(3).request("POST", "https://http2.akamai.com/"))
+tests/h2-tests/tests/flow_control.rs:436:        srv.send_frame(frames::headers(3).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:461:        // This effectively reserves the entire connection window
+tests/h2-tests/tests/flow_control.rs:462:        s1.reserve_capacity(window_size);
+tests/h2-tests/tests/flow_control.rs:478:        s2.reserve_capacity(5);
+tests/h2-tests/tests/flow_control.rs:495:        // (which will send a RST_STREAM) before the connection is closed.
+tests/h2-tests/tests/flow_control.rs:504:        srv.recv_frame(frames::headers(1).request("POST", "https://http2.akamai.com/"))
+tests/h2-tests/tests/flow_control.rs:506:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:507:        srv.recv_frame(frames::headers(3).request("POST", "https://http2.akamai.com/"))
+tests/h2-tests/tests/flow_control.rs:509:        srv.send_frame(frames::headers(3).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:510:        srv.recv_frame(frames::headers(1).eos()).await;
+tests/h2-tests/tests/flow_control.rs:526:            frames::headers(1)
+tests/h2-tests/tests/flow_control.rs:531:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:536:            frames::headers(3)
+tests/h2-tests/tests/flow_control.rs:541:        srv.send_frame(frames::headers(3).response(200).eos()).await;
+tests/h2-tests/tests/flow_control.rs:594:        // Send a data frame, this will also close the connection
+tests/h2-tests/tests/flow_control.rs:605:        // Wait for the connection to close
+tests/h2-tests/tests/flow_control.rs:611:        srv.recv_frame(frames::headers(1).request("POST", "https://http2.akamai.com/"))
+tests/h2-tests/tests/flow_control.rs:613:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:640:        stream.reserve_capacity(10);
+tests/h2-tests/tests/flow_control.rs:649:        // Wait for the connection to close
+tests/h2-tests/tests/flow_control.rs:656:        srv.recv_frame(frames::headers(1).request("POST", "https://http2.akamai.com/"))
+tests/h2-tests/tests/flow_control.rs:663:        // Increase the connection window
+tests/h2-tests/tests/flow_control.rs:674:        srv.send_frame(frames::headers(1).response(204).eos()).await;
+tests/h2-tests/tests/flow_control.rs:684:async fn connection_notified_on_released_capacity() {
+tests/h2-tests/tests/flow_control.rs:690:    // We're going to run the connection on a thread in order to isolate task
+tests/h2-tests/tests/flow_control.rs:691:    // notifications. This test is here, in part, to ensure that the connection
+tests/h2-tests/tests/flow_control.rs:707:            frames::headers(1)
+tests/h2-tests/tests/flow_control.rs:714:            frames::headers(3)
+tests/h2-tests/tests/flow_control.rs:720:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:722:        srv.send_frame(frames::headers(3).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:724:        // Fill the connection window
+tests/h2-tests/tests/flow_control.rs:751:        // Run the connection to completion
+tests/h2-tests/tests/flow_control.rs:805:        srv.recv_frame(frames::headers(1).request("POST", "https://http2.akamai.com/"))
+tests/h2-tests/tests/flow_control.rs:811:        srv.send_frame(frames::headers(1).response(204).eos()).await;
+tests/h2-tests/tests/flow_control.rs:824:        stream.reserve_capacity(11);
+tests/h2-tests/tests/flow_control.rs:834:        // Wait for the connection to close
+tests/h2-tests/tests/flow_control.rs:851:        srv.recv_frame(frames::headers(1).request("POST", "https://http2.akamai.com/"))
+tests/h2-tests/tests/flow_control.rs:858:        srv.send_frame(frames::headers(1).response(204).eos()).await;
+tests/h2-tests/tests/flow_control.rs:871:        stream.reserve_capacity(11);
+tests/h2-tests/tests/flow_control.rs:897:        srv.recv_frame(frames::headers(1).request("POST", "https://http2.akamai.com/"))
+tests/h2-tests/tests/flow_control.rs:909:        srv.send_frame(frames::headers(1).response(204).eos()).await;
+tests/h2-tests/tests/flow_control.rs:922:        stream.reserve_capacity(11);
+tests/h2-tests/tests/flow_control.rs:932:        // Wait for the connection to close
+tests/h2-tests/tests/flow_control.rs:940:async fn settings_lowered_capacity_returns_capacity_to_connection() {
+tests/h2-tests/tests/flow_control.rs:956:        srv.recv_frame(frames::headers(1).request("POST", "https://example.com/one"))
+tests/h2-tests/tests/flow_control.rs:958:        srv.recv_frame(frames::headers(3).request("POST", "https://example.com/two"))
+tests/h2-tests/tests/flow_control.rs:988:        srv.send_frame(frames::headers(1).response(204).eos()).await;
+tests/h2-tests/tests/flow_control.rs:989:        srv.send_frame(frames::headers(3).response(204).eos()).await;
+tests/h2-tests/tests/flow_control.rs:997:    // Drive client connection
+tests/h2-tests/tests/flow_control.rs:1016:    // Reserve capacity for stream one, this will consume all connection level
+tests/h2-tests/tests/flow_control.rs:1018:    stream1.reserve_capacity(window_size);
+tests/h2-tests/tests/flow_control.rs:1022:    stream2.reserve_capacity(11);
+tests/h2-tests/tests/flow_control.rs:1075:            frames::headers(1)
+tests/h2-tests/tests/flow_control.rs:1080:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:1116:            frames::headers(1)
+tests/h2-tests/tests/flow_control.rs:1121:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:1165:            frames::headers(1)
+tests/h2-tests/tests/flow_control.rs:1170:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:1237:            frames::headers(1)
+tests/h2-tests/tests/flow_control.rs:1242:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:1246:            frames::headers(3)
+tests/h2-tests/tests/flow_control.rs:1251:        srv.send_frame(frames::headers(3).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:1255:            frames::headers(5)
+tests/h2-tests/tests/flow_control.rs:1260:        srv.send_frame(frames::headers(5).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:1315:            assert!(body1.is_end_stream());
+tests/h2-tests/tests/flow_control.rs:1342:            assert!(!body3.is_end_stream());
+tests/h2-tests/tests/flow_control.rs:1383:        srv.recv_frame(frames::headers(1).request("POST", "https://http2.akamai.com/"))
+tests/h2-tests/tests/flow_control.rs:1394:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/flow_control.rs:1416:async fn reserve_capacity_after_peer_closes() {
+tests/h2-tests/tests/flow_control.rs:1424:        srv.recv_frame(frames::headers(1).request("POST", "https://http2.akamai.com/"))
+tests/h2-tests/tests/flow_control.rs:1426:        // close connection suddenly
+tests/h2-tests/tests/flow_control.rs:1442:        // As stated in #300, this would panic because the connection
+tests/h2-tests/tests/flow_control.rs:1444:        req_body.reserve_capacity(1);
+tests/h2-tests/tests/flow_control.rs:1454:    // connection-level window reassigns that window to another stream.
+tests/h2-tests/tests/flow_control.rs:1462:        srv.recv_frame(frames::headers(1).request("GET", "http://example.com/"))
+tests/h2-tests/tests/flow_control.rs:1464:        srv.recv_frame(frames::headers(3).request("GET", "http://example.com/"))
+tests/h2-tests/tests/flow_control.rs:1466:        srv.recv_frame(frames::headers(5).request("GET", "http://example.com/"))
+tests/h2-tests/tests/flow_control.rs:1472:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:1473:        // Assign enough connection window for stream 3...
+tests/h2-tests/tests/flow_control.rs:1479:        srv.send_frame(frames::headers(5).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:1496:        // Use up the connection window.
+tests/h2-tests/tests/flow_control.rs:1498:        // Queue up for more connection window.
+tests/h2-tests/tests/flow_control.rs:1528:            frames::headers(1)
+tests/h2-tests/tests/flow_control.rs:1534:            frames::headers(1)
+tests/h2-tests/tests/flow_control.rs:1574:        srv.recv_frame(frames::headers(1).request("POST", "https://www.example.com/"))
+tests/h2-tests/tests/flow_control.rs:1576:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:1597:        stream.reserve_capacity(5);
+tests/h2-tests/tests/flow_control.rs:1607:        // Wait for the connection to close
+tests/h2-tests/tests/flow_control.rs:1624:        srv.recv_frame(frames::headers(1).request("POST", "https://www.example.com/"))
+tests/h2-tests/tests/flow_control.rs:1626:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:1651:        stream.reserve_capacity(5);
+tests/h2-tests/tests/flow_control.rs:1662:        // Wait for the connection to close
+tests/h2-tests/tests/flow_control.rs:1677:        srv.recv_frame(frames::headers(1).request("POST", "https://www.example.com/"))
+tests/h2-tests/tests/flow_control.rs:1679:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/flow_control.rs:1702:        stream.reserve_capacity(10);
+tests/h2-tests/tests/flow_control.rs:1711:        stream.reserve_capacity(15);
+tests/h2-tests/tests/flow_control.rs:1719:        // Wait for the connection to close
+tests/h2-tests/tests/flow_control.rs:1734:        srv.recv_frame(frames::headers(1).request("POST", "https://www.example.com/"))
+tests/h2-tests/tests/flow_control.rs:1736:        srv.send_frame(frames::headers(1).response(200).eos()).await;
+tests/h2-tests/tests/flow_control.rs:1764:        stream.reserve_capacity(TO_SEND);
+tests/h2-tests/tests/flow_control.rs:1792:        // Wait for the connection to close
+tests/h2-tests/tests/flow_control.rs:1810:        srv.recv_frame(frames::headers(1).request("POST", "https://www.example.com/"))
+tests/h2-tests/tests/flow_control.rs:1812:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:1839:        stream.reserve_capacity(10);
+tests/h2-tests/tests/flow_control.rs:1846:        stream.reserve_capacity(5);
+tests/h2-tests/tests/flow_control.rs:1854:        // Wait for the connection to close
+tests/h2-tests/tests/flow_control.rs:1913:        srv.recv_frame(frames::headers(1).request("POST", "https://www.example.com/"))
+tests/h2-tests/tests/flow_control.rs:1915:        srv.send_frame(frames::headers(1).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:1923:        // By now, this peer's connection window is completely depleted.
+tests/h2-tests/tests/flow_control.rs:1925:        srv.recv_frame(frames::headers(3).request("POST", "https://www.example.com/"))
+tests/h2-tests/tests/flow_control.rs:1927:        srv.send_frame(frames::headers(3).response(200)).await;
+tests/h2-tests/tests/flow_control.rs:1958:        // connection window.
+tests/h2-tests/tests/flow_control.rs:1960:        depleting_stream.reserve_capacity(1);
+tests/h2-tests/tests/flow_control.rs:1980:        // server's connection window is completely empty.
+tests/h2-tests/tests/flow_control.rs:1984:        // any available connection window, only requested it.
+src/proto/streams/streams.rs:23:    /// Holds most of the connection and stream related state for processing
+src/proto/streams/streams.rs:94:    /// If the connection errors, a copy is kept for any StreamRefs.
+src/proto/streams/streams.rs:121:    pub fn set_target_connection_window_size(&mut self, size: WindowSize) -> Result<(), Reason> {
+src/proto/streams/streams.rs:127:            .set_target_connection_window(size, &mut me.actions.task)
+src/proto/streams/streams.rs:272:            stream.content_length = ContentLength::Head;
+src/proto/streams/streams.rs:276:        let headers =
+src/proto/streams/streams.rs:281:        let sent = me.actions.send.send_headers(
+src/proto/streams/streams.rs:282:            headers,
+src/proto/streams/streams.rs:289:        // send_headers can return a UserError, if it does,
+src/proto/streams/streams.rs:315:    pub(crate) fn is_extended_connect_protocol_enabled(&self) -> bool {
+src/proto/streams/streams.rs:321:            .is_extended_connect_protocol_enabled()
+src/proto/streams/streams.rs:344:    pub fn recv_headers(&mut self, frame: frame::Headers) -> Result<(), Error> {
+src/proto/streams/streams.rs:347:        me.recv_headers(self.peer, self.send_buffer, frame)
+src/proto/streams/streams.rs:361:    /// Notify all streams that a connection-level error happened.
+src/proto/streams/streams.rs:421:    fn recv_headers<B>(
+src/proto/streams/streams.rs:447:                // the request headers, so don't allow.
+src/proto/streams/streams.rs:449:                    // This may be response headers for a stream we've already
+src/proto/streams/streams.rs:453:                            "recv_headers for old stream={:?}, sending STREAM_CLOSED",
+src/proto/streams/streams.rs:485:            tracing::trace!("recv_headers; ignoring trailers on {:?}", stream.id);
+src/proto/streams/streams.rs:495:                "recv_headers; stream={:?}; state={:?}",
+src/proto/streams/streams.rs:500:            let res = if stream.state.is_recv_headers() {
+src/proto/streams/streams.rs:501:                match actions.recv.recv_headers(frame, stream, counts) {
+src/proto/streams/streams.rs:505:                            let sent = actions.send.send_headers(
+src/proto/streams/streams.rs:525:                if !frame.is_end_stream() {
+src/proto/streams/streams.rs:528:                    proto_err!(stream: "recv_headers: trailers frame was not EOS; stream={:?}", stream.id);
+src/proto/streams/streams.rs:593:                    .release_connection_capacity(sz as WindowSize, &mut None);
+src/proto/streams/streams.rs:660:                .recv_connection_window_update(frame, &mut self.store, &mut self.counts)
+src/proto/streams/streams.rs:833:        // If we're successful, push the headers and stream...
+src/proto/streams/streams.rs:860:                    "connection closed because of a broken pipe",
+src/proto/streams/streams.rs:937:                //    stream in our store. Maybe that should be a connection
+src/proto/streams/streams.rs:1173:                .send_headers(frame, send_buffer, stream, counts, &mut actions.task)
+src/proto/streams/streams.rs:1255:    pub fn reserve_capacity(&mut self, capacity: WindowSize) {
+src/proto/streams/streams.rs:1263:            .reserve_capacity(capacity, &mut stream, &mut me.counts)
+src/proto/streams/streams.rs:1357:    pub fn is_end_stream(&self) -> bool {
+src/proto/streams/streams.rs:1363:        me.actions.recv.is_end_stream(&stream)
+src/proto/streams/streams.rs:1401:    /// WINDOW_UPDATE frames on both the stream and connection.
+src/proto/streams/streams.rs:1500:    // (connection) so that it can close properly
+src/proto/streams/streams.rs:1511:            // Release any recv window back to connection, no one can access
+[package]
+name = "h2-support"
+version = "0.1.0"
+authors = ["Carl Lerche <<email>>"]
+publish = false
+edition = "2018"
+
+[dependencies]
+h2 = { path = "../..", features = ["stream", "unstable"] }
+
+atty = "0.2"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+tracing-tree = "0.2"
+futures = { version = "0.3", default-features = false }
+http = "1"
+tokio = { version = "1", features = ["time"] }
+tokio-test = "0.4"

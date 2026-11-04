@@ -1,0 +1,671 @@
+//! Deserialize Lua values to a Rust data structure.
+
+use std::cell::RefCell;
+use std::os::raw::c_void;
+use std::rc::Rc;
+use std::result::Result as StdResult;
+use std::string::String as StdString;
+
+use rustc_hash::FxHashSet;
+use serde::de::{self, IntoDeserializer};
+
+use crate::error::{Error, Result};
+use crate::table::{Table, TablePairs, TableSequence};
+use crate::userdata::AnyUserData;
+use crate::value::Value;
+
+/// A struct for deserializing Lua values into Rust values.
+#[derive(Debug, Default)]
+pub struct Deserializer {
+    value: Value,
+    options: Options,
+    visited: Rc<RefCell<FxHashSet<*const c_void>>>,
+    len: Option<usize>, // A length hint for sequences
+}
+
+/// A struct with options to change default deserializer behavior.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct Options {
+    /// If true, an attempt to serialize types such as [`Function`], [`Thread`], [`LightUserData`]
+    /// and [`Error`] will cause an error.
+    /// Otherwise these types skipped when iterating or serialized as unit type.
+    ///
+    /// Default: **true**
+    ///
+    /// [`Function`]: crate::Function
+    /// [`Thread`]: crate::Thread
+    /// [`LightUserData`]: crate::LightUserData
+    /// [`Error`]: crate::Error
+    pub deny_unsupported_types: bool,
+
+    /// If true, an attempt to serialize a recursive table (table that refers to itself)
+    /// will cause an error.
+    /// Otherwise subsequent attempts to serialize the same table will be ignored.
+    ///
+    /// Default: **true**
+    pub deny_recursive_tables: bool,
+
+    /// If true, keys in tables will be iterated in sorted order.
+    ///
+    /// Default: **false**
+    pub sort_keys: bool,
+
+    /// If true, empty Lua tables will be encoded as array, instead of map.
+    ///
+    /// Default: **false**
+    pub encode_empty_tables_as_array: bool,
+
+    /// If true, enable detection of mixed tables.
+    ///
+    /// A mixed table is a table that has both array-like and map-like entries or several borders.
+    /// See [`The Length Operator`] documentation for details about borders.
+    ///
+    /// When this option is disabled, a table with a non-zero length (with one or more borders) will
+    /// be always encoded as an array.
+    ///
+    /// Default: **false**
+    ///
+    /// [`The Length Operator`]: https://www.lua.org/manual/5.4/manual.html#3.4.7
+    pub detect_mixed_tables: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        const { Self::new() }
+    }
+}
+
+impl Options {
+    /// Returns a new instance of `Options` with default parameters.
+    pub const fn new() -> Self {
+        Options {
+            deny_unsupported_types: true,
+            deny_recursive_tables: true,
+            sort_keys: false,
+            encode_empty_tables_as_array: false,
+            detect_mixed_tables: false,
+        }
+    }
+
+    /// Sets [`deny_unsupported_types`] option.
+    ///
+    /// [`deny_unsupported_types`]: #structfield.deny_unsupported_types
+    #[must_use]
+    pub const fn deny_unsupported_types(mut self, enabled: bool) -> Self {
+        self.deny_unsupported_types = enabled;
+        self
+    }
+
+    /// Sets [`deny_recursive_tables`] option.
+    ///
+    /// [`deny_recursive_tables`]: #structfield.deny_recursive_tables
+    #[must_use]
+    pub const fn deny_recursive_tables(mut self, enabled: bool) -> Self {
+        self.deny_recursive_tables = enabled;
+        self
+    }
+
+    /// Sets [`sort_keys`] option.
+    ///
+    /// [`sort_keys`]: #structfield.sort_keys
+    #[must_use]
+    pub const fn sort_keys(mut self, enabled: bool) -> Self {
+        self.sort_keys = enabled;
+        self
+    }
+
+    /// Sets [`encode_empty_tables_as_array`] option.
+    ///
+    /// [`encode_empty_tables_as_array`]: #structfield.encode_empty_tables_as_array
+    #[must_use]
+    pub const fn encode_empty_tables_as_array(mut self, enabled: bool) -> Self {
+        self.encode_empty_tables_as_array = enabled;
+        self
+    }
+
+    /// Sets [`detect_mixed_tables`] option.
+    ///
+    /// [`detect_mixed_tables`]: #structfield.detect_mixed_tables
+    #[must_use]
+    pub const fn detect_mixed_tables(mut self, enable: bool) -> Self {
+        self.detect_mixed_tables = enable;
+        self
+    }
+}
+
+impl Deserializer {
+    /// Creates a new Lua Deserializer for the [`Value`].
+    pub fn new(value: Value) -> Self {
+        Self::new_with_options(value, Options::default())
+    }
+
+    /// Creates a new Lua Deserializer for the [`Value`] with custom options.
+    pub fn new_with_options(value: Value, options: Options) -> Self {
+        Deserializer {
+            value,
+            options,
+            ..Default::default()
+        }
+    }
+
+    fn from_parts(value: Value, options: Options, visited: Rc<RefCell<FxHashSet<*const c_void>>>) -> Self {
+        Deserializer {
+            value,
+            options,
+            visited,
+            ..Default::default()
+        }
+    }
+
+    fn with_len(mut self, len: usize) -> Self {
+        self.len = Some(len);
+        self
+    }
+}
+
+impl<'de> serde::Deserializer<'de> for Deserializer {
+    type Error = Error;
+
+    #[inline]
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: de::Visitor<'de>,
+    {
+        match self.value {
+            Value::Nil => visitor.visit_unit(),
+            Value::Boolean(b) => visitor.visit_bool(b),
+            #[allow(clippy::useless_conversion)]
+            Value::Integer(i) => visitor.visit_i64(i.into()),
+            #[allow(clippy::useless_conversion)]
+            Value::Number(n) => visitor.visit_f64(n.into()),
+            #[cfg(feature = "luau")]
+            Value::Vector(_) => self.deserialize_seq(visitor),
+            Value::String(s) => match s.to_str() {
+                Ok(s) => visitor.visit_str(&s),
+                Err(_) => visitor.visit_bytes(&s.as_bytes()),
+            },
+            Value::Table(ref t) => {
+                if let Some(len) = t.encode_as_array(self.options) {
+                    self.with_len(len).deserialize_seq(visitor)
+                } else {
+                    self.deserialize_map(visitor)
+                }
+            }
+            Value::LightUserData(ud) if ud.0.is_null() => visitor.visit_none(),
+            Value::UserData(ud) if ud.is_serializable() => {
+                serde_userdata(ud, |value| value.deserialize_any(visitor))
+            }
+            #[cfg(feature = "luau")]
+            Value::Buffer(buf) => {
+                let lua = buf.0.lua.lock();
+                visitor.visit_bytes(buf.as_slice(&lua))
+            }
+            Value::Function(_)
+            | Value::Thread(_)
+            | Value::UserData(_)
+            | Value::LightUserData(_)
+            | Value::Error(_)
+            | Value::Other(_) => {
+                if self.options.deny_unsupported_types {
+        if options.detect_mixed_tables {
+            if let Some((len, max_idx)) = self.find_array_len() {
+                // If the array is too sparse, serialize it as a map instead
+                if len < 10 || len * 2 >= max_idx {
+                    return Some(max_idx);
+                }
+            }
+        } else {
+            let len = self.raw_len();
+            if len > 0 || self.has_array_metatable() {
+                return Some(len);
+            }
+            if options.encode_empty_tables_as_array && self.is_empty() {
+                return Some(0);
+            }
+        }
+        None
+    }
+
+    #[cfg(feature = "luau")]
+    #[inline(always)]
+    fn check_readonly_write(&self, lua: &RawLua) -> Result<()> {
+        if unsafe { ffi::lua_getreadonly(lua.ref_thread(), self.0.index) != 0 } {
+            return Err(Error::runtime("attempt to modify a readonly table"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn fmt_pretty(
+        &self,
+        fmt: &mut fmt::Formatter,
+        ident: usize,
+        visited: &mut HashSet<*const c_void>,
+    ) -> fmt::Result {
+        visited.insert(self.to_pointer());
+
+        // Collect key/value pairs into a vector so we can sort them
+        let mut pairs = self.pairs::<Value, Value>().flatten().collect::<Vec<_>>();
+        // Sort keys
+        pairs.sort_by(|(a, _), (b, _)| a.sort_cmp(b));
+        let is_sequence = (pairs.iter().enumerate())
+            .all(|(i, (k, _))| matches!(k, Value::Integer(n) if *n == (i + 1) as Integer));
+        if pairs.is_empty() {
+            return write!(fmt, "{{}}");
+        }
+        writeln!(fmt, "{{")?;
+        if is_sequence {
+            // Format as list
+            for (_, value) in pairs {
+                write!(fmt, "{}", " ".repeat(ident + 2))?;
+                value.fmt_pretty(fmt, true, ident + 2, visited)?;
+                writeln!(fmt, ",")?;
+            }
+        } else {
+            fn is_simple_key(key: &[u8]) -> bool {
+                key.iter().take(1).all(|c| c.is_ascii_alphabetic() || *c == b'_')
+                    && key.iter().all(|c| c.is_ascii_alphanumeric() || *c == b'_')
+            }
+
+            for (key, value) in pairs {
+                match key {
+                    Value::String(key) if is_simple_key(&key.as_bytes()) => {
+                        write!(fmt, "{}{}", " ".repeat(ident + 2), key.display())?;
+                        write!(fmt, " = ")?;
+                    }
+                    _ => {
+                        write!(fmt, "{}[", " ".repeat(ident + 2))?;
+                        key.fmt_pretty(fmt, false, ident + 2, visited)?;
+                        write!(fmt, "] = ")?;
+                    }
+                }
+                value.fmt_pretty(fmt, true, ident + 2, visited)?;
+                writeln!(fmt, ",")?;
+            }
+        }
+        write!(fmt, "{}}}", " ".repeat(ident))
+    }
+}
+
+impl fmt::Debug for Table {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        if fmt.alternate() {
+            return self.fmt_pretty(fmt, 0, &mut HashSet::new());
+        }
+        fmt.debug_tuple("Table").field(&self.0).finish()
+    }
+}
+
+impl<T> PartialEq<[T]> for Table
+where
+    T: IntoLua + Clone,
+{
+    fn eq(&self, other: &[T]) -> bool {
+        let lua = self.0.lua.lock();
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            assert_stack(state, 4);
+
+            lua.push_ref(&self.0);
+
+            let len = ffi::lua_rawlen(state, -1);
+            for i in 0..len {
+                ffi::lua_rawgeti(state, -1, (i + 1) as _);
+                let val = lua.pop_value();
+                if val == Nil {
+                    return i == other.len();
+                }
+                match other.get(i).map(|v| v.clone().into_lua(lua.lua())) {
+                    Some(Ok(other_val)) if val == other_val => continue,
+                    _ => return false,
+                }
+            }
+        }
+        true
+    }
+}
+
+impl<T> PartialEq<&[T]> for Table
+where
+    T: IntoLua + Clone,
+{
+    #[inline]
+    fn eq(&self, other: &&[T]) -> bool {
+        self == *other
+    }
+}
+
+impl<T, const N: usize> PartialEq<[T; N]> for Table
+where
+    T: IntoLua + Clone,
+{
+    #[inline]
+    fn eq(&self, other: &[T; N]) -> bool {
+        self == &other[..]
+    }
+}
+
+impl LuaType for Table {
+    const TYPE_ID: c_int = ffi::LUA_TTABLE;
+}
+
+impl ObjectLike for Table {
+    #[inline]
+    fn get<V: FromLua>(&self, key: impl IntoLua) -> Result<V> {
+        self.get(key)
+    }
+
+    #[inline]
+    fn set(&self, key: impl IntoLua, value: impl IntoLua) -> Result<()> {
+        self.set(key, value)
+    }
+
+    #[inline]
+    fn call<R>(&self, args: impl IntoLuaMulti) -> Result<R>
+    where
+        R: FromLuaMulti,
+    {
+        // Convert table to a function and call via pcall that respects the `__call` metamethod.
+        Function(self.0.clone()).call(args)
+    }
+
+    #[cfg(feature = "async")]
+    #[inline]
+    fn call_async<R>(&self, args: impl IntoLuaMulti) -> AsyncCallFuture<R>
+    where
+        R: FromLuaMulti,
+    {
+        Function(self.0.clone()).call_async(args)
+    }
+
+    #[inline]
+    fn call_method<R>(&self, name: &str, args: impl IntoLuaMulti) -> Result<R>
+    where
+        R: FromLuaMulti,
+    {
+        self.call_function(name, (self, args))
+    }
+
+    #[cfg(feature = "async")]
+    fn call_async_method<R>(&self, name: &str, args: impl IntoLuaMulti) -> AsyncCallFuture<R>
+    where
+        R: FromLuaMulti,
+    {
+        self.call_async_function(name, (self, args))
+    }
+
+    #[inline]
+    fn call_function<R: FromLuaMulti>(&self, name: &str, args: impl IntoLuaMulti) -> Result<R> {
+        match self.get(name)? {
+            Value::Function(func) => func.call(args),
+            val => {
+                let msg = format!("attempt to call a {} value (function '{name}')", val.type_name());
+                Err(Error::runtime(msg))
+            }
+        }
+    }
+
+    #[cfg(feature = "async")]
+    #[inline]
+    fn call_async_function<R>(&self, name: &str, args: impl IntoLuaMulti) -> AsyncCallFuture<R>
+    where
+        R: FromLuaMulti,
+    {
+        match self.get(name) {
+            Ok(Value::Function(func)) => func.call_async(args),
+            Ok(val) => {
+                let msg = format!("attempt to call a {} value (function '{name}')", val.type_name());
+                AsyncCallFuture::error(Error::RuntimeError(msg))
+            }
+            Err(err) => AsyncCallFuture::error(err),
+        }
+    }
+
+    #[inline]
+    fn to_string(&self) -> Result<StdString> {
+        Value::Table(Table(self.0.clone())).to_string()
+    }
+
+    #[inline]
+    fn to_value(&self) -> Value {
+//! Serialize a Rust data structure into Lua value.
+
+use serde::{ser, Serialize};
+
+use super::LuaSerdeExt;
+use crate::error::{Error, Result};
+use crate::state::Lua;
+use crate::table::Table;
+use crate::traits::IntoLua;
+use crate::value::Value;
+
+/// A struct for serializing Rust values into Lua values.
+#[derive(Debug)]
+pub struct Serializer<'a> {
+    lua: &'a Lua,
+    options: Options,
+}
+
+/// A struct with options to change default serializer behavior.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct Options {
+    /// If true, sequence serialization to a Lua table will create table
+    /// with the [`array_metatable`] attached.
+    ///
+    /// Default: **true**
+    ///
+    /// [`array_metatable`]: crate::LuaSerdeExt::array_metatable
+    pub set_array_metatable: bool,
+
+    /// If true, serialize `None` (part of the `Option` type) to [`null`].
+    /// Otherwise it will be set to Lua [`Nil`].
+    ///
+    /// Default: **true**
+    ///
+    /// [`null`]: crate::LuaSerdeExt::null
+    /// [`Nil`]: crate::Value::Nil
+    pub serialize_none_to_null: bool,
+
+    /// If true, serialize `Unit` (type of `()` in Rust) and Unit structs to [`null`].
+    /// Otherwise it will be set to Lua [`Nil`].
+    ///
+    /// Default: **true**
+    ///
+    /// [`null`]: crate::LuaSerdeExt::null
+    /// [`Nil`]: crate::Value::Nil
+    pub serialize_unit_to_null: bool,
+
+    /// If true, serialize `serde_json::Number` with arbitrary_precision to a Lua number.
+    /// Otherwise it will be serialized as an object (what serde does).
+    ///
+    /// Default: **false**
+    pub detect_serde_json_arbitrary_precision: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        const { Self::new() }
+    }
+}
+
+impl Options {
+    /// Returns a new instance of [`Options`] with default parameters.
+    pub const fn new() -> Self {
+        Options {
+            set_array_metatable: true,
+            serialize_none_to_null: true,
+            serialize_unit_to_null: true,
+            detect_serde_json_arbitrary_precision: false,
+        }
+    }
+
+    /// Sets [`set_array_metatable`] option.
+    ///
+    /// [`set_array_metatable`]: #structfield.set_array_metatable
+    #[must_use]
+    pub const fn set_array_metatable(mut self, enabled: bool) -> Self {
+        self.set_array_metatable = enabled;
+        self
+    }
+
+    /// Sets [`serialize_none_to_null`] option.
+    ///
+    /// [`serialize_none_to_null`]: #structfield.serialize_none_to_null
+    #[must_use]
+    pub const fn serialize_none_to_null(mut self, enabled: bool) -> Self {
+        self.serialize_none_to_null = enabled;
+        self
+    }
+
+    /// Sets [`serialize_unit_to_null`] option.
+    ///
+    /// [`serialize_unit_to_null`]: #structfield.serialize_unit_to_null
+    #[must_use]
+    pub const fn serialize_unit_to_null(mut self, enabled: bool) -> Self {
+        self.serialize_unit_to_null = enabled;
+        self
+    }
+
+    /// Sets [`detect_serde_json_arbitrary_precision`] option.
+    ///
+    /// This option is used to serialize `serde_json::Number` with arbitrary precision to a Lua
+    /// number. Otherwise it will be serialized as an object (what serde does).
+    ///
+    /// This option is disabled by default.
+    ///
+    /// [`detect_serde_json_arbitrary_precision`]: #structfield.detect_serde_json_arbitrary_precision
+    #[must_use]
+    pub const fn detect_serde_json_arbitrary_precision(mut self, enabled: bool) -> Self {
+        self.detect_serde_json_arbitrary_precision = enabled;
+        self
+    }
+}
+
+impl<'a> Serializer<'a> {
+    /// Creates a new Lua Serializer with default options.
+    pub fn new(lua: &'a Lua) -> Self {
+        Self::new_with_options(lua, Options::default())
+    }
+
+    /// Creates a new Lua Serializer with custom options.
+    pub fn new_with_options(lua: &'a Lua, options: Options) -> Self {
+        Serializer { lua, options }
+    }
+}
+
+macro_rules! lua_serialize_number {
+    ($name:ident, $t:ty) => {
+        #[inline]
+        fn $name(self, value: $t) -> Result<Value> {
+            value.into_lua(self.lua)
+        }
+    };
+}
+
+impl<'a> ser::Serializer for Serializer<'a> {
+    type Ok = Value;
+    type Error = Error;
+
+    // Associated types for keeping track of additional state while serializing
+    // compound data structures like sequences and maps.
+    type SerializeSeq = SerializeSeq<'a>;
+    type SerializeTuple = SerializeSeq<'a>;
+    type SerializeTupleStruct = SerializeSeq<'a>;
+    type SerializeTupleVariant = SerializeTupleVariant<'a>;
+    type SerializeMap = SerializeMap<'a>;
+    type SerializeStruct = SerializeStruct<'a>;
+    type SerializeStructVariant = SerializeStructVariant<'a>;
+
+    #[inline]
+    fn serialize_bool(self, value: bool) -> Result<Value> {
+        Ok(Value::Boolean(value))
+    }
+
+    lua_serialize_number!(serialize_i8, i8);
+    lua_serialize_number!(serialize_u8, u8);
+    lua_serialize_number!(serialize_i16, i16);
+    lua_serialize_number!(serialize_u16, u16);
+    lua_serialize_number!(serialize_i32, i32);
+    lua_serialize_number!(serialize_u32, u32);
+    lua_serialize_number!(serialize_i64, i64);
+    lua_serialize_number!(serialize_u64, u64);
+    lua_serialize_number!(serialize_i128, i128);
+    lua_serialize_number!(serialize_u128, u128);
+
+    lua_serialize_number!(serialize_f32, f32);
+    lua_serialize_number!(serialize_f64, f64);
+
+    #[inline]
+    fn serialize_char(self, value: char) -> Result<Value> {
+        self.serialize_str(&value.to_string())
+    }
+
+    #[inline]
+    fn serialize_str(self, value: &str) -> Result<Value> {
+        self.lua.create_string(value).map(Value::String)
+    }
+
+    #[inline]
+    fn serialize_bytes(self, value: &[u8]) -> Result<Value> {
+        self.lua.create_string(value).map(Value::String)
+    }
+
+    #[inline]
+    fn serialize_none(self) -> Result<Value> {
+        if self.options.serialize_none_to_null {
+            Ok(self.lua.null())
+        } else {
+            Ok(Value::Nil)
+        }
+    }
+
+    #[inline]
+    fn serialize_some<T>(self, value: &T) -> Result<Value>
+    where
+        T: Serialize + ?Sized,
+    {
+        value.serialize(self)
+    }
+
+    #[inline]
+    fn serialize_unit(self) -> Result<Value> {
+        if self.options.serialize_unit_to_null {
+            Ok(self.lua.null())
+        } else {
+            Ok(Value::Nil)
+        }
+    }
+
+    #[inline]
+    fn serialize_unit_struct(self, _name: &'static str) -> Result<Value> {
+        if self.options.serialize_unit_to_null {
+            Ok(self.lua.null())
+        } else {
+            Ok(Value::Nil)
+        }
+    }
+
+    #[inline]
+    fn serialize_unit_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        variant: &'static str,
+    ) -> Result<Value> {
+        self.serialize_str(variant)
+    }
+
+    #[inline]
+    fn serialize_newtype_struct<T>(self, _name: &'static str, value: &T) -> Result<Value>
+    where
+        T: Serialize + ?Sized,
+    {
+        value.serialize(self)
+    }
+
+    #[inline]
+    fn serialize_newtype_variant<T>(
+        self,
+        _name: &'static str,

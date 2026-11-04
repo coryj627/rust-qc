@@ -1,0 +1,1102 @@
+///
+///         methods.add_meta_method(MetaMethod::Add, |_, this, value: i32| {
+///             Ok(this.0 + value)
+///         });
+///     }
+/// }
+///
+/// lua.globals().set("myobject", MyUserData(123))?;
+///
+/// lua.load(r#"
+///     assert(myobject.val == 123)
+///     myobject:add(7)
+///     assert(myobject.val == 130)
+///     assert(myobject + 10 == 140)
+/// "#).exec()?;
+/// # Ok(())
+/// # }
+/// ```
+pub trait UserData: Sized {
+    /// Adds custom fields specific to this userdata.
+    #[allow(unused_variables)]
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {}
+
+    /// Adds custom methods and operators specific to this userdata.
+    #[allow(unused_variables)]
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {}
+
+    /// Registers this type for use in Lua.
+    ///
+    /// This method is responsible for calling `add_fields` and `add_methods` on the provided
+    /// [`UserDataRegistry`].
+    fn register(registry: &mut UserDataRegistry<Self>) {
+        Self::add_fields(registry);
+        Self::add_methods(registry);
+    }
+}
+
+/// Handle to an internal Lua userdata for any type that implements [`UserData`].
+///
+/// Similar to [`std::any::Any`], this provides an interface for dynamic type checking via the
+/// [`is`] and [`borrow`] methods.
+///
+/// # Note
+///
+/// This API should only be used when necessary. Implementing [`UserData`] already allows defining
+/// methods which check the type and acquire a borrow behind the scenes.
+///
+/// [`is`]: crate::AnyUserData::is
+/// [`borrow`]: crate::AnyUserData::borrow
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnyUserData(pub(crate) ValueRef);
+
+impl AnyUserData {
+    /// Checks whether the type of this userdata is `T`.
+    #[inline]
+    pub fn is<T: 'static>(&self) -> bool {
+        let type_id = self.type_id();
+        // We do not use wrapped types here, rather prefer to check the "real" type of the userdata
+        matches!(type_id, Some(type_id) if type_id == TypeId::of::<T>())
+    }
+
+    /// Borrow this userdata immutably if it is of type `T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`UserDataBorrowError`] if the userdata is already mutably borrowed.
+    /// Returns a [`DataTypeMismatch`] if the userdata is not of type `T` or if it's
+    /// scoped.
+    ///
+    /// [`UserDataBorrowError`]: crate::Error::UserDataBorrowError
+    /// [`DataTypeMismatch`]: crate::Error::UserDataTypeMismatch
+    #[inline]
+    pub fn borrow<T: 'static>(&self) -> Result<UserDataRef<T>> {
+        let lua = self.0.lua.lock();
+        unsafe { UserDataRef::borrow_from_stack(&lua, lua.ref_thread(), self.0.index) }
+    }
+
+    /// Borrow this userdata immutably if it is of type `T`, passing the borrowed value
+    /// to the closure.
+    ///
+    /// This method is the only way to borrow scoped userdata (created inside [`Lua::scope`]).
+    pub fn borrow_scoped<T: 'static, R>(&self, f: impl FnOnce(&T) -> R) -> Result<R> {
+        let lua = self.0.lua.lock();
+        let type_id = lua.get_userdata_ref_type_id(&self.0)?;
+        let type_hints = TypeIdHints::new::<T>();
+        unsafe { borrow_userdata_scoped(lua.ref_thread(), self.0.index, type_id, type_hints, f) }
+    }
+
+    /// Borrow this userdata mutably if it is of type `T`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`UserDataBorrowMutError`] if the userdata cannot be mutably borrowed.
+    /// Returns a [`UserDataTypeMismatch`] if the userdata is not of type `T` or if it's
+    /// scoped.
+    ///
+    /// [`UserDataBorrowMutError`]: crate::Error::UserDataBorrowMutError
+    /// [`UserDataTypeMismatch`]: crate::Error::UserDataTypeMismatch
+    #[inline]
+    pub fn borrow_mut<T: 'static>(&self) -> Result<UserDataRefMut<T>> {
+        let lua = self.0.lua.lock();
+        unsafe { UserDataRefMut::borrow_from_stack(&lua, lua.ref_thread(), self.0.index) }
+    }
+
+    /// Borrow this userdata mutably if it is of type `T`, passing the borrowed value
+    /// to the closure.
+    ///
+    /// This method is the only way to borrow scoped userdata (created inside [`Lua::scope`]).
+    pub fn borrow_mut_scoped<T: 'static, R>(&self, f: impl FnOnce(&mut T) -> R) -> Result<R> {
+        let lua = self.0.lua.lock();
+        let type_id = lua.get_userdata_ref_type_id(&self.0)?;
+        let type_hints = TypeIdHints::new::<T>();
+        unsafe { borrow_userdata_scoped_mut(lua.ref_thread(), self.0.index, type_id, type_hints, f) }
+    }
+
+    /// Takes the value out of this userdata.
+    ///
+    /// Sets the special "destructed" metatable that prevents any further operations with this
+    /// userdata.
+    ///
+    /// Keeps associated user values unchanged (they will be collected by Lua's GC).
+    pub fn take<T: 'static>(&self) -> Result<T> {
+        let lua = self.0.lua.lock();
+        match lua.get_userdata_ref_type_id(&self.0)? {
+            Some(type_id) if type_id == TypeId::of::<T>() => unsafe {
+                let ref_thread = lua.ref_thread();
+                if (*get_userdata::<UserDataStorage<T>>(ref_thread, self.0.index)).has_exclusive_access() {
+                    take_userdata::<UserDataStorage<T>>(ref_thread, self.0.index).into_inner()
+                } else {
+                    Err(Error::UserDataBorrowMutError)
+                }
+            },
+            _ => Err(Error::UserDataTypeMismatch),
+        }
+    }
+
+    /// Destroys this userdata.
+    ///
+    /// This is similar to [`AnyUserData::take`], but it doesn't require a type.
+    ///
+    /// This method works for non-scoped userdata only.
+    pub fn destroy(&self) -> Result<()> {
+        let lua = self.0.lua.lock();
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            check_stack(state, 3)?;
+
+            lua.push_userdata_ref(&self.0)?;
+            protect_lua!(state, 1, 1, fn(state) {
+                if ffi::luaL_callmeta(state, -1, cstr!("__gc")) == 0 {
+                    ffi::lua_pushboolean(state, 0);
+                }
+            })?;
+            if ffi::lua_isboolean(state, -1) != 0 && ffi::lua_toboolean(state, -1) != 0 {
+                return Ok(());
+            }
+            Err(Error::UserDataBorrowMutError)
+        }
+    }
+
+    /// Sets an associated value to this [`AnyUserData`].
+    ///
+    /// The value may be any Lua value whatsoever, and can be retrieved with [`user_value`].
+    ///
+    /// This is the same as calling [`set_nth_user_value`] with `n` set to 1.
+    ///
+    /// [`user_value`]: AnyUserData::user_value
+    /// [`set_nth_user_value`]: AnyUserData::set_nth_user_value
+    #[inline]
+    pub fn set_user_value(&self, v: impl IntoLua) -> Result<()> {
+        self.set_nth_user_value(1, v)
+    }
+
+    /// Returns an associated value set by [`set_user_value`].
+    ///
+    /// This is the same as calling [`nth_user_value`] with `n` set to 1.
+    ///
+    /// [`set_user_value`]: AnyUserData::set_user_value
+    /// [`nth_user_value`]: AnyUserData::nth_user_value
+    #[inline]
+    pub fn user_value<V: FromLua>(&self) -> Result<V> {
+        self.nth_user_value(1)
+    }
+
+    /// Sets an associated `n`th value to this [`AnyUserData`].
+    ///
+    /// The value may be any Lua value whatsoever, and can be retrieved with [`nth_user_value`].
+    /// `n` starts from 1 and can be up to 65535.
+    ///
+    /// This is supported for all Lua versions using a wrapping table.
+    ///
+    /// [`nth_user_value`]: AnyUserData::nth_user_value
+    pub fn set_nth_user_value(&self, n: usize, v: impl IntoLua) -> Result<()> {
+        if n < 1 || n > u16::MAX as usize {
+            return Err(Error::runtime("user value index out of bounds"));
+        }
+
+        let lua = self.0.lua.lock();
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            check_stack(state, 5)?;
+
+            lua.push_userdata_ref(&self.0)?;
+            lua.push(v)?;
+
+            // Multiple (extra) user values are emulated by storing them in a table
+            protect_lua!(state, 2, 0, |state| {
+                if ffi::lua_getuservalue(state, -2) != ffi::LUA_TTABLE {
+                    // Create a new table to use as uservalue
+                    ffi::lua_pop(state, 1);
+                    ffi::lua_newtable(state);
+                    ffi::lua_pushvalue(state, -1);
+                    ffi::lua_setuservalue(state, -4);
+                }
+                ffi::lua_pushvalue(state, -2);
+                ffi::lua_rawseti(state, -2, n as ffi::lua_Integer);
+            })?;
+
+            Ok(())
+        }
+    }
+
+    /// Returns an associated `n`th value set by [`set_nth_user_value`].
+    ///
+    /// `n` starts from 1 and can be up to 65535.
+    ///
+    /// This is supported for all Lua versions using a wrapping table.
+    ///
+    /// [`set_nth_user_value`]: AnyUserData::set_nth_user_value
+    pub fn nth_user_value<V: FromLua>(&self, n: usize) -> Result<V> {
+        if n < 1 || n > u16::MAX as usize {
+            return Err(Error::runtime("user value index out of bounds"));
+        }
+
+        let lua = self.0.lua.lock();
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            check_stack(state, 4)?;
+
+            lua.push_userdata_ref(&self.0)?;
+
+            // Multiple (extra) user values are emulated by storing them in a table
+            if ffi::lua_getuservalue(state, -1) != ffi::LUA_TTABLE {
+                return V::from_lua(Value::Nil, lua.lua());
+            }
+            ffi::lua_rawgeti(state, -1, n as ffi::lua_Integer);
+
+            V::from_lua(lua.pop_value(), lua.lua())
+        }
+    }
+
+    /// Sets an associated value to this [`AnyUserData`] by name.
+    ///
+    /// The value can be retrieved with [`named_user_value`].
+    ///
+    /// [`named_user_value`]: AnyUserData::named_user_value
+    pub fn set_named_user_value(&self, name: &str, v: impl IntoLua) -> Result<()> {
+        let lua = self.0.lua.lock();
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            check_stack(state, 5)?;
+
+            lua.push_userdata_ref(&self.0)?;
+            lua.push(v)?;
+
+            // Multiple (extra) user values are emulated by storing them in a table
+            protect_lua!(state, 2, 0, |state| {
+                if ffi::lua_getuservalue(state, -2) != ffi::LUA_TTABLE {
+                    // Create a new table to use as uservalue
+                    ffi::lua_pop(state, 1);
+                    ffi::lua_newtable(state);
+                    ffi::lua_pushvalue(state, -1);
+                    ffi::lua_setuservalue(state, -4);
+                }
+                ffi::lua_pushlstring(state, name.as_ptr() as *const c_char, name.len());
+                ffi::lua_pushvalue(state, -3);
+                ffi::lua_rawset(state, -3);
+            })?;
+
+            Ok(())
+        }
+    }
+
+    /// Returns an associated value by name set by [`set_named_user_value`].
+    ///
+    /// [`set_named_user_value`]: AnyUserData::set_named_user_value
+    pub fn named_user_value<V: FromLua>(&self, name: &str) -> Result<V> {
+        let lua = self.0.lua.lock();
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            check_stack(state, 4)?;
+        }
+        #[cfg(feature = "userdata-wrappers")]
+        Some(type_id) if type_id == type_hints.arc_pl_mutex => {
+            let ud = get_userdata::<UserDataStorage<std::sync::Arc<parking_lot::Mutex<T>>>>(state, idx);
+            (*ud).try_borrow_scoped_mut(|ud| {
+                let mut ud = ud.try_lock().ok_or(Error::UserDataBorrowMutError)?;
+                Ok(f(&mut ud))
+            })?
+        }
+        #[cfg(feature = "userdata-wrappers")]
+        Some(type_id) if type_id == type_hints.arc_pl_rwlock => {
+            let ud = get_userdata::<UserDataStorage<std::sync::Arc<parking_lot::RwLock<T>>>>(state, idx);
+            (*ud).try_borrow_scoped_mut(|ud| {
+                let mut ud = ud.try_write().ok_or(Error::UserDataBorrowMutError)?;
+                Ok(f(&mut ud))
+            })?
+        }
+        _ => Err(Error::UserDataTypeMismatch),
+    }
+}
+
+// Populates the given table with the appropriate members to be a userdata metatable for the given
+// type. This function takes the given table at the `metatable` index, and adds an appropriate
+// `__gc` member to it for the given type and a `__metatable` entry to protect the table from script
+// access. The function also, if given a `field_getters` or `methods` tables, will create an
+// `__index` metamethod (capturing previous one) to lookup in `field_getters` first, then `methods`
+// and falling back to the captured `__index` if no matches found.
+// The same is also applicable for `__newindex` metamethod and `field_setters` table.
+// Internally uses 9 stack spaces and does not call checkstack.
+pub(crate) unsafe fn init_userdata_metatable(
+    state: *mut ffi::lua_State,
+    metatable: c_int,
+    field_getters: Option<c_int>,
+    field_setters: Option<c_int>,
+    methods: Option<c_int>,
+    _methods_map: Option<FxHashMap<Vec<u8>, CallbackPtr>>, // Used only in Luau for `__namecall`
+) -> Result<()> {
+    if field_getters.is_some() || methods.is_some() {
+        // Push `__index` generator function
+        init_userdata_metatable_index(state)?;
+
+        let index_type = rawget_field(state, metatable, "__index")?;
+        match index_type {
+            ffi::LUA_TNIL | ffi::LUA_TTABLE | ffi::LUA_TFUNCTION => {
+                for &idx in &[field_getters, methods] {
+                    if let Some(idx) = idx {
+                        ffi::lua_pushvalue(state, idx);
+                    } else {
+                        ffi::lua_pushnil(state);
+                    }
+                }
+
+                // Generate `__index`
+                protect_lua!(state, 4, 1, fn(state) ffi::lua_call(state, 3, 1))?;
+            }
+            _ => mlua_panic!("improper `__index` type: {}", index_type),
+        }
+
+        rawset_field(state, metatable, "__index")?;
+
+        #[cfg(feature = "luau")]
+        if let Some(methods_map) = _methods_map {
+            // In Luau we can speedup method calls by providing a dedicated `__namecall` metamethod
+            push_userdata_metatable_namecall(state, methods_map)?;
+            rawset_field(state, metatable, "__namecall")?;
+        }
+    }
+
+    if let Some(field_setters) = field_setters {
+        // Push `__newindex` generator function
+        init_userdata_metatable_newindex(state)?;
+
+        let newindex_type = rawget_field(state, metatable, "__newindex")?;
+        match newindex_type {
+            ffi::LUA_TNIL | ffi::LUA_TTABLE | ffi::LUA_TFUNCTION => {
+                ffi::lua_pushvalue(state, field_setters);
+                // Generate `__newindex`
+                protect_lua!(state, 3, 1, fn(state) ffi::lua_call(state, 2, 1))?;
+            }
+            _ => mlua_panic!("improper `__newindex` type: {}", newindex_type),
+        }
+
+        rawset_field(state, metatable, "__newindex")?;
+    }
+
+    ffi::lua_pushboolean(state, 0);
+    rawset_field(state, metatable, "__metatable")?;
+
+    Ok(())
+}
+
+unsafe extern "C-unwind" fn lua_error_impl(state: *mut ffi::lua_State) -> c_int {
+    ffi::lua_error(state);
+}
+
+unsafe extern "C-unwind" fn lua_isfunction_impl(state: *mut ffi::lua_State) -> c_int {
+    ffi::lua_pushboolean(state, ffi::lua_isfunction(state, -1));
+    1
+}
+
+unsafe extern "C-unwind" fn lua_istable_impl(state: *mut ffi::lua_State) -> c_int {
+    ffi::lua_pushboolean(state, ffi::lua_istable(state, -1));
+    1
+}
+
+unsafe fn init_userdata_metatable_index(state: *mut ffi::lua_State) -> Result<()> {
+    let index_key = &USERDATA_METATABLE_INDEX as *const u8 as *const _;
+    if ffi::lua_rawgetp(state, ffi::LUA_REGISTRYINDEX, index_key) == ffi::LUA_TFUNCTION {
+        return Ok(());
+    }
+    ffi::lua_pop(state, 1);
+
+    // Create and cache `__index` generator
+    let code = cr#"
+        local error, isfunction, istable = ...
+        return function (__index, field_getters, methods)
+            -- Common case: has field getters and index is a table
+            if field_getters ~= nil and methods == nil and istable(__index) then
+                return function (self, key)
+                    local field_getter = field_getters[key]
+                    if field_getter ~= nil then
+                        return field_getter(self)
+                    end
+                    return __index[key]
+                end
+            end
+
+            return function (self, key)
+                if field_getters ~= nil then
+                    local field_getter = field_getters[key]
+                    if field_getter ~= nil then
+                        return field_getter(self)
+                    end
+                end
+
+                if methods ~= nil then
+                    local method = methods[key]
+                    if method ~= nil then
+                        return method
+                    end
+                end
+
+                if isfunction(__index) then
+                    return __index(self, key)
+                elseif __index == nil then
+                    error("attempt to get an unknown field '"..key.."'")
+                else
+                    return __index[key]
+                end
+            end
+        end
+    "#;
+    protect_lua!(state, 0, 1, |state| {
+        let ret = ffi::luaL_loadbuffer(state, code.as_ptr(), code.count_bytes(), cstr!("=__mlua_index"));
+        if ret != ffi::LUA_OK {
+            ffi::lua_error(state);
+        }
+        ffi::lua_pushcfunction(state, lua_error_impl);
+        ffi::lua_pushcfunction(state, lua_isfunction_impl);
+        ffi::lua_pushcfunction(state, lua_istable_impl);
+        ffi::lua_call(state, 3, 1);
+
+        #[cfg(feature = "luau-jit")]
+        if ffi::luau_codegen_supported() != 0 {
+            ffi::luau_codegen_compile(state, -1);
+        }
+
+        // Store in the registry
+        ffi::lua_pushvalue(state, -1);
+        ffi::lua_rawsetp(state, ffi::LUA_REGISTRYINDEX, index_key);
+    })
+}
+
+unsafe fn init_userdata_metatable_newindex(state: *mut ffi::lua_State) -> Result<()> {
+    let newindex_key = &USERDATA_METATABLE_NEWINDEX as *const u8 as *const _;
+    if ffi::lua_rawgetp(state, ffi::LUA_REGISTRYINDEX, newindex_key) == ffi::LUA_TFUNCTION {
+        return Ok(());
+    }
+    ffi::lua_pop(state, 1);
+
+    // Create and cache `__newindex` generator
+    let code = cr#"
+        local error, isfunction = ...
+        return function (__newindex, field_setters)
+            return function (self, key, value)
+                if field_setters ~= nil then
+                    local field_setter = field_setters[key]
+                    if field_setter ~= nil then
+                        field_setter(self, value)
+                        return
+                    end
+                end
+
+                if isfunction(__newindex) then
+                    __newindex(self, key, value)
+                elseif __newindex == nil then
+                    error("attempt to set an unknown field '"..key.."'")
+                else
+                    __newindex[key] = value
+                end
+            end
+        end
+    "#;
+    protect_lua!(state, 0, 1, |state| {
+        let code_len = code.count_bytes();
+        let ret = ffi::luaL_loadbuffer(state, code.as_ptr(), code_len, cstr!("=__mlua_newindex"));
+        if ret != ffi::LUA_OK {
+            ffi::lua_error(state);
+        }
+        ffi::lua_pushcfunction(state, lua_error_impl);
+        ffi::lua_pushcfunction(state, lua_isfunction_impl);
+        ffi::lua_call(state, 2, 1);
+
+        #[cfg(feature = "luau-jit")]
+        if ffi::luau_codegen_supported() != 0 {
+            ffi::luau_codegen_compile(state, -1);
+        }
+
+        // Store in the registry
+        ffi::lua_pushvalue(state, -1);
+        ffi::lua_rawsetp(state, ffi::LUA_REGISTRYINDEX, newindex_key);
+    })
+}
+
+#[cfg(feature = "luau")]
+unsafe fn push_userdata_metatable_namecall(
+    state: *mut ffi::lua_State,
+    methods_map: FxHashMap<Vec<u8>, CallbackPtr>,
+) -> Result<()> {
+    unsafe extern "C-unwind" fn namecall(state: *mut ffi::lua_State) -> c_int {
+        let name = ffi::lua_namecallatom(state, ptr::null_mut());
+        if name.is_null() {
+            ffi::luaL_error(state, cstr!("attempt to call an unknown method"));
+        }
+        let name_cs = std::ffi::CStr::from_ptr(name);
+        let methods_map = get_userdata::<FxHashMap<Vec<u8>, CallbackPtr>>(state, ffi::lua_upvalueindex(1));
+        let callback_ptr = match (*methods_map).get(name_cs.to_bytes()) {
+            Some(ptr) => *ptr,
+            #[rustfmt::skip]
+            None => ffi::luaL_error(state, cstr!("attempt to call an unknown method '%s'"), name),
+        };
+        crate::state::callback_error_ext(state, ptr::null_mut(), true, |extra, nargs| {
+            let rawlua = (*extra).raw_lua();
+            (*callback_ptr)(rawlua, nargs)
+        })
+    }
+
+    // Automatic destructor is provided for any Luau userdata
+    crate::util::push_userdata(state, methods_map, true)?;
+    protect_lua!(state, 1, 1, |state| {
+        ffi::lua_pushcclosured(state, namecall, cstr!("__namecall"), 1);
+    })
+}
+
+// This method is called by Lua GC when it's time to collect the userdata.
+//
+// This method is usually used to collect internal userdata.
+#[cfg(not(feature = "luau"))]
+pub(crate) unsafe extern "C-unwind" fn collect_userdata<T>(state: *mut ffi::lua_State) -> c_int {
+    let ud = get_userdata::<T>(state, -1);
+    ptr::drop_in_place(ud);
+    0
+}
+
+// This method is called by Luau GC when it's time to collect the userdata.
+#[cfg(feature = "luau")]
+pub(crate) unsafe extern "C" fn collect_userdata<T>(
+    state: *mut ffi::lua_State,
+    ud: *mut std::os::raw::c_void,
+) {
+    // Almost none Lua operations are allowed when destructor is running,
+    // so we need to set a flag to prevent calling any Lua functions
+    let extra = (*ffi::lua_callbacks(state)).userdata as *mut crate::state::ExtraData;
+    (*extra).running_gc = true;
+    // Luau does not support _any_ panics in destructors (they are declared as "C", NOT as "C-unwind"),
+    // so any panics will trigger `abort()`.
+    ptr::drop_in_place(ud as *mut T);
+    (*extra).running_gc = false;
+}
+
+// This method can be called by user or Lua GC to destroy the userdata.
+// It checks if the userdata is safe to destroy and sets the "destroyed" metatable
+// to prevent further GC collection.
+pub(super) unsafe extern "C-unwind" fn destroy_userdata_storage<T>(state: *mut ffi::lua_State) -> c_int {
+    let ud = get_userdata::<UserDataStorage<T>>(state, 1);
+    if (*ud).is_safe_to_destroy() {
+        take_userdata::<UserDataStorage<T>>(state, 1);
+        ffi::lua_pushboolean(state, 1);
+    } else {
+        ffi::lua_pushboolean(state, 0);
+    }
+    1
+}
+
+static USERDATA_METATABLE_INDEX: u8 = 0;
+static USERDATA_METATABLE_NEWINDEX: u8 = 0;
+use std::alloc::{self, Layout};
+use std::os::raw::c_void;
+use std::ptr;
+
+pub(crate) static ALLOCATOR: ffi::lua_Alloc = allocator;
+
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct MemoryState {
+    used_memory: isize,
+    memory_limit: isize,
+    // Can be set to temporary ignore the memory limit.
+    // This is used when calling `lua_pushcfunction` for lua5.1/jit/luau.
+    ignore_limit: bool,
+    // Indicates that the memory limit was reached on the last allocation.
+    #[cfg(feature = "luau")]
+    limit_reached: bool,
+}
+
+impl MemoryState {
+    #[cfg(feature = "luau")]
+    #[inline]
+    pub(crate) unsafe fn get(state: *mut ffi::lua_State) -> *mut Self {
+        let mut mem_state = ptr::null_mut();
+        ffi::lua_getallocf(state, &mut mem_state);
+        mlua_assert!(!mem_state.is_null(), "Luau state has no allocator userdata");
+        mem_state as *mut MemoryState
+    }
+
+    #[cfg(not(feature = "luau"))]
+    #[rustversion::since(1.85)]
+    #[inline]
+    #[allow(clippy::incompatible_msrv)]
+    pub(crate) unsafe fn get(state: *mut ffi::lua_State) -> *mut Self {
+        let mut mem_state = ptr::null_mut();
+        if !ptr::fn_addr_eq(ffi::lua_getallocf(state, &mut mem_state), ALLOCATOR) {
+            mem_state = ptr::null_mut();
+        }
+        mem_state as *mut MemoryState
+    }
+
+    #[cfg(not(feature = "luau"))]
+    #[rustversion::before(1.85)]
+    #[inline]
+    pub(crate) unsafe fn get(state: *mut ffi::lua_State) -> *mut Self {
+        let mut mem_state = ptr::null_mut();
+        if ffi::lua_getallocf(state, &mut mem_state) != ALLOCATOR {
+            mem_state = ptr::null_mut();
+        }
+        mem_state as *mut MemoryState
+    }
+
+    #[inline]
+    pub(crate) fn used_memory(&self) -> usize {
+        self.used_memory as usize
+    }
+
+    #[inline]
+    pub(crate) fn memory_limit(&self) -> usize {
+        self.memory_limit as usize
+    }
+
+    #[inline]
+    pub(crate) fn set_memory_limit(&mut self, limit: usize) -> usize {
+        let prev_limit = self.memory_limit;
+        self.memory_limit = limit as isize;
+        prev_limit as usize
+    }
+
+    // This function is used primarily for calling `lua_pushcfunction` in lua5.1/jit/luau
+    // to bypass the memory limit (if set).
+    #[cfg(any(feature = "lua51", feature = "luajit", feature = "luau"))]
+    #[inline]
+    pub(crate) unsafe fn relax_limit_with(state: *mut ffi::lua_State, f: impl FnOnce()) {
+        let mem_state = Self::get(state);
+        if !mem_state.is_null() {
+            (*mem_state).ignore_limit = true;
+            f();
+            (*mem_state).ignore_limit = false;
+        } else {
+            f();
+        }
+    }
+
+    // Does nothing apart from calling `f()`, we don't need to bypass any limits
+    #[cfg(any(feature = "lua52", feature = "lua53", feature = "lua54"))]
+    #[inline]
+    pub(crate) unsafe fn relax_limit_with(_state: *mut ffi::lua_State, f: impl FnOnce()) {
+        f();
+    }
+
+    // Returns `true` if the memory limit was reached on the last memory operation
+    #[cfg(feature = "luau")]
+    #[inline]
+    pub(crate) unsafe fn limit_reached(state: *mut ffi::lua_State) -> bool {
+        (*Self::get(state)).limit_reached
+    }
+}
+
+unsafe extern "C" fn allocator(
+    extra: *mut c_void,
+    ptr: *mut c_void,
+    osize: usize,
+    nsize: usize,
+) -> *mut c_void {
+    let mem_state = &mut *(extra as *mut MemoryState);
+    #[cfg(feature = "luau")]
+    {
+        // Reset the flag
+        mem_state.limit_reached = false;
+    }
+
+    if nsize == 0 {
+        // Free memory
+        if !ptr.is_null() {
+            let layout = Layout::from_size_align_unchecked(osize, ffi::SYS_MIN_ALIGN);
+            alloc::dealloc(ptr as *mut u8, layout);
+            mem_state.used_memory -= osize as isize;
+        }
+        return ptr::null_mut();
+    }
+
+    // Do not allocate more than isize::MAX
+    if nsize > isize::MAX as usize {
+        return ptr::null_mut();
+    }
+
+    // Are we fit to the memory limits?
+    let mut mem_diff = nsize as isize;
+    if !ptr.is_null() {
+        mem_diff -= osize as isize;
+    }
+    let mem_limit = mem_state.memory_limit;
+    let new_used_memory = mem_state.used_memory + mem_diff;
+    if mem_limit > 0 && new_used_memory > mem_limit && !mem_state.ignore_limit {
+        #[cfg(feature = "luau")]
+        {
+            mem_state.limit_reached = true;
+        }
+        return ptr::null_mut();
+    }
+    mem_state.used_memory += mem_diff;
+
+    if ptr.is_null() {
+        // Allocate new memory
+        let new_layout = match Layout::from_size_align(nsize, ffi::SYS_MIN_ALIGN) {
+            Ok(layout) => layout,
+            Err(_) => return ptr::null_mut(),
+        };
+        let new_ptr = alloc::alloc(new_layout) as *mut c_void;
+        if new_ptr.is_null() {
+            alloc::handle_alloc_error(new_layout);
+        }
+        return new_ptr;
+    }
+
+    // Reallocate memory
+    let old_layout = Layout::from_size_align_unchecked(osize, ffi::SYS_MIN_ALIGN);
+    let new_ptr = alloc::realloc(ptr as *mut u8, old_layout, nsize) as *mut c_void;
+    if new_ptr.is_null() {
+        alloc::handle_alloc_error(old_layout);
+    }
+    new_ptr
+}
+//! (De)Serialization support using serde.
+
+use std::os::raw::c_void;
+
+use serde::de::DeserializeOwned;
+use serde::ser::Serialize;
+
+use crate::error::Result;
+use crate::private::Sealed;
+use crate::state::Lua;
+use crate::table::Table;
+use crate::util::check_stack;
+use crate::value::Value;
+
+/// Trait for serializing/deserializing Lua values using Serde.
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+pub trait LuaSerdeExt: Sealed {
+    /// A special value (lightuserdata) to encode/decode optional (none) values.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use mlua::{Lua, Result, LuaSerdeExt};
+    ///
+    /// fn main() -> Result<()> {
+    ///     let lua = Lua::new();
+    ///     lua.globals().set("null", lua.null())?;
+    ///
+    ///     let val = lua.load(r#"{a = null}"#).eval()?;
+    ///     let map: HashMap<String, Option<String>> = lua.from_value(val)?;
+    ///     assert_eq!(map["a"], None);
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    fn null(&self) -> Value;
+
+    /// A metatable attachable to a Lua table to systematically encode it as Array (instead of Map).
+    /// As result, encoded Array will contain only sequence part of the table, with the same length
+    /// as the `#` operator on that table.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mlua::{Lua, Result, LuaSerdeExt};
+    /// use serde_json::Value as JsonValue;
+    ///
+    /// fn main() -> Result<()> {
+    ///     let lua = Lua::new();
+    ///     lua.globals().set("array_mt", lua.array_metatable())?;
+    ///
+    ///     // Encode as an empty array (no sequence part in the lua table)
+    ///     let val = lua.load("setmetatable({a = 5}, array_mt)").eval()?;
+    ///     let j: JsonValue = lua.from_value(val)?;
+    ///     assert_eq!(j.to_string(), "[]");
+    ///
+    ///     // Encode as object
+    ///     let val = lua.load("{a = 5}").eval()?;
+    ///     let j: JsonValue = lua.from_value(val)?;
+    ///     assert_eq!(j.to_string(), r#"{"a":5}"#);
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    fn array_metatable(&self) -> Table;
+
+    /// Converts `T` into a [`Value`] instance.
+    ///
+    /// [`Value`]: crate::Value
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mlua::{Lua, Result, LuaSerdeExt};
+    /// use serde::Serialize;
+    ///
+    /// #[derive(Serialize)]
+    /// struct User {
+    ///     name: String,
+    ///     age: u8,
+    /// }
+    ///
+    /// fn main() -> Result<()> {
+    ///     let lua = Lua::new();
+    ///     let u = User {
+    ///         name: "John Smith".into(),
+    ///         age: 20,
+    ///     };
+    ///     lua.globals().set("user", lua.to_value(&u)?)?;
+    ///     lua.load(r#"
+    ///         assert(user["name"] == "John Smith")
+    ///         assert(user["age"] == 20)
+    ///     "#).exec()
+    /// }
+    /// ```
+    fn to_value<T: Serialize + ?Sized>(&self, t: &T) -> Result<Value>;
+
+    /// Converts `T` into a [`Value`] instance with options.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mlua::{Lua, Result, LuaSerdeExt, SerializeOptions};
+    ///
+    /// fn main() -> Result<()> {
+    ///     let lua = Lua::new();
+    ///     let v = vec![1, 2, 3];
+    ///     let options = SerializeOptions::new().set_array_metatable(false);
+    ///     lua.globals().set("v", lua.to_value_with(&v, options)?)?;
+    ///
+    ///     lua.load(r#"
+    ///         assert(#v == 3 and v[1] == 1 and v[2] == 2 and v[3] == 3)
+    ///         assert(getmetatable(v) == nil)
+    ///     "#).exec()
+    /// }
+    /// ```
+    fn to_value_with<T>(&self, t: &T, options: ser::Options) -> Result<Value>
+    where
+        T: Serialize + ?Sized;
+
+    /// Deserializes a [`Value`] into any serde deserializable object.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mlua::{Lua, Result, LuaSerdeExt};
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Deserialize, Debug, PartialEq)]
+    /// struct User {
+    ///     name: String,
+    ///     age: u8,
+    /// }
+    ///
+    /// fn main() -> Result<()> {
+    ///     let lua = Lua::new();
+    ///     let val = lua.load(r#"{name = "John Smith", age = 20}"#).eval()?;
+    ///     let u: User = lua.from_value(val)?;
+    ///
+    ///     assert_eq!(u, User { name: "John Smith".into(), age: 20 });
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    #[allow(clippy::wrong_self_convention)]
+    fn from_value<T: DeserializeOwned>(&self, value: Value) -> Result<T>;
+
+    /// Deserializes a [`Value`] into any serde deserializable object with options.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use mlua::{Lua, Result, LuaSerdeExt, DeserializeOptions};
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Deserialize, Debug, PartialEq)]
+    /// struct User {
+    ///     name: String,
+    ///     age: u8,
+    /// }
+    ///
+    /// fn main() -> Result<()> {
+    ///     let lua = Lua::new();
+    ///     let val = lua.load(r#"{name = "John Smith", age = 20, f = function() end}"#).eval()?;
+    ///     let options = DeserializeOptions::new().deny_unsupported_types(false);
+    ///     let u: User = lua.from_value_with(val, options)?;
+    ///
+    ///     assert_eq!(u, User { name: "John Smith".into(), age: 20 });
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    #[allow(clippy::wrong_self_convention)]
+    fn from_value_with<T: DeserializeOwned>(&self, value: Value, options: de::Options) -> Result<T>;
+}
+
+impl LuaSerdeExt for Lua {
+    fn null(&self) -> Value {
+        Value::NULL
+    }
+
+    fn array_metatable(&self) -> Table {
+        let lua = self.lock();
+        unsafe {
+            push_array_metatable(lua.ref_thread());
+            Table(lua.pop_ref_thread())
+        }
+    }
+
+    fn to_value<T>(&self, t: &T) -> Result<Value>
+    where
+        T: Serialize + ?Sized,
+    {
+        t.serialize(ser::Serializer::new(self))
+    }
+
+    fn to_value_with<T>(&self, t: &T, options: ser::Options) -> Result<Value>
+    where
+        T: Serialize + ?Sized,
+    {
+        t.serialize(ser::Serializer::new_with_options(self, options))
+    }
+
+    fn from_value<T>(&self, value: Value) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        T::deserialize(de::Deserializer::new(value))
+    }
+    assert_eq!(sum.call_async::<i64>((5, 1)).await?, 6);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_async_call_many_returns() -> Result<()> {
+    let lua = Lua::new();
+
+    let hello = lua.create_async_function(|_lua, ()| async move {
+        sleep_ms(10).await;
+        Ok(("a", "b", "c", 1))
+    })?;
+
+    let vals = hello.call_async::<MultiValue>(()).await?;
+    assert_eq!(vals.len(), 4);
+    assert_eq!(vals[0].to_string()?, "a");
+    assert_eq!(vals[1].to_string()?, "b");
+    assert_eq!(vals[2].to_string()?, "c");
+    assert_eq!(vals[3], Value::Integer(1));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_async_bind_call() -> Result<()> {
+    let lua = Lua::new();
+
+    let sum = lua.create_async_function(|_lua, (a, b): (i64, i64)| async move {
+        tokio::task::yield_now().await;
+        Ok(a + b)
+    })?;
+
+    let plus_10 = sum.bind(10)?;
+    lua.globals().set("plus_10", plus_10)?;
+
+    assert_eq!(lua.load("plus_10(-1)").eval_async::<i64>().await?, 9);
+    assert_eq!(lua.load("plus_10(1)").eval_async::<i64>().await?, 11);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_async_handle_yield() -> Result<()> {
+    let lua = Lua::new();
+
+    let sum = lua.create_async_function(|_lua, (a, b): (i64, i64)| async move {
+        sleep_ms(10).await;
+        Ok(a + b)
+    })?;
+
+    lua.globals().set("sleep_sum", sum)?;
+
+    let res: String = lua
+        .load(
+            r#"
+        sum = sleep_sum(6, 7)
+        assert(sum == 13)
+        coroutine.yield("in progress")
+        return "done"
+    "#,
+        )
+        .call_async(())
+        .await?;
+
+    assert_eq!(res, "done");
+
+    let min = lua
+        .load(
+            r#"
+        function (a, b)
+            coroutine.yield("ignore me")
+            if a < b then return a else return b end
+        end
+    "#,
+        )
+        .eval::<Function>()?;
+    assert_eq!(min.call_async::<i64>((-1, 1)).await?, -1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_async_multi_return_nil() -> Result<()> {
+    let lua = Lua::new();
+    lua.globals().set(
+        "func",
+        lua.create_async_function(|_, _: ()| async { Ok((Option::<String>::None, "error")) })?,
+    )?;
+
+    lua.load(
+        r#"
+        local ok, err = func()
+        assert(err == "error")
+    "#,
+    )
+    .exec_async()
+    .await
+}
+
+#[tokio::test]
+async fn test_async_return_async_closure() -> Result<()> {
+    let lua = Lua::new();
+
+    let f = lua.create_async_function(|lua, a: i64| async move {
+        sleep_ms(10).await;
+
+        let g = lua.create_async_function(move |_, b: i64| async move {
+            sleep_ms(10).await;
+            return Ok(a + b);
+        })?;
+
+        Ok(g)
+    })?;
+
+    lua.globals().set("f", f)?;
+
+    let res: i64 = lua
+        .load("local g = f(1); return g(2) + g(3)")
+        .call_async(())
+        .await?;
+
+    assert_eq!(res, 7);
+
+    Ok(())
+}
+
+#[cfg(feature = "lua54")]
+#[tokio::test]
+async fn test_async_lua54_to_be_closed() -> Result<()> {
+    let lua = Lua::new();
+
+    let globals = lua.globals();
+    globals.set("close_count", 0)?;
+
+    let code = r#"

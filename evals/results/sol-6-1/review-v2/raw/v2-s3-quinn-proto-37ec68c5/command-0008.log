@@ -1,0 +1,1233 @@
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, binary_heap::PeekMut},
+    mem,
+};
+
+use bytes::{Buf, Bytes, BytesMut};
+
+use crate::range_set::RangeSet;
+
+/// Helper to assemble unordered stream frames into an ordered stream
+#[derive(Debug, Default)]
+pub(super) struct Assembler {
+    state: State,
+    data: BinaryHeap<Buffer>,
+    /// Total number of buffered bytes, including duplicates in ordered mode.
+    buffered: usize,
+    /// Estimated number of allocated bytes, will never be less than `buffered`.
+    allocated: usize,
+    /// Number of bytes read by the application. When only ordered reads have been used, this is the
+    /// length of the contiguous prefix of the stream which has been consumed by the application,
+    /// aka the stream offset.
+    bytes_read: u64,
+    end: u64,
+}
+
+impl Assembler {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reset to the initial state
+    pub(super) fn reinit(&mut self) {
+        let old_data = mem::take(&mut self.data);
+        *self = Self::default();
+        self.data = old_data;
+        self.data.clear();
+    }
+
+    pub(super) fn ensure_ordering(&mut self, ordered: bool) -> Result<(), IllegalOrderedRead> {
+        if ordered && !self.state.is_ordered() {
+            return Err(IllegalOrderedRead);
+        } else if !ordered && self.state.is_ordered() {
+            // Enter unordered mode
+            if !self.data.is_empty() {
+                // Get rid of possible duplicates
+                self.defragment();
+            }
+            let mut recvd = RangeSet::new();
+            recvd.insert(0..self.bytes_read);
+            for chunk in &self.data {
+                recvd.insert(chunk.offset..chunk.offset + chunk.bytes.len() as u64);
+            }
+            self.state = State::Unordered { recvd };
+        }
+        Ok(())
+    }
+
+    /// Get the the next chunk
+    pub(super) fn read(&mut self, max_length: usize, ordered: bool) -> Option<Chunk> {
+        loop {
+            let mut chunk = self.data.peek_mut()?;
+
+            if ordered {
+                if chunk.offset > self.bytes_read {
+                    // Next chunk is after current read index
+                    return None;
+                } else if (chunk.offset + chunk.bytes.len() as u64) <= self.bytes_read {
+                    // Next chunk is useless as the read index is beyond its end
+                    self.buffered -= chunk.bytes.len();
+                    self.allocated -= chunk.allocation_size;
+                    PeekMut::pop(chunk);
+                    continue;
+                }
+
+                // Determine `start` and `len` of the slice of useful data in chunk
+                let start = (self.bytes_read - chunk.offset) as usize;
+                if start > 0 {
+                    chunk.bytes.advance(start);
+                    chunk.offset += start as u64;
+                    self.buffered -= start;
+                }
+            }
+
+            return Some(if max_length < chunk.bytes.len() {
+                self.bytes_read += max_length as u64;
+                let offset = chunk.offset;
+                chunk.offset += max_length as u64;
+                self.buffered -= max_length;
+                Chunk::new(offset, chunk.bytes.split_to(max_length))
+            } else {
+                self.bytes_read += chunk.bytes.len() as u64;
+                self.buffered -= chunk.bytes.len();
+                self.allocated -= chunk.allocation_size;
+                let chunk = PeekMut::pop(chunk);
+                Chunk::new(chunk.offset, chunk.bytes)
+            });
+        }
+    }
+
+    /// Copy fragmented chunk data to new chunks backed by a single buffer
+    ///
+    /// This makes sure we're not unnecessarily holding on to many larger allocations.
+    /// We merge contiguous chunks in the process of doing so.
+    fn defragment(&mut self) {
+        let new = BinaryHeap::with_capacity(self.data.len());
+        let old = mem::replace(&mut self.data, new);
+        let mut buffers = old.into_sorted_vec();
+        self.buffered = 0;
+        let mut fragmented_buffered = 0;
+        let mut offset = 0;
+        for chunk in buffers.iter_mut().rev() {
+            chunk.try_mark_defragment(offset);
+            let size = chunk.bytes.len();
+            offset = chunk.offset + size as u64;
+            self.buffered += size;
+            if !chunk.defragmented {
+                fragmented_buffered += size;
+            }
+        }
+        self.allocated = self.buffered;
+        let mut buffer = BytesMut::with_capacity(fragmented_buffered);
+        let mut offset = 0;
+        for chunk in buffers.into_iter().rev() {
+            if chunk.defragmented {
+                // bytes might be empty after try_mark_defragment
+                if !chunk.bytes.is_empty() {
+                    self.data.push(chunk);
+                }
+                continue;
+            }
+            // Overlap is resolved by try_mark_defragment
+            if chunk.offset != offset + (buffer.len() as u64) {
+                if !buffer.is_empty() {
+                    self.data
+                        .push(Buffer::new_defragmented(offset, buffer.split().freeze()));
+                }
+                offset = chunk.offset;
+            }
+            buffer.extend_from_slice(&chunk.bytes);
+        }
+        if !buffer.is_empty() {
+            self.data
+                .push(Buffer::new_defragmented(offset, buffer.split().freeze()));
+        }
+    }
+
+    // Note: If a packet contains many frames from the same stream, the estimated over-allocation
+    // will be much higher because we are counting the same allocation multiple times.
+    pub(super) fn insert(&mut self, mut offset: u64, mut bytes: Bytes, allocation_size: usize) {
+        debug_assert!(
+            bytes.len() <= allocation_size,
+            "allocation_size less than bytes.len(): {:?} < {:?}",
+            allocation_size,
+            bytes.len()
+        );
+        self.end = self.end.max(offset + bytes.len() as u64);
+        if let State::Unordered { ref mut recvd } = self.state {
+            // Discard duplicate data
+            for duplicate in recvd.replace(offset..offset + bytes.len() as u64) {
+                if duplicate.start > offset {
+                    let buffer = Buffer::new(
+                        offset,
+                        bytes.split_to((duplicate.start - offset) as usize),
+                        allocation_size,
+                    );
+                    self.buffered += buffer.bytes.len();
+                    self.allocated += buffer.allocation_size;
+                    self.data.push(buffer);
+                    offset = duplicate.start;
+                }
+                bytes.advance((duplicate.end - offset) as usize);
+                offset = duplicate.end;
+            }
+        } else if offset < self.bytes_read {
+            if (offset + bytes.len() as u64) <= self.bytes_read {
+                return;
+            } else {
+                let diff = self.bytes_read - offset;
+                offset += diff;
+                bytes.advance(diff as usize);
+            }
+        }
+
+        if bytes.is_empty() {
+            return;
+        }
+        let buffer = Buffer::new(offset, bytes, allocation_size);
+        self.buffered += buffer.bytes.len();
+        self.allocated += buffer.allocation_size;
+        self.data.push(buffer);
+        // `self.buffered` also counts duplicate bytes, therefore we use
+        // `self.end - self.bytes_read` as an upper bound of buffered unique
+        // bytes. This will cause a defragmentation if the amount of duplicate
+        // bytes exceedes a proportion of the receive window size.
+        let buffered = self.buffered.min((self.end - self.bytes_read) as usize);
+        let over_allocation = self.allocated - buffered;
+        // Rationale: on the one hand, we want to defragment rarely, ideally never
+        // in non-pathological scenarios. However, a pathological or malicious
+        // peer could send us one-byte frames, and since we use reference-counted
+        // buffers in order to prevent copying, this could result in keeping a lot
+        // of memory allocated. This limits over-allocation in proportion to the
+        // buffered data. The constants are chosen somewhat arbitrarily and try to
+        // balance between defragmentation overhead and over-allocation.
+        let threshold = 32768.max(buffered * 3 / 2);
+        if over_allocation > threshold {
+            self.defragment()
+        }
+    }
+
+    /// Number of bytes consumed by the application
+    pub(super) fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// Discard all buffered data
+    pub(super) fn clear(&mut self) {
+        self.data.clear();
+        self.buffered = 0;
+        self.allocated = 0;
+    }
+}
+
+/// A chunk of data from the receive stream
+#[derive(Debug, PartialEq, Eq)]
+pub struct Chunk {
+    /// The offset in the stream
+    pub offset: u64,
+    /// The contents of the chunk
+    pub bytes: Bytes,
+}
+
+impl Chunk {
+    fn new(offset: u64, bytes: Bytes) -> Self {
+        Self { offset, bytes }
+    }
+}
+
+#[derive(Debug, Eq)]
+struct Buffer {
+    offset: u64,
+    bytes: Bytes,
+    /// Size of the allocation behind `bytes`, if `defragmented == false`.
+    /// Otherwise this will be set to `bytes.len()` by `try_mark_defragment`.
+    /// Will never be less than `bytes.len()`.
+    allocation_size: usize,
+    defragmented: bool,
+}
+
+impl Buffer {
+    /// Constructs a new fragmented Buffer
+    fn new(offset: u64, bytes: Bytes, allocation_size: usize) -> Self {
+        Self {
+            offset,
+            bytes,
+            allocation_size,
+            defragmented: false,
+        }
+    }
+
+    /// Constructs a new defragmented Buffer
+    fn new_defragmented(offset: u64, bytes: Bytes) -> Self {
+        let allocation_size = bytes.len();
+        Self {
+            offset,
+            bytes,
+            allocation_size,
+            defragmented: true,
+        }
+    }
+
+    /// Discards data before `offset` and flags `self` as defragmented if it has good utilization
+    fn try_mark_defragment(&mut self, offset: u64) {
+        let duplicate = offset.saturating_sub(self.offset) as usize;
+        self.offset = self.offset.max(offset);
+        if duplicate >= self.bytes.len() {
+            // All bytes are duplicate
+            self.bytes = Bytes::new();
+            self.defragmented = true;
+            self.allocation_size = 0;
+            return;
+        }
+        self.bytes.advance(duplicate);
+        // Make sure that fragmented buffers with high utilization become defragmented and
+        // defragmented buffers remain defragmented
+        self.defragmented = self.defragmented || self.bytes.len() * 6 / 5 >= self.allocation_size;
+        if self.defragmented {
+            // Make sure that defragmented buffers do not contribute to over-allocation
+            self.allocation_size = self.bytes.len();
+        }
+    }
+}
+
+impl Ord for Buffer {
+    // Invert ordering based on offset (max-heap, min offset first),
+    // prioritize longer chunks at the same offset.
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.offset
+            .cmp(&other.offset)
+            .reverse()
+            .then(self.bytes.len().cmp(&other.bytes.len()))
+    }
+}
+
+impl PartialOrd for Buffer {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Buffer {
+    fn eq(&self, other: &Self) -> bool {
+        (self.offset, self.bytes.len()) == (other.offset, other.bytes.len())
+    }
+}
+
+#[derive(Debug)]
+enum State {
+    Ordered,
+    Unordered {
+        /// The set of offsets that have been received from the peer, including portions not yet
+        /// read by the application.
+        recvd: RangeSet,
+    },
+}
+
+impl State {
+    fn is_ordered(&self) -> bool {
+        matches!(self, Self::Ordered)
+    }
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self::Ordered
+    }
+}
+
+/// Error indicating that an ordered read was performed on a stream after an unordered read
+#[derive(Debug)]
+pub struct IllegalOrderedRead;
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use assert_matches::assert_matches;
+
+    #[test]
+    fn assemble_ordered() {
+        let mut x = Assembler::new();
+use bytes::Bytes;
+use thiserror::Error;
+
+use crate::{VarInt, connection::send_buffer::SendBuffer, frame};
+
+#[derive(Debug)]
+pub(super) struct Send {
+    pub(super) max_data: u64,
+    pub(super) state: SendState,
+    pub(super) pending: SendBuffer,
+    pub(super) priority: i32,
+    /// Whether a frame containing a FIN bit must be transmitted, even if we don't have any new data
+    pub(super) fin_pending: bool,
+    /// Whether this stream is in the `connection_blocked` list of `Streams`
+    pub(super) connection_blocked: bool,
+    /// The reason the peer wants us to stop, if `STOP_SENDING` was received
+    pub(super) stop_reason: Option<VarInt>,
+}
+
+impl Send {
+    pub(super) fn new(max_data: VarInt) -> Box<Self> {
+        Box::new(Self {
+            max_data: max_data.into(),
+            state: SendState::Ready,
+            pending: SendBuffer::new(),
+            priority: 0,
+            fin_pending: false,
+            connection_blocked: false,
+            stop_reason: None,
+        })
+    }
+
+    /// Whether the stream has been reset
+    pub(super) fn is_reset(&self) -> bool {
+        matches!(self.state, SendState::ResetSent)
+    }
+
+    pub(super) fn finish(&mut self) -> Result<(), FinishError> {
+        if let Some(error_code) = self.stop_reason {
+            Err(FinishError::Stopped(error_code))
+        } else if self.state == SendState::Ready {
+            self.state = SendState::DataSent {
+                finish_acked: false,
+            };
+            self.fin_pending = true;
+            Ok(())
+        } else {
+            Err(FinishError::ClosedStream)
+        }
+    }
+
+    pub(super) fn write<S: BytesSource>(
+        &mut self,
+        source: &mut S,
+        limit: u64,
+    ) -> Result<Written, WriteError> {
+        if !self.is_writable() {
+            return Err(WriteError::ClosedStream);
+        }
+        if let Some(error_code) = self.stop_reason {
+            return Err(WriteError::Stopped(error_code));
+        }
+        let budget = self.max_data - self.pending.offset();
+        if budget == 0 {
+            return Err(WriteError::Blocked);
+        }
+        let mut limit = limit.min(budget) as usize;
+
+        let mut result = Written::default();
+        loop {
+            let (chunk, chunks_consumed) = source.pop_chunk(limit);
+            result.chunks += chunks_consumed;
+            result.bytes += chunk.len();
+
+            if chunk.is_empty() {
+                break;
+            }
+
+            limit -= chunk.len();
+            self.pending.write(chunk);
+        }
+
+        Ok(result)
+    }
+
+    /// Update stream state due to a reset sent by the local application
+    pub(super) fn reset(&mut self) {
+        use SendState::*;
+        if let DataSent { .. } | Ready = self.state {
+            self.state = ResetSent;
+        }
+    }
+
+    /// Handle STOP_SENDING
+    ///
+    /// Returns true if the stream was stopped due to this frame, and false
+    /// if it had been stopped before
+    pub(super) fn try_stop(&mut self, error_code: VarInt) -> bool {
+        if self.stop_reason.is_none() {
+            self.stop_reason = Some(error_code);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns whether the stream has been finished and all data has been acknowledged by the peer
+    pub(super) fn ack(&mut self, frame: frame::StreamMeta) -> bool {
+        self.pending.ack(frame.offsets);
+        match self.state {
+            SendState::DataSent {
+                ref mut finish_acked,
+            } => {
+                *finish_acked |= frame.fin;
+                *finish_acked && self.pending.is_fully_acked()
+            }
+            _ => false,
+        }
+    }
+
+    /// Handle increase to stream-level flow control limit
+    ///
+    /// Returns whether the stream was unblocked
+    pub(super) fn increase_max_data(&mut self, offset: u64) -> bool {
+        if offset <= self.max_data || self.state != SendState::Ready {
+            return false;
+        }
+        let was_blocked = self.pending.offset() == self.max_data;
+        self.max_data = offset;
+        was_blocked
+    }
+
+    pub(super) fn offset(&self) -> u64 {
+        self.pending.offset()
+    }
+
+    pub(super) fn is_pending(&self) -> bool {
+        self.pending.has_unsent_data() || self.fin_pending
+    }
+
+    pub(super) fn is_writable(&self) -> bool {
+        matches!(self.state, SendState::Ready)
+    }
+}
+
+/// A [`BytesSource`] implementation for `&'a mut [Bytes]`
+///
+/// The type allows to dequeue [`Bytes`] chunks from an array of chunks, up to
+/// a configured limit.
+pub(crate) struct BytesArray<'a> {
+    /// The wrapped slice of `Bytes`
+    chunks: &'a mut [Bytes],
+    /// The amount of chunks consumed from this source
+    consumed: usize,
+}
+
+impl<'a> BytesArray<'a> {
+    pub(crate) fn from_chunks(chunks: &'a mut [Bytes]) -> Self {
+        Self {
+            chunks,
+            consumed: 0,
+        }
+    }
+}
+
+impl BytesSource for BytesArray<'_> {
+    fn pop_chunk(&mut self, limit: usize) -> (Bytes, usize) {
+        // The loop exists to skip empty chunks while still marking them as
+        // consumed
+        let mut chunks_consumed = 0;
+
+        while self.consumed < self.chunks.len() {
+            let chunk = &mut self.chunks[self.consumed];
+
+            if chunk.len() <= limit {
+                let chunk = std::mem::take(chunk);
+                self.consumed += 1;
+                chunks_consumed += 1;
+                if chunk.is_empty() {
+                    continue;
+                }
+                return (chunk, chunks_consumed);
+            } else if limit > 0 {
+                let chunk = chunk.split_to(limit);
+                return (chunk, chunks_consumed);
+            } else {
+                break;
+            }
+        }
+
+        (Bytes::new(), chunks_consumed)
+    }
+}
+
+/// A [`BytesSource`] implementation for `&[u8]`
+///
+/// The type allows to dequeue a single [`Bytes`] chunk, which will be lazily
+/// created from a reference. This allows to defer the allocation until it is
+/// known how much data needs to be copied.
+pub(crate) struct ByteSlice<'a> {
+    /// The wrapped byte slice
+    data: &'a [u8],
+}
+
+impl<'a> ByteSlice<'a> {
+    pub(crate) fn from_slice(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+}
+
+impl BytesSource for ByteSlice<'_> {
+    fn pop_chunk(&mut self, limit: usize) -> (Bytes, usize) {
+        let limit = limit.min(self.data.len());
+        if limit == 0 {
+            return (Bytes::new(), 0);
+        }
+
+        let chunk = Bytes::from(self.data[..limit].to_owned());
+        self.data = &self.data[chunk.len()..];
+
+        let chunks_consumed = usize::from(self.data.is_empty());
+        (chunk, chunks_consumed)
+    }
+}
+
+/// A source of one or more buffers which can be converted into `Bytes` buffers on demand
+///
+/// The purpose of this data type is to defer conversion as long as possible,
+/// so that no heap allocation is required in case no data is writable.
+pub(super) trait BytesSource {
+    /// Returns the next chunk from the source of owned chunks.
+    ///
+    /// This method will consume parts of the source.
+    /// Calling it will yield `Bytes` elements up to the configured `limit`.
+    ///
+    /// The method returns a tuple:
+    /// - The first item is the yielded `Bytes` element. The element will be
+    ///   empty if the limit is zero or no more data is available.
+    /// - The second item returns how many complete chunks inside the source had
+    ///   had been consumed. This can be less than 1, if a chunk inside the
+    ///   source had been truncated in order to adhere to the limit. It can also
+    ///   be more than 1, if zero-length chunks had been skipped.
+    fn pop_chunk(&mut self, limit: usize) -> (Bytes, usize);
+}
+
+/// Indicates how many bytes and chunks had been transferred in a write operation
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub struct Written {
+    /// The amount of bytes which had been written
+    pub bytes: usize,
+    /// The amount of full chunks which had been written
+    ///
+    /// If a chunk was only partially written, it will not be counted by this field.
+    pub chunks: usize,
+}
+
+/// Errors triggered while writing to a send stream
+#[derive(Debug, Error, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum WriteError {
+    /// The peer is not able to accept additional data, or the connection is congested.
+    ///
+    /// If the peer issues additional flow control credit, a [`StreamEvent::Writable`] event will
+    /// be generated, indicating that retrying the write might succeed.
+    ///
+    /// [`StreamEvent::Writable`]: crate::StreamEvent::Writable
+    #[error("unable to accept further writes")]
+    Blocked,
+    /// The peer is no longer accepting data on this stream, and it has been implicitly reset. The
+    /// stream cannot be finished or further written to.
+    ///
+    /// Carries an application-defined error code.
+    ///
+    /// [`StreamEvent::Finished`]: crate::StreamEvent::Finished
+    #[error("stopped by peer: code {0}")]
+    Stopped(VarInt),
+    /// The stream has not been opened or has already been finished or reset
+    #[error("closed stream")]
+    ClosedStream,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(super) enum SendState {
+    /// Sending new data
+    Ready,
+    /// Stream was finished; now sending retransmits only
+    DataSent { finish_acked: bool },
+    /// Sent RESET
+    ResetSent,
+}
+
+/// Reasons why attempting to finish a stream might fail
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum FinishError {
+    /// The peer is no longer accepting data on this stream. No
+    /// [`StreamEvent::Finished`] event will be emitted for this stream.
+    ///
+    /// Carries an application-defined error code.
+    ///
+    /// [`StreamEvent::Finished`]: crate::StreamEvent::Finished
+    #[error("stopped by peer: code {0}")]
+    Stopped(VarInt),
+    /// The stream has not been opened or was already finished or reset
+    #[error("closed stream")]
+    ClosedStream,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bytes_array() {
+        let full = b"Hello World 123456789 ABCDEFGHJIJKLMNOPQRSTUVWXYZ".to_owned();
+        for limit in 0..full.len() {
+            let mut chunks = [
+                Bytes::from_static(b""),
+                Bytes::from_static(b"Hello "),
+                Bytes::from_static(b"Wo"),
+                Bytes::from_static(b""),
+                Bytes::from_static(b"r"),
+                Bytes::from_static(b"ld"),
+                Bytes::from_static(b""),
+                Bytes::from_static(b" 12345678"),
+                Bytes::from_static(b"9 ABCDE"),
+                Bytes::from_static(b"F"),
+                Bytes::from_static(b"GHJIJKLMNOPQRSTUVWXYZ"),
+            ];
+            let num_chunks = chunks.len();
+            let last_chunk_len = chunks[chunks.len() - 1].len();
+
+            let mut array = BytesArray::from_chunks(&mut chunks);
+
+            let mut buf = Vec::new();
+            let mut chunks_popped = 0;
+            let mut chunks_consumed = 0;
+            let mut remaining = limit;
+            loop {
+                let (chunk, consumed) = array.pop_chunk(remaining);
+                chunks_consumed += consumed;
+
+                if !chunk.is_empty() {
+                    buf.extend_from_slice(&chunk);
+                    remaining -= chunk.len();
+                    chunks_popped += 1;
+                } else {
+                    break;
+                }
+            }
+
+            assert_eq!(&buf[..], &full[..limit]);
+
+            if limit == full.len() {
+                // Full consumption of the last chunk
+                assert_eq!(chunks_consumed, num_chunks);
+                // Since there are empty chunks, we consume more than there are popped
+                assert_eq!(chunks_consumed, chunks_popped + 3);
+            } else if limit > full.len() - last_chunk_len {
+                // Partial consumption of the last chunk
+                assert_eq!(chunks_consumed, num_chunks - 1);
+                assert_eq!(chunks_consumed, chunks_popped + 2);
+            }
+        }
+    }
+
+    #[test]
+    fn byte_slice() {
+        let full = b"Hello World 123456789 ABCDEFGHJIJKLMNOPQRSTUVWXYZ".to_owned();
+        for limit in 0..full.len() {
+            let mut array = ByteSlice::from_slice(&full[..]);
+
+            let mut buf = Vec::new();
+            let mut chunks_popped = 0;
+            let mut chunks_consumed = 0;
+            let mut remaining = limit;
+            loop {
+                let (chunk, consumed) = array.pop_chunk(remaining);
+                chunks_consumed += consumed;
+
+                if !chunk.is_empty() {
+                    buf.extend_from_slice(&chunk);
+                    remaining -= chunk.len();
+                    chunks_popped += 1;
+                } else {
+                    break;
+                }
+            }
+
+            assert_eq!(&buf[..], &full[..limit]);
+            if limit != 0 {
+                assert_eq!(chunks_popped, 1);
+            } else {
+                assert_eq!(chunks_popped, 0);
+            }
+
+            if limit == full.len() {
+                assert_eq!(chunks_consumed, 1);
+            } else {
+                assert_eq!(chunks_consumed, 0);
+            }
+        }
+    }
+}
+use std::{
+    cmp,
+    collections::{HashMap, HashSet, VecDeque},
+    env,
+    io::{self, Write},
+    mem,
+    net::{Ipv6Addr, SocketAddr, UdpSocket},
+    ops::RangeFrom,
+    str,
+    sync::{Arc, Mutex},
+};
+
+use assert_matches::assert_matches;
+use bytes::BytesMut;
+use lazy_static::lazy_static;
+use rustls::{
+    KeyLogFile,
+    client::WebPkiServerVerifier,
+    pki_types::{CertificateDer, PrivateKeyDer},
+};
+use tracing::{info_span, trace};
+
+use super::crypto::rustls::{QuicClientConfig, QuicServerConfig, configured_provider};
+use super::*;
+use crate::{Duration, Instant};
+
+pub(super) const DEFAULT_MTU: usize = 1452;
+
+pub(super) struct Pair {
+    pub(super) server: TestEndpoint,
+    pub(super) client: TestEndpoint,
+    /// Start time
+    epoch: Instant,
+    /// Current time
+    pub(super) time: Instant,
+    /// Simulates the maximum size allowed for UDP payloads by the link (packets exceeding this size will be dropped)
+    pub(super) mtu: usize,
+    /// Simulates explicit congestion notification
+    pub(super) congestion_experienced: bool,
+    // One-way
+    pub(super) latency: Duration,
+    /// Number of spin bit flips
+    pub(super) spins: u64,
+    last_spin: bool,
+}
+
+impl Pair {
+    pub(super) fn default_with_deterministic_pns() -> Self {
+        let mut cfg = server_config();
+        let mut transport = TransportConfig::default();
+        transport.deterministic_packet_numbers(true);
+        cfg.transport = Arc::new(transport);
+        Self::new(Default::default(), cfg)
+    }
+
+    pub(super) fn new(endpoint_config: Arc<EndpointConfig>, server_config: ServerConfig) -> Self {
+        let server = Endpoint::new(
+            endpoint_config.clone(),
+            Some(Arc::new(server_config)),
+            true,
+            None,
+        );
+        let client = Endpoint::new(endpoint_config, None, true, None);
+
+        Self::new_from_endpoint(client, server)
+    }
+
+    pub(super) fn new_from_endpoint(client: Endpoint, server: Endpoint) -> Self {
+        let server_addr = SocketAddr::new(
+            Ipv6Addr::LOCALHOST.into(),
+            SERVER_PORTS.lock().unwrap().next().unwrap(),
+        );
+        let client_addr = SocketAddr::new(
+            Ipv6Addr::LOCALHOST.into(),
+            CLIENT_PORTS.lock().unwrap().next().unwrap(),
+        );
+        let now = Instant::now();
+        Self {
+            server: TestEndpoint::new(server, server_addr),
+            client: TestEndpoint::new(client, client_addr),
+            epoch: now,
+            time: now,
+            mtu: DEFAULT_MTU,
+            latency: Duration::ZERO,
+            spins: 0,
+            last_spin: false,
+            congestion_experienced: false,
+        }
+    }
+
+    /// Returns whether the connection is not idle
+    pub(super) fn step(&mut self) -> bool {
+        self.drive_client();
+        self.drive_server();
+        if self.client.is_idle() && self.server.is_idle() {
+            return false;
+        }
+
+        let client_t = self.client.next_wakeup();
+        let server_t = self.server.next_wakeup();
+        match min_opt(client_t, server_t) {
+            Some(t) if Some(t) == client_t => {
+                if t != self.time {
+                    self.time = self.time.max(t);
+                    trace!("advancing to {:?} for client", self.time - self.epoch);
+                }
+                true
+            }
+            Some(t) if Some(t) == server_t => {
+                if t != self.time {
+                    self.time = self.time.max(t);
+                    trace!("advancing to {:?} for server", self.time - self.epoch);
+                }
+                true
+            }
+            Some(_) => unreachable!(),
+            None => false,
+        }
+    }
+
+    /// Advance time until both connections are idle
+    pub(super) fn drive(&mut self) {
+        while self.step() {}
+    }
+
+    /// Advance time until both connections are idle, or after 100 steps have been executed
+    ///
+    /// Returns true if the amount of steps exceeds the bounds, because the connections never became
+    /// idle
+    pub(super) fn drive_bounded(&mut self) -> bool {
+        for _ in 0..100 {
+            if !self.step() {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    pub(super) fn drive_client(&mut self) {
+        let span = info_span!("client");
+        let _guard = span.enter();
+        self.client.drive(self.time, self.server.addr);
+        for (packet, buffer) in self.client.outbound.drain(..) {
+            let packet_size = packet_size(&packet, &buffer);
+            if packet_size > self.mtu {
+                info!(packet_size, "dropping packet (max size exceeded)");
+                continue;
+            }
+            if buffer[0] & packet::LONG_HEADER_FORM == 0 {
+                let spin = buffer[0] & packet::SPIN_BIT != 0;
+                self.spins += (spin == self.last_spin) as u64;
+                self.last_spin = spin;
+            }
+            if let Some(ref socket) = self.client.socket {
+                socket.send_to(&buffer, packet.destination).unwrap();
+            }
+            if self.server.addr == packet.destination {
+                let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced);
+                self.server.inbound.push_back((
+                    self.time + self.latency,
+                    ecn,
+                    buffer.as_ref().into(),
+                ));
+            }
+        }
+    }
+
+    pub(super) fn drive_server(&mut self) {
+        let span = info_span!("server");
+        let _guard = span.enter();
+        self.server.drive(self.time, self.client.addr);
+        for (packet, buffer) in self.server.outbound.drain(..) {
+            let packet_size = packet_size(&packet, &buffer);
+            if packet_size > self.mtu {
+                info!(packet_size, "dropping packet (max size exceeded)");
+                continue;
+            }
+            if let Some(ref socket) = self.server.socket {
+                socket.send_to(&buffer, packet.destination).unwrap();
+            }
+            if self.client.addr == packet.destination {
+                let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced);
+                self.client.inbound.push_back((
+                    self.time + self.latency,
+                    ecn,
+                    buffer.as_ref().into(),
+                ));
+            }
+        }
+    }
+
+    pub(super) fn connect(&mut self) -> (ConnectionHandle, ConnectionHandle) {
+        self.connect_with(client_config())
+    }
+
+    pub(super) fn connect_with(
+        &mut self,
+        config: ClientConfig,
+    ) -> (ConnectionHandle, ConnectionHandle) {
+        info!("connecting");
+        let client_ch = self.begin_connect(config);
+        self.drive();
+        let server_ch = self.server.assert_accept();
+        self.finish_connect(client_ch, server_ch);
+        (client_ch, server_ch)
+    }
+
+    /// Just start connecting the client
+    pub(super) fn begin_connect(&mut self, config: ClientConfig) -> ConnectionHandle {
+        let span = info_span!("client");
+        let _guard = span.enter();
+        let (client_ch, client_conn) = self
+            .client
+            .connect(self.time, config, self.server.addr, "localhost")
+            .unwrap();
+        self.client.connections.insert(client_ch, client_conn);
+        client_ch
+    }
+
+    fn finish_connect(&mut self, client_ch: ConnectionHandle, server_ch: ConnectionHandle) {
+        assert_matches!(
+            self.client_conn_mut(client_ch).poll(),
+            Some(Event::HandshakeDataReady)
+        );
+        assert_matches!(
+            self.client_conn_mut(client_ch).poll(),
+            Some(Event::Connected)
+        );
+        assert_matches!(
+            self.server_conn_mut(server_ch).poll(),
+            Some(Event::HandshakeDataReady)
+        );
+        assert_matches!(
+            self.server_conn_mut(server_ch).poll(),
+            Some(Event::Connected)
+        );
+    }
+
+    pub(super) fn client_conn_mut(&mut self, ch: ConnectionHandle) -> &mut Connection {
+use std::{
+    convert::TryInto,
+    mem,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{Arc, Mutex},
+};
+
+use assert_matches::assert_matches;
+#[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
+use aws_lc_rs::hmac;
+use bytes::{Bytes, BytesMut};
+use hex_literal::hex;
+use rand::RngCore;
+#[cfg(feature = "ring")]
+use ring::hmac;
+#[cfg(all(feature = "rustls-aws-lc-rs", not(feature = "rustls-ring")))]
+use rustls::crypto::aws_lc_rs::default_provider;
+#[cfg(feature = "rustls-ring")]
+use rustls::crypto::ring::default_provider;
+use rustls::{
+    AlertDescription, RootCertStore,
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    server::WebPkiClientVerifier,
+};
+use tracing::info;
+
+use super::*;
+use crate::{
+    Duration, Instant,
+    cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
+    crypto::rustls::QuicServerConfig,
+    frame::FrameStruct,
+    transport_parameters::TransportParameters,
+};
+mod util;
+use util::*;
+
+mod token;
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasm_bindgen_test::wasm_bindgen_test as test;
+
+// Enable this if you want to run these tests in the browser.
+// Unfortunately it's either-or: Enable this and you can run in the browser, disable to run in nodejs.
+// #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+// wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+#[test]
+fn version_negotiate_server() {
+    let _guard = subscribe();
+    let client_addr = "[::2]:7890".parse().unwrap();
+    let mut server = Endpoint::new(
+        Default::default(),
+        Some(Arc::new(server_config())),
+        true,
+        None,
+    );
+    let now = Instant::now();
+    let mut buf = Vec::with_capacity(server.config().get_max_udp_payload_size() as usize);
+    let event = server.handle(
+        now,
+        client_addr,
+        None,
+        None,
+        // Long-header packet with reserved version number
+        hex!("80 0a1a2a3a 04 00000000 04 00000000 00")[..].into(),
+        &mut buf,
+    );
+    let Some(DatagramEvent::Response(Transmit { .. })) = event else {
+        panic!("expected a response");
+    };
+
+    assert_ne!(buf[0] & 0x80, 0);
+    assert_eq!(&buf[1..15], hex!("00000000 04 00000000 04 00000000"));
+    assert!(buf[15..].chunks(4).any(|x| {
+        DEFAULT_SUPPORTED_VERSIONS.contains(&u32::from_be_bytes(x.try_into().unwrap()))
+    }));
+}
+
+#[test]
+fn version_negotiate_client() {
+    let _guard = subscribe();
+    let server_addr = "[::2]:7890".parse().unwrap();
+    // Configure client to use empty CIDs so we can easily hardcode a server version negotiation
+    // packet
+    let cid_generator_factory: fn() -> Box<dyn ConnectionIdGenerator> =
+        || Box::new(RandomConnectionIdGenerator::new(0));
+    let mut client = Endpoint::new(
+        Arc::new(EndpointConfig {
+            connection_id_generator_factory: Arc::new(cid_generator_factory),
+            ..Default::default()
+        }),
+        None,
+        true,
+        None,
+    );
+    let (_, mut client_ch) = client
+        .connect(Instant::now(), client_config(), server_addr, "localhost")
+        .unwrap();
+    let now = Instant::now();
+    let mut buf = Vec::with_capacity(client.config().get_max_udp_payload_size() as usize);
+    let opt_event = client.handle(
+        now,
+        server_addr,
+        None,
+        None,
+        // Version negotiation packet for reserved version, with empty DCID
+        hex!(
+            "80 00000000 00 04 00000000
+             0a1a2a3a"
+        )[..]
+            .into(),
+        &mut buf,
+    );
+    if let Some(DatagramEvent::ConnectionEvent(_, event)) = opt_event {
+        client_ch.handle_event(event);
+    }
+    assert_matches!(
+        client_ch.poll(),
+        Some(Event::ConnectionLost {
+            reason: ConnectionError::VersionMismatch,
+        })
+    );
+}
+
+#[test]
+fn lifecycle() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    assert_matches!(pair.client_conn_mut(client_ch).poll(), None);
+    assert!(pair.client_conn_mut(client_ch).using_ecn());
+    assert!(pair.server_conn_mut(server_ch).using_ecn());
+
+    const REASON: &[u8] = b"whee";
+    info!("closing");
+    pair.client.connections.get_mut(&client_ch).unwrap().close(
+        pair.time,
+        VarInt(42),
+        REASON.into(),
+    );
+    pair.drive();
+    assert_matches!(pair.server_conn_mut(server_ch).poll(),
+                    Some(Event::ConnectionLost { reason: ConnectionError::ApplicationClosed(
+                        ApplicationClose { error_code: VarInt(42), ref reason }
+                    )}) if reason == REASON);
+    assert_matches!(pair.client_conn_mut(client_ch).poll(), None);
+    assert_eq!(pair.client.known_connections(), 0);
+    assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+}
+
+#[test]
+fn draft_version_compat() {
+    let _guard = subscribe();
+
+    let mut client_config = client_config();
+    client_config.version(0xff00_0020);
+
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect_with(client_config);
+
+    assert_matches!(pair.client_conn_mut(client_ch).poll(), None);
+    assert!(pair.client_conn_mut(client_ch).using_ecn());
+    assert!(pair.server_conn_mut(server_ch).using_ecn());
+
+    const REASON: &[u8] = b"whee";
+    info!("closing");
+    pair.client.connections.get_mut(&client_ch).unwrap().close(
+        pair.time,
+        VarInt(42),
+        REASON.into(),
+    );
+    pair.drive();
+    assert_matches!(pair.server_conn_mut(server_ch).poll(),
+                    Some(Event::ConnectionLost { reason: ConnectionError::ApplicationClosed(
+                        ApplicationClose { error_code: VarInt(42), ref reason }
+                    )}) if reason == REASON);
+    assert_matches!(pair.client_conn_mut(client_ch).poll(), None);
+    assert_eq!(pair.client.known_connections(), 0);
+    assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+}
+
+#[test]
+fn server_stateless_reset() {
+    let _guard = subscribe();
+    let mut key_material = vec![0; 64];
+    let mut rng = rand::rng();
+    rng.fill_bytes(&mut key_material);
+    let reset_key = hmac::Key::new(hmac::HMAC_SHA256, &key_material);
+    rng.fill_bytes(&mut key_material);
+
+    let mut endpoint_config = EndpointConfig::new(Arc::new(reset_key));
+    endpoint_config.cid_generator(move || Box::new(HashedConnectionIdGenerator::from_key(0)));
+    let endpoint_config = Arc::new(endpoint_config);
+
+    let mut pair = Pair::new(endpoint_config.clone(), server_config());
+    let (client_ch, _) = pair.connect();
+    pair.drive(); // Flush any post-handshake frames
+    pair.server.endpoint =
+        Endpoint::new(endpoint_config, Some(Arc::new(server_config())), true, None);
+    // Force the server to generate the smallest possible stateless reset
+    pair.client.connections.get_mut(&client_ch).unwrap().ping();
+    info!("resetting");
+    pair.drive();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::ConnectionLost {
+            reason: ConnectionError::Reset
+        })
+    );
+}
+
+#[test]
+fn client_stateless_reset() {
+    let _guard = subscribe();
+    let mut key_material = vec![0; 64];
+    let mut rng = rand::rng();
+    rng.fill_bytes(&mut key_material);
+    let reset_key = hmac::Key::new(hmac::HMAC_SHA256, &key_material);
+    rng.fill_bytes(&mut key_material);
+
+    let mut endpoint_config = EndpointConfig::new(Arc::new(reset_key));
+    endpoint_config.cid_generator(move || Box::new(HashedConnectionIdGenerator::from_key(0)));
+    let endpoint_config = Arc::new(endpoint_config);
+
+    let mut pair = Pair::new(endpoint_config.clone(), server_config());
+    let (_, server_ch) = pair.connect();
+    pair.client.endpoint =
+        Endpoint::new(endpoint_config, Some(Arc::new(server_config())), true, None);
+    // Send something big enough to allow room for a smaller stateless reset.
+    pair.server.connections.get_mut(&server_ch).unwrap().close(
+        pair.time,
+        VarInt(42),
+        (&[0xab; 128][..]).into(),
+    );
+    info!("resetting");
+2.4M	/work/crate

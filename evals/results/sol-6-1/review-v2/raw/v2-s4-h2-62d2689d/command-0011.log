@@ -1,0 +1,1276 @@
+                self.try_assign_capacity(stream);
+            })
+        }
+    }
+
+    /// Request capacity to send data
+    fn try_assign_capacity(&mut self, stream: &mut store::Ptr) {
+        let total_requested = stream.requested_send_capacity;
+
+        // Total requested should never go below actual assigned
+        // (Note: the window size can go lower than assigned)
+        debug_assert!(stream.send_flow.available() <= total_requested as usize);
+
+        // The amount of additional capacity that the stream requests.
+        // Don't assign more than the window has available!
+        let additional = cmp::min(
+            total_requested - stream.send_flow.available().as_size(),
+            // Can't assign more than what is available
+            stream.send_flow.window_size() - stream.send_flow.available().as_size(),
+        );
+        let span = tracing::trace_span!("try_assign_capacity", ?stream.id);
+        let _e = span.enter();
+        tracing::trace!(
+            requested = total_requested,
+            additional,
+            buffered = stream.buffered_send_data,
+            window = stream.send_flow.window_size(),
+            conn = %self.flow.available()
+        );
+
+        if additional == 0 {
+            // Nothing more to do
+            return;
+use crate::frame::{self, Frame, Kind, Reason};
+use crate::frame::{
+    DEFAULT_MAX_FRAME_SIZE, DEFAULT_SETTINGS_HEADER_TABLE_SIZE, MAX_MAX_FRAME_SIZE,
+};
+use crate::proto::Error;
+
+use crate::hpack;
+
+use futures_core::Stream;
+
+use bytes::{Buf, BytesMut};
+
+use std::io;
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::AsyncRead;
+use tokio_util::codec::FramedRead as InnerFramedRead;
+use tokio_util::codec::{LengthDelimitedCodec, LengthDelimitedCodecError};
+
+// 16 MB "sane default" taken from golang http2
+const DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE: usize = 16 << 20;
+
+#[derive(Debug)]
+pub struct FramedRead<T> {
+    inner: InnerFramedRead<T, LengthDelimitedCodec>,
+
+    // hpack decoder state
+    hpack: hpack::Decoder,
+
+    max_header_list_size: usize,
+
+    max_continuation_frames: usize,
+
+    partial: Option<Partial>,
+}
+
+/// Partially loaded headers frame
+#[derive(Debug)]
+struct Partial {
+    /// Empty frame
+    frame: Continuable,
+
+    /// Partial header payload
+    buf: BytesMut,
+
+    continuation_frames_count: usize,
+}
+
+#[derive(Debug)]
+enum Continuable {
+    Headers(frame::Headers),
+    PushPromise(frame::PushPromise),
+}
+
+impl<T> FramedRead<T> {
+    pub fn new(inner: InnerFramedRead<T, LengthDelimitedCodec>) -> FramedRead<T> {
+        let max_header_list_size = DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE;
+        let max_continuation_frames =
+            calc_max_continuation_frames(max_header_list_size, inner.decoder().max_frame_length());
+        FramedRead {
+            inner,
+            hpack: hpack::Decoder::new(DEFAULT_SETTINGS_HEADER_TABLE_SIZE),
+            max_header_list_size,
+            max_continuation_frames,
+            partial: None,
+        }
+    }
+
+    pub fn get_ref(&self) -> &T {
+        self.inner.get_ref()
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        self.inner.get_mut()
+    }
+
+    /// Returns the current max frame size setting
+    #[inline]
+    pub fn max_frame_size(&self) -> usize {
+        self.inner.decoder().max_frame_length()
+    }
+
+    /// Updates the max frame size setting.
+    ///
+    /// Must be within 16,384 and 16,777,215.
+    #[inline]
+    pub fn set_max_frame_size(&mut self, val: usize) {
+        assert!(DEFAULT_MAX_FRAME_SIZE as usize <= val && val <= MAX_MAX_FRAME_SIZE as usize);
+        self.inner.decoder_mut().set_max_frame_length(val);
+        // Update max CONTINUATION frames too, since its based on this
+        self.max_continuation_frames = calc_max_continuation_frames(self.max_header_list_size, val);
+    }
+
+    /// Update the max header list size setting.
+    #[inline]
+    pub fn set_max_header_list_size(&mut self, val: usize) {
+        self.max_header_list_size = val;
+        // Update max CONTINUATION frames too, since its based on this
+        self.max_continuation_frames = calc_max_continuation_frames(val, self.max_frame_size());
+    }
+
+    /// Update the header table size setting.
+    #[inline]
+    pub fn set_header_table_size(&mut self, val: usize) {
+        self.hpack.queue_size_update(val);
+    }
+}
+
+fn calc_max_continuation_frames(header_max: usize, frame_max: usize) -> usize {
+    // At least this many frames needed to use max header list size
+    let min_frames_for_list = (header_max / frame_max).max(1);
+    // Some padding for imperfectly packed frames
+    // 25% without floats
+    let padding = min_frames_for_list >> 2;
+    min_frames_for_list.saturating_add(padding).max(5)
+}
+
+/// Decodes a frame.
+///
+/// This method is intentionally de-generified and outlined because it is very large.
+fn decode_frame(
+    hpack: &mut hpack::Decoder,
+    max_header_list_size: usize,
+    max_continuation_frames: usize,
+    partial_inout: &mut Option<Partial>,
+    mut bytes: BytesMut,
+) -> Result<Option<Frame>, Error> {
+    let span = tracing::trace_span!("FramedRead::decode_frame", offset = bytes.len());
+    let _e = span.enter();
+
+    tracing::trace!("decoding frame from {}B", bytes.len());
+
+    // Parse the head
+    let head = frame::Head::parse(&bytes);
+
+    if partial_inout.is_some() && head.kind() != Kind::Continuation {
+        proto_err!(conn: "expected CONTINUATION, got {:?}", head.kind());
+        return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+    }
+
+    let kind = head.kind();
+
+    tracing::trace!(frame.kind = ?kind);
+
+    macro_rules! header_block {
+        ($frame:ident, $head:ident, $bytes:ident) => ({
+            // Drop the frame header
+            $bytes.advance(frame::HEADER_LEN);
+
+            // Parse the header frame w/o parsing the payload
+            let (mut frame, mut payload) = match frame::$frame::load($head, $bytes) {
+                Ok(res) => res,
+                Err(frame::Error::InvalidDependencyId) => {
+                    proto_err!(stream: "invalid HEADERS dependency ID");
+                    // A stream cannot depend on itself. An endpoint MUST
+                    // treat this as a stream error (Section 5.4.2) of type
+                    // `PROTOCOL_ERROR`.
+                    return Err(Error::library_reset($head.stream_id(), Reason::PROTOCOL_ERROR));
+                },
+                Err(e) => {
+                    proto_err!(conn: "failed to load frame; err={:?}", e);
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+                }
+            };
+
+            let is_end_headers = frame.is_end_headers();
+
+            // Load the HPACK encoded headers
+            match frame.load_hpack(&mut payload, max_header_list_size, hpack) {
+                Ok(_) => {},
+                Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !is_end_headers => {},
+                Err(frame::Error::MalformedMessage) => {
+                    let id = $head.stream_id();
+                    proto_err!(stream: "malformed header block; stream={:?}", id);
+                    return Err(Error::library_reset(id, Reason::PROTOCOL_ERROR));
+                },
+                Err(e) => {
+                    proto_err!(conn: "failed HPACK decoding; err={:?}", e);
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+                }
+            }
+
+            if is_end_headers {
+                frame.into()
+            } else {
+                tracing::trace!("loaded partial header block");
+                // Defer returning the frame
+                *partial_inout = Some(Partial {
+                    frame: Continuable::$frame(frame),
+                    buf: payload,
+                    continuation_frames_count: 0,
+                });
+
+                return Ok(None);
+            }
+        });
+    }
+
+    let frame = match kind {
+        Kind::Settings => {
+            let res = frame::Settings::load(head, &bytes[frame::HEADER_LEN..]);
+
+            res.map_err(|e| {
+                proto_err!(conn: "failed to load SETTINGS frame; err={:?}", e);
+                Error::library_go_away(Reason::PROTOCOL_ERROR)
+            })?
+            .into()
+        }
+        Kind::Ping => {
+            let res = frame::Ping::load(head, &bytes[frame::HEADER_LEN..]);
+
+            res.map_err(|e| {
+                proto_err!(conn: "failed to load PING frame; err={:?}", e);
+                Error::library_go_away(Reason::PROTOCOL_ERROR)
+            })?
+            .into()
+        }
+        Kind::WindowUpdate => {
+            let res = frame::WindowUpdate::load(head, &bytes[frame::HEADER_LEN..]);
+
+            res.map_err(|e| {
+                proto_err!(conn: "failed to load WINDOW_UPDATE frame; err={:?}", e);
+                Error::library_go_away(Reason::PROTOCOL_ERROR)
+            })?
+            .into()
+        }
+        Kind::Data => {
+            bytes.advance(frame::HEADER_LEN);
+            let res = frame::Data::load(head, bytes.freeze());
+            let res = frame::Data::load(head, bytes.freeze());
+
+            // TODO: Should this always be connection level? Probably not...
+            res.map_err(|e| {
+                proto_err!(conn: "failed to load DATA frame; err={:?}", e);
+                Error::library_go_away(Reason::PROTOCOL_ERROR)
+            })?
+            .into()
+        }
+        Kind::Headers => header_block!(Headers, head, bytes),
+        Kind::Reset => {
+            let res = frame::Reset::load(head, &bytes[frame::HEADER_LEN..]);
+            res.map_err(|e| {
+                proto_err!(conn: "failed to load RESET frame; err={:?}", e);
+                Error::library_go_away(Reason::PROTOCOL_ERROR)
+            })?
+            .into()
+        }
+        Kind::GoAway => {
+            let res = frame::GoAway::load(&bytes[frame::HEADER_LEN..]);
+            res.map_err(|e| {
+                proto_err!(conn: "failed to load GO_AWAY frame; err={:?}", e);
+                Error::library_go_away(Reason::PROTOCOL_ERROR)
+            })?
+            .into()
+        }
+        Kind::PushPromise => header_block!(PushPromise, head, bytes),
+        Kind::Priority => {
+            if head.stream_id() == 0 {
+                // Invalid stream identifier
+                proto_err!(conn: "invalid stream ID 0");
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+            }
+
+            match frame::Priority::load(head, &bytes[frame::HEADER_LEN..]) {
+                Ok(frame) => frame.into(),
+                Err(frame::Error::InvalidDependencyId) => {
+                    // A stream cannot depend on itself. An endpoint MUST
+                    // treat this as a stream error (Section 5.4.2) of type
+                    // `PROTOCOL_ERROR`.
+                    let id = head.stream_id();
+                    proto_err!(stream: "PRIORITY invalid dependency ID; stream={:?}", id);
+                    return Err(Error::library_reset(id, Reason::PROTOCOL_ERROR));
+                }
+                Err(e) => {
+                    proto_err!(conn: "failed to load PRIORITY frame; err={:?};", e);
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+                }
+            }
+        }
+        Kind::Continuation => {
+            let is_end_headers = (head.flag() & 0x4) == 0x4;
+
+            let mut partial = match partial_inout.take() {
+                Some(partial) => partial,
+                None => {
+                    proto_err!(conn: "received unexpected CONTINUATION frame");
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+                }
+            };
+
+            // The stream identifiers must match
+            if partial.frame.stream_id() != head.stream_id() {
+                proto_err!(conn: "CONTINUATION frame stream ID does not match previous frame stream ID");
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+            }
+
+            // Check for CONTINUATION flood
+            if is_end_headers {
+                partial.continuation_frames_count = 0;
+            } else {
+                let cnt = partial.continuation_frames_count + 1;
+                if cnt > max_continuation_frames {
+                    tracing::debug!("too_many_continuations, max = {}", max_continuation_frames);
+                    return Err(Error::library_go_away_data(
+                        Reason::ENHANCE_YOUR_CALM,
+                        "too_many_continuations",
+                    ));
+                } else {
+                    partial.continuation_frames_count = cnt;
+                }
+            }
+
+            // Extend the buf
+            if partial.buf.is_empty() {
+                partial.buf = bytes.split_off(frame::HEADER_LEN);
+            } else {
+                if partial.frame.is_over_size() {
+                    // If there was left over bytes previously, they may be
+                    // needed to continue decoding, even though we will
+                    // be ignoring this frame. This is done to keep the HPACK
+                    // decoder state up-to-date.
+                    //
+                    // Still, we need to be careful, because if a malicious
+                    // attacker were to try to send a gigantic string, such
+                    // that it fits over multiple header blocks, we could
+                    // grow memory uncontrollably again, and that'd be a shame.
+                    //
+                    // Instead, we use a simple heuristic to determine if
+                    // we should continue to ignore decoding, or to tell
+                    // the attacker to go away.
+                    if partial.buf.len() + bytes.len() > max_header_list_size {
+                        proto_err!(conn: "CONTINUATION frame header block size over ignorable limit");
+                        return Err(Error::library_go_away(Reason::COMPRESSION_ERROR));
+                    }
+                }
+                partial.buf.extend_from_slice(&bytes[frame::HEADER_LEN..]);
+            }
+
+            match partial
+                .frame
+                .load_hpack(&mut partial.buf, max_header_list_size, hpack)
+            {
+                Ok(_) => {}
+                Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !is_end_headers => {}
+                Err(frame::Error::MalformedMessage) => {
+                    let id = head.stream_id();
+                    proto_err!(stream: "malformed CONTINUATION frame; stream={:?}", id);
+                    return Err(Error::library_reset(id, Reason::PROTOCOL_ERROR));
+                }
+                Err(e) => {
+                    proto_err!(conn: "failed HPACK decoding; err={:?}", e);
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+                }
+            }
+
+            if is_end_headers {
+                partial.frame.into()
+            } else {
+                *partial_inout = Some(partial);
+                return Ok(None);
+            }
+        }
+        Kind::Unknown => {
+            // Unknown frames are ignored
+            return Ok(None);
+        }
+    };
+
+    Ok(Some(frame))
+}
+
+impl<T> Stream for FramedRead<T>
+where
+    T: AsyncRead + Unpin,
+{
+    type Item = Result<Frame, Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let span = tracing::trace_span!("FramedRead::poll_next");
+        let _e = span.enter();
+        loop {
+            tracing::trace!("poll");
+            let bytes = match ready!(Pin::new(&mut self.inner).poll_next(cx)) {
+                Some(Ok(bytes)) => bytes,
+                Some(Err(e)) => return Poll::Ready(Some(Err(map_err(e)))),
+                None => return Poll::Ready(None),
+            };
+
+            tracing::trace!(read.bytes = bytes.len());
+            let Self {
+                ref mut hpack,
+                max_header_list_size,
+                ref mut partial,
+                max_continuation_frames,
+                ..
+            } = *self;
+            if let Some(frame) = decode_frame(
+                hpack,
+                max_header_list_size,
+                max_continuation_frames,
+                partial,
+                bytes,
+            )? {
+                tracing::debug!(?frame, "received");
+                return Poll::Ready(Some(Ok(frame)));
+            }
+        }
+    }
+}
+
+fn map_err(err: io::Error) -> Error {
+    if let io::ErrorKind::InvalidData = err.kind() {
+        if let Some(custom) = err.get_ref() {
+            if custom.is::<LengthDelimitedCodecError>() {
+                return Error::library_go_away(Reason::FRAME_SIZE_ERROR);
+            }
+        }
+    }
+    err.into()
+}
+
+// ===== impl Continuable =====
+
+impl Continuable {
+    fn stream_id(&self) -> frame::StreamId {
+        match *self {
+            Continuable::Headers(ref h) => h.stream_id(),
+            Continuable::PushPromise(ref p) => p.stream_id(),
+        }
+    }
+
+    fn is_over_size(&self) -> bool {
+        match *self {
+            Continuable::Headers(ref h) => h.is_over_size(),
+            Continuable::PushPromise(ref p) => p.is_over_size(),
+        }
+    }
+
+    fn load_hpack(
+        &mut self,
+        src: &mut BytesMut,
+        max_header_list_size: usize,
+        decoder: &mut hpack::Decoder,
+    ) -> Result<(), frame::Error> {
+        match *self {
+            Continuable::Headers(ref mut h) => h.load_hpack(src, max_header_list_size, decoder),
+            Continuable::PushPromise(ref mut p) => p.load_hpack(src, max_header_list_size, decoder),
+        }
+    }
+}
+
+impl<T> From<Continuable> for Frame<T> {
+    fn from(cont: Continuable) -> Self {
+        match cont {
+            Continuable::Headers(mut headers) => {
+                headers.set_end_headers();
+                headers.into()
+            }
+            Continuable::PushPromise(mut push) => {
+                push.set_end_headers();
+                push.into()
+            }
+        }
+    }
+}
+                    Open {
+                        local,
+                        remote: AwaitingHeaders,
+                    }
+                }
+            }
+            Open {
+                local: AwaitingHeaders,
+                remote,
+            } => {
+                if eos {
+                    HalfClosedLocal(remote)
+                } else {
+                    Open { local, remote }
+                }
+            }
+            HalfClosedRemote(AwaitingHeaders) | ReservedLocal => {
+                if eos {
+                    Closed(Cause::EndStream)
+                } else {
+                    HalfClosedRemote(local)
+                }
+            }
+            _ => {
+                // All other transitions result in a protocol error
+                return Err(UserError::UnexpectedFrameType);
+            }
+        };
+
+        Ok(())
+    }
+
+    /// Opens the receive-half of the stream when a HEADERS frame is received.
+    ///
+    /// Returns true if this transitions the state to Open.
+    pub fn recv_open(&mut self, frame: &frame::Headers) -> Result<bool, Error> {
+        let mut initial = false;
+        let eos = frame.is_end_stream();
+
+        self.inner = match self.inner {
+            Idle => {
+                initial = true;
+
+                if eos {
+                    HalfClosedRemote(AwaitingHeaders)
+                } else {
+                    Open {
+                        local: AwaitingHeaders,
+                        remote: if frame.is_informational() {
+                            tracing::trace!("skipping 1xx response headers");
+                            AwaitingHeaders
+                        } else {
+                            Streaming
+                        },
+                    }
+                }
+            }
+            ReservedRemote => {
+                initial = true;
+
+                if eos {
+                    Closed(Cause::EndStream)
+                } else if frame.is_informational() {
+                    tracing::trace!("skipping 1xx response headers");
+                    ReservedRemote
+                } else {
+                    HalfClosedLocal(Streaming)
+                }
+            }
+            Open {
+                local,
+                remote: AwaitingHeaders,
+            } => {
+                if eos {
+                    HalfClosedRemote(local)
+                } else {
+                    Open {
+                        local,
+                        remote: if frame.is_informational() {
+                            tracing::trace!("skipping 1xx response headers");
+                            AwaitingHeaders
+                        } else {
+                            Streaming
+                        },
+                    }
+                }
+            }
+            HalfClosedLocal(AwaitingHeaders) => {
+                if eos {
+                    Closed(Cause::EndStream)
+                } else if frame.is_informational() {
+                    tracing::trace!("skipping 1xx response headers");
+                    HalfClosedLocal(AwaitingHeaders)
+                } else {
+                    HalfClosedLocal(Streaming)
+                }
+            }
+            ref state => {
+                // All other transitions result in a protocol error
+                proto_err!(conn: "recv_open: in unexpected state {:?}", state);
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+            }
+        };
+
+        Ok(initial)
+    }
+
+    /// Transition from Idle -> ReservedRemote
+    pub fn reserve_remote(&mut self) -> Result<(), Error> {
+        match self.inner {
+            Idle => {
+                self.inner = ReservedRemote;
+                Ok(())
+            }
+            ref state => {
+                proto_err!(conn: "reserve_remote: in unexpected state {:?}", state);
+                Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
+            }
+        }
+    }
+
+    /// Transition from Idle -> ReservedLocal
+    pub fn reserve_local(&mut self) -> Result<(), UserError> {
+        match self.inner {
+            Idle => {
+                self.inner = ReservedLocal;
+                Ok(())
+            }
+            _ => Err(UserError::UnexpectedFrameType),
+        }
+    }
+
+    /// Indicates that the remote side will not send more data to the local.
+    pub fn recv_close(&mut self) -> Result<(), Error> {
+        match self.inner {
+            Open { local, .. } => {
+                // The remote side will continue to receive data.
+                tracing::trace!("recv_close: Open => HalfClosedRemote({:?})", local);
+                self.inner = HalfClosedRemote(local);
+                Ok(())
+            }
+            HalfClosedLocal(..) => {
+                tracing::trace!("recv_close: HalfClosedLocal => Closed");
+                self.inner = Closed(Cause::EndStream);
+                Ok(())
+            }
+            ref state => {
+                proto_err!(conn: "recv_close: in unexpected state {:?}", state);
+                Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
+            }
+        }
+    }
+
+    /// The remote explicitly sent a RST_STREAM.
+    ///
+    /// # Arguments
+    /// - `frame`: the received RST_STREAM frame.
+    /// - `queued`: true if this stream has frames in the pending send queue.
+    pub fn recv_reset(&mut self, frame: frame::Reset, queued: bool) {
+        match self.inner {
+            // If the stream is already in a `Closed` state, do nothing,
+            // provided that there are no frames still in the send queue.
+            Closed(..) if !queued => {}
+            // A notionally `Closed` stream may still have queued frames in
+            // the following cases:
+            //
+            // - if the cause is `Cause::Scheduled(..)` (i.e. we have not
+            //   actually closed the stream yet).
+            // - if the cause is `Cause::EndStream`: we transition to this
+            //   state when an EOS frame is *enqueued* (so that it's invalid
+            //   to enqueue more frames), not when the EOS frame is *sent*;
+            //   therefore, there may still be frames ahead of the EOS frame
+            //   in the send queue.
+            //
+            // In either of these cases, we want to overwrite the stream's
+            // previous state with the received RST_STREAM, so that the queue
+            // will be cleared by `Prioritize::pop_frame`.
+            ref state => {
+                tracing::trace!(
+                    "recv_reset; frame={:?}; state={:?}; queued={:?}",
+                    frame,
+                    state,
+                    queued
+                );
+                self.inner = Closed(Cause::Error(Error::remote_reset(
+                    frame.stream_id(),
+
+    fn recv_headers<B>(
+        &mut self,
+        peer: peer::Dyn,
+        send_buffer: &SendBuffer<B>,
+        frame: frame::Headers,
+    ) -> Result<(), Error> {
+        let id = frame.stream_id();
+
+        // The GOAWAY process has begun. All streams with a greater ID than
+        // specified as part of GOAWAY should be ignored.
+        if id > self.actions.recv.max_stream_id() {
+            tracing::trace!(
+                "id ({:?}) > max_stream_id ({:?}), ignoring HEADERS",
+                id,
+                self.actions.recv.max_stream_id()
+            );
+            return Ok(());
+        }
+
+        let key = match self.store.find_entry(id) {
+            Entry::Occupied(e) => e.key(),
+            Entry::Vacant(e) => {
+                // Client: it's possible to send a request, and then send
+                // a RST_STREAM while the response HEADERS were in transit.
+                //
+                // Server: we can't reset a stream before having received
+                // the request headers, so don't allow.
+                if !peer.is_server() {
+                    // This may be response headers for a stream we've already
+                    // forgotten about...
+                    if self.actions.may_have_forgotten_stream(peer, id) {
+                        tracing::debug!(
+                            "recv_headers for old stream={:?}, sending STREAM_CLOSED",
+                            id,
+                        );
+                        return Err(Error::library_reset(id, Reason::STREAM_CLOSED));
+                    }
+                }
+
+                match self
+                    .actions
+                    .recv
+                    .open(id, Open::Headers, &mut self.counts)?
+                {
+                    Some(stream_id) => {
+                        let stream = Stream::new(
+                            stream_id,
+                            self.actions.send.init_window_sz(),
+                            self.actions.recv.init_window_sz(),
+                        );
+
+                        e.insert(stream)
+                    }
+                    None => return Ok(()),
+                }
+            }
+        };
+
+        let stream = self.store.resolve(key);
+
+        })
+    }
+
+    /// Called by the server after the stream is accepted. Given that clients
+    /// initialize streams by sending HEADERS, the request will always be
+    /// available.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if the request isn't present.
+    pub fn take_request(&self) -> Request<()> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.opaque.key);
+        me.actions.recv.take_request(&mut stream)
+    }
+
+    /// Called by a client to see if the current stream is pending open
+    pub fn is_pending_open(&self) -> bool {
+        let mut me = self.opaque.inner.lock().unwrap();
+        me.store.resolve(self.opaque.key).is_pending_open
+    }
+
+    /// Request capacity to send data
+    pub fn reserve_capacity(&mut self, capacity: WindowSize) {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.opaque.key);
+
+        me.actions
+            .send
+            .reserve_capacity(capacity, &mut stream, &mut me.counts)
+    }
+
+    /// Returns the stream's current send capacity.
+    pub fn capacity(&self) -> WindowSize {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.opaque.key);
+
+        me.actions.send.capacity(&mut stream)
+    }
+
+    /// Request to be notified when the stream's capacity increases
+    pub fn poll_capacity(&mut self, cx: &Context) -> Poll<Option<Result<WindowSize, UserError>>> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.opaque.key);
+
+        me.actions.send.poll_capacity(cx, &mut stream)
+    }
+
+    /// Request to be notified for if a `RST_STREAM` is received for this stream.
+    pub(crate) fn poll_reset(
+        &mut self,
+        cx: &Context,
+        mode: proto::PollReset,
+    ) -> Poll<Result<Reason, crate::Error>> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.opaque.key);
+
+        me.actions.send.poll_reset(cx, &mut stream, mode)
+    }
+
+    pub fn clone_to_opaque(&self) -> OpaqueStreamRef {
+        self.opaque.clone()
+    }
+
+    pub fn stream_id(&self) -> StreamId {
+        self.opaque.stream_id()
+    }
+}
+
+impl<B> Clone for StreamRef<B> {
+    fn clone(&self) -> Self {
+        StreamRef {
+            opaque: self.opaque.clone(),
+            send_buffer: self.send_buffer.clone(),
+        }
+    }
+}
+
+// ===== impl OpaqueStreamRef =====
+
+impl OpaqueStreamRef {
+    fn new(inner: Arc<Mutex<Inner>>, stream: &mut store::Ptr) -> OpaqueStreamRef {
+        stream.ref_inc();
+        OpaqueStreamRef {
+            inner,
+            key: stream.key(),
+        }
+    }
+    /// Called by a client to check for a received response.
+    pub fn poll_response(&mut self, cx: &Context) -> Poll<Result<Response<()>, proto::Error>> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.key);
+
+        me.actions.recv.poll_response(cx, &mut stream)
+    }
+    /// Called by a client to check for a pushed request.
+    pub fn poll_pushed(
+        &mut self,
+        cx: &Context,
+    ) -> Poll<Option<Result<(Request<()>, OpaqueStreamRef), proto::Error>>> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.key);
+        me.actions
+            .recv
+            .poll_pushed(cx, &mut stream)
+            .map_ok(|(h, key)| {
+                me.refs += 1;
+                let opaque_ref =
+                    OpaqueStreamRef::new(self.inner.clone(), &mut me.store.resolve(key));
+                (h, opaque_ref)
+            })
+    }
+
+    pub fn is_end_stream(&self) -> bool {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let stream = me.store.resolve(self.key);
+
+        me.actions.recv.is_end_stream(&stream)
+    }
+
+    pub fn poll_data(&mut self, cx: &Context) -> Poll<Option<Result<Bytes, proto::Error>>> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.key);
+
+        me.actions.recv.poll_data(cx, &mut stream)
+    }
+
+    pub fn poll_trailers(&mut self, cx: &Context) -> Poll<Option<Result<HeaderMap, proto::Error>>> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.key);
+
+        me.actions.recv.poll_trailers(cx, &mut stream)
+    }
+
+    pub(crate) fn available_recv_capacity(&self) -> isize {
+        let me = self.inner.lock().unwrap();
+        let me = &*me;
+
+        let stream = &me.store[self.key];
+        stream.recv_flow.available().into()
+    }
+
+    pub(crate) fn used_recv_capacity(&self) -> WindowSize {
+        let me = self.inner.lock().unwrap();
+        let me = &*me;
+
+        let stream = &me.store[self.key];
+        stream.in_flight_recv_data
+    }
+
+    /// Releases recv capacity back to the peer. This may result in sending
+    /// WINDOW_UPDATE frames on both the stream and connection.
+    pub fn release_capacity(&mut self, capacity: WindowSize) -> Result<(), UserError> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.key);
+
+        me.actions
+            .recv
+            .release_capacity(capacity, &mut stream, &mut me.actions.task)
+    }
+
+    /// Clear the receive queue and set the status to no longer receive data frames.
+    pub(crate) fn clear_recv_buffer(&mut self) {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.key);
+        stream.is_recv = false;
+        me.actions.recv.clear_recv_buffer(&mut stream);
+    }
+
+    pub fn stream_id(&self) -> StreamId {
+        self.inner.lock().unwrap().store[self.key].id
+    }
+}
+
+impl fmt::Debug for OpaqueStreamRef {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        use std::sync::TryLockError::*;
+
+        match self.inner.try_lock() {
+            Ok(me) => {
+                let stream = &me.store[self.key];
+                fmt.debug_struct("OpaqueStreamRef")
+                    .field("stream_id", &stream.id)
+                    .field("ref_count", &stream.ref_count)
+                    .finish()
+            }
+            Err(Poisoned(_)) => fmt
+/// A stream identifier, as described in [Section 5.1.1] of RFC 7540.
+///
+/// Streams are identified with an unsigned 31-bit integer. Streams
+/// initiated by a client MUST use odd-numbered stream identifiers; those
+/// initiated by the server MUST use even-numbered stream identifiers.  A
+/// stream identifier of zero (0x0) is used for connection control
+/// messages; the stream identifier of zero cannot be used to establish a
+/// new stream.
+///
+/// [Section 5.1.1]: https://tools.ietf.org/html/rfc7540#section-5.1.1
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct StreamId(u32);
+
+#[derive(Debug, Copy, Clone)]
+pub struct StreamIdOverflow;
+
+const STREAM_ID_MASK: u32 = 1 << 31;
+
+impl StreamId {
+    /// Stream ID 0.
+    pub const ZERO: StreamId = StreamId(0);
+
+    /// The maximum allowed stream ID.
+    pub const MAX: StreamId = StreamId(u32::MAX >> 1);
+
+    /// Parse the stream ID
+    #[inline]
+    pub fn parse(buf: &[u8]) -> (StreamId, bool) {
+        let mut ubuf = [0; 4];
+        ubuf.copy_from_slice(&buf[0..4]);
+        let unpacked = u32::from_be_bytes(ubuf);
+        let flag = unpacked & STREAM_ID_MASK == STREAM_ID_MASK;
+
+        // Now clear the most significant bit, as that is reserved and MUST be
+        // ignored when received.
+        (StreamId(unpacked & !STREAM_ID_MASK), flag)
+    }
+
+    /// Returns true if this stream ID corresponds to a stream that
+    /// was initiated by the client.
+    pub fn is_client_initiated(&self) -> bool {
+        let id = self.0;
+        id != 0 && id % 2 == 1
+    }
+
+    /// Returns true if this stream ID corresponds to a stream that
+    /// was initiated by the server.
+    pub fn is_server_initiated(&self) -> bool {
+        let id = self.0;
+        id != 0 && id % 2 == 0
+    }
+
+    /// Return a new `StreamId` for stream 0.
+    #[inline]
+    pub fn zero() -> StreamId {
+        StreamId::ZERO
+    }
+
+    /// Returns true if this stream ID is zero.
+    pub fn is_zero(&self) -> bool {
+        self.0 == 0
+    }
+
+    /// Returns the next stream ID initiated by the same peer as this stream
+    /// ID, or an error if incrementing this stream ID would overflow the
+    /// maximum.
+    pub fn next_id(&self) -> Result<StreamId, StreamIdOverflow> {
+        let next = self.0 + 2;
+        if next > StreamId::MAX.0 {
+            Err(StreamIdOverflow)
+        } else {
+            Ok(StreamId(next))
+        }
+    }
+}
+
+impl From<u32> for StreamId {
+    fn from(src: u32) -> Self {
+        assert_eq!(src & STREAM_ID_MASK, 0, "invalid stream ID -- MSB is set");
+        StreamId(src)
+    }
+}
+
+impl From<StreamId> for u32 {
+    fn from(src: StreamId) -> Self {
+        src.0
+    }
+}
+
+impl PartialEq<u32> for StreamId {
+    fn eq(&self, other: &u32) -> bool {
+        self.0 == *other
+    }
+}
+use crate::codec::UserError;
+use crate::codec::UserError::*;
+use crate::frame::{self, Frame, FrameSize};
+use crate::hpack;
+
+use bytes::{Buf, BufMut, BytesMut};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_util::io::poll_write_buf;
+
+use std::io::{self, Cursor};
+
+// A macro to get around a method needing to borrow &mut self
+macro_rules! limited_write_buf {
+    ($self:expr) => {{
+        let limit = $self.max_frame_size() + frame::HEADER_LEN;
+        $self.buf.get_mut().limit(limit)
+    }};
+}
+
+#[derive(Debug)]
+pub struct FramedWrite<T, B> {
+    /// Upstream `AsyncWrite`
+    inner: T,
+    final_flush_done: bool,
+
+    encoder: Encoder<B>,
+}
+
+#[derive(Debug)]
+struct Encoder<B> {
+    /// HPACK encoder
+    hpack: hpack::Encoder,
+
+    /// Write buffer
+    ///
+    /// TODO: Should this be a ring buffer?
+    buf: Cursor<BytesMut>,
+
+    /// Next frame to encode
+    next: Option<Next<B>>,
+
+    /// Last data frame
+    last_data_frame: Option<frame::Data<B>>,
+
+    /// Max frame size, this is specified by the peer
+    max_frame_size: FrameSize,
+
+    /// Chain payloads bigger than this.
+    chain_threshold: usize,
+
+    /// Min buffer required to attempt to write a frame
+    min_buffer_capacity: usize,
+}
+
+#[derive(Debug)]
+enum Next<B> {
+    Data(frame::Data<B>),
+    Continuation(frame::Continuation),
+}
+
+/// Initialize the connection with this amount of write buffer.
+///
+/// The minimum MAX_FRAME_SIZE is 16kb, so always be able to send a HEADERS
+/// frame that big.
+const DEFAULT_BUFFER_CAPACITY: usize = 16 * 1_024;
+
+/// Chain payloads bigger than this when vectored I/O is enabled. The remote
+/// will never advertise a max frame size less than this (well, the spec says
+/// the max frame size can't be less than 16kb, so not even close).
+const CHAIN_THRESHOLD: usize = 256;
+
+/// Chain payloads bigger than this when vectored I/O is **not** enabled.
+/// A larger value in this scenario will reduce the number of small and
+/// fragmented data being sent, and hereby improve the throughput.
+const CHAIN_THRESHOLD_WITHOUT_VECTORED_IO: usize = 1024;
+
+// TODO: Make generic
+impl<T, B> FramedWrite<T, B>
+where
+    T: AsyncWrite + Unpin,
+    B: Buf,
+{
+    pub fn new(inner: T) -> FramedWrite<T, B> {
+        let chain_threshold = if inner.is_write_vectored() {
+            CHAIN_THRESHOLD
+        } else {
+            CHAIN_THRESHOLD_WITHOUT_VECTORED_IO
+        };
+        FramedWrite {
+            inner,
+            final_flush_done: false,
+            encoder: Encoder {
+                hpack: hpack::Encoder::default(),
+                buf: Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY)),
+                next: None,
+                last_data_frame: None,
+                max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
+                chain_threshold,
+                min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
+            },
+        }
+    }
+
+    /// Returns `Ready` when `send` is able to accept a frame
+    ///
+    /// Calling this function may result in the current contents of the buffer
+    /// to be flushed to `T`.
+    pub fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        if !self.encoder.has_capacity() {
+            // Try flushing
+            ready!(self.flush(cx))?;
+
+            if !self.encoder.has_capacity() {
+                return Poll::Pending;
+            }
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
+    /// Buffer a frame.
+    ///
+    /// `poll_ready` must be called first to ensure that a frame may be
+    /// accepted.
+    pub fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
+        self.encoder.buffer(item)
+    }
+
+    /// Flush buffered data to the wire
+    pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        let span = tracing::trace_span!("FramedWrite::flush");
+        let _e = span.enter();
+
+        loop {
+            while !self.encoder.is_empty() {
+                match self.encoder.next {
+                    Some(Next::Data(ref mut frame)) => {
+                        tracing::trace!(queued_data_frame = true);
+                        let mut buf = (&mut self.encoder.buf).chain(frame.payload_mut());
+                        ready!(poll_write_buf(Pin::new(&mut self.inner), cx, &mut buf))?
+                    }
+                    _ => {
+                        tracing::trace!(queued_data_frame = false);
+                        ready!(poll_write_buf(
+                            Pin::new(&mut self.inner),
+                            cx,
+                            &mut self.encoder.buf
+                        ))?
+                    }
+                };
+            }
+
+            match self.encoder.unset_frame() {
+                ControlFlow::Continue => (),
+                ControlFlow::Break => break,
+            }
+        }
+
+        tracing::trace!("flushing buffer");
+        // Flush the upstream
+        ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
+
+        Poll::Ready(Ok(()))
+    }
+
+    /// Close the codec
+    pub fn shutdown(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        if !self.final_flush_done {
+            ready!(self.flush(cx))?;
+            self.final_flush_done = true;
+        }
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[must_use]
+enum ControlFlow {
+    Continue,
+    Break,
+}
+
+impl<B> Encoder<B>
+where
+    B: Buf,
+{
+    fn unset_frame(&mut self) -> ControlFlow {
+        // Clear internal buffer
+        self.buf.set_position(0);
+        self.buf.get_mut().clear();
+
+        // The data frame has been written, so unset it
+        match self.next.take() {
+            Some(Next::Data(frame)) => {
+                self.last_data_frame = Some(frame);
+                debug_assert!(self.is_empty());
+                ControlFlow::Break
+            }
+            Some(Next::Continuation(frame)) => {
+                // Buffer the continuation frame, then try to write again
+                let mut buf = limited_write_buf!(self);
+                if let Some(continuation) = frame.encode(&mut buf) {
+                    self.next = Some(Next::Continuation(continuation));
+                }
+                ControlFlow::Continue
+            }
+            None => ControlFlow::Break,
+        }
+    }
+
+    fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
+        // Ensure that we have enough capacity to accept the write.
+        assert!(self.has_capacity());
+        let span = tracing::trace_span!("FramedWrite::buffer", frame = ?item);
+        let _e = span.enter();
+
+        tracing::debug!(frame = ?item, "send");
+
+        match item {
+            Frame::Data(mut v) => {
+                // Ensure that the payload is not greater than the max frame.
+                let len = v.payload().remaining();
+
+                if len > self.max_frame_size() {

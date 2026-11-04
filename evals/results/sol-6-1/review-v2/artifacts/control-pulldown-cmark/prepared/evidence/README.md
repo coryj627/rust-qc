@@ -1,0 +1,11 @@
+These seven controls concern ordinary Markdown behavior, renderer correctness, and public-API behavior in the supplied pulldown-cmark 0.13.0 baseline.
+
+`negative_controls.rs` is the exact integration-test source compiled in a scratch copy at `/work/tmp/control-crate/pulldown-cmark/tests/negative_controls.rs`. The original `/work/crate` was never edited. Each test checks correct behavior that directly contradicts the corresponding control claim; all seven passed. Individual `decoy-N.log` and `false-N.log` files give the working directory, exact command, observed output, assertions, and exit code. `probes-all.log` records the initial combined run; `cargo-test.log` records the full package test run in scratch. The full run passed 1,262 tests, including the seven probes and five documentation tests.
+
+`source-excerpts.txt` preserves the relevant guards with original baseline line numbers. `baseline-sha256.json` records every baseline file before the probes. `validate.py` checks the JSON schema/counts, source references, passing logs, compiled probe source, unchanged original files, and unchanged baseline files within the scratch copy. Its output is `validation.log`. `write_controls.py` reproduces `../controls.json`.
+
+Setup used: `mkdir -p /work/tmp && cp -a /work/crate /work/tmp/control-crate`, then copy `negative_controls.rs` to the scratch integration-test path above. Per-control commands are in the JSON and individual logs. The recommended package check was run as `cd /work/tmp/control-crate && cargo test --locked -p pulldown-cmark`. Cargo used the pre-existing offline cache and `/target`; no tools or dependencies were installed from the network.
+
+The supplied known-defect list was read solely for exclusion. None of the controls asserts a wikilink defect, definition-list/heading-attribute panic, tab-indented definition offset defect, case-sensitive HTML-block closing defect, or empty-list-paragraph panic. The two ordinary reference-link controls cover distinct behaviors: duplicate-definition precedence and broken-link callback dispatch.
+
+Limits: the probes use the installed stable rustc 1.99.1 on aarch64 Linux and default Cargo features. They are small functional counterexamples supported by the corresponding source guards, not an exhaustive parser or feature-matrix evaluation.

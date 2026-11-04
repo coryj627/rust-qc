@@ -1,0 +1,1172 @@
+            rtt_variance: updated.rtt_variance.map(|rtt| rtt.as_secs_f32()),
+            pto_count: updated
+                .pto_count
+                .map(|count| count.try_into().unwrap_or(u16::MAX)),
+            bytes_in_flight: updated.bytes_in_flight,
+            packets_in_flight: updated.packets_in_flight,
+            congestion_window: updated.congestion_window,
+            ssthresh: updated.ssthresh,
+            pacing_rate: updated.pacing_rate,
+        })
+    }
+}
+
+/// RTT estimation for a particular network path
+#[derive(Copy, Clone)]
+pub struct RttEstimator {
+    /// The most recent RTT measurement made when receiving an ack for a previously unacked packet
+    latest: Duration,
+    /// The smoothed RTT of the connection, computed as described in RFC6298
+    smoothed: Option<Duration>,
+    /// The RTT variance, computed as described in RFC6298
+    var: Duration,
+    /// The minimum RTT seen in the connection, ignoring ack delay.
+    min: Duration,
+}
+
+impl RttEstimator {
+    fn new(initial_rtt: Duration) -> Self {
+        Self {
+            latest: initial_rtt,
+            smoothed: None,
+            var: initial_rtt / 2,
+            min: initial_rtt,
+        }
+    }
+
+    /// The current best RTT estimation.
+    pub fn get(&self) -> Duration {
+        self.smoothed.unwrap_or(self.latest)
+    }
+
+    /// Conservative estimate of RTT
+    ///
+    /// Takes the maximum of smoothed and latest RTT, as recommended
+    /// in 6.1.2 of the recovery spec (draft 29).
+    pub fn conservative(&self) -> Duration {
+        self.get().max(self.latest)
+    }
+
+    /// Minimum RTT registered so far for this estimator.
+    pub fn min(&self) -> Duration {
+        self.min
+    }
+
+    // PTO computed as described in RFC9002#6.2.1
+    pub(crate) fn pto_base(&self) -> Duration {
+        self.get() + cmp::max(4 * self.var, TIMER_GRANULARITY)
+    }
+
+    pub(crate) fn update(&mut self, ack_delay: Duration, rtt: Duration) {
+        self.latest = rtt;
+        // min_rtt ignores ack delay.
+        self.min = cmp::min(self.min, self.latest);
+        // Based on RFC6298.
+        if let Some(smoothed) = self.smoothed {
+            let adjusted_rtt = if self.min + ack_delay <= self.latest {
+                self.latest - ack_delay
+            } else {
+                self.latest
+            };
+            let var_sample = if smoothed > adjusted_rtt {
+                smoothed - adjusted_rtt
+            } else {
+                adjusted_rtt - smoothed
+            };
+            self.var = (3 * self.var + var_sample) / 4;
+            self.smoothed = Some((7 * smoothed + adjusted_rtt) / 8);
+        } else {
+            self.smoothed = Some(self.latest);
+            self.var = self.latest / 2;
+            self.min = self.latest;
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct PathResponses {
+    pending: Vec<PathResponse>,
+}
+
+impl PathResponses {
+    pub(crate) fn push(&mut self, packet: u64, token: u64, remote: SocketAddr) {
+        /// Arbitrary permissive limit to prevent abuse
+        const MAX_PATH_RESPONSES: usize = 16;
+        let response = PathResponse {
+            packet,
+            token,
+            remote,
+        };
+        let existing = self.pending.iter_mut().find(|x| x.remote == remote);
+        if let Some(existing) = existing {
+            // Update a queued response
+            if existing.packet <= packet {
+                *existing = response;
+            }
+            return;
+        }
+        if self.pending.len() < MAX_PATH_RESPONSES {
+            self.pending.push(response);
+        } else {
+            // We don't expect to ever hit this with well-behaved peers, so we don't bother dropping
+            // older challenges.
+            trace!("ignoring excessive PATH_CHALLENGE");
+        }
+    }
+
+    pub(crate) fn pop_off_path(&mut self, remote: SocketAddr) -> Option<(u64, SocketAddr)> {
+        let response = *self.pending.last()?;
+        if response.remote == remote {
+            // We don't bother searching further because we expect that the on-path response will
+            // get drained in the immediate future by a call to `pop_on_path`
+            return None;
+        }
+        self.pending.pop();
+        Some((response.token, response.remote))
+    }
+
+    pub(crate) fn pop_on_path(&mut self, remote: SocketAddr) -> Option<u64> {
+        let response = *self.pending.last()?;
+        if response.remote != remote {
+            // We don't bother searching further because we expect that the off-path response will
+            // get drained in the immediate future by a call to `pop_off_path`
+            return None;
+        }
+        self.pending.pop();
+        Some(response.token)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+#[derive(Copy, Clone)]
+struct PathResponse {
+    /// The packet number the corresponding PATH_CHALLENGE was received in
+    packet: u64,
+    token: u64,
+    /// The address the corresponding PATH_CHALLENGE was received from
+    remote: SocketAddr,
+}
+
+/// Summary statistics of packets that have been sent on a particular path, but which have not yet
+/// been acked or deemed lost
+pub(super) struct InFlight {
+    /// Sum of the sizes of all sent packets considered "in flight" by congestion control
+    ///
+    /// The size does not include IP or UDP overhead. Packets only containing ACK frames do not
+    /// count towards this to ensure congestion control does not impede congestion feedback.
+    pub(super) bytes: u64,
+    /// Number of packets in flight containing frames other than ACK and PADDING
+    ///
+    /// This can be 0 even when bytes is not 0 because PADDING frames cause a packet to be
+    /// considered "in flight" by congestion control. However, if this is nonzero, bytes will always
+    /// also be nonzero.
+    pub(super) ack_eliciting: u64,
+}
+
+impl InFlight {
+    fn new() -> Self {
+        Self {
+            bytes: 0,
+            ack_eliciting: 0,
+        }
+    }
+
+    fn insert(&mut self, packet: &SentPacket) {
+        self.bytes += u64::from(packet.size);
+        self.ack_eliciting += u64::from(packet.ack_eliciting);
+    }
+
+    /// Update counters to account for a packet becoming acknowledged, lost, or abandoned
+    fn remove(&mut self, packet: &SentPacket) {
+        self.bytes -= u64::from(packet.size);
+        self.ack_eliciting -= u64::from(packet.ack_eliciting);
+    }
+}
+use crate::{Instant, MAX_UDP_PAYLOAD, MtuDiscoveryConfig, packet::SpaceId};
+use std::cmp;
+use tracing::trace;
+
+/// Implements Datagram Packetization Layer Path Maximum Transmission Unit Discovery
+///
+/// See [`MtuDiscoveryConfig`] for details
+#[derive(Clone)]
+pub(crate) struct MtuDiscovery {
+    /// Detected MTU for the path
+    current_mtu: u16,
+    /// The state of the MTU discovery, if enabled
+    state: Option<EnabledMtuDiscovery>,
+    /// The state of the black hole detector
+    black_hole_detector: BlackHoleDetector,
+}
+
+impl MtuDiscovery {
+    pub(crate) fn new(
+        initial_plpmtu: u16,
+        min_mtu: u16,
+        peer_max_udp_payload_size: Option<u16>,
+        config: MtuDiscoveryConfig,
+    ) -> Self {
+        debug_assert!(
+            initial_plpmtu >= min_mtu,
+            "initial_max_udp_payload_size must be at least {min_mtu}"
+        );
+
+        let mut mtud = Self::with_state(
+            initial_plpmtu,
+            min_mtu,
+            Some(EnabledMtuDiscovery::new(config)),
+        );
+
+        // We might be migrating an existing connection to a new path, in which case the transport
+        // parameters have already been transmitted, and we already know the value of
+        // `peer_max_udp_payload_size`
+        if let Some(peer_max_udp_payload_size) = peer_max_udp_payload_size {
+            mtud.on_peer_max_udp_payload_size_received(peer_max_udp_payload_size);
+        }
+
+        mtud
+    }
+
+    /// MTU discovery will be disabled and the current MTU will be fixed to the provided value
+    pub(crate) fn disabled(plpmtu: u16, min_mtu: u16) -> Self {
+        Self::with_state(plpmtu, min_mtu, None)
+    }
+
+    fn with_state(current_mtu: u16, min_mtu: u16, state: Option<EnabledMtuDiscovery>) -> Self {
+        Self {
+            current_mtu,
+            state,
+            black_hole_detector: BlackHoleDetector::new(min_mtu),
+        }
+    }
+
+    pub(super) fn reset(&mut self, current_mtu: u16, min_mtu: u16) {
+        self.current_mtu = current_mtu;
+        if let Some(state) = self.state.take() {
+            self.state = Some(EnabledMtuDiscovery::new(state.config));
+            self.on_peer_max_udp_payload_size_received(state.peer_max_udp_payload_size);
+        }
+        self.black_hole_detector = BlackHoleDetector::new(min_mtu);
+    }
+
+    /// Returns the current MTU
+    pub(crate) fn current_mtu(&self) -> u16 {
+        self.current_mtu
+    }
+
+    /// Returns the amount of bytes that should be sent as an MTU probe, if any
+    pub(crate) fn poll_transmit(&mut self, now: Instant, next_pn: u64) -> Option<u16> {
+        self.state
+            .as_mut()
+            .and_then(|state| state.poll_transmit(now, self.current_mtu, next_pn))
+    }
+
+    /// Notifies the [`MtuDiscovery`] that the peer's `max_udp_payload_size` transport parameter has
+    /// been received
+    pub(crate) fn on_peer_max_udp_payload_size_received(&mut self, peer_max_udp_payload_size: u16) {
+        self.current_mtu = self.current_mtu.min(peer_max_udp_payload_size);
+
+        if let Some(state) = self.state.as_mut() {
+            // MTUD is only active after the connection has been fully established, so it is
+            // guaranteed we will receive the peer's transport parameters before we start probing
+            debug_assert!(matches!(state.phase, Phase::Initial));
+            state.peer_max_udp_payload_size = peer_max_udp_payload_size;
+        }
+    }
+
+    /// Notifies the [`MtuDiscovery`] that a packet has been ACKed
+    ///
+    /// Returns true if the packet was an MTU probe
+    pub(crate) fn on_acked(&mut self, space: SpaceId, pn: u64, len: u16) -> bool {
+        // MTU probes are only sent in application data space
+        if space != SpaceId::Data {
+            return false;
+        }
+
+        // Update the state of the MTU search
+        if let Some(new_mtu) = self
+            .state
+            .as_mut()
+            .and_then(|state| state.on_probe_acked(pn))
+        {
+            self.current_mtu = new_mtu;
+            trace!(current_mtu = self.current_mtu, "new MTU detected");
+
+            self.black_hole_detector.on_probe_acked(pn, len);
+            true
+        } else {
+            self.black_hole_detector.on_non_probe_acked(pn, len);
+            false
+        }
+    }
+
+    /// Returns the packet number of the in-flight MTU probe, if any
+    pub(crate) fn in_flight_mtu_probe(&self) -> Option<u64> {
+        match &self.state {
+            Some(EnabledMtuDiscovery {
+                phase: Phase::Searching(search_state),
+                ..
+            }) => search_state.in_flight_probe,
+            _ => None,
+        }
+    }
+
+    /// Notifies the [`MtuDiscovery`] that the in-flight MTU probe was lost
+    pub(crate) fn on_probe_lost(&mut self) {
+        if let Some(state) = &mut self.state {
+            state.on_probe_lost();
+        }
+    }
+
+    /// Notifies the [`MtuDiscovery`] that a non-probe packet was lost
+    ///
+    /// When done notifying of lost packets, [`MtuDiscovery::black_hole_detected`] must be called, to
+    /// ensure the last loss burst is properly processed and to trigger black hole recovery logic if
+    /// necessary.
+    pub(crate) fn on_non_probe_lost(&mut self, pn: u64, len: u16) {
+        self.black_hole_detector.on_non_probe_lost(pn, len);
+    }
+
+    /// Returns true if a black hole was detected
+    ///
+    /// Calling this function will close the previous loss burst. If a black hole is detected, the
+    /// current MTU will be reset to `min_mtu`.
+    pub(crate) fn black_hole_detected(&mut self, now: Instant) -> bool {
+        if !self.black_hole_detector.black_hole_detected() {
+            return false;
+        }
+
+        self.current_mtu = self.black_hole_detector.min_mtu;
+
+        if let Some(state) = &mut self.state {
+            state.on_black_hole_detected(now);
+        }
+
+        true
+    }
+}
+
+/// Additional state for enabled MTU discovery
+#[derive(Debug, Clone)]
+struct EnabledMtuDiscovery {
+    phase: Phase,
+    peer_max_udp_payload_size: u16,
+    config: MtuDiscoveryConfig,
+}
+
+impl EnabledMtuDiscovery {
+    fn new(config: MtuDiscoveryConfig) -> Self {
+        Self {
+            phase: Phase::Initial,
+            peer_max_udp_payload_size: MAX_UDP_PAYLOAD,
+            config,
+        }
+    }
+
+    /// Returns the amount of bytes that should be sent as an MTU probe, if any
+    fn poll_transmit(&mut self, now: Instant, current_mtu: u16, next_pn: u64) -> Option<u16> {
+        if let Phase::Initial = &self.phase {
+            // Start the first search
+            self.phase = Phase::Searching(SearchState::new(
+                current_mtu,
+                self.peer_max_udp_payload_size,
+                &self.config,
+            ));
+        } else if let Phase::Complete(next_mtud_activation) = &self.phase {
+            if now < *next_mtud_activation {
+                return None;
+            }
+
+            // Start a new search (we have reached the next activation time)
+            self.phase = Phase::Searching(SearchState::new(
+                current_mtu,
+                self.peer_max_udp_payload_size,
+                &self.config,
+            ));
+        }
+
+        if let Phase::Searching(state) = &mut self.phase {
+            // Nothing to do while there is a probe in flight
+            if state.in_flight_probe.is_some() {
+                return None;
+            }
+
+            // Retransmit lost probes, if any
+            if 0 < state.lost_probe_count && state.lost_probe_count < MAX_PROBE_RETRANSMITS {
+                state.in_flight_probe = Some(next_pn);
+                return Some(state.last_probed_mtu);
+            }
+
+            let last_probe_succeeded = state.lost_probe_count == 0;
+
+            // The probe is definitely lost (we reached the MAX_PROBE_RETRANSMITS threshold)
+            if !last_probe_succeeded {
+                state.lost_probe_count = 0;
+                state.in_flight_probe = None;
+            }
+
+            if let Some(probe_udp_payload_size) = state.next_mtu_to_probe(last_probe_succeeded) {
+                state.in_flight_probe = Some(next_pn);
+                state.last_probed_mtu = probe_udp_payload_size;
+                return Some(probe_udp_payload_size);
+            } else {
+                let next_mtud_activation = now + self.config.interval;
+                self.phase = Phase::Complete(next_mtud_activation);
+                return None;
+            }
+        }
+
+        None
+    }
+
+    /// Called when a packet is acknowledged in [`SpaceId::Data`]
+    ///
+    /// Returns the new `current_mtu` if the packet number corresponds to the in-flight MTU probe
+    fn on_probe_acked(&mut self, pn: u64) -> Option<u16> {
+        match &mut self.phase {
+            Phase::Searching(state) if state.in_flight_probe == Some(pn) => {
+                state.in_flight_probe = None;
+                state.lost_probe_count = 0;
+                Some(state.last_probed_mtu)
+            }
+            _ => None,
+        }
+    }
+
+    /// Called when the in-flight MTU probe was lost
+    fn on_probe_lost(&mut self) {
+        // We might no longer be searching, e.g. if a black hole was detected
+        if let Phase::Searching(state) = &mut self.phase {
+            state.in_flight_probe = None;
+            state.lost_probe_count += 1;
+        }
+    }
+
+    /// Called when a black hole is detected
+    fn on_black_hole_detected(&mut self, now: Instant) {
+        // Stop searching, if applicable, and reset the timer
+        let next_mtud_activation = now + self.config.black_hole_cooldown;
+        self.phase = Phase::Complete(next_mtud_activation);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Phase {
+    /// We haven't started polling yet
+    Initial,
+    /// We are currently searching for a higher PMTU
+    Searching(SearchState),
+    /// Searching has completed and will be triggered again at the provided instant
+    Complete(Instant),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SearchState {
+    /// The lower bound for the current binary search
+    lower_bound: u16,
+    /// The upper bound for the current binary search
+    upper_bound: u16,
+    /// The minimum change to stop the current binary search
+    minimum_change: u16,
+    /// The UDP payload size we last sent a probe for
+    last_probed_mtu: u16,
+    /// Packet number of an in-flight probe (if any)
+    in_flight_probe: Option<u64>,
+    /// Lost probes at the current probe size
+    lost_probe_count: usize,
+}
+
+impl SearchState {
+    /// Creates a new search state, with the specified lower bound (the upper bound is derived from
+    /// the config and the peer's `max_udp_payload_size` transport parameter)
+    fn new(
+        mut lower_bound: u16,
+        peer_max_udp_payload_size: u16,
+        config: &MtuDiscoveryConfig,
+    ) -> Self {
+        lower_bound = lower_bound.min(peer_max_udp_payload_size);
+        let upper_bound = config
+            .upper_bound
+            .clamp(lower_bound, peer_max_udp_payload_size);
+
+        Self {
+            in_flight_probe: None,
+            lost_probe_count: 0,
+            lower_bound,
+            upper_bound,
+            minimum_change: config.minimum_change,
+            // During initialization, we consider the lower bound to have already been
+            // successfully probed
+            last_probed_mtu: lower_bound,
+        }
+    }
+
+    /// Determines the next MTU to probe using binary search
+    fn next_mtu_to_probe(&mut self, last_probe_succeeded: bool) -> Option<u16> {
+        debug_assert_eq!(self.in_flight_probe, None);
+
+        if last_probe_succeeded {
+            self.lower_bound = self.last_probed_mtu;
+        } else {
+            self.upper_bound = self.last_probed_mtu - 1;
+        }
+
+        let next_mtu = (self.lower_bound as i32 + self.upper_bound as i32) / 2;
+
+        // Binary search stopping condition
+        if ((next_mtu - self.last_probed_mtu as i32).unsigned_abs() as u16) < self.minimum_change {
+            // Special case: if the upper bound is far enough, we want to probe it as a last
+            // step (otherwise we will never achieve the upper bound)
+            if self.upper_bound.saturating_sub(self.last_probed_mtu) >= self.minimum_change {
+                return Some(self.upper_bound);
+            }
+
+            return None;
+        }
+
+        Some(next_mtu as u16)
+    }
+}
+
+/// Judges whether packet loss might indicate a drop in MTU
+///
+/// Our MTU black hole detection scheme is a heuristic based on the order in which packets were sent
+/// (the packet number order), their sizes, and which are deemed lost.
+            (transmitted..SIZE1, false)
+        );
+        transmitted = SIZE1;
+
+        // Offset 64 requires 2 bytes
+        assert_eq!(
+            buf.poll_transmit((SIZE2 - transmitted + 2) as usize),
+            (transmitted..SIZE2, false)
+        );
+        buf.retransmit(transmitted..SIZE2);
+        assert_eq!(
+            buf.poll_transmit((SIZE2 - transmitted + 2) as usize),
+            (transmitted..SIZE2, false)
+        );
+        transmitted = SIZE2;
+
+        // Offset 16384 requires requires 4 bytes
+        assert_eq!(
+            buf.poll_transmit((SIZE3 - transmitted + 4) as usize),
+            (transmitted..SIZE3, false)
+        );
+        buf.retransmit(transmitted..SIZE3);
+        assert_eq!(
+            buf.poll_transmit((SIZE3 - transmitted + 4) as usize),
+            (transmitted..SIZE3, false)
+        );
+        transmitted = SIZE3;
+
+        // Offset 1GB requires 8 bytes
+        assert_eq!(
+            buf.poll_transmit(chunk.len() + 8),
+            (transmitted..transmitted + chunk.len() as u64, false)
+        );
+        buf.retransmit(transmitted..transmitted + chunk.len() as u64);
+        assert_eq!(
+            buf.poll_transmit(chunk.len() + 8),
+            (transmitted..transmitted + chunk.len() as u64, false)
+        );
+    }
+
+    #[test]
+    fn multiple_segments() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world!";
+        const MSG_LEN: u64 = MSG.len() as u64;
+
+        const SEG1: &[u8] = b"He";
+        buf.write(SEG1.into());
+        const SEG2: &[u8] = b"llo,";
+        buf.write(SEG2.into());
+        const SEG3: &[u8] = b" w";
+        buf.write(SEG3.into());
+        const SEG4: &[u8] = b"o";
+        buf.write(SEG4.into());
+        const SEG5: &[u8] = b"rld!";
+        buf.write(SEG5.into());
+
+        assert_eq!(aggregate_unacked(&buf), MSG);
+
+        assert_eq!(buf.poll_transmit(16), (0..8, true));
+        assert_eq!(buf.get(0..5), SEG1);
+        assert_eq!(buf.get(2..8), SEG2);
+        assert_eq!(buf.get(6..8), SEG3);
+
+        assert_eq!(buf.poll_transmit(16), (8..MSG_LEN, true));
+        assert_eq!(buf.get(8..MSG_LEN), SEG4);
+        assert_eq!(buf.get(9..MSG_LEN), SEG5);
+
+        assert_eq!(buf.poll_transmit(42), (MSG_LEN..MSG_LEN, true));
+
+        // Now drain the segments
+        buf.ack(0..1);
+        assert_eq!(aggregate_unacked(&buf), &MSG[1..]);
+        buf.ack(0..3);
+        assert_eq!(aggregate_unacked(&buf), &MSG[3..]);
+        buf.ack(3..5);
+        assert_eq!(aggregate_unacked(&buf), &MSG[5..]);
+        buf.ack(7..9);
+        assert_eq!(aggregate_unacked(&buf), &MSG[5..]);
+        buf.ack(4..7);
+        assert_eq!(aggregate_unacked(&buf), &MSG[9..]);
+        buf.ack(0..MSG_LEN);
+        assert_eq!(aggregate_unacked(&buf), &[] as &[u8]);
+    }
+
+    #[test]
+    fn retransmit() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world with extra data!";
+        buf.write(MSG.into());
+        // Transmit two frames
+        assert_eq!(buf.poll_transmit(16), (0..16, false));
+        assert_eq!(buf.poll_transmit(16), (16..23, true));
+        // Lose the first, but not the second
+        buf.retransmit(0..16);
+        // Ensure we only retransmit the lost frame, then continue sending fresh data
+        assert_eq!(buf.poll_transmit(16), (0..16, false));
+        assert_eq!(buf.poll_transmit(16), (23..MSG.len() as u64, true));
+        // Lose the second frame
+        buf.retransmit(16..23);
+        assert_eq!(buf.poll_transmit(16), (16..23, true));
+    }
+
+    #[test]
+    fn ack() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world!";
+        buf.write(MSG.into());
+        assert_eq!(buf.poll_transmit(16), (0..8, true));
+        buf.ack(0..8);
+        assert_eq!(aggregate_unacked(&buf), &MSG[8..]);
+    }
+
+    #[test]
+    fn reordered_ack() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world with extra data!";
+        buf.write(MSG.into());
+        assert_eq!(buf.poll_transmit(16), (0..16, false));
+        assert_eq!(buf.poll_transmit(16), (16..23, true));
+        buf.ack(16..23);
+        assert_eq!(aggregate_unacked(&buf), MSG);
+        buf.ack(0..16);
+        assert_eq!(aggregate_unacked(&buf), &MSG[23..]);
+        assert!(buf.acks.is_empty());
+    }
+
+    fn aggregate_unacked(buf: &SendBuffer) -> Vec<u8> {
+        let mut result = Vec::new();
+        for segment in buf.unacked_segments.iter() {
+            result.extend_from_slice(&segment[..]);
+        }
+        result
+    }
+}
+//! Tests specifically for tokens
+
+use super::*;
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasm_bindgen_test::wasm_bindgen_test as test;
+
+#[test]
+fn stateless_retry() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server.handle_incoming = Box::new(validate_incoming);
+    let (client_ch, _server_ch) = pair.connect();
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.drive();
+    assert_eq!(pair.client.known_connections(), 0);
+    assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+}
+
+#[test]
+fn retry_token_expired() {
+    let _guard = subscribe();
+
+    let fake_time = Arc::new(FakeTimeSource::new());
+    let retry_token_lifetime = Duration::from_secs(1);
+
+    let mut pair = Pair::default();
+    pair.server.handle_incoming = Box::new(validate_incoming);
+
+    let mut config = server_config();
+    config
+        .time_source(Arc::clone(&fake_time) as _)
+        .retry_token_lifetime(retry_token_lifetime);
+    pair.server.set_server_config(Some(Arc::new(config)));
+
+    let client_ch = pair.begin_connect(client_config());
+    pair.drive_client();
+    pair.drive_server();
+    pair.drive_client();
+
+    // to expire retry token
+    fake_time.advance(retry_token_lifetime + Duration::from_millis(1));
+
+    pair.drive();
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::ConnectionLost { reason: ConnectionError::ConnectionClosed(err) })
+        if err.error_code == TransportErrorCode::INVALID_TOKEN
+    );
+
+    assert_eq!(pair.client.known_connections(), 0);
+    assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+}
+
+#[test]
+fn use_token() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let client_config = client_config();
+    let (client_ch, _server_ch) = pair.connect_with(client_config.clone());
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.drive();
+    assert_eq!(pair.client.known_connections(), 0);
+    assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+
+    pair.server.handle_incoming = Box::new(|incoming| {
+        assert!(incoming.remote_address_validated());
+        assert!(incoming.may_retry());
+        IncomingConnectionBehavior::Accept
+    });
+    let (client_ch_2, _server_ch_2) = pair.connect_with(client_config);
+    pair.client
+        .connections
+        .get_mut(&client_ch_2)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.drive();
+    assert_eq!(pair.client.known_connections(), 0);
+    assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+}
+
+#[test]
+fn retry_then_use_token() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let client_config = client_config();
+    pair.server.handle_incoming = Box::new(validate_incoming);
+    let (client_ch, _server_ch) = pair.connect_with(client_config.clone());
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.drive();
+    assert_eq!(pair.client.known_connections(), 0);
+    assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+
+    pair.server.handle_incoming = Box::new(|incoming| {
+        assert!(incoming.remote_address_validated());
+        assert!(incoming.may_retry());
+        IncomingConnectionBehavior::Accept
+    });
+    let (client_ch_2, _server_ch_2) = pair.connect_with(client_config);
+    pair.client
+        .connections
+        .get_mut(&client_ch_2)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.drive();
+    assert_eq!(pair.client.known_connections(), 0);
+    assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+}
+
+#[test]
+fn use_token_then_retry() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let client_config = client_config();
+    let (client_ch, _server_ch) = pair.connect_with(client_config.clone());
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.drive();
+    assert_eq!(pair.client.known_connections(), 0);
+    assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+
+    pair.server.handle_incoming = Box::new({
+        let mut i = 0;
+        move |incoming| {
+            if i == 0 {
+                assert!(incoming.remote_address_validated());
+                assert!(incoming.may_retry());
+                i += 1;
+                IncomingConnectionBehavior::Retry
+            } else if i == 1 {
+                assert!(incoming.remote_address_validated());
+                assert!(!incoming.may_retry());
+                i += 1;
+                IncomingConnectionBehavior::Accept
+            } else {
+                panic!("too many handle_incoming iterations")
+            }
+        }
+    });
+    let (client_ch_2, _server_ch_2) = pair.connect_with(client_config);
+    pair.client
+        .connections
+        .get_mut(&client_ch_2)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.drive();
+    assert_eq!(pair.client.known_connections(), 0);
+    assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+}
+
+#[test]
+fn use_same_token_twice() {
+    #[derive(Default)]
+    struct EvilTokenStore(Mutex<Bytes>);
+
+    impl TokenStore for EvilTokenStore {
+        fn insert(&self, _server_name: &str, token: Bytes) {
+            let mut lock = self.0.lock().unwrap();
+            if lock.is_empty() {
+                *lock = token;
+            }
+        }
+
+        fn take(&self, _server_name: &str) -> Option<Bytes> {
+            let lock = self.0.lock().unwrap();
+            if lock.is_empty() {
+                None
+            } else {
+                Some(lock.clone())
+            }
+        }
+    }
+
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let mut client_config = client_config();
+    client_config.token_store(Arc::new(EvilTokenStore::default()));
+    let (client_ch, _server_ch) = pair.connect_with(client_config.clone());
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.drive();
+    assert_eq!(pair.client.known_connections(), 0);
+    assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+
+    pair.server.handle_incoming = Box::new(|incoming| {
+        assert!(incoming.remote_address_validated());
+        assert!(incoming.may_retry());
+        IncomingConnectionBehavior::Accept
+    });
+    let (client_ch_2, _server_ch_2) = pair.connect_with(client_config.clone());
+    pair.client
+        .connections
+        .get_mut(&client_ch_2)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.drive();
+    assert_eq!(pair.client.known_connections(), 0);
+    assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+
+    pair.server.handle_incoming = Box::new(|incoming| {
+        assert!(!incoming.remote_address_validated());
+        assert!(incoming.may_retry());
+        IncomingConnectionBehavior::Accept
+    });
+    let (client_ch_3, _server_ch_3) = pair.connect_with(client_config);
+    pair.client
+        .connections
+        .get_mut(&client_ch_3)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.drive();
+    assert_eq!(pair.client.known_connections(), 0);
+    assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+}
+
+#[test]
+fn use_token_expired() {
+    let _guard = subscribe();
+    let fake_time = Arc::new(FakeTimeSource::new());
+    let lifetime = Duration::from_secs(10000);
+    let mut server_config = server_config();
+    server_config
+        .time_source(Arc::clone(&fake_time) as _)
+        .validation_token
+        .lifetime(lifetime);
+    let mut pair = Pair::new(Default::default(), server_config);
+    let client_config = client_config();
+    let (client_ch, _server_ch) = pair.connect_with(client_config.clone());
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.drive();
+    assert_eq!(pair.client.known_connections(), 0);
+    assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+
+    pair.server.handle_incoming = Box::new(|incoming| {
+        assert!(incoming.remote_address_validated());
+        assert!(incoming.may_retry());
+        IncomingConnectionBehavior::Accept
+    });
+    let (client_ch_2, _server_ch_2) = pair.connect_with(client_config.clone());
+    pair.client
+        .connections
+        .get_mut(&client_ch_2)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.drive();
+    assert_eq!(pair.client.known_connections(), 0);
+    assert_eq!(pair.client.known_cids(), 0);
+    assert_eq!(pair.server.known_connections(), 0);
+    assert_eq!(pair.server.known_cids(), 0);
+
+    fake_time.advance(lifetime + Duration::from_secs(1));
+
+    pair.server.handle_incoming = Box::new(|incoming| {
+        assert!(!incoming.remote_address_validated());
+//! Storing tokens sent from servers in NEW_TOKEN frames and using them in subsequent connections
+
+use std::{
+    collections::{HashMap, VecDeque, hash_map},
+    sync::{Arc, Mutex},
+};
+
+use bytes::Bytes;
+use lru_slab::LruSlab;
+use tracing::trace;
+
+use crate::token::TokenStore;
+
+/// `TokenStore` implementation that stores up to `N` tokens per server name for up to a
+/// limited number of server names, in-memory
+#[derive(Debug)]
+pub struct TokenMemoryCache(Mutex<State>);
+
+impl TokenMemoryCache {
+    /// Construct empty
+    pub fn new(max_server_names: u32, max_tokens_per_server: usize) -> Self {
+        Self(Mutex::new(State::new(
+            max_server_names,
+            max_tokens_per_server,
+        )))
+    }
+}
+
+impl TokenStore for TokenMemoryCache {
+    fn insert(&self, server_name: &str, token: Bytes) {
+        trace!(%server_name, "storing token");
+        self.0.lock().unwrap().store(server_name, token)
+    }
+
+    fn take(&self, server_name: &str) -> Option<Bytes> {
+        let token = self.0.lock().unwrap().take(server_name);
+        trace!(%server_name, found=%token.is_some(), "taking token");
+        token
+    }
+}
+
+/// Defaults to a maximum of 256 servers and 2 tokens per server
+impl Default for TokenMemoryCache {
+    fn default() -> Self {
+        Self::new(256, 2)
+    }
+}
+
+/// Lockable inner state of `TokenMemoryCache`
+#[derive(Debug)]
+struct State {
+    max_server_names: u32,
+    max_tokens_per_server: usize,
+    // map from server name to index in lru
+    lookup: HashMap<Arc<str>, u32>,
+    lru: LruSlab<CacheEntry>,
+}
+
+impl State {
+    fn new(max_server_names: u32, max_tokens_per_server: usize) -> Self {
+        Self {
+            max_server_names,
+            max_tokens_per_server,
+            lookup: HashMap::new(),
+            lru: LruSlab::default(),
+        }
+    }
+
+    fn store(&mut self, server_name: &str, token: Bytes) {
+        if self.max_server_names == 0 {
+            // the rest of this method assumes that we can always insert a new entry so long as
+            // we're willing to evict a pre-existing entry. thus, an entry limit of 0 is an edge
+            // case we must short-circuit on now.
+            return;
+        }
+        if self.max_tokens_per_server == 0 {
+            // similarly to above, the rest of this method assumes that we can always push a new
+            // token to a queue so long as we're willing to evict a pre-existing token, so we
+            // short-circuit on the edge case of a token limit of 0.
+            return;
+        }
+
+        let server_name = Arc::<str>::from(server_name);
+        match self.lookup.entry(server_name.clone()) {
+            hash_map::Entry::Occupied(hmap_entry) => {
+                // key already exists, push the new token to its token queue
+                let tokens = &mut self.lru.get_mut(*hmap_entry.get()).tokens;
+                if tokens.len() >= self.max_tokens_per_server {
+                    debug_assert!(tokens.len() == self.max_tokens_per_server);
+                    tokens.pop_front().unwrap();
+                }
+                tokens.push_back(token);
+            }
+            hash_map::Entry::Vacant(hmap_entry) => {
+                // key does not yet exist, create a new one, evicting the oldest if necessary
+                let removed_key = if self.lru.len() >= self.max_server_names {
+                    // unwrap safety: max_server_names is > 0, so there's at least one entry, so
+                    //                lru() is some
+                    Some(self.lru.remove(self.lru.lru().unwrap()).server_name)
+                } else {
+                    None
+                };
+
+                hmap_entry.insert(self.lru.insert(CacheEntry::new(server_name, token)));
+
+                // for borrowing reasons, we must defer removing the evicted hmap entry to here
+                if let Some(removed_slot) = removed_key {
+                    let removed = self.lookup.remove(&removed_slot);
+                    debug_assert!(removed.is_some());
+                }
+            }
+        };
+    }
+
+    fn take(&mut self, server_name: &str) -> Option<Bytes> {
+        let slab_key = *self.lookup.get(server_name)?;
+
+        // pop from entry's token queue
+        let entry = self.lru.get_mut(slab_key);
+        // unwrap safety: we never leave tokens empty
+        let token = entry.tokens.pop_front().unwrap();
+
+        if entry.tokens.is_empty() {
+            // token stack emptied, remove entry
+            self.lru.remove(slab_key);
+            self.lookup.remove(server_name);
+        }
+
+        Some(token)
+    }
+}
+
+/// Cache entry within `TokenMemoryCache`'s LRU slab
+#[derive(Debug)]
+struct CacheEntry {
+    server_name: Arc<str>,
+    // invariant: tokens is never empty
+    tokens: VecDeque<Bytes>,
+}
+
+impl CacheEntry {
+    /// Construct with a single token
+    fn new(server_name: Arc<str>, token: Bytes) -> Self {
+        let mut tokens = VecDeque::new();
+        tokens.push_back(token);
+        Self {
+            server_name,
+            tokens,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use super::*;
+    use rand::prelude::*;
+    use rand_pcg::Pcg32;
+
+    fn new_rng() -> impl Rng {
+        Pcg32::from_seed(0xdeadbeefdeadbeefdeadbeefdeadbeefu128.to_le_bytes())
+    }
+
+    #[test]
+    fn cache_test() {
+        let mut rng = new_rng();
+        const N: usize = 2;
+
+        for _ in 0..10 {
+            let mut cache_1: Vec<(u32, VecDeque<Bytes>)> = Vec::new(); // keep it sorted oldest to newest
+            let cache_2 = TokenMemoryCache::new(20, 2);
+
+            for i in 0..200 {
+                let server_name = rng.random::<u32>() % 10;
+                if rng.random_bool(0.666) {
+                    // store
+                    let token = Bytes::from(vec![i]);
+                    println!("STORE {server_name} {token:?}");
+                    if let Some((j, _)) = cache_1
+                        .iter()
+                        .enumerate()
+                        .find(|&(_, &(server_name_2, _))| server_name_2 == server_name)
+                    {
+                        let (_, mut queue) = cache_1.remove(j);
+                        queue.push_back(token.clone());
+                        if queue.len() > N {
+                            queue.pop_front();
+                        }
+                        cache_1.push((server_name, queue));
+                    } else {
+                        let mut queue = VecDeque::new();
+                        queue.push_back(token.clone());
+                        cache_1.push((server_name, queue));
+                        if cache_1.len() > 20 {
+                            cache_1.remove(0);
+                        }
+                    }
+                    cache_2.insert(&server_name.to_string(), token);
+                } else {

@@ -1,0 +1,445 @@
+    pub(crate) fn schedule(
+        &mut self,
+        entry_info: MiniArc<EntryInfo<K>>,
+        deq_nodes: MiniArc<Mutex<DeqNodes<K>>>,
+    ) -> Option<NonNull<DeqNode<TimerNode<K>>>> {
+        debug_assert!(self.is_enabled());
+
+        if let Some(t) = entry_info.expiration_time() {
+            let (level, index) = self.bucket_indices(t);
+            let node = Box::new(DeqNode::new(TimerNode::new(
+                entry_info, deq_nodes, level, index,
+            )));
+            let node = self.wheels[level][index].push_back(node);
+            Some(node)
+        } else {
+            None
+        }
+    }
+
+    fn schedule_existing_node(
+        &mut self,
+        mut node: NonNull<DeqNode<TimerNode<K>>>,
+    ) -> ReschedulingResult<K> {
+        debug_assert!(self.is_enabled());
+
+        // Since cache entry's ValueEntry has a pointer to this node, we must reuse
+        // the node.
+        //
+        // SAFETY on `node.as_mut()`: The self (`TimerWheel`) is the only owner of
+        // the node, and we have `&mut self` here. We are the only one who can mutate
+        // the node.
+        if let entry @ TimerNode::Entry { .. } = &mut unsafe { node.as_mut() }.element {
+            if let Some(t) = entry.entry_info().expiration_time() {
+                let (level, index) = self.bucket_indices(t);
+                entry.set_position(level, index);
+                let node = unsafe { Box::from_raw(node.as_ptr()) };
+                self.wheels[level][index].push_back(node);
+                ReschedulingResult::Rescheduled
+            } else {
+                entry.unset_position();
+                entry.unset_timer_node_in_deq_nodes();
+                ReschedulingResult::Removed(unsafe { Box::from_raw(node.as_ptr()) })
+            }
+        } else {
+            unreachable!()
+        }
+    }
+
+    /// Reschedules an active timer event for the node.
+    pub(crate) fn reschedule(
+        policy_weight: u32,
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        counters: &mut EvictionCounters,
+    ) {
+        counters.saturating_add(1, policy_weight);
+
+        self.update_timer_wheel(entry, timer_wheel);
+
+        // Update the deques.
+        deqs.push_back_ao(
+            CacheRegion::MainProbation,
+            KeyHashDate::new(entry.entry_info()),
+            entry,
+        );
+        if self.is_write_order_queue_enabled() {
+            deqs.push_back_wo(KeyHashDate::new(entry.entry_info()), entry);
+        }
+        entry.set_admitted(true);
+    }
+
+    /// NOTE: This method may enable the timer wheel.
+    fn update_timer_wheel(
+        &self,
+        entry: &MiniArc<ValueEntry<K, V>>,
+        timer_wheel: &mut TimerWheel<K>,
+    ) {
+        // Enable the timer wheel if needed.
+        if entry.entry_info().expiration_time().is_some() && !timer_wheel.is_enabled() {
+            timer_wheel.enable();
+        }
+
+        // Update the timer wheel.
+        match (
+            entry.entry_info().expiration_time().is_some(),
+            entry.timer_node(),
+        ) {
+            // Do nothing; the cache entry has no expiration time and not registered
+            // to the timer wheel.
+            (false, None) => (),
+            // Register the cache entry to the timer wheel; the cache entry has an
+            // expiration time and not registered to the timer wheel.
+            (true, None) => {
+                let timer = timer_wheel.schedule(
+                    MiniArc::clone(entry.entry_info()),
+                    MiniArc::clone(entry.deq_nodes()),
+                );
+                entry.set_timer_node(timer);
+            }
+            // Reschedule the cache entry in the timer wheel; the cache entry has an
+            // expiration time and already registered to the timer wheel.
+            (true, Some(tn)) => {
+                let result = timer_wheel.reschedule(tn);
+                if let ReschedulingResult::Removed(removed_tn) = result {
+                    // The timer node was removed from the timer wheel because the
+                    // expiration time has been unset by other thread after we
+                    // checked.
+                    entry.set_timer_node(None);
+                    drop(removed_tn);
+                }
+            }
+            // Unregister the cache entry from the timer wheel; the cache entry has
+            // no expiration time but registered to the timer wheel.
+            (false, Some(tn)) => {
+                entry.set_timer_node(None);
+                timer_wheel.deschedule(tn);
+            }
+        }
+    }
+
+    fn handle_remove(
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        entry: MiniArc<ValueEntry<K, V>>,
+        gen: Option<u16>,
+        counters: &mut EvictionCounters,
+    ) {
+        if let Some(timer_node) = entry.take_timer_node() {
+            timer_wheel.deschedule(timer_node);
+        }
+        Self::handle_remove_without_timer_wheel(deqs, entry, gen, counters);
+    }
+
+    fn handle_remove_without_timer_wheel(
+        deqs: &mut Deques<K>,
+        entry: MiniArc<ValueEntry<K, V>>,
+        gen: Option<u16>,
+        counters: &mut EvictionCounters,
+    ) {
+        if entry.is_admitted() {
+            entry.set_admitted(false);
+            counters.saturating_sub(1, entry.policy_weight());
+            // The following two unlink_* functions will unset the deq nodes.
+            deqs.unlink_ao(&entry);
+            Deques::unlink_wo(&mut deqs.write_order, &entry);
+        } else {
+            entry.unset_q_nodes();
+        }
+        if let Some(g) = gen {
+            entry.entry_info().set_policy_gen(g);
+        }
+    }
+
+    fn handle_remove_with_deques(
+        ao_deq_name: &str,
+        ao_deq: &mut Deque<KeyHashDate<K>>,
+        wo_deq: &mut Deque<KeyHashDate<K>>,
+        timer_wheel: &mut TimerWheel<K>,
+        entry: MiniArc<ValueEntry<K, V>>,
+        counters: &mut EvictionCounters,
+    ) {
+        if let Some(timer) = entry.take_timer_node() {
+            timer_wheel.deschedule(timer);
+        }
+        if entry.is_admitted() {
+            entry.set_admitted(false);
+            counters.saturating_sub(1, entry.policy_weight());
+            // The following two unlink_* functions will unset the deq nodes.
+            Deques::unlink_ao_from_deque(ao_deq_name, ao_deq, &entry);
+            Deques::unlink_wo(wo_deq, &entry);
+        } else {
+            entry.unset_q_nodes();
+        }
+    }
+use std::{
+    hash::{BuildHasher, Hash},
+    sync::Arc,
+};
+
+use crate::{cht::SegmentedHashMap, common::concurrent::arc::MiniArc};
+
+use parking_lot::{Mutex, MutexGuard};
+
+const LOCK_MAP_NUM_SEGMENTS: usize = 64;
+
+type LockMap<K, S> = SegmentedHashMap<Arc<K>, MiniArc<Mutex<()>>, S>;
+
+// We need the `where` clause here because of the Drop impl.
+pub(crate) struct KeyLock<'a, K, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
+    map: &'a LockMap<K, S>,
+    key: Arc<K>,
+    hash: u64,
+    lock: MiniArc<Mutex<()>>,
+}
+
+impl<K, S> Drop for KeyLock<'_, K, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
+    fn drop(&mut self) {
+        if MiniArc::count(&self.lock) <= 2 {
+            self.map.remove_if(
+                self.hash,
+                |k| k == &self.key,
+                |_k, v| MiniArc::count(v) <= 2,
+            );
+        }
+    }
+}
+
+impl<'a, K, S> KeyLock<'a, K, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
+    fn new(map: &'a LockMap<K, S>, key: &Arc<K>, hash: u64, lock: MiniArc<Mutex<()>>) -> Self {
+        Self {
+            map,
+            key: Arc::clone(key),
+            hash,
+            lock,
+        }
+    }
+
+    pub(crate) fn lock(&self) -> MutexGuard<'_, ()> {
+        self.lock.lock()
+    }
+}
+
+pub(crate) struct KeyLockMap<K, S> {
+    locks: LockMap<K, S>,
+}
+
+impl<K, S> KeyLockMap<K, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
+    pub(crate) fn with_hasher(hasher: S) -> Self {
+        Self {
+            locks: SegmentedHashMap::with_num_segments_and_hasher(LOCK_MAP_NUM_SEGMENTS, hasher),
+        }
+    }
+
+    pub(crate) fn key_lock(&self, key: &Arc<K>) -> KeyLock<'_, K, S> {
+        let hash = self.locks.hash(key);
+        let kl = MiniArc::new(Mutex::new(()));
+        match self
+            .locks
+            .insert_if_not_present(Arc::clone(key), hash, kl.clone())
+        {
+            None => KeyLock::new(&self.locks, key, hash, kl),
+            Some(existing_kl) => KeyLock::new(&self.locks, key, hash, existing_kl),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<K, S> KeyLockMap<K, S> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.locks.len() == 0
+    }
+}
+
+impl<K, V, S> HashMap<K, V, S> {
+    #[inline]
+    fn bucket_array_ref(&'_ self, hash: u64) -> BucketArrayRef<'_, K, V, S> {
+        let index = self.segment_index_from_hash(hash);
+
+        let Segment {
+            ref bucket_array,
+            ref len,
+        } = self.segments[index];
+
+        BucketArrayRef {
+            bucket_array,
+            build_hasher: &self.build_hasher,
+            len,
+        }
+    }
+
+    #[inline]
+    fn segment_index_from_hash(&'_ self, hash: u64) -> usize {
+        if self.segment_shift == 64 {
+            0
+        } else {
+            (hash >> self.segment_shift) as usize
+        }
+    }
+}
+
+struct Segment<K, V> {
+    bucket_array: Atomic<BucketArray<K, V>>,
+    len: AtomicUsize,
+}
+
+#[cfg(test)]
+fn default_num_segments() -> usize {
+    crate::common::available_parallelism() * 2
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::BTreeMap,
+        sync::{Arc, Barrier},
+        thread::{spawn, JoinHandle},
+    };
+
+    use super::*;
+    use crate::cht::test_util::{run_deferred, DropNotifier, NoisyDropper};
+
+    }
+
+    /// Returns the number of elements the map can hold without reallocating any
+    /// bucket pointer arrays.
+    ///
+    /// Note that all mutating operations except removal will result in a bucket
+    /// being allocated or reallocated.
+    ///
+    /// # Safety
+    ///
+    /// This method on its own is safe, but other threads can increase the
+    /// capacity of each segment at any time by adding elements.
+    #[cfg(any(test, feature = "unstable-debug-counters"))]
+    pub(crate) fn capacity(&self) -> usize {
+        let guard = &crossbeam_epoch::pin();
+
+        self.segments
+            .iter()
+            .map(|s| s.bucket_array.load_consume(guard))
+            .map(|p| unsafe { p.as_ref() })
+            .map(|a| a.map_or(0, BucketArray::capacity))
+            .sum::<usize>()
+    }
+
+    #[cfg(test)]
+    /// Returns the number of segments in the map.
+    pub(crate) fn num_segments(&self) -> usize {
+        self.segments.len()
+    }
+}
+
+impl<K: Hash + Eq, V, S: BuildHasher> HashMap<K, V, S> {
+    #[inline]
+    pub(crate) fn contains_key(&self, hash: u64, eq: impl FnMut(&K) -> bool) -> bool {
+        self.get_key_value_and_then(hash, eq, |_, _| Some(()))
+            .is_some()
+    }
+
+    /// Returns a clone of the value corresponding to the key.
+    #[inline]
+    pub(crate) fn get(&self, hash: u64, eq: impl FnMut(&K) -> bool) -> Option<V>
+    where
+        V: Clone,
+    {
+        self.get_key_value_and(hash, eq, |_, v| v.clone())
+    }
+
+    /// Returns the result of invoking a function with a reference to the
+    /// key-value pair corresponding to the supplied key.
+    #[inline]
+    pub(crate) fn get_key_value_and<T>(
+        &self,
+        hash: u64,
+        eq: impl FnMut(&K) -> bool,
+        with_entry: impl FnOnce(&K, &V) -> T,
+    ) -> Option<T> {
+        self.get_key_value_and_then(hash, eq, |k, v| Some(with_entry(k, v)))
+    }
+
+    /// Returns the result of invoking a function with a reference to the
+    /// key-value pair corresponding to the supplied key.
+    #[inline]
+    pub(crate) fn get_key_value_and_then<T>(
+        &self,
+        hash: u64,
+        eq: impl FnMut(&K) -> bool,
+        with_entry: impl FnOnce(&K, &V) -> Option<T>,
+    ) -> Option<T> {
+        self.bucket_array_ref(hash)
+            .get_key_value_and_then(hash, eq, with_entry)
+    }
+99 |     /// https://github.com/Manishearth/triomphe/pull/84
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: bare URLs are not automatically turned into clickable links
+   = note: `-D rustdoc::bare-urls` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(rustdoc::bare_urls)]`
+help: use an automatic link instead
+   |
+99 |     /// <https://github.com/Manishearth/triomphe/pull/84>
+   |         +                                               +
+
+error: could not document `moka`
+
+== tests
+   Compiling cfg-if v1.0.5
+   Compiling libc v0.2.191
+   Compiling smallvec v1.16.4
+   Compiling pin-project-lite v0.2.17
+   Compiling zerofrom v0.1.8
+   Compiling stable_deref_trait v1.2.1
+   Compiling bytes v1.12.1
+   Compiling yoke v0.8.4
+   Compiling scopeguard v1.2.0
+   Compiling futures-core v0.3.34
+   Compiling zerovec v0.11.9
+   Compiling lock_api v0.4.14
+   Compiling utf_types v1.0.0
+   Compiling writeable v0.6.4
+   Compiling litemap v0.8.3
+   Compiling tinystr v0.8.5
+   Compiling itoa v1.0.18
+   Compiling potential_utf v0.1.6
+   Compiling icu_locale_core v2.4.0
+   Compiling utf8_iter v1.1.0
+   Compiling parking_lot_core v0.9.12
+   Compiling errno v0.3.14
+   Compiling getrandom v0.2.17
+   Compiling signal-hook-registry v1.4.8
+   Compiling parking_lot v0.12.5
+   Compiling mio v1.2.4
+   Compiling socket2 v0.6.5
+   Compiling zerotrie v0.2.5
+   Compiling tokio v1.54.1
+   Compiling once_cell v1.21.4
+   Compiling icu_provider v2.4.0
+   Compiling icu_collections v2.4.0
+   Compiling http v1.5.0
+   Compiling futures-task v0.3.34
+   Compiling zeroize v1.9.1
+458:test result: ok. 150 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 10.36s
+465:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+477:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+486:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+493:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+500:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+575:test result: ok. 67 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 27.22s
+7.4691833333333335 minutes used of 45.0

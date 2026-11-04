@@ -1,0 +1,1054 @@
+        common::{time::Clock, HousekeeperConfig},
+        policy::{EvictionPolicy, ExpirationPolicy},
+    };
+
+    use super::BaseCache;
+
+    #[cfg_attr(target_pointer_width = "16", ignore)]
+    #[test]
+    fn test_skt_capacity_will_not_overflow() {
+        use std::collections::hash_map::RandomState;
+
+        // power of two
+        let pot = |exp| 2u64.pow(exp);
+
+        let ensure_sketch_len = |max_capacity, len, name| {
+            let cache = BaseCache::<u8, u8>::new(
+                None,
+                Some(max_capacity),
+                None,
+                RandomState::default(),
+                None,
+                EvictionPolicy::default(),
+                None,
+                ExpirationPolicy::default(),
+                HousekeeperConfig::default(),
+                false,
+                Clock::default(),
+            );
+            cache.inner.enable_frequency_sketch_for_testing();
+            assert_eq!(
+                cache.inner.frequency_sketch.read().table_len(),
+                len as usize,
+                "{name}"
+            );
+        };
+
+        if cfg!(target_pointer_width = "32") {
+            let pot24 = pot(24);
+            let pot16 = pot(16);
+            ensure_sketch_len(0, 128, "0");
+            ensure_sketch_len(128, 128, "128");
+            ensure_sketch_len(pot16, pot16, "pot16");
+            // due to ceiling to next_power_of_two
+            ensure_sketch_len(pot16 + 1, pot(17), "pot16 + 1");
+            // due to ceiling to next_power_of_two
+            ensure_sketch_len(pot24 - 1, pot24, "pot24 - 1");
+            ensure_sketch_len(pot24, pot24, "pot24");
+            ensure_sketch_len(pot(27), pot24, "pot(27)");
+            ensure_sketch_len(u32::MAX as u64, pot24, "u32::MAX");
+        } else {
+            // target_pointer_width: 64 or larger.
+            let pot30 = pot(30);
+            let pot16 = pot(16);
+            ensure_sketch_len(0, 128, "0");
+            ensure_sketch_len(128, 128, "128");
+            ensure_sketch_len(pot16, pot16, "pot16");
+            // due to ceiling to next_power_of_two
+            ensure_sketch_len(pot16 + 1, pot(17), "pot16 + 1");
+
+            // The following tests will allocate large memory (~8GiB).
+            if !cfg!(skip_large_mem_tests) {
+                // due to ceiling to next_power_of_two
+                ensure_sketch_len(pot30 - 1, pot30, "pot30- 1");
+                ensure_sketch_len(pot30, pot30, "pot30");
+                ensure_sketch_len(u64::MAX, pot30, "u64::MAX");
+            }
+        };
+    }
+
+    #[test]
+    fn test_per_entry_expiration() {
+        use super::InnerSync;
+        use crate::{common::time::Clock, Entry, Expiry};
+
+        use std::{
+            collections::hash_map::RandomState,
+            sync::{Arc, Mutex},
+            time::{Duration, Instant as StdInstant},
+        };
+
+        type Key = u32;
+        type Value = char;
+
+        fn current_time(cache: &BaseCache<Key, Value>) -> StdInstant {
+            cache.inner.clock().to_std_instant(cache.current_time())
+        }
+
+        fn insert(cache: &BaseCache<Key, Value>, key: Key, hash: u64, value: Value) {
+            let (op, _now) = cache.do_insert_with_hash(Arc::new(key), hash, value);
+            cache.write_op_ch.send(op).expect("Failed to send");
+        }
+
+        macro_rules! assert_params_eq {
+            ($left:expr, $right:expr, $param_name:expr, $line:expr) => {
+                assert_eq!(
+                    $left, $right,
+                    "Mismatched `{}`s. line: {}",
+                    $param_name, $line
+                );
+            };
+        }
+
+        macro_rules! assert_expiry {
+            ($cache:ident, $key:ident, $hash:ident, $mock:ident, $duration_secs:expr) => {
+                // Increment the time.
+                $mock.increment(Duration::from_millis($duration_secs * 1000 - 1));
+                $cache.inner.run_pending_tasks(None, 1, 10);
+                assert!($cache.contains_key_with_hash(&$key, $hash));
+                assert_eq!($cache.entry_count(), 1);
+
+                // Increment the time by 1ms (3). The entry should be expired.
+                $mock.increment(Duration::from_millis(1));
+                $cache.inner.run_pending_tasks(None, 1, 10);
+                assert!(!$cache.contains_key_with_hash(&$key, $hash));
+
+                // Increment the time again to ensure the entry has been evicted from the
+                // cache.
+                $mock.increment(Duration::from_secs(1));
+                $cache.inner.run_pending_tasks(None, 1, 10);
+                assert_eq!($cache.entry_count(), 0);
+            };
+        }
+
+        /// Contains expected call parameters and also a return value.
+        #[derive(Debug)]
+        enum ExpiryExpectation {
+            NoCall,
+            AfterCreate {
+                caller_line: u32,
+                key: Key,
+                value: Value,
+                current_time: StdInstant,
+                new_duration_secs: Option<u64>,
+            },
+            AfterRead {
+                caller_line: u32,
+                key: Key,
+                value: Value,
+                current_time: StdInstant,
+                current_duration_secs: Option<u64>,
+                last_modified_at: StdInstant,
+                new_duration_secs: Option<u64>,
+            },
+            AfterUpdate {
+                caller_line: u32,
+                key: Key,
+                value: Value,
+                current_time: StdInstant,
+                current_duration_secs: Option<u64>,
+                new_duration_secs: Option<u64>,
+            },
+        }
+
+        impl ExpiryExpectation {
+            fn after_create(
+                caller_line: u32,
+                key: Key,
+                value: Value,
+                current_time: StdInstant,
+                new_duration_secs: Option<u64>,
+            ) -> Self {
+                Self::AfterCreate {
+                    caller_line,
+                    key,
+                    value,
+                    current_time,
+                    new_duration_secs,
+                }
+            }
+
+            fn after_read(
+                caller_line: u32,
+                key: Key,
+                value: Value,
+                current_time: StdInstant,
+                current_duration_secs: Option<u64>,
+                last_modified_at: StdInstant,
+                new_duration_secs: Option<u64>,
+            ) -> Self {
+                Self::AfterRead {
+                    caller_line,
+                    key,
+                    value,
+                    current_time,
+                    current_duration_secs,
+                    last_modified_at,
+                    new_duration_secs,
+                }
+            }
+
+            fn after_update(
+                caller_line: u32,
+                key: Key,
+                value: Value,
+                current_time: StdInstant,
+                current_duration_secs: Option<u64>,
+                new_duration_secs: Option<u64>,
+            ) -> Self {
+                Self::AfterUpdate {
+                    caller_line,
+                    key,
+                    value,
+                    current_time,
+                    current_duration_secs,
+                    new_duration_secs,
+                }
+            }
+        }
+
+        let expectation = Arc::new(Mutex::new(ExpiryExpectation::NoCall));
+
+        struct MyExpiry {
+            expectation: Arc<Mutex<ExpiryExpectation>>,
+        }
+
+        impl Expiry<u32, char> for MyExpiry {
+            fn expire_after_create(
+                &self,
+                actual_key: &u32,
+                actual_value: &char,
+                actual_current_time: StdInstant,
+            ) -> Option<Duration> {
+                use ExpiryExpectation::*;
+
+                let lock = &mut *self.expectation.lock().unwrap();
+                let expected = std::mem::replace(lock, NoCall);
+                match expected {
+                    AfterCreate {
+                        caller_line,
+                        key,
+                        value,
+                        current_time,
+                        new_duration_secs: new_duration,
+                    } => {
+                        assert_params_eq!(*actual_key, key, "key", caller_line);
+                        assert_params_eq!(*actual_value, value, "value", caller_line);
+                        assert_params_eq!(
+                            actual_current_time,
+                            current_time,
+                            "current_time",
+                            caller_line
+                        );
+                        new_duration.map(Duration::from_secs)
+                    }
+                    expected => {
+                        panic!(
+                            "Unexpected call to expire_after_create: caller_line {}, expected: {expected:?}",
+                            line!()
+                        );
+                    }
+                }
+            }
+
+            fn expire_after_read(
+                &self,
+                actual_key: &u32,
+                actual_value: &char,
+                actual_current_time: StdInstant,
+                actual_current_duration: Option<Duration>,
+                actual_last_modified_at: StdInstant,
+            ) -> Option<Duration> {
+                use ExpiryExpectation::*;
+
+                let lock = &mut *self.expectation.lock().unwrap();
+                let expected = std::mem::replace(lock, NoCall);
+                match expected {
+                    AfterRead {
+                        caller_line,
+                        key,
+                        value,
+                        current_time,
+                        current_duration_secs,
+                        last_modified_at,
+                        new_duration_secs,
+                    } => {
+                        assert_params_eq!(*actual_key, key, "key", caller_line);
+                        assert_params_eq!(*actual_value, value, "value", caller_line);
+                        assert_params_eq!(
+                            actual_current_time,
+                            current_time,
+                            "current_time",
+                            caller_line
+                        );
+                        assert_params_eq!(
+                            actual_current_duration,
+                            current_duration_secs.map(Duration::from_secs),
+                            "current_duration",
+                            caller_line
+                        );
+                        assert_params_eq!(
+                            actual_last_modified_at,
+                            last_modified_at,
+                            "last_modified_at",
+                            caller_line
+                        );
+                        new_duration_secs.map(Duration::from_secs)
+                    }
+                    expected => {
+                        panic!(
+                            "Unexpected call to expire_after_read: caller_line {}, expected: {expected:?}",
+                            line!()
+                        );
+                    }
+                }
+            }
+
+            fn expire_after_update(
+                &self,
+                actual_key: &u32,
+                actual_value: &char,
+                actual_current_time: StdInstant,
+                actual_current_duration: Option<Duration>,
+            ) -> Option<Duration> {
+                use ExpiryExpectation::*;
+
+                let lock = &mut *self.expectation.lock().unwrap();
+                let expected = std::mem::replace(lock, NoCall);
+                match expected {
+                    AfterUpdate {
+                        caller_line,
+                        key,
+                        value,
+                        current_time,
+                        current_duration_secs,
+                        new_duration_secs,
+                    } => {
+                        assert_params_eq!(*actual_key, key, "key", caller_line);
+                        assert_params_eq!(*actual_value, value, "value", caller_line);
+                        assert_params_eq!(
+                            actual_current_time,
+                            current_time,
+                            "current_time",
+                            caller_line
+                        );
+                        assert_params_eq!(
+                            actual_current_duration,
+                            current_duration_secs.map(Duration::from_secs),
+                            "current_duration",
+                            caller_line
+                        );
+                        new_duration_secs.map(Duration::from_secs)
+                    }
+                    expected => {
+                        panic!(
+                            "Unexpected call to expire_after_update: caller_line {}, expected: {expected:?}",
+                            line!()
+                        );
+                    }
+                }
+            }
+        }
+
+        const TTL: u64 = 16;
+        const TTI: u64 = 7;
+        let expiry: Option<Arc<dyn Expiry<_, _> + Send + Sync + 'static>> =
+            Some(Arc::new(MyExpiry {
+                expectation: Arc::clone(&expectation),
+            }));
+
+        let (clock, mock) = Clock::mock();
+
+        let mut cache = BaseCache::<Key, Value>::new(
+            None,
+            None,
+            None,
+            RandomState::default(),
+            None,
+            EvictionPolicy::default(),
+            None,
+            ExpirationPolicy::new(
+                Some(Duration::from_secs(TTL)),
+                Some(Duration::from_secs(TTI)),
+                expiry,
+            ),
+            HousekeeperConfig::default(),
+            false,
+            clock,
+        );
+        cache.reconfigure_for_testing();
+
+        // Make the cache exterior immutable.
+        } else {
+            None
+        };
+
+        let type_id = ValueInitializer::<K, V, S>::type_id_for_try_get_with::<E>();
+        let post_init = ValueInitializer::<K, V, S>::post_init_for_try_get_with;
+
+        match self
+            .value_initializer
+            .try_init_or_read(&key, type_id, get, init, insert, post_init)
+        {
+            InitResult::Initialized(v) => {
+                crossbeam_epoch::pin().flush();
+                Ok(Entry::new(k, v, true, false))
+            }
+            InitResult::ReadExisting(v) => Ok(Entry::new(k, v, false, false)),
+            InitResult::InitErr(e) => {
+                crossbeam_epoch::pin().flush();
+                Err(e)
+            }
+        }
+    }
+
+    /// Inserts a key-value pair into the cache.
+    ///
+    /// If the cache has this key present, the value is updated.
+    pub fn insert(&self, key: K, value: V) {
+        let hash = self.base.hash(&key);
+        let key = Arc::new(key);
+        self.insert_with_hash(key, hash, value);
+    }
+
+    pub(crate) fn insert_with_hash(&self, key: Arc<K>, hash: u64, value: V) {
+        if self.base.is_map_disabled() {
+            return;
+        }
+
+        let (op, now) = self.base.do_insert_with_hash(key, hash, value);
+        let hk = self.base.housekeeper.as_ref();
+        Self::schedule_write_op(
+            self.base.inner.as_ref(),
+            &self.base.write_op_ch,
+            op,
+            now,
+            hk,
+        )
+        .expect("Failed to insert");
+    }
+
+    pub(crate) fn compute_with_hash_and_fun<F>(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        f: F,
+    ) -> compute::CompResult<K, V>
+    where
+        F: FnOnce(Option<Entry<K, V>>) -> compute::Op<V>,
+    {
+        let post_init = ValueInitializer::<K, V, S>::post_init_for_compute_with;
+        match self
+            .value_initializer
+            .try_compute(key, hash, self, f, post_init, true)
+        {
+            Ok(result) => result,
+            Err(_) => unreachable!(),
+        }
+    }
+
+    pub(crate) fn try_compute_with_hash_and_fun<F, E>(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        f: F,
+    ) -> Result<compute::CompResult<K, V>, E>
+    where
+        F: FnOnce(Option<Entry<K, V>>) -> Result<compute::Op<V>, E>,
+        E: Send + Sync + 'static,
+    {
+        let post_init = ValueInitializer::<K, V, S>::post_init_for_try_compute_with;
+        self.value_initializer
+            .try_compute(key, hash, self, f, post_init, true)
+    }
+
+    pub(crate) fn upsert_with_hash_and_fun<F>(&self, key: Arc<K>, hash: u64, f: F) -> Entry<K, V>
+    where
+        F: FnOnce(Option<Entry<K, V>>) -> V,
+    {
+        let post_init = ValueInitializer::<K, V, S>::post_init_for_upsert_with;
+        match self
+            .value_initializer
+            .try_compute(key, hash, self, f, post_init, false)
+        {
+            Ok(CompResult::Inserted(entry) | CompResult::ReplacedWith(entry)) => entry,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Discards any cached value for the key.
+    ///
+    /// If you need to get a the value that has been discarded, use the
+    /// [`remove`](#method.remove) method instead.
+    ///
+    /// The key may be any borrowed form of the cache's key type, but `Hash` and `Eq`
+    /// on the borrowed form _must_ match those for the key type.
+    pub fn invalidate<Q>(&self, key: &Q)
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        let hash = self.base.hash(key);
+        self.invalidate_with_hash(key, hash, false);
+    }
+
+    /// Discards any cached value for the key and returns a _clone_ of the value.
+    ///
+    /// If you do not need to get the value that has been discarded, use the
+    /// [`invalidate`](#method.invalidate) method instead.
+    ///
+    /// The key may be any borrowed form of the cache's key type, but `Hash` and `Eq`
+    /// on the borrowed form _must_ match those for the key type.
+    pub fn remove<Q>(&self, key: &Q) -> Option<V>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        let hash = self.base.hash(key);
+        self.invalidate_with_hash(key, hash, true)
+    }
+
+    pub(crate) fn invalidate_with_hash<Q>(&self, key: &Q, hash: u64, need_value: bool) -> Option<V>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        // Lock the key for removal if blocking removal notification is enabled.
+        let mut kl = None;
+        let mut klg = None;
+        if self.base.is_removal_notifier_enabled() {
+            // To lock the key, we have to get Arc<K> for key (&Q).
+            //
+            // TODO: Enhance this if possible. This is rather hack now because
+            // it cannot prevent race conditions like this:
+            //
+            // 1. We miss the key because it does not exist. So we do not lock
+            //    the key.
+            // 2. Somebody else (other thread) inserts the key.
+            // 3. We remove the entry for the key, but without the key lock!
+            //
+            if let Some(arc_key) = self.base.get_key_with_hash(key, hash) {
+                kl = self.base.maybe_key_lock(&arc_key);
+                klg = kl.as_ref().map(|kl| kl.lock());
+            }
+        }
+
+        match self.base.remove_entry(key, hash) {
+            None => None,
+            Some(kv) => {
+                let now = self.base.current_time();
+
+                let info = kv.entry.entry_info();
+                let entry_gen = info.incr_entry_gen();
+
+                if self.base.is_removal_notifier_enabled() {
+                    self.base.notify_invalidate(&kv.key, &kv.entry);
+                }
+                // Drop the locks before scheduling write op to avoid a potential
+                // dead lock. (Scheduling write can do spin lock when the queue is
+                // full, and queue will be drained by the housekeeping thread that
+                // can lock the same key)
+                std::mem::drop(klg);
+                std::mem::drop(kl);
+
+                let maybe_v = if need_value {
+                    Some(kv.entry.value.clone())
+                } else {
+                    None
+                };
+
+                let op = WriteOp::Remove {
+                    kv_entry: kv,
+                    entry_gen,
+                };
+                let hk = self.base.housekeeper.as_ref();
+                Self::schedule_write_op(
+                    self.base.inner.as_ref(),
+                    &self.base.write_op_ch,
+                    op,
+                    now,
+                    hk,
+                )
+                .expect("Failed to remove");
+                crossbeam_epoch::pin().flush();
+                maybe_v
+            }
+        }
+    }
+
+    /// Discards all cached values.
+    ///
+    /// This method returns immediately by just setting the current time as the
+    /// invalidation time. `get` and other retrieval methods are guaranteed not to
+    /// return the entries inserted before or at the invalidation time.
+    ///
+    /// The actual removal of the invalidated entries is done as a maintenance task
+    /// driven by a user thread. For more details, see
+    /// [the Maintenance Tasks section](../index.html#maintenance-tasks) in the crate
+    /// level documentation.
+    ///
+    /// Like the `invalidate` method, this method does not clear the historic
+    /// popularity estimator of keys so that it retains the client activities of
+    /// trying to retrieve an item.
+    pub fn invalidate_all(&self) {
+        self.base.invalidate_all();
+    }
+
+    /// Discards cached values that satisfy a predicate.
+    ///
+    /// `invalidate_entries_if` takes a closure that returns `true` or `false`. The
+    /// closure is called against each cached entry inserted before or at the time
+    /// when this method was called. If the closure returns `true` that entry will be
+    /// evicted from the cache.
+    ///
+    /// This method returns immediately by not actually removing the invalidated
+    /// entries. Instead, it just sets the predicate to the cache with the time when
+    /// this method was called. The actual removal of the invalidated entries is done
+    /// as a maintenance task driven by a user thread. For more details, see
+    /// [the Maintenance Tasks section](../index.html#maintenance-tasks) in the crate
+    /// level documentation.
+    ///
+    /// Also the `get` and other retrieval methods will apply the closure to a cached
+    /// entry to determine if it should have been invalidated. Therefore, it is
+    /// guaranteed that these methods must not return invalidated values.
+    ///
+    /// Note that you must call
+    /// [`CacheBuilder::support_invalidation_closures`][support-invalidation-closures]
+    /// at the cache creation time as the cache needs to maintain additional internal
+    /// data structures to support this method. Otherwise, calling this method will
+    /// fail with a
+    /// [`PredicateError::InvalidationClosuresDisabled`][invalidation-disabled-error].
+    ///
+    /// Like the `invalidate` method, this method does not clear the historic
+    /// popularity estimator of keys so that it retains the client activities of
+    /// trying to retrieve an item.
+    ///
+    /// [support-invalidation-closures]:
+    ///     ./struct.CacheBuilder.html#method.support_invalidation_closures
+    /// [invalidation-disabled-error]:
+    ///     ../enum.PredicateError.html#variant.InvalidationClosuresDisabled
+    pub fn invalidate_entries_if<F>(&self, predicate: F) -> Result<PredicateId, PredicateError>
+    where
+        F: Fn(&K, &V) -> bool + Send + Sync + 'static,
+    {
+        self.base.invalidate_entries_if(Arc::new(predicate))
+    }
+
+    pub(crate) fn invalidate_entries_with_arc_fun<F>(
+        &self,
+        predicate: Arc<F>,
+    ) -> Result<PredicateId, PredicateError>
+    where
+        F: Fn(&K, &V) -> bool + Send + Sync + 'static,
+    {
+        self.base.invalidate_entries_if(predicate)
+    }
+
+    /// Creates an iterator visiting all key-value pairs in arbitrary order. The
+    /// iterator element type is `(Arc<K>, V)`, where `V` is a clone of a stored
+    /// value.
+    ///
+    /// Iterators do not block concurrent reads and writes on the cache. An entry can
+    /// be inserted to, invalidated or evicted from a cache while iterators are alive
+    /// on the same cache.
+    ///
+    /// Unlike the `get` method, visiting entries via an iterator do not update the
+    /// historic popularity estimator or reset idle timers for keys.
+    ///
+    /// # Guarantees
+    ///
+    /// In order to allow concurrent access to the cache, iterator's `next` method
+    /// does _not_ guarantee the following:
+    ///
+    /// - It does not guarantee to return a key-value pair (an entry) if its key has
+    ///   been inserted to the cache _after_ the iterator was created.
+    ///   - Such an entry may or may not be returned depending on key's hash and
+    ///     timing.
+    ///
+    /// and the `next` method guarantees the followings:
+    ///
+    /// - It guarantees not to return the same entry more than once.
+    /// - It guarantees not to return an entry if it has been removed from the cache
+    ///   after the iterator was created.
+    ///     - Note: An entry can be removed by following reasons:
+    ///         - Manually invalidated.
+    ///         - Expired (e.g. time-to-live).
+    ///         - Evicted as the cache capacity exceeded.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use moka::sync::Cache;
+    ///
+    /// let cache = Cache::new(100);
+    /// cache.insert("Julia", 14);
+    ///
+    fn expire_after_read(
+        &self,
+        key: &K,
+        value: &V,
+        read_at: Instant,
+        duration_until_expiry: Option<Duration>,
+        last_modified_at: Instant,
+    ) -> Option<Duration> {
+        duration_until_expiry
+    }
+
+    /// Specifies that the entry should be automatically removed from the cache once
+    /// the duration has elapsed after the replacement of its value. This method is
+    /// called for cache write methods such as `insert` but only when the key is
+    /// already present in the cache.
+    ///
+    /// # Parameters
+    ///
+    /// - `key` &mdash; A reference to the key of the entry.
+    /// - `value` &mdash; A reference to the value of the entry.
+    /// - `updated_at` &mdash; The time when this entry was updated.
+    /// - `duration_until_expiry` &mdash; The remaining duration until the entry
+    ///   expires. (Calculated by `expiration_time - updated_at`)
+    ///
+    /// # Return value
+    ///
+    /// The returned `Option<Duration>` is used to set the expiration time of the
+    /// entry.
+    ///
+    /// - Returning `Some(duration)` &mdash; The expiration time is set to
+    ///   `updated_at + duration`.
+    /// - Returning `None` &mdash; The expiration time is cleared (no expiration).
+    /// - Returning `duration_until_expiry` will not modify the expiration time.
+    ///   - This is the value that the default implementation returns.
+    ///
+    /// # Notes on `time_to_live` and `time_to_idle` policies
+    ///
+    /// When the cache is configured with `time_to_live` and/or `time_to_idle`
+    /// policies, then:
+    ///
+    /// - The entry will be evicted after the earliest of the expiration time
+    ///   returned by this expiry, the `time_to_live` and `time_to_idle` policies.
+    /// - The `duration_until_expiry` takes in account the `time_to_live` and
+    ///   `time_to_idle` policies.
+    #[allow(unused_variables)]
+    fn expire_after_update(
+        &self,
+        key: &K,
+        value: &V,
+        updated_at: Instant,
+        duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
+        duration_until_expiry
+    }
+}
+
+pub(crate) struct ExpirationPolicy<K, V> {
+    time_to_live: Option<Duration>,
+    time_to_idle: Option<Duration>,
+    expiry: Option<Arc<dyn Expiry<K, V> + Send + Sync + 'static>>,
+}
+
+impl<K, V> Default for ExpirationPolicy<K, V> {
+    fn default() -> Self {
+        Self {
+            time_to_live: None,
+            time_to_idle: None,
+            expiry: None,
+        }
+    }
+}
+
+impl<K, V> Clone for ExpirationPolicy<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            time_to_live: self.time_to_live,
+            time_to_idle: self.time_to_idle,
+            expiry: self.expiry.clone(),
+        }
+    }
+}
+use async_lock::{RwLock, RwLockWriteGuard};
+use futures_util::FutureExt;
+use std::{
+    any::{Any, TypeId},
+    fmt,
+    future::Future,
+    hash::{BuildHasher, Hash},
+    pin::Pin,
+    sync::Arc,
+};
+
+use crate::{
+    common::concurrent::arc::MiniArc,
+    ops::compute::{CompResult, Op},
+    Entry,
+};
+
+use super::{Cache, ComputeNone, OptionallyNone};
+
+const WAITER_MAP_NUM_SEGMENTS: usize = 64;
+
+type ErrorObject = Arc<dyn Any + Send + Sync + 'static>;
+
+pub(crate) enum InitResult<V, E> {
+    Initialized(V),
+    ReadExisting(V),
+    InitErr(Arc<E>),
+}
+
+enum WaiterValue<V> {
+    Computing,
+    Ready(Result<V, ErrorObject>),
+    ReadyNone,
+    // https://github.com/moka-rs/moka/issues/43
+    InitFuturePanicked,
+    // https://github.com/moka-rs/moka/issues/59
+    EnclosingFutureAborted,
+}
+
+impl<V> fmt::Debug for WaiterValue<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WaiterValue::Computing => write!(f, "Computing"),
+            WaiterValue::Ready(_) => write!(f, "Ready"),
+            WaiterValue::ReadyNone => write!(f, "ReadyNone"),
+            WaiterValue::InitFuturePanicked => write!(f, "InitFuturePanicked"),
+            WaiterValue::EnclosingFutureAborted => write!(f, "EnclosingFutureAborted"),
+        }
+    }
+}
+
+type Waiter<V> = MiniArc<RwLock<WaiterValue<V>>>;
+type WaiterMap<K, V, S> = crate::cht::SegmentedHashMap<(Arc<K>, TypeId), Waiter<V>, S>;
+
+struct WaiterGuard<'a, K, V, S>
+// NOTE: We usually do not attach trait bounds to here at the struct definition, but
+// the Drop trait requires these bounds here.
+where
+    K: Eq + Hash,
+    V: Clone,
+    S: BuildHasher,
+{
+    w_key: Option<(Arc<K>, TypeId)>,
+    w_hash: u64,
+    waiters: &'a WaiterMap<K, V, S>,
+    write_lock: RwLockWriteGuard<'a, WaiterValue<V>>,
+}
+
+impl<'a, K, V, S> WaiterGuard<'a, K, V, S>
+where
+    K: Eq + Hash,
+    V: Clone,
+    S: BuildHasher,
+{
+    fn new(
+        w_key: (Arc<K>, TypeId),
+        w_hash: u64,
+        waiters: &'a WaiterMap<K, V, S>,
+        write_lock: RwLockWriteGuard<'a, WaiterValue<V>>,
+    ) -> Self {
+        Self {
+            w_key: Some(w_key),
+            w_hash,
+            waiters,
+            write_lock,
+        }
+    }
+
+    fn set_waiter_value(mut self, v: WaiterValue<V>) {
+        *self.write_lock = v;
+        if let Some(w_key) = self.w_key.take() {
+            remove_waiter(self.waiters, w_key, self.w_hash);
+        }
+    }
+}
+
+impl<K, V, S> Drop for WaiterGuard<'_, K, V, S>
+where
+    K: Eq + Hash,
+    V: Clone,
+    S: BuildHasher,
+{
+    fn drop(&mut self) {
+        if let Some(w_key) = self.w_key.take() {
+            // Value is not set. This means the future containing `*get_with` method
+            // has been aborted. Remove our waiter to prevent the issue described in
+            // https://github.com/moka-rs/moka/issues/59
+            *self.write_lock = WaiterValue::EnclosingFutureAborted;
+            remove_waiter(self.waiters, w_key, self.w_hash);
+        }
+    }
+}
+
+pub(crate) struct ValueInitializer<K, V, S> {
+    // TypeId is the type ID of the concrete error type of generic type E in the
+    // try_get_with method. We use the type ID as a part of the key to ensure that we
+    // can always downcast the trait object ErrorObject (in Waiter<V>) into its
+    // concrete type.
+    waiters: MiniArc<WaiterMap<K, V, S>>,
+}
+
+impl<K, V, S> ValueInitializer<K, V, S>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn with_hasher(hasher: S) -> Self {
+        Self {
+            waiters: MiniArc::new(crate::cht::SegmentedHashMap::with_num_segments_and_hasher(
+                WAITER_MAP_NUM_SEGMENTS,
+                hasher,
+            )),
+        }
+    }
+
+    //
+    // NOTES: We use `Pin<&mut impl Future>` instead of `impl Future` here for the
+    // `init` argument. This is because we want to avoid the future size inflation
+    // caused by calling nested async functions. See the following links for more
+    // details:
+    //
+    // - https://github.com/moka-rs/moka/issues/212
+    // - https://swatinem.de/blog/future-size/
+    //
+
+    /// # Panics
+    /// Panics if the `init` future has been panicked.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn try_init_or_read<I, O, E>(
+        &self,
+        c_key: &Arc<K>,
+        c_hash: u64,
+        type_id: TypeId,
+        cache: &Cache<K, V, S>,
+        mut ignore_if: Option<I>,
+        // Future to initialize a new value.
+        init: Pin<&mut impl Future<Output = O>>,
+        // Function to convert a value O, returned from the init future, into
+        // Result<V, E>.
+        post_init: fn(O) -> Result<V, E>,
+    ) -> InitResult<V, E>
+    where
+        I: FnMut(&V) -> bool + Send,
+        E: Send + Sync + 'static,
+    {
+        use std::panic::{resume_unwind, AssertUnwindSafe};
+        use InitResult::{InitErr, Initialized, ReadExisting};
+
+        const MAX_RETRIES: usize = 200;
+        let mut retries = 0;
+
+        let (w_key, w_hash) = waiter_key_hash(&self.waiters, c_key, type_id);
+
+        let waiter = MiniArc::new(RwLock::new(WaiterValue::Computing));
+        // NOTE: We have to acquire a write lock before `try_insert_waiter`,
+        // so that any concurrent attempt will get our lock and wait on it.
+        let lock = waiter.write().await;
+
+        loop {
+            let Some(existing_waiter) =
+                try_insert_waiter(&self.waiters, w_key.clone(), w_hash, &waiter)
+            else {
+                // Inserted.
+                break;
+            };
+
+            // Somebody else's waiter already exists, so wait for its result to become available.
+            let waiter_result = existing_waiter.read().await;
+            match &*waiter_result {
+                WaiterValue::Ready(Ok(value)) => return ReadExisting(value.clone()),
+                WaiterValue::Ready(Err(e)) => return InitErr(Arc::clone(e).downcast().unwrap()),
+                // Somebody else's init future has been panicked.
+                WaiterValue::InitFuturePanicked => {
+                    retries += 1;
+                    panic_if_retry_exhausted_for_panicking(retries, MAX_RETRIES);
+                    // Retry from the beginning.
+                    continue;
+                }
+                // Somebody else (a future containing `get_with`/`try_get_with`)
+                // has been aborted.
+                WaiterValue::EnclosingFutureAborted => {
+                    retries += 1;
+                    panic_if_retry_exhausted_for_aborting(retries, MAX_RETRIES);
+                    // Retry from the beginning.
+                    continue;
+                }
+                // Unexpected state.
+                s @ (WaiterValue::Computing | WaiterValue::ReadyNone) => panic!(
+                    "Got unexpected state `{s:?}` after resolving `init` future. \
+                    This might be a bug in Moka"
+                ),
+            }
+        }
+
+        // Our waiter was inserted.
+
+        // Create a guard. This will ensure to remove our waiter when the
+        // enclosing future has been aborted:
+        // https://github.com/moka-rs/moka/issues/59
+        let waiter_guard = WaiterGuard::new(w_key, w_hash, &self.waiters, lock);
+
+        // Check if the value has already been inserted by other thread.
+        if let Some(value) = cache
+            .base
+            .get_with_hash(&**c_key, c_hash, ignore_if.as_mut(), false, false)
+            .await
+            .map(Entry::into_value)
+        {
+            // Yes. Set the waiter value, remove our waiter, and return
+            // the existing value.
+            waiter_guard.set_waiter_value(WaiterValue::Ready(Ok(value.clone())));
+            return ReadExisting(value);
+        }
+
+        // The value still does note exist. Let's resolve the init
+        // future. Catching panic is safe here as we do not try to
+        // resolve the future again.
+        match AssertUnwindSafe(init).catch_unwind().await {
+            // Resolved.
+            Ok(value) => match post_init(value) {
+                Ok(value) => {
+                    cache
+                        .insert_with_hash(Arc::clone(c_key), c_hash, value.clone())
+                        .await;
+                    waiter_guard.set_waiter_value(WaiterValue::Ready(Ok(value.clone())));
+                    Initialized(value)
+                }
+                Err(e) => {
+                    let err: ErrorObject = Arc::new(e);
+                    waiter_guard.set_waiter_value(WaiterValue::Ready(Err(Arc::clone(&err))));
+                    InitErr(err.downcast().unwrap())
+                }
+            },
+            // Panicked.
+            Err(payload) => {
+                waiter_guard.set_waiter_value(WaiterValue::InitFuturePanicked);
+                resume_unwind(payload);
+            }
+        }
+use std::{error::Error, fmt::Display};
+
+/// The error type for the functionalities around
+/// [`Cache::invalidate_entries_if`][invalidate-if] method.
+///
+/// [invalidate-if]: ./sync/struct.Cache.html#method.invalidate_entries_if
+#[derive(Debug)]
+pub enum PredicateError {
+    /// This cache does not have a necessary configuration enabled to support
+    /// invalidating entries with a closure.
+    ///
+    /// To enable the configuration, call
+    /// [`CacheBuilder::support_invalidation_closures`][support-invalidation-closures]
+    /// method at the cache creation time.
+    ///
+    /// [support-invalidation-closures]: ./sync/struct.CacheBuilder.html#method.support_invalidation_closures
+    InvalidationClosuresDisabled,
+}
+
+impl Display for PredicateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Support for invalidation closures is disabled in this cache. \
+            Please enable it by calling the support_invalidation_closures \
+            method of the builder at the cache creation time",
+        )
+    }
+}
+
+impl Error for PredicateError {}

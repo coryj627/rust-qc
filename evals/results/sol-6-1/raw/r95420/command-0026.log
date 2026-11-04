@@ -1,0 +1,852 @@
+use equivalent::Equivalent;
+
+use super::{cache::Cache, CacheBuilder, OwnedKeyEntrySelector, RefKeyEntrySelector};
+use crate::common::concurrent::Weigher;
+use crate::common::time::Clock;
+use crate::{
+    common::{
+        iter::{Iter, ScanningGet},
+        HousekeeperConfig,
+    },
+    notification::EvictionListener,
+    policy::{EvictionPolicy, ExpirationPolicy},
+    Entry, Policy, PredicateError,
+};
+
+use std::{
+    collections::hash_map::RandomState,
+    fmt,
+    hash::{BuildHasher, Hash, Hasher},
+    sync::Arc,
+};
+
+/// A thread-safe concurrent in-memory cache, with multiple internal segments.
+///
+/// `SegmentedCache` has multiple internal [`Cache`][cache-struct] instances for
+/// increased concurrent update performance. However, it has little overheads on
+/// retrievals and updates for managing these segments.
+///
+/// For usage examples, see the document of the [`Cache`][cache-struct].
+///
+/// [cache-struct]: ./struct.Cache.html
+///
+pub struct SegmentedCache<K, V, S = RandomState> {
+    inner: Arc<Inner<K, V, S>>,
+}
+
+unsafe impl<K, V, S> Send for SegmentedCache<K, V, S>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+    S: Send,
+{
+}
+
+unsafe impl<K, V, S> Sync for SegmentedCache<K, V, S>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+    S: Sync,
+{
+}
+
+impl<K, V, S> Clone for SegmentedCache<K, V, S> {
+    /// Makes a clone of this shared cache.
+    ///
+    /// This operation is cheap as it only creates thread-safe reference counted
+    /// pointers to the shared internal data structures.
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<K, V, S> fmt::Debug for SegmentedCache<K, V, S>
+where
+    K: fmt::Debug + Eq + Hash + Send + Sync + 'static,
+    V: fmt::Debug + Clone + Send + Sync + 'static,
+    // TODO: Remove these bounds from S.
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut d_map = f.debug_map();
+
+        for (k, v) in self {
+            d_map.entry(&k, &v);
+        }
+
+        d_map.finish()
+    }
+}
+
+impl<K, V> SegmentedCache<K, V, RandomState>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    /// Constructs a new `SegmentedCache<K, V>` that has multiple internal
+    /// segments and will store up to the `max_capacity`.
+    ///
+    /// To adjust various configuration knobs such as `initial_capacity` or
+    /// `time_to_live`, use the [`CacheBuilder`][builder-struct].
+    ///
+    /// [builder-struct]: ./struct.CacheBuilder.html
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is 0.
+    pub fn new(max_capacity: u64, num_segments: usize) -> Self {
+        let build_hasher = RandomState::default();
+        Self::with_everything(
+            None,
+            Some(max_capacity),
+            None,
+            num_segments,
+            build_hasher,
+            None,
+            EvictionPolicy::default(),
+            None,
+            ExpirationPolicy::default(),
+            HousekeeperConfig::default(),
+            false,
+            Clock::default(),
+        )
+    }
+
+    /// Returns a [`CacheBuilder`][builder-struct], which can builds a
+    /// `SegmentedCache` with various configuration knobs.
+    ///
+    /// [builder-struct]: ./struct.CacheBuilder.html
+    pub fn builder(num_segments: usize) -> CacheBuilder<K, V, SegmentedCache<K, V, RandomState>> {
+        CacheBuilder::default().segments(num_segments)
+    }
+}
+
+impl<K, V, S> SegmentedCache<K, V, S> {
+    /// Returns cache’s name.
+    pub fn name(&self) -> Option<&str> {
+        self.inner.segments[0].name()
+    }
+
+    /// Returns a read-only cache policy of this cache.
+    ///
+    /// At this time, cache policy cannot be modified after cache creation.
+    /// A future version may support to modify it.
+    pub fn policy(&self) -> Policy {
+        let mut policy = self.inner.segments[0].policy();
+        policy.set_max_capacity(self.inner.desired_capacity);
+        policy.set_num_segments(self.inner.segments.len());
+        policy
+    }
+
+    /// Returns an approximate number of entries in this cache.
+    ///
+    /// The value returned is _an estimate_; the actual count may differ if there are
+    /// concurrent insertions or removals, or if some entries are pending removal due
+    /// to expiration. This inaccuracy can be mitigated by performing a
+    /// `run_pending_tasks` first.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use moka::sync::SegmentedCache;
+    ///
+    /// let cache = SegmentedCache::new(10, 4);
+    /// cache.insert('n', "Netherland Dwarf");
+    /// cache.insert('l', "Lop Eared");
+    /// cache.insert('d', "Dutch");
+    ///
+    /// // Ensure an entry exists.
+    /// assert!(cache.contains_key(&'n'));
+    ///
+    /// // However, followings may print stale number zeros instead of threes.
+    /// println!("{}", cache.entry_count());   // -> 0
+    /// println!("{}", cache.weighted_size()); // -> 0
+    ///
+    /// // To mitigate the inaccuracy, call `run_pending_tasks` method to run
+    /// // pending internal tasks.
+    /// cache.run_pending_tasks();
+    ///
+    /// // Followings will print the actual numbers.
+    /// println!("{}", cache.entry_count());   // -> 3
+    /// println!("{}", cache.weighted_size()); // -> 3
+    /// ```
+    ///
+    pub fn entry_count(&self) -> u64 {
+        self.inner
+            .segments
+            .iter()
+            .map(|seg| seg.entry_count())
+            .sum()
+    }
+
+    /// Returns an approximate total weighted size of entries in this cache.
+    ///
+    /// The value returned is _an estimate_; the actual size may differ if there are
+    /// concurrent insertions or removals, or if some entries are pending removal due
+    /// to expiration. This inaccuracy can be mitigated by performing a
+    /// `run_pending_tasks` first. See [`entry_count`](#method.entry_count) for a
+    /// sample code.
+    pub fn weighted_size(&self) -> u64 {
+        self.inner
+            .segments
+            .iter()
+            .map(|seg| seg.weighted_size())
+            .sum()
+    }
+}
+
+impl<K, V, S> SegmentedCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is 0.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_everything(
+        name: Option<String>,
+        max_capacity: Option<u64>,
+        initial_capacity: Option<usize>,
+        num_segments: usize,
+        build_hasher: S,
+        weigher: Option<Weigher<K, V>>,
+        eviction_policy: EvictionPolicy,
+        eviction_listener: Option<EvictionListener<K, V>>,
+        expiration_policy: ExpirationPolicy<K, V>,
+        housekeeper_config: HousekeeperConfig,
+        invalidator_enabled: bool,
+        clock: Clock,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Inner::new(
+                name,
+                max_capacity,
+                initial_capacity,
+                num_segments,
+                build_hasher,
+                weigher,
+                eviction_policy,
+                eviction_listener,
+                expiration_policy,
+                housekeeper_config,
+                invalidator_enabled,
+                clock,
+            )),
+        }
+    }
+
+    /// Returns `true` if the cache contains a value for the key.
+    ///
+    /// Unlike the `get` method, this method is not considered a cache read operation,
+    /// so it does not update the historic popularity estimator or reset the idle
+    /// timer for the key.
+    ///
+    /// The key may be any borrowed form of the cache's key type, but `Hash` and `Eq`
+    /// on the borrowed form _must_ match those for the key type.
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    }
+}
+
+impl<'a, K, V, S> IntoIterator for &'a SegmentedCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    type Item = (Arc<K>, V);
+
+    type IntoIter = Iter<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+// For unit tests.
+#[cfg(test)]
+impl<K, V, S> SegmentedCache<K, V, S> {
+    fn is_waiter_map_empty(&self) -> bool {
+        self.inner.segments.iter().all(Cache::is_waiter_map_empty)
+    }
+}
+
+#[cfg(test)]
+impl<K, V, S> SegmentedCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn invalidation_predicate_count(&self) -> usize {
+        self.inner
+            .segments
+            .iter()
+            .map(|seg| seg.invalidation_predicate_count())
+            .sum()
+    }
+
+    fn reconfigure_for_testing(&mut self) {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("There are other strong reference to self.inner Arc");
+
+        for segment in inner.segments.iter_mut() {
+            segment.reconfigure_for_testing();
+        }
+    }
+
+    fn key_locks_map_is_empty(&self) -> bool {
+        self.inner
+            .segments
+            .iter()
+            .all(|seg| seg.key_locks_map_is_empty())
+    }
+}
+
+struct Inner<K, V, S> {
+    desired_capacity: Option<u64>,
+    segments: Box<[Cache<K, V, S>]>,
+    build_hasher: S,
+    segment_shift: u32,
+}
+
+impl<K, V, S> Inner<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is 0.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        name: Option<String>,
+        max_capacity: Option<u64>,
+        initial_capacity: Option<usize>,
+        num_segments: usize,
+        build_hasher: S,
+        weigher: Option<Weigher<K, V>>,
+        eviction_policy: EvictionPolicy,
+        eviction_listener: Option<EvictionListener<K, V>>,
+        expiration_policy: ExpirationPolicy<K, V>,
+        housekeeper_config: HousekeeperConfig,
+        invalidator_enabled: bool,
+        clock: Clock,
+    ) -> Self {
+        assert!(num_segments > 0);
+
+        let actual_num_segments = num_segments.next_power_of_two();
+        let segment_shift = 64 - actual_num_segments.trailing_zeros();
+        let seg_max_capacity =
+            max_capacity.map(|n| (n as f64 / actual_num_segments as f64).ceil() as u64);
+        let seg_init_capacity =
+            initial_capacity.map(|cap| (cap as f64 / actual_num_segments as f64).ceil() as usize);
+        // NOTE: We cannot initialize the segments as `vec![cache; actual_num_segments]`
+        // because Cache::clone() does not clone its inner but shares the same inner.
+        let segments = (0..actual_num_segments)
+            .map(|_| {
+                Cache::with_everything(
+                    name.clone(),
+                    seg_max_capacity,
+                    seg_init_capacity,
+                    build_hasher.clone(),
+                    weigher.clone(),
+                    eviction_policy.clone(),
+                    eviction_listener.clone(),
+                    expiration_policy.clone(),
+                    housekeeper_config.clone(),
+                    invalidator_enabled,
+                    clock.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        Self {
+            desired_capacity: max_capacity,
+            segments: segments.into_boxed_slice(),
+            build_hasher,
+            segment_shift,
+        }
+    }
+
+    #[inline]
+    fn hash<Q>(&self, key: &Q) -> u64
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        let mut hasher = self.build_hasher.build_hasher();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[inline]
+    fn select(&self, hash: u64) -> &Cache<K, V, S> {
+        let index = self.segment_index_from_hash(hash);
+        &self.segments[index]
+    }
+
+    #[inline]
+    fn segment_index_from_hash(&self, hash: u64) -> usize {
+        if self.segment_shift == 64 {
+            0
+        } else {
+            (hash >> self.segment_shift) as usize
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SegmentedCache;
+    use crate::notification::RemovalCause;
+    use parking_lot::Mutex;
+    use std::{error::Error, fmt::Display, sync::Arc, time::Duration};
+
+    #[test]
+    fn max_capacity_zero() {
+        let mut cache = SegmentedCache::new(0, 1);
+        cache.reconfigure_for_testing();
+
+        // Make the cache exterior immutable.
+        let cache = cache;
+
+        cache.insert(0, ());
+
+        assert!(!cache.contains_key(&0));
+        assert!(cache.get(&0).is_none());
+        cache.run_pending_tasks();
+        assert!(!cache.contains_key(&0));
+        assert!(cache.get(&0).is_none());
+        assert_eq!(cache.entry_count(), 0)
+    }
+
+    #[test]
+    fn basic_single_thread() {
+        // The following `Vec`s will hold actual and expected notifications.
+        let actual = Arc::new(Mutex::new(Vec::new()));
+        let mut expected = Vec::new();
+
+        // Create an eviction listener.
+        let a1 = Arc::clone(&actual);
+        let listener = move |k, v, cause| a1.lock().push((k, v, cause));
+
+        // Create a cache with the eviction listener.
+        let mut cache = SegmentedCache::builder(1)
+            .max_capacity(3)
+            .eviction_listener(listener)
+            .build();
+        cache.reconfigure_for_testing();
+
+        // Make the cache exterior immutable.
+        let cache = cache;
+
+        cache.insert("a", "alice");
+        cache.insert("b", "bob");
+        assert_eq!(cache.get(&"a"), Some("alice"));
+        assert!(cache.contains_key(&"a"));
+        assert!(cache.contains_key(&"b"));
+        assert_eq!(cache.get(&"b"), Some("bob"));
+        cache.run_pending_tasks();
+        // counts: a -> 1, b -> 1
+
+        cache.insert("c", "cindy");
+        assert_eq!(cache.get(&"c"), Some("cindy"));
+        assert!(cache.contains_key(&"c"));
+        // counts: a -> 1, b -> 1, c -> 1
+        cache.run_pending_tasks();
+
+        assert!(cache.contains_key(&"a"));
+        assert_eq!(cache.get(&"a"), Some("alice"));
+        assert_eq!(cache.get(&"b"), Some("bob"));
+        assert!(cache.contains_key(&"b"));
+        cache.run_pending_tasks();
+        // counts: a -> 2, b -> 2, c -> 1
+
+        // "d" should not be admitted because its frequency is too low.
+        cache.insert("d", "david"); //   count: d -> 0
+        expected.push((Arc::new("d"), "david", RemovalCause::Size));
+use super::constants::LOG_SYNC_INTERVAL_MILLIS;
+
+use super::constants::{READ_LOG_FLUSH_POINT, WRITE_LOG_FLUSH_POINT};
+use crate::common::time::{AtomicInstant, Instant};
+use crate::common::HousekeeperConfig;
+
+use parking_lot::{Mutex, MutexGuard};
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
+
+pub(crate) trait InnerSync {
+    /// Runs the pending tasks. Returns `true` if there are more entries to evict in
+    /// next run.
+    fn run_pending_tasks(
+        &self,
+        timeout: Option<Duration>,
+        max_log_sync_repeats: u32,
+        eviction_batch_size: u32,
+    ) -> bool;
+
+    fn now(&self) -> Instant;
+}
+
+pub(crate) struct Housekeeper {
+    run_lock: Mutex<()>,
+    run_after: AtomicInstant,
+    /// A flag to indicate if the last call on `run_pending_tasks` method left some
+    /// entries to evict.
+    ///
+    /// Used only when the eviction listener closure is set for this cache instance
+    /// because, if not, `run_pending_tasks` will never leave entries to evict.
+    more_entries_to_evict: Option<AtomicBool>,
+    /// The timeout duration for the `run_pending_tasks` method. This is a safe-guard
+    /// to prevent cache read/write operations (that may call `run_pending_tasks`
+    /// internally) from being blocked for a long time when the user wrote a slow
+    /// eviction listener closure.
+    ///
+    /// Used only when the eviction listener closure is set for this cache instance.
+    maintenance_task_timeout: Option<Duration>,
+    /// The maximum repeat count for receiving operation logs from the read and write
+    /// log channels. Default: `MAX_LOG_SYNC_REPEATS`.
+    max_log_sync_repeats: u32,
+    /// The batch size of entries to be processed by each internal eviction method.
+    /// Default: `EVICTION_BATCH_SIZE`.
+    eviction_batch_size: u32,
+    auto_run_enabled: AtomicBool,
+}
+
+impl Housekeeper {
+    pub(crate) fn new(
+        is_eviction_listener_enabled: bool,
+        config: HousekeeperConfig,
+        now: Instant,
+    ) -> Self {
+        let (more_entries_to_evict, maintenance_task_timeout) = if is_eviction_listener_enabled {
+            (
+                Some(AtomicBool::new(false)),
+                Some(config.maintenance_task_timeout),
+            )
+        } else {
+            (None, None)
+        };
+
+        Self {
+            run_lock: Mutex::default(),
+            run_after: AtomicInstant::new(Self::sync_after(now)),
+            more_entries_to_evict,
+            maintenance_task_timeout,
+            max_log_sync_repeats: config.max_log_sync_repeats,
+            eviction_batch_size: config.eviction_batch_size,
+            auto_run_enabled: AtomicBool::new(true),
+        }
+    }
+
+    pub(crate) fn should_apply_reads(&self, ch_len: usize, now: Instant) -> bool {
+        self.more_entries_to_evict() || self.should_apply(ch_len, READ_LOG_FLUSH_POINT, now)
+    }
+
+    pub(crate) fn should_apply_writes(&self, ch_len: usize, now: Instant) -> bool {
+        self.more_entries_to_evict() || self.should_apply(ch_len, WRITE_LOG_FLUSH_POINT, now)
+    }
+
+    #[inline]
+    fn more_entries_to_evict(&self) -> bool {
+        self.more_entries_to_evict
+            .as_ref()
+            .map(|v| v.load(Ordering::Acquire))
+            .unwrap_or(false)
+    }
+
+    fn set_more_entries_to_evict(&self, v: bool) {
+        if let Some(flag) = &self.more_entries_to_evict {
+            flag.store(v, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    fn should_apply(&self, ch_len: usize, ch_flush_point: usize, now: Instant) -> bool {
+        self.auto_run_enabled.load(Ordering::Relaxed)
+            && (ch_len >= ch_flush_point || now >= self.run_after.instant().unwrap())
+    }
+
+    pub(crate) fn run_pending_tasks<T: InnerSync>(&self, cache: &T) {
+        let lock = self.run_lock.lock();
+        self.do_run_pending_tasks(cache, lock);
+    }
+
+    pub(crate) fn try_run_pending_tasks<T: InnerSync>(&self, cache: &T) -> bool {
+        if let Some(lock) = self.run_lock.try_lock() {
+            self.do_run_pending_tasks(cache, lock);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn do_run_pending_tasks<T: InnerSync>(&self, cache: &T, _lock: MutexGuard<'_, ()>) {
+        let now = cache.now();
+        self.run_after.set_instant(Self::sync_after(now));
+        let timeout = self.maintenance_task_timeout;
+        let repeats = self.max_log_sync_repeats;
+        let batch_size = self.eviction_batch_size;
+        let more_to_evict = cache.run_pending_tasks(timeout, repeats, batch_size);
+        self.set_more_entries_to_evict(more_to_evict);
+    }
+
+    fn sync_after(now: Instant) -> Instant {
+        let dur = Duration::from_millis(LOG_SYNC_INTERVAL_MILLIS);
+        now.saturating_add(dur)
+    }
+}
+
+#[cfg(test)]
+impl Housekeeper {
+    pub(crate) fn disable_auto_run(&self) {
+        self.auto_run_enabled.store(false, Ordering::Relaxed);
+    }
+}
+use std::{hash::Hash, sync::Arc};
+
+// This trait is implemented by `sync::BaseCache` and `sync::Cache`.
+pub(crate) trait ScanningGet<K, V> {
+    /// Returns the number of segments in the concurrent hash table.
+    fn num_cht_segments(&self) -> usize;
+
+    /// Returns a _clone_ of the value corresponding to the key.
+    ///
+    /// Unlike the `get` method of cache, this method is not considered a cache read
+    /// operation, so it does not update the historic popularity estimator or reset
+    /// the idle timer for the key.
+    fn scanning_get(&self, key: &Arc<K>) -> Option<V>;
+
+    /// Returns a vec of keys in a specified segment of the concurrent hash table.
+    fn keys(&self, cht_segment: usize) -> Option<Vec<Arc<K>>>;
+}
+
+/// Iterator visiting all key-value pairs in a cache in arbitrary order.
+///
+/// Call [`Cache::iter`](./struct.Cache.html#method.iter) method to obtain an `Iter`.
+pub struct Iter<'i, K, V> {
+    keys: Option<Vec<Arc<K>>>,
+    cache_segments: Box<[&'i dyn ScanningGet<K, V>]>,
+    num_cht_segments: usize,
+    cache_seg_index: usize,
+    cht_seg_index: usize,
+    is_done: bool,
+}
+
+impl<'i, K, V> Iter<'i, K, V> {
+    pub(crate) fn with_single_cache_segment(
+        cache: &'i dyn ScanningGet<K, V>,
+        num_cht_segments: usize,
+    ) -> Self {
+        Self {
+            keys: None,
+            cache_segments: Box::new([cache]),
+            num_cht_segments,
+            cache_seg_index: 0,
+            cht_seg_index: 0,
+            is_done: false,
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    pub(crate) fn with_multiple_cache_segments(
+        cache_segments: Box<[&'i dyn ScanningGet<K, V>]>,
+        num_cht_segments: usize,
+    ) -> Self {
+        Self {
+            keys: None,
+            cache_segments,
+            num_cht_segments,
+            cache_seg_index: 0,
+            cht_seg_index: 0,
+            is_done: false,
+        }
+    }
+}
+
+impl<K, V> Iterator for Iter<'_, K, V>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    type Item = (Arc<K>, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.is_done {
+            return None;
+        }
+
+        while let Some(key) = self.next_key() {
+            if let Some(v) = self.cache().scanning_get(&key) {
+                return Some((key, v));
+            }
+        }
+
+        self.is_done = true;
+        None
+    }
+}
+
+impl<'i, K, V> Iter<'i, K, V>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    fn cache(&self) -> &'i dyn ScanningGet<K, V> {
+        self.cache_segments[self.cache_seg_index]
+    }
+
+    fn next_key(&mut self) -> Option<Arc<K>> {
+        while let Some(keys) = self.current_keys() {
+            if let key @ Some(_) = keys.pop() {
+                return key;
+            }
+        }
+        None
+    }
+
+    fn current_keys(&mut self) -> Option<&mut Vec<Arc<K>>> {
+        // If keys is none or some but empty, try to get next keys.
+        while self.keys.as_ref().map_or(true, Vec::is_empty) {
+            // Adjust indices.
+            if self.cht_seg_index >= self.num_cht_segments {
+                self.cache_seg_index += 1;
+                self.cht_seg_index = 0;
+                if self.cache_seg_index >= self.cache_segments.len() {
+                    // No more cache segments left.
+                    return None;
+                }
+            }
+
+            let cache_segment = self.cache_segments[self.cache_seg_index];
+            self.keys = cache_segment.keys(self.cht_seg_index);
+            self.num_cht_segments = cache_segment.num_cht_segments();
+
+            self.cht_seg_index += 1;
+        }
+
+        self.keys.as_mut()
+    }
+}
+
+// Clippy beta 0.1.83 (f41c7ed9889 2024-10-31) warns about unused lifetimes on 'a.
+// This seems a false positive. The lifetimes are used in the Send and Sync impls.
+// Let's suppress the warning.
+// https://rust-lang.github.io/rust-clippy/master/index.html#extra_unused_lifetimes
+#[allow(clippy::extra_unused_lifetimes)]
+unsafe impl<'a, K, V> Send for Iter<'_, K, V>
+where
+    K: 'a + Eq + Hash + Send,
+    V: 'a + Send,
+{
+}
+
+// Clippy beta 0.1.83 (f41c7ed9889 2024-10-31) warns about unused lifetimes on 'a.
+// This seems a false positive. The lifetimes are used in the Send and Sync impls.
+// Let's suppress the warning.
+// https://rust-lang.github.io/rust-clippy/master/index.html#extra_unused_lifetimes
+#[allow(clippy::extra_unused_lifetimes)]
+unsafe impl<'a, K, V> Sync for Iter<'_, K, V>
+where
+    K: 'a + Eq + Hash + Sync,
+    V: 'a + Sync,
+{
+}
+use std::{fmt::Debug, sync::Arc};
+
+/// A snapshot of a single entry in the cache.
+///
+/// `Entry` is constructed from the methods like `or_insert` on the struct returned
+/// by cache's `entry` or `entry_by_ref` methods. `Entry` holds the cached key and
+/// value at the time it was constructed. It also carries extra information about the
+/// entry; [`is_fresh`](#method.is_fresh) method returns `true` if the value was not
+/// cached and was freshly computed.
+///
+/// See the followings for more information about `entry` and `entry_by_ref` methods:
+///
+/// - `sync::Cache`:
+///     - [`entry`](./sync/struct.Cache.html#method.entry)
+///     - [`entry_by_ref`](./sync/struct.Cache.html#method.entry_by_ref)
+/// - `future::Cache`:
+///     - [`entry`](./future/struct.Cache.html#method.entry)
+///     - [`entry_by_ref`](./future/struct.Cache.html#method.entry_by_ref)
+///
+pub struct Entry<K, V> {
+    key: Option<Arc<K>>,
+    value: V,
+    is_fresh: bool,
+    is_old_value_replaced: bool,
+}
+
+impl<K, V> Debug for Entry<K, V>
+where
+    K: Debug,
+    V: Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("key", self.key())
+            .field("value", &self.value)
+            .field("is_fresh", &self.is_fresh)
+            .field("is_old_value_replaced", &self.is_old_value_replaced)
+            .finish()
+    }
+}
+
+impl<K, V> Entry<K, V> {
+    pub(crate) fn new(
+        key: Option<Arc<K>>,
+        value: V,
+        is_fresh: bool,
+        is_old_value_replaced: bool,
+    ) -> Self {
+        Self {
+            key,
+            value,
+            is_fresh,
+            is_old_value_replaced,
+        }
+    }
+
+    /// Returns a reference to the wrapped key.
+    pub fn key(&self) -> &K {
+        self.key.as_ref().expect("Bug: Key is None")
+    }
+
+    /// Returns a reference to the wrapped value.
+    ///
+    /// Note that the returned reference is _not_ pointing to the original value in
+    /// the cache. Instead, it is pointing to the cloned value in this `Entry`.
+    pub fn value(&self) -> &V {
+        &self.value
+    }
+
+    /// Consumes this `Entry`, returning the wrapped value.
+    ///
+    /// Note that the returned value is a clone of the original value in the cache.
+    /// It was cloned when this `Entry` was constructed.
+    pub fn into_value(self) -> V {
+        self.value
+    }
+
+    /// Returns `true` if the value in this `Entry` was not cached and was freshly
+    /// computed.
+    pub fn is_fresh(&self) -> bool {
+        self.is_fresh
+    }
+
+    /// Returns `true` if an old value existed in the cache and was replaced by the
+    /// value in this `Entry`.
+    ///
+    /// Note that the new value can be the same as the old value. This method still
+    /// returns `true` in that case.
+    pub fn is_old_value_replaced(&self) -> bool {
+        self.is_old_value_replaced
+    }
+}

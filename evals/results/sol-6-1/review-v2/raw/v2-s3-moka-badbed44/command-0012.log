@@ -1,0 +1,1155 @@
+use super::{base_cache::Inner, PredicateId, PredicateIdStr};
+use crate::{
+    common::{
+        concurrent::{arc::MiniArc, AccessTime, KvEntry, ValueEntry},
+        time::Instant,
+    },
+    notification::RemovalCause,
+    PredicateError,
+};
+
+use parking_lot::{Mutex, MutexGuard};
+use std::{
+    hash::{BuildHasher, Hash},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
+use uuid::Uuid;
+
+pub(crate) type PredicateFun<K, V> = Arc<dyn Fn(&K, &V) -> bool + Send + Sync + 'static>;
+
+const PREDICATE_MAP_NUM_SEGMENTS: usize = 16;
+
+pub(crate) struct KeyDateLite<K> {
+    key: Arc<K>,
+    hash: u64,
+    timestamp: Instant,
+}
+
+impl<K> Clone for KeyDateLite<K> {
+    fn clone(&self) -> Self {
+        Self {
+            key: Arc::clone(&self.key),
+            hash: self.hash,
+            timestamp: self.timestamp,
+        }
+    }
+}
+
+impl<K> KeyDateLite<K> {
+    pub(crate) fn new(key: &Arc<K>, hash: u64, timestamp: Instant) -> Self {
+        Self {
+            key: Arc::clone(key),
+            hash,
+            timestamp,
+        }
+    }
+}
+
+pub(crate) struct Invalidator<K, V, S> {
+    predicates: crate::cht::SegmentedHashMap<PredicateId, Predicate<K, V>, S>,
+    is_empty: AtomicBool,
+    scan_context: Arc<ScanContext<K, V>>,
+}
+
+//
+// Crate public methods.
+//
+impl<K, V, S> Invalidator<K, V, S> {
+    pub(crate) fn new(hasher: S) -> Self
+    where
+        S: BuildHasher,
+    {
+        const CAPACITY: usize = 0;
+        let predicates = crate::cht::SegmentedHashMap::with_num_segments_capacity_and_hasher(
+            PREDICATE_MAP_NUM_SEGMENTS,
+            CAPACITY,
+            hasher,
+        );
+        Self {
+            predicates,
+            is_empty: AtomicBool::new(true),
+            scan_context: Arc::new(ScanContext::default()),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.is_empty.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn remove_predicates_registered_before(&self, ts: Instant)
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher,
+    {
+        let pred_map = &self.predicates;
+
+        let removing_ids = pred_map
+            .iter()
+            .filter(|(_, pred)| pred.registered_at <= ts)
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+
+        for id in removing_ids {
+            let hash = pred_map.hash(&id);
+            pred_map.remove(hash, |k| k == &id);
+        }
+
+        if pred_map.is_empty() {
+            self.is_empty.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn register_predicate(
+        &self,
+        predicate: PredicateFun<K, V>,
+        registered_at: Instant,
+    ) -> Result<PredicateId, PredicateError>
+    where
+        K: Hash + Eq,
+        S: BuildHasher,
+    {
+        const MAX_RETRY: usize = 1_000;
+        let mut tries = 0;
+        let preds = &self.predicates;
+
+        while tries < MAX_RETRY {
+            let id = Uuid::new_v4().as_hyphenated().to_string();
+
+            let hash = preds.hash(&id);
+            if preds.contains_key(hash, |k| k == &id) {
+                tries += 1;
+
+                continue; // Retry
+            }
+            let pred = Predicate::new(&id, predicate, registered_at);
+            preds.insert_entry_and(id.clone(), hash, pred, |_, _| ());
+            self.is_empty.store(false, Ordering::Release);
+
+            return Ok(id);
+        }
+
+        // Since we are using 128-bit UUID for the ID and we do retries for MAX_RETRY
+        // times, this panic should extremely unlikely occur (unless there is a bug in
+        // UUID generation).
+        panic!("Cannot assign a new PredicateId to a predicate");
+    }
+
+    // This method will be called by the get method of Cache.
+    #[inline]
+    pub(crate) fn apply_predicates(&self, key: &Arc<K>, entry: &MiniArc<ValueEntry<K, V>>) -> bool
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher,
+    {
+        if self.is_empty() {
+            false
+        } else if let Some(ts) = entry.last_modified() {
+            Self::do_apply_predicates(
+                self.predicates.iter().map(|(_, v)| v),
+                key,
+                &entry.value,
+                ts,
+            )
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn scan_and_invalidate(
+        &self,
+        cache: &Inner<K, V, S>,
+        candidates: Vec<KeyDateLite<K>>,
+        is_truncated: bool,
+    ) -> (Vec<KvEntry<K, V>>, bool)
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher,
+    {
+        let mut predicates = self.scan_context.predicates.lock();
+        if predicates.is_empty() {
+            *predicates = self.predicates.iter().map(|(_k, v)| v).collect();
+        }
+
+        let mut invalidated = Vec::default();
+        let mut newest_timestamp = None;
+
+        for candidate in &candidates {
+            let key = &candidate.key;
+            let hash = candidate.hash;
+            let ts = candidate.timestamp;
+            if self.apply(&predicates, cache, key, hash, ts) {
+                if let Some(entry) = Self::invalidate(cache, key, hash, ts) {
+                    invalidated.push(KvEntry {
+                        key: Arc::clone(key),
+                        entry,
+                    });
+                }
+            }
+            newest_timestamp = Some(ts);
+        }
+
+        self.remove_finished_predicates(predicates, is_truncated, newest_timestamp);
+
+        (invalidated, self.predicates.is_empty())
+    }
+}
+
+//
+// Private methods.
+//
+impl<K, V, S> Invalidator<K, V, S>
+where
+    K: Hash + Eq,
+    S: BuildHasher,
+{
+    #[inline]
+    fn do_apply_predicates<I>(predicates: I, key: &K, value: &V, ts: Instant) -> bool
+    where
+        I: Iterator<Item = Predicate<K, V>>,
+    {
+        for predicate in predicates {
+            if predicate.is_applicable(ts) && predicate.apply(key, value) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn remove_finished_predicates(
+        &self,
+        mut predicates: MutexGuard<'_, Vec<Predicate<K, V>>>,
+        is_truncated: bool,
+        newest_timestamp: Option<Instant>,
+    ) where
+        K: Hash + Eq,
+        S: BuildHasher,
+    {
+        let predicates = &mut *predicates;
+        if is_truncated {
+            if let Some(ts) = newest_timestamp {
+                let (active, finished): (Vec<_>, Vec<_>) =
+                    predicates.drain(..).partition(|p| p.is_applicable(ts));
+
+                // Remove finished predicates from the predicate registry.
+                self.remove_predicates(&finished);
+                // Set the active predicates to the scan context.
+                *predicates = active;
+            } else {
+                unreachable!();
+            }
+        } else {
+            // Remove all the predicates from the predicate registry and scan context.
+            self.remove_predicates(predicates);
+            predicates.clear();
+        }
+    }
+
+    fn remove_predicates(&self, predicates: &[Predicate<K, V>])
+    where
+        K: Hash + Eq,
+        S: BuildHasher,
+    {
+        let pred_map = &self.predicates;
+        for p in predicates.iter() {
+            let hash = pred_map.hash(p.id());
+            pred_map.remove(hash, |k| k == p.id());
+        }
+
+        if pred_map.is_empty() {
+            self.is_empty.store(true, Ordering::Release);
+        }
+    }
+
+    fn apply(
+        &self,
+        predicates: &[Predicate<K, V>],
+        cache: &Inner<K, V, S>,
+        key: &Arc<K>,
+        hash: u64,
+        ts: Instant,
+    ) -> bool {
+        if let Some(entry) = cache.cache.get(hash, |k| k == key) {
+            if let Some(lm) = entry.last_modified() {
+                if lm == ts {
+                    return Invalidator::<_, _, S>::do_apply_predicates(
+                        predicates.iter().cloned(),
+                        key,
+                        &entry.value,
+                        lm,
+                    );
+                }
+            }
+        }
+
+        false
+    }
+
+    fn invalidate(
+        cache: &Inner<K, V, S>,
+        key: &Arc<K>,
+        hash: u64,
+        ts: Instant,
+    ) -> Option<MiniArc<ValueEntry<K, V>>>
+    where
+        K: Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+    {
+        // Lock the key for removal if blocking removal notification is enabled.
+        let kl = cache.maybe_key_lock(key);
+        let _klg = &kl.as_ref().map(|kl| kl.lock());
+
+        let maybe_entry = cache.cache.remove_if(
+            hash,
+            |k| k == key,
+            |_, v| {
+                if let Some(lm) = v.last_modified() {
+                    lm == ts
+                } else {
+                    false
+                }
+            },
+        );
+        if let Some(entry) = &maybe_entry {
+            if cache.is_removal_notifier_enabled() {
+                cache.notify_single_removal(Arc::clone(key), entry, RemovalCause::Explicit);
+            }
+        }
+        maybe_entry
+    }
+}
+
+//
+// for testing
+//
+#[cfg(test)]
+impl<K, V, S> Invalidator<K, V, S> {
+    pub(crate) fn predicate_count(&self) -> usize {
+        self.predicates.len()
+    }
+}
+
+struct ScanContext<K, V> {
+    predicates: Mutex<Vec<Predicate<K, V>>>,
+}
+
+impl<K, V> Default for ScanContext<K, V> {
+    fn default() -> Self {
+        Self {
+            predicates: Mutex::new(Vec::default()),
+        }
+    }
+}
+
+struct Predicate<K, V> {
+    id: PredicateId,
+    f: PredicateFun<K, V>,
+    registered_at: Instant,
+}
+
+impl<K, V> Clone for Predicate<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            f: Arc::clone(&self.f),
+            registered_at: self.registered_at,
+        }
+    }
+}
+
+impl<K, V> Predicate<K, V> {
+    fn new(id: PredicateIdStr<'_>, f: PredicateFun<K, V>, registered_at: Instant) -> Self {
+        Self {
+            id: id.to_string(),
+            f,
+            registered_at,
+        }
+    }
+
+    fn id(&self) -> PredicateIdStr<'_> {
+        &self.id
+    }
+
+    fn is_applicable(&self, last_modified: Instant) -> bool {
+        last_modified <= self.registered_at
+    }
+
+    fn apply(&self, key: &K, value: &V) -> bool {
+        (self.f)(key, value)
+    }
+}
+use std::{hash::Hash, sync::Arc};
+
+// This trait is implemented by `sync::BaseCache` and `sync::Cache`.
+pub(crate) trait ScanningGet<K, V> {
+    /// Returns the number of segments in the concurrent hash table.
+    fn num_cht_segments(&self) -> usize;
+
+    /// Returns a _clone_ of the value corresponding to the key.
+    ///
+    /// Unlike the `get` method of cache, this method is not considered a cache read
+    /// operation, so it does not update the historic popularity estimator or reset
+    /// the idle timer for the key.
+    fn scanning_get(&self, key: &Arc<K>) -> Option<V>;
+
+    /// Returns a vec of keys in a specified segment of the concurrent hash table.
+    fn keys(&self, cht_segment: usize) -> Option<Vec<Arc<K>>>;
+}
+
+/// Iterator visiting all key-value pairs in a cache in arbitrary order.
+///
+/// Call [`Cache::iter`](./struct.Cache.html#method.iter) method to obtain an `Iter`.
+pub struct Iter<'i, K, V> {
+    keys: Option<Vec<Arc<K>>>,
+    cache_segments: Box<[&'i dyn ScanningGet<K, V>]>,
+    num_cht_segments: usize,
+    cache_seg_index: usize,
+    cht_seg_index: usize,
+    is_done: bool,
+}
+
+impl<'i, K, V> Iter<'i, K, V> {
+    pub(crate) fn with_single_cache_segment(
+        cache: &'i dyn ScanningGet<K, V>,
+        num_cht_segments: usize,
+    ) -> Self {
+        Self {
+            keys: None,
+            cache_segments: Box::new([cache]),
+            num_cht_segments,
+            cache_seg_index: 0,
+            cht_seg_index: 0,
+            is_done: false,
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    pub(crate) fn with_multiple_cache_segments(
+        cache_segments: Box<[&'i dyn ScanningGet<K, V>]>,
+        num_cht_segments: usize,
+    ) -> Self {
+        Self {
+            keys: None,
+            cache_segments,
+            num_cht_segments,
+            cache_seg_index: 0,
+            cht_seg_index: 0,
+            is_done: false,
+        }
+    }
+}
+
+impl<K, V> Iterator for Iter<'_, K, V>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    type Item = (Arc<K>, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.is_done {
+            return None;
+        }
+
+        while let Some(key) = self.next_key() {
+            if let Some(v) = self.cache().scanning_get(&key) {
+                return Some((key, v));
+            }
+        }
+
+        self.is_done = true;
+        None
+    }
+}
+
+impl<'i, K, V> Iter<'i, K, V>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    fn cache(&self) -> &'i dyn ScanningGet<K, V> {
+        self.cache_segments[self.cache_seg_index]
+    }
+
+    fn next_key(&mut self) -> Option<Arc<K>> {
+        while let Some(keys) = self.current_keys() {
+            if let key @ Some(_) = keys.pop() {
+                return key;
+            }
+        }
+        None
+    }
+
+    fn current_keys(&mut self) -> Option<&mut Vec<Arc<K>>> {
+        // If keys is none or some but empty, try to get next keys.
+        while self.keys.as_ref().map_or(true, Vec::is_empty) {
+            // Adjust indices.
+            if self.cht_seg_index >= self.num_cht_segments {
+                self.cache_seg_index += 1;
+                self.cht_seg_index = 0;
+                if self.cache_seg_index >= self.cache_segments.len() {
+                    // No more cache segments left.
+                    return None;
+                }
+            }
+
+            let cache_segment = self.cache_segments[self.cache_seg_index];
+            self.keys = cache_segment.keys(self.cht_seg_index);
+            self.num_cht_segments = cache_segment.num_cht_segments();
+
+            self.cht_seg_index += 1;
+        }
+
+        self.keys.as_mut()
+    }
+}
+
+// Clippy beta 0.1.83 (f41c7ed9889 2024-10-31) warns about unused lifetimes on 'a.
+// This seems a false positive. The lifetimes are used in the Send and Sync impls.
+// Let's suppress the warning.
+// https://rust-lang.github.io/rust-clippy/master/index.html#extra_unused_lifetimes
+#[allow(clippy::extra_unused_lifetimes)]
+unsafe impl<'a, K, V> Send for Iter<'_, K, V>
+where
+    K: 'a + Eq + Hash + Send,
+    V: 'a + Send,
+{
+}
+
+// Clippy beta 0.1.83 (f41c7ed9889 2024-10-31) warns about unused lifetimes on 'a.
+// This seems a false positive. The lifetimes are used in the Send and Sync impls.
+// Let's suppress the warning.
+// https://rust-lang.github.io/rust-clippy/master/index.html#extra_unused_lifetimes
+#[allow(clippy::extra_unused_lifetimes)]
+unsafe impl<'a, K, V> Sync for Iter<'_, K, V>
+where
+    K: 'a + Eq + Hash + Sync,
+    V: 'a + Sync,
+{
+}
+use crate::common::{
+    concurrent::constants::{
+        LOG_SYNC_INTERVAL_MILLIS, READ_LOG_FLUSH_POINT, WRITE_LOG_FLUSH_POINT,
+    },
+    time::{AtomicInstant, Instant},
+    HousekeeperConfig,
+};
+
+use std::{
+    hash::{BuildHasher, Hash},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+
+use async_lock::Mutex;
+use futures_util::future::{BoxFuture, Shared};
+
+use super::base_cache::Inner;
+
+pub(crate) struct Housekeeper {
+    /// A shared `Future` of the maintenance task that is currently being resolved.
+    current_task: Mutex<Option<Shared<BoxFuture<'static, bool>>>>,
+    run_after: AtomicInstant,
+    /// A flag to indicate if the last call on `run_pending_tasks` method left some
+    /// entries to evict.
+    ///
+    /// Used only when the eviction listener closure is set for this cache instance
+    /// because, if not, `run_pending_tasks` will never leave entries to evict.
+    more_entries_to_evict: Option<AtomicBool>,
+    /// The timeout duration for the `run_pending_tasks` method. This is a safe-guard
+    /// to prevent cache read/write operations (that may call `run_pending_tasks`
+    /// internally) from being blocked for a long time when the user wrote a slow
+    /// eviction listener closure.
+    ///
+    /// Used only when the eviction listener closure is set for this cache instance.
+    maintenance_task_timeout: Option<Duration>,
+    /// The maximum repeat count for receiving operation logs from the read and write
+    /// log channels. Default: `MAX_LOG_SYNC_REPEATS`.
+    max_log_sync_repeats: u32,
+    /// The batch size of entries to be processed by each internal eviction method.
+    /// Default: `EVICTION_BATCH_SIZE`.
+    eviction_batch_size: u32,
+    auto_run_enabled: AtomicBool,
+    #[cfg(test)]
+    pub(crate) start_count: AtomicUsize,
+    #[cfg(test)]
+    pub(crate) complete_count: AtomicUsize,
+}
+
+impl Housekeeper {
+    pub(crate) fn new(
+        is_eviction_listener_enabled: bool,
+        config: HousekeeperConfig,
+        now: Instant,
+    ) -> Self {
+        let (more_entries_to_evict, maintenance_task_timeout) = if is_eviction_listener_enabled {
+            (
+                Some(AtomicBool::new(false)),
+                Some(config.maintenance_task_timeout),
+            )
+        } else {
+            (None, None)
+        };
+
+        Self {
+            current_task: Mutex::default(),
+            run_after: AtomicInstant::new(Self::sync_after(now)),
+            more_entries_to_evict,
+            maintenance_task_timeout,
+            max_log_sync_repeats: config.max_log_sync_repeats,
+            eviction_batch_size: config.eviction_batch_size,
+            auto_run_enabled: AtomicBool::new(true),
+            #[cfg(test)]
+            start_count: Default::default(),
+            #[cfg(test)]
+            complete_count: Default::default(),
+        }
+    }
+
+    pub(crate) fn should_apply_reads(&self, ch_len: usize, now: Instant) -> bool {
+        self.more_entries_to_evict() || self.should_apply(ch_len, READ_LOG_FLUSH_POINT, now)
+    }
+
+    pub(crate) fn should_apply_writes(&self, ch_len: usize, now: Instant) -> bool {
+        self.more_entries_to_evict() || self.should_apply(ch_len, WRITE_LOG_FLUSH_POINT, now)
+    }
+
+    #[inline]
+    fn more_entries_to_evict(&self) -> bool {
+        self.more_entries_to_evict
+            .as_ref()
+            .map(|v| v.load(Ordering::Acquire))
+            .unwrap_or(false)
+    }
+
+    fn set_more_entries_to_evict(&self, v: bool) {
+        if let Some(flag) = &self.more_entries_to_evict {
+            flag.store(v, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    fn should_apply(&self, ch_len: usize, ch_flush_point: usize, now: Instant) -> bool {
+        self.auto_run_enabled.load(Ordering::Relaxed)
+            && (ch_len >= ch_flush_point || now >= self.run_after.instant().unwrap())
+    }
+
+    pub(crate) async fn run_pending_tasks<K, V, S>(&self, cache: Arc<Inner<K, V, S>>)
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher + Clone + Send + Sync + 'static,
+    {
+        let mut current_task = self.current_task.lock().await;
+        self.do_run_pending_tasks(Arc::clone(&cache), &mut current_task)
+            .await;
+
+        drop(current_task);
+
+        // If there are any async tasks waiting in `BaseCache::schedule_write_op`
+        // method for the write op channel, notify them.
+        cache.write_op_ch_ready_event.notify(usize::MAX);
+    }
+
+    /// Tries to run the pending tasks if the lock is free. Returns `true` if there
+    /// are more entries to evict in next run.
+    pub(crate) async fn try_run_pending_tasks<K, V, S>(&self, cache: &Arc<Inner<K, V, S>>) -> bool
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher + Clone + Send + Sync + 'static,
+    {
+        if let Some(mut current_task) = self.current_task.try_lock() {
+            self.do_run_pending_tasks(Arc::clone(cache), &mut current_task)
+                .await;
+        } else {
+            return false;
+        }
+
+        // The `current_task` lock should be free now.
+
+        // If there are any async tasks waiting in `BaseCache::schedule_write_op`
+        // method for the write op channel, notify them.
+        cache.write_op_ch_ready_event.notify(usize::MAX);
+        true
+    }
+
+    async fn do_run_pending_tasks<K, V, S>(
+        &self,
+        cache: Arc<Inner<K, V, S>>,
+        current_task: &mut Option<Shared<BoxFuture<'static, bool>>>,
+    ) where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher + Clone + Send + Sync + 'static,
+    {
+        use futures_util::FutureExt;
+
+        let now = cache.current_time();
+        let more_to_evict;
+        // Async Cancellation Safety: Our maintenance task is cancellable as we save
+        // it in the lock. If it is canceled, we will resume it in the next run.
+
+        if let Some(task) = &*current_task {
+            // This task was cancelled in the previous run due to the enclosing
+            // Future was dropped. Resume the task now by awaiting.
+            more_to_evict = task.clone().await;
+        } else {
+            let timeout = self.maintenance_task_timeout;
+            let repeats = self.max_log_sync_repeats;
+            let batch_size = self.eviction_batch_size;
+            // Create a new maintenance task and await it.
+            let task = async move {
+                cache
+                    .do_run_pending_tasks(timeout, repeats, batch_size)
+                    .await
+            }
+            .boxed()
+            .shared();
+            *current_task = Some(task.clone());
+
+            #[cfg(test)]
+            self.start_count.fetch_add(1, Ordering::AcqRel);
+
+            more_to_evict = task.await;
+        }
+
+        // If we are here, it means that the maintenance task has been completed.
+        // We can remove it from the lock.
+        *current_task = None;
+        self.run_after.set_instant(Self::sync_after(now));
+        self.set_more_entries_to_evict(more_to_evict);
+
+        #[cfg(test)]
+        self.complete_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn sync_after(now: Instant) -> Instant {
+        let dur = Duration::from_millis(LOG_SYNC_INTERVAL_MILLIS);
+        now.saturating_add(dur)
+    }
+}
+
+#[cfg(test)]
+impl Housekeeper {
+    pub(crate) fn disable_auto_run(&self) {
+        self.auto_run_enabled.store(false, Ordering::Relaxed);
+    }
+}
+        }
+        false
+    }
+
+    #[inline]
+    fn weigh(&self, key: &K, value: &V) -> u32 {
+        self.weigher.as_ref().map_or(1, |w| w(key, value))
+    }
+}
+
+impl<K, V, S> InnerSync for Inner<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn run_pending_tasks(
+        &self,
+        timeout: Option<Duration>,
+        max_log_sync_repeats: u32,
+        eviction_batch_size: u32,
+    ) -> bool {
+        self.do_run_pending_tasks(timeout, max_log_sync_repeats, eviction_batch_size)
+    }
+
+    fn now(&self) -> Instant {
+        self.current_time()
+    }
+}
+
+impl<K, V, S> Inner<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn do_run_pending_tasks(
+        &self,
+        timeout: Option<Duration>,
+        max_log_sync_repeats: u32,
+        eviction_batch_size: u32,
+    ) -> bool {
+        if self.max_capacity == Some(0) {
+            return false;
+        }
+
+        // Acquire some locks.
+        let mut deqs = self.deques.lock();
+        let mut timer_wheel = self.timer_wheel.lock();
+
+        let started_at = if timeout.is_some() {
+            Some(self.current_time())
+        } else {
+            None
+        };
+        let mut should_process_logs = true;
+        let mut calls = 0u32;
+        let current_ec = self.entry_count.load();
+        let current_ws = self.weighted_size.load();
+        let mut eviction_state =
+            EvictionState::new(current_ec, current_ws, self.removal_notifier.as_ref());
+
+        loop {
+            if should_process_logs {
+                let r_len = self.read_op_ch.len();
+                if r_len > 0 {
+                    self.apply_reads(&mut deqs, &mut timer_wheel, r_len);
+                }
+
+                let w_len = self.write_op_ch.len();
+                if w_len > 0 {
+                    self.apply_writes(&mut deqs, &mut timer_wheel, w_len, &mut eviction_state);
+                }
+
+                if self.eviction_policy == EvictionPolicyConfig::TinyLfu
+                    && self.should_enable_frequency_sketch(&eviction_state.counters)
+                {
+                    self.enable_frequency_sketch(&eviction_state.counters);
+                }
+
+                calls += 1;
+            }
+
+            // Set this flag to `false`. The `evict_*` and `invalidate_*` methods
+            // below may set it to `true` if there are more entries to evict in next
+            // loop.
+            eviction_state.more_entries_to_evict = false;
+            let last_eviction_count = eviction_state.counters.eviction_count;
+
+            // Evict entries if there are any expired entries in the hierarchical
+            // timer wheels.
+            if timer_wheel.is_enabled() {
+                self.evict_expired_entries_using_timers(
+                    &mut timer_wheel,
+                    &mut deqs,
+                    &mut eviction_state,
+                );
+            }
+
+            // Evict entries if there are any expired entries in the write order or
+            // access order deques.
+            if self.has_expiry() || self.has_valid_after() {
+                self.evict_expired_entries_using_deqs(
+                    &mut deqs,
+                    &mut timer_wheel,
+                    eviction_batch_size,
+                    &mut eviction_state,
+                );
+            }
+
+            // Evict entries if there are any invalidation predicates set by the
+            // `invalidate_entries_if` method.
+            if let Some(invalidator) = &self.invalidator {
+                if !invalidator.is_empty() {
+                    self.invalidate_entries(
+                        invalidator,
+                        &mut deqs,
+                        &mut timer_wheel,
+                        eviction_batch_size,
+                        &mut eviction_state,
+                    );
+                }
+            }
+
+            // Evict if this cache has more entries than its capacity.
+            let weights_to_evict = self.weights_to_evict(&eviction_state.counters);
+            if weights_to_evict > 0 {
+                self.evict_lru_entries(
+                    &mut deqs,
+                    &mut timer_wheel,
+                    eviction_batch_size,
+                    weights_to_evict,
+                    &mut eviction_state,
+                );
+            }
+
+            // Check whether to continue this loop or not.
+
+            should_process_logs = calls <= max_log_sync_repeats
+                && (self.read_op_ch.len() >= READ_LOG_FLUSH_POINT
+                    || self.write_op_ch.len() >= WRITE_LOG_FLUSH_POINT);
+
+            let should_evict_more_entries = eviction_state.more_entries_to_evict
+                // Check if there were any entries evicted in this loop.
+                && (eviction_state.counters.eviction_count - last_eviction_count) > 0;
+
+            // Break the loop if there will be nothing to do in next loop.
+            if !should_process_logs && !should_evict_more_entries {
+                break;
+            }
+
+            // Break the loop if the eviction listener is set and timeout has been
+            // reached.
+            if let (Some(to), Some(started)) = (timeout, started_at) {
+                let elapsed = self.current_time().saturating_duration_since(started);
+                if elapsed >= to {
+                    break;
+                }
+            }
+        }
+
+        debug_assert_eq!(self.entry_count.load(), current_ec);
+        debug_assert_eq!(self.weighted_size.load(), current_ws);
+        self.entry_count.store(eviction_state.counters.entry_count);
+        self.weighted_size
+            .store(eviction_state.counters.weighted_size);
+
+        crossbeam_epoch::pin().flush();
+
+        // Ensure the deqs lock is held until here.
+        drop(deqs);
+
+        eviction_state.more_entries_to_evict
+    }
+}
+
+//
+// private methods
+//
+impl<K, V, S> Inner<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn has_enough_capacity(&self, candidate_weight: u32, counters: &EvictionCounters) -> bool {
+        self.max_capacity.map_or(true, |limit| {
+            counters.weighted_size + candidate_weight as u64 <= limit
+        })
+    }
+
+    fn weights_to_evict(&self, counters: &EvictionCounters) -> u64 {
+        self.max_capacity
+            .map(|limit| counters.weighted_size.saturating_sub(limit))
+            .unwrap_or_default()
+    }
+use super::{Cache, SegmentedCache};
+use crate::{
+    common::{builder_utils, concurrent::Weigher, time::Clock, HousekeeperConfig},
+    notification::{EvictionListener, RemovalCause},
+    policy::{EvictionPolicy, ExpirationPolicy},
+    Expiry,
+};
+
+use std::{
+    collections::hash_map::RandomState,
+    hash::{BuildHasher, Hash},
+    marker::PhantomData,
+    sync::Arc,
+    time::Duration,
+};
+
+/// Builds a [`Cache`][cache-struct] or [`SegmentedCache`][seg-cache-struct]
+/// with various configuration knobs.
+///
+/// [cache-struct]: ./struct.Cache.html
+/// [seg-cache-struct]: ./struct.SegmentedCache.html
+///
+/// # Example: Expirations
+///
+/// ```rust
+/// use moka::sync::Cache;
+/// use std::time::Duration;
+///
+/// let cache = Cache::builder()
+///     // Max 10,000 entries
+///     .max_capacity(10_000)
+///     // Time to live (TTL): 30 minutes
+///     .time_to_live(Duration::from_secs(30 * 60))
+///     // Time to idle (TTI):  5 minutes
+///     .time_to_idle(Duration::from_secs( 5 * 60))
+///     // Create the cache.
+///     .build();
+///
+/// // This entry will expire after 5 minutes (TTI) if there is no get().
+/// cache.insert(0, "zero");
+///
+/// // This get() will extend the entry life for another 5 minutes.
+/// cache.get(&0);
+///
+/// // Even though we keep calling get(), the entry will expire
+/// // after 30 minutes (TTL) from the insert().
+/// ```
+///
+#[must_use]
+pub struct CacheBuilder<K, V, C> {
+    name: Option<String>,
+    max_capacity: Option<u64>,
+    initial_capacity: Option<usize>,
+    num_segments: Option<usize>,
+    weigher: Option<Weigher<K, V>>,
+    eviction_policy: EvictionPolicy,
+    eviction_listener: Option<EvictionListener<K, V>>,
+    expiration_policy: ExpirationPolicy<K, V>,
+    housekeeper_config: HousekeeperConfig,
+    invalidator_enabled: bool,
+    clock: Clock,
+    cache_type: PhantomData<C>,
+}
+
+impl<K, V> Default for CacheBuilder<K, V, Cache<K, V, RandomState>>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    fn default() -> Self {
+        Self {
+            name: None,
+            max_capacity: None,
+            initial_capacity: None,
+            num_segments: None,
+            weigher: None,
+            eviction_listener: None,
+            eviction_policy: EvictionPolicy::default(),
+            expiration_policy: ExpirationPolicy::default(),
+            housekeeper_config: HousekeeperConfig::default(),
+            invalidator_enabled: false,
+            clock: Clock::default(),
+            cache_type: PhantomData,
+        }
+    }
+}
+
+impl<K, V> CacheBuilder<K, V, Cache<K, V, RandomState>>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    /// Construct a new `CacheBuilder` that will be used to build a `Cache` or
+    /// `SegmentedCache` holding up to `max_capacity` entries.
+    pub fn new(max_capacity: u64) -> Self {
+        Self {
+            max_capacity: Some(max_capacity),
+            ..Default::default()
+        }
+    }
+
+    /// Sets the number of segments of the cache.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is zero.
+    pub fn segments(
+        self,
+        num_segments: usize,
+    ) -> CacheBuilder<K, V, SegmentedCache<K, V, RandomState>> {
+        assert!(num_segments != 0);
+
+        CacheBuilder {
+            name: self.name,
+            max_capacity: self.max_capacity,
+            initial_capacity: self.initial_capacity,
+            num_segments: Some(num_segments),
+            weigher: self.weigher,
+            eviction_policy: self.eviction_policy,
+            eviction_listener: self.eviction_listener,
+            expiration_policy: self.expiration_policy,
+            housekeeper_config: self.housekeeper_config,
+            invalidator_enabled: self.invalidator_enabled,
+            clock: self.clock,
+            cache_type: PhantomData,
+        }
+    }
+
+    /// Builds a `Cache<K, V>`.
+    ///
+    /// If you want to build a `SegmentedCache<K, V>`, call `segments` method before
+    /// calling this method.
+    ///
+    /// # Panics
+    ///
+    /// Panics if configured with either `time_to_live` or `time_to_idle` higher than
+    /// 1000 years. This is done to protect against overflow when computing key
+    /// expiration.
+    pub fn build(self) -> Cache<K, V, RandomState> {
+        let build_hasher = RandomState::default();
+        let exp = &self.expiration_policy;
+        builder_utils::ensure_expirations_or_panic(exp.time_to_live(), exp.time_to_idle());
+        Cache::with_everything(
+            self.name,
+            self.max_capacity,
+            self.initial_capacity,
+            build_hasher,
+            self.weigher,
+            self.eviction_policy,
+            self.eviction_listener,
+            self.expiration_policy,
+            self.housekeeper_config,
+            self.invalidator_enabled,
+            self.clock,
+        )
+    }
+
+    /// Builds a `Cache<K, V, S>` with the given `hasher` of type `S`.
+    ///
+    /// # Examples
+    ///
+    /// This example uses AHash hasher from [AHash][ahash-crate] crate.
+    ///
+    /// [ahash-crate]: https://crates.io/crates/ahash
+    ///
+    /// ```rust
+    /// // Cargo.toml
+    /// // [dependencies]
+    /// // ahash = "0.8"
+    /// // moka = ...
+    ///
+    /// use moka::sync::Cache;
+    ///
+    /// // The type of this cache is: Cache<i32, String, ahash::RandomState>
+    /// let cache = Cache::builder()
+    ///     .max_capacity(100)
+    ///     .build_with_hasher(ahash::RandomState::default());
+    /// cache.insert(1, "one".to_string());
+    /// ```
+    ///
+    /// Note: If you need to add a type annotation to your cache, you must use the
+    /// form of `Cache<K, V, S>` instead of `Cache<K, V>`. That `S` is the type of
+    /// the build hasher, and its default is the `RandomState` from
+    /// `std::collections::hash_map` module . If you use a different build hasher,
+    /// you must specify `S` explicitly.
+    ///
+    /// Here is a good example:
+    ///
+    /// ```rust
+    /// # use moka::sync::Cache;
+    /// # let cache = Cache::builder()
+    /// #     .build_with_hasher(ahash::RandomState::default());
+    /// struct Good {
+    ///     // Specifying the type in Cache<K, V, S> format.
+    ///     cache: Cache<i32, String, ahash::RandomState>,
+    /// }
+    ///
+    /// // Storing the cache from above example. This should compile.
+    /// Good { cache };
+    /// ```
+    ///
+    /// Here is a bad example. This struct cannot store the above cache because it
+    /// does not specify `S`:
+    ///
+    /// ```compile_fail
+    /// # use moka::sync::Cache;
+    /// # let cache = Cache::builder()
+    /// #     .build_with_hasher(ahash::RandomState::default());
+    /// struct Bad {
+    ///     // Specifying the type in Cache<K, V> format.

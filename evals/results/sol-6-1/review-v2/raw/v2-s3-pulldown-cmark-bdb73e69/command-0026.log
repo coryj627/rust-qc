@@ -1,0 +1,584 @@
+#!/usr/bin/env bash
+# Runs the verification gate for a Rust crate or workspace.
+#
+# Usage: check.sh [--audit] [--target TRIPLE] [--features LIST] <crate-root>
+#
+#   --audit           Also run an advisory clippy pass with the lints that
+#                     enforce this skill's documentation, unsafe, and panic
+#                     rules. Its warnings are findings to report; they do not
+#                     change the exit status.
+#   --target TRIPLE   Lint and document for TRIPLE (for example
+#                     x86_64-pc-windows-msvc) so code behind #[cfg(...)] for
+#                     that platform is checked. Tests are skipped, because a
+#                     cross target cannot run on this host.
+#   --features LIST   Use these features instead of --all-features, for
+#                     crates whose features are mutually exclusive.
+#
+# When rustfmt.toml uses nightly-only options, the format step uses nightly
+# rustfmt, or is skipped with a reason if nightly rustfmt is not installed.
+#
+# The gate steps always all run, even after an earlier failure, so one
+# invocation reports the full picture. A missing tool, toolchain, or manifest
+# stops the script immediately, because results without it would be misleading.
+# The script never installs a toolchain.
+#
+# Exit status: 0 if every gate step passed, 1 if any failed, 2 on a
+# precondition failure.
+
+set -uo pipefail
+
+# rustup otherwise downloads any missing toolchain a command asks for, whether
+# through `+nightly` or the project's rust-toolchain.toml.
+export RUSTUP_AUTO_INSTALL=0
+
+audit=0
+target=""
+features=(--all-features)
+while [[ $# -gt 1 ]]; do
+    case "$1" in
+        --audit) audit=1; shift ;;
+        --target) target="$2"; shift 2 ;;
+        --features) features=(--features "$2"); shift 2 ;;
+        *) echo "error: unknown option $1" >&2; exit 2 ;;
+    esac
+done
+if [[ $# -ne 1 ]]; then
+    echo "usage: check.sh [--audit] [--target TRIPLE] [--features LIST] <crate-root>" >&2
+    exit 2
+fi
+root="$1"
+
+if [[ ! -f "$root/Cargo.toml" ]]; then
+    echo "error: no Cargo.toml in $root" >&2
+    exit 2
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "error: cargo is not installed or not on PATH" >&2
+    exit 2
+fi
+
+# The checks below run from the crate root so they see its pinned toolchain.
+cd "$root" || exit 2
+
+if ! cargo --version >/dev/null 2>&1; then
+    echo "error: cargo cannot run in $root; is the toolchain its rust-toolchain.toml names installed?" >&2
+    exit 2
+fi
+if ! cargo fmt --version >/dev/null 2>&1; then
+    echo "error: rustfmt is not installed (rustup component add rustfmt)" >&2
+    exit 2
+fi
+if ! cargo clippy --version >/dev/null 2>&1; then
+    echo "error: clippy is not installed (rustup component add clippy)" >&2
+    exit 2
+fi
+
+# Never empty: bash 3.2, the macOS default, treats expanding an empty array as
+# an unbound variable under `set -u`. Pipelines below send grep's output to
+# /dev/null instead of using -q, so an early exit cannot fail them under
+# pipefail.
+build_args=("${features[@]}")
+if [[ -n "$target" ]]; then
+    if ! rustup target list --installed 2>/dev/null | grep -x "$target" >/dev/null; then
+        echo "error: target $target is not installed (rustup target add $target)" >&2
+        exit 2
+    fi
+    build_args+=(--target "$target")
+fi
+
+# Asks rustup first, because versions without RUSTUP_AUTO_INSTALL would download
+# nightly for `cargo +nightly`. A dated nightly does not answer to `+nightly`.
+nightly_rustfmt_installed() {
+    rustup toolchain list 2>/dev/null | grep -E '^nightly-[^0-9]' >/dev/null &&
+        cargo +nightly fmt --version >/dev/null 2>&1
+}
+
+failed=0
+results=()
+
+run_step() {
+    local name="$1"
+    shift
+    echo
+    echo "== $name"
+    if "$@"; then
+        results+=("pass  $name")
+    else
+        results+=("FAIL  $name")
+        failed=1
+    fi
+}
+
+# A rustfmt.toml with nightly-only options formats differently on stable, so
+# stable's diffs are not the project's standard. Use nightly rustfmt, as the
+# project's own CI must, or skip the step and say why. The warning is captured,
+# not piped: stable's diff exits nonzero, which would fail a pipeline under
+# pipefail even though the warning matched.
+stable_fmt_stderr="$(cargo fmt --all --check 2>&1 >/dev/null)"
+if [[ "$stable_fmt_stderr" == *'only available in nightly channel'* ]]; then
+    if nightly_rustfmt_installed; then
+        run_step "format (nightly rustfmt, required by rustfmt.toml)" cargo +nightly fmt --all --check
+    else
+        results+=("skip  format (rustfmt.toml uses nightly-only options and nightly rustfmt is not installed)")
+    fi
+else
+    run_step "format" cargo fmt --all --check
+fi
+run_step "clippy" cargo clippy --workspace --all-targets "${build_args[@]}" -- -D warnings
+run_step "rustdoc" env RUSTDOCFLAGS="-D warnings" \
+    cargo doc --workspace --no-deps --document-private-items "${build_args[@]}"
+if [[ -z "$target" ]]; then
+    run_step "tests" cargo test --workspace "${features[@]}"
+else
+    results+=("skip  tests (cross target $target cannot run here)")
+fi
+
+if [[ "$audit" == 1 ]]; then
+    # Library and binary targets only, so #[cfg(test)] code is not compiled
+    # and unwrap in tests is not reported.
+    echo
+    echo "== audit lints (advisory)"
+    cargo clippy --workspace --lib --bins "${build_args[@]}" -- \
+        -W missing_docs \
+        -W missing_debug_implementations \
+        -W clippy::missing_errors_doc \
+        -W clippy::missing_panics_doc \
+        -W clippy::undocumented_unsafe_blocks \
+        -W clippy::unwrap_used \
+        -W clippy::allow_attributes_without_reason \
+        -W clippy::dbg_macro \
+        -W clippy::todo \
+        -W clippy::unimplemented \
+        -W clippy::wildcard_imports \
+        -W clippy::missing_assert_message \
+        -W clippy::map_err_ignore \
+        -W clippy::too_long_first_doc_paragraph
+    results+=("done  audit lints (advisory; warnings above are findings)")
+fi
+
+echo
+echo "== Summary"
+printf '%s\n' "${results[@]}"
+
+if grep -rqE '\bunsafe\b' --include='*.rs' --exclude-dir=target . 2>/dev/null; then
+    echo
+    echo "note: unsafe code present; also run 'cargo +nightly miri test'."
+fi
+
+exit "$failed"
+#[cfg(not(all(target_arch = "x86_64", feature = "simd")))]
+type LookupTable = [bool; 256];
+
+/// This function walks the byte slices from the given index and
+/// calls the callback function on all bytes (and their indices) that are in the following set:
+/// `` ` ``, `\`, `&`, `*`, `_`, `~`, `!`, `<`, `[`, `]`, `|`, `\r`, `\n`
+/// It is guaranteed not call the callback on other bytes.
+/// Whenever `callback(ix, byte)` returns a `ContinueAndSkip(n)` value, the callback
+/// will not be called with an index that is less than `ix + n + 1`.
+/// When the callback returns a `BreakAtWith(end_ix, opt+val)`, no more callbacks will be
+/// called and the function returns immediately with the return value `(end_ix, opt_val)`.
+/// If `BreakAtWith(..)` is never returned, this function will return the first
+/// index that is outside the byteslice bound and a `None` value.
+fn iterate_special_bytes<F, T>(
+    lut: &LookupTable,
+    bytes: &[u8],
+    ix: usize,
+    callback: F,
+) -> (usize, Option<T>)
+where
+    F: FnMut(usize, u8) -> LoopInstruction<Option<T>>,
+{
+    #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+    {
+        simd::iterate_special_bytes(lut, bytes, ix, callback)
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "simd")))]
+    {
+        scalar_iterate_special_bytes(lut, bytes, ix, callback)
+    }
+}
+
+fn scalar_iterate_special_bytes<F, T>(
+    lut: &[bool; 256],
+    bytes: &[u8],
+    mut ix: usize,
+    mut callback: F,
+) -> (usize, Option<T>)
+where
+    F: FnMut(usize, u8) -> LoopInstruction<Option<T>>,
+{
+    while ix < bytes.len() {
+        let b = bytes[ix];
+        if lut[b as usize] {
+            match callback(ix, b) {
+                LoopInstruction::ContinueAndSkip(skip) => {
+                    ix += skip;
+                }
+                LoopInstruction::BreakAtWith(ix, val) => {
+                    return (ix, val);
+                }
+            }
+        }
+        ix += 1;
+    }
+
+    (ix, None)
+}
+
+/// Split the usual heading content range and the content inside the trailing attribute block.
+///
+/// Returns `(leading_content_len, Option<trailing_attr_block_range>)`.
+///
+/// Note that `trailing_attr_block_range` will be empty range when the block
+/// is `{}`, since the range is content inside the wrapping `{` and `}`.
+///
+/// The closing `}` of an attribute block can have trailing whitespaces.
+/// They are automatically trimmed when the attribute block is being searched.
+///
+/// However, this method does not trim the trailing whitespaces of heading content.
+/// It is callers' responsibility to trim them if necessary.
+fn extract_attribute_block_content_from_header_text(
+    heading: &[u8],
+) -> (usize, Option<Range<usize>>) {
+    let heading_len = heading.len();
+    let mut ix = heading_len;
+    ix -= scan_rev_while(heading, |b| {
+        b == b'\n' || b == b'\r' || b == b' ' || b == b'\t'
+    });
+    if ix == 0 {
+        return (heading_len, None);
+    }
+
+    let attr_block_close = ix - 1;
+    if heading.get(attr_block_close) != Some(&b'}') {
+        // The last character is not `}`. No attribute blocks found.
+        return (heading_len, None);
+    }
+    // move cursor before the closing right brace (`}`)
+    ix -= 1;
+
+    ix -= scan_rev_while(&heading[..ix], |b| {
+        // Characters to be excluded:
+        //  * `{` and `}`: special characters to open and close an attribute block.
+        //  * `\\`: a special character to escape many characters and disable some syntaxes.
+        //      + Handling of this escape character differs among markdown processors.
+        //      + Escaped characters will be separate text node from neighbors, so
+        //        it is not easy to handle unescaped string and trim the trailing block.
+        //  * `<` and `>`: special characters to start and end HTML tag.
+        //      + No known processors converts `{#<i>foo</i>}` into
+        //        `id="&lt;i&gt;foo&lt;/&gt;"` as of this writing, so hopefully
+        //        this restriction won't cause compatibility issues.
+        //  * `\n` and `\r`: a newline character.
+        //      + Setext heading can have multiple lines. However it is hard to support
+        //        attribute blocks that have newline inside, since the parsing proceeds line by
+        //        line and lines will be separate nodes even they are logically a single text.
+        !matches!(b, b'{' | b'}' | b'<' | b'>' | b'\\' | b'\n' | b'\r')
+    });
+    if ix == 0 {
+        // `{` is not found. No attribute blocks available.
+        return (heading_len, None);
+    }
+    let attr_block_open = ix - 1;
+    if heading[attr_block_open] != b'{' {
+        // `{` is not found. No attribute blocks available.
+        return (heading_len, None);
+    }
+
+    (attr_block_open, Some(ix..attr_block_close))
+}
+
+/// Parses an attribute block content, such as `.class1 #id .class2`.
+///
+/// Returns `(id, classes)`.
+///
+/// It is callers' responsibility to find opening and closing characters of the attribute
+/// block. Usually [`extract_attribute_block_content_from_header_text`] function does it for you.
+///
+/// Note that this parsing requires explicit whitespace separators between
+/// attributes. This is intentional design with the reasons below:
+///
+/// * to keep conversion simple and easy to understand for any possible input,
+/// * to avoid adding less obvious conversion rule that can reduce compatibility
+///   with other implementations more, and
+/// * to follow the major design of implementations with the support for the
+///   attribute blocks extension (as of this writing).
+///
+/// See also: [`Options::ENABLE_HEADING_ATTRIBUTES`].
+///
+/// [`Options::ENABLE_HEADING_ATTRIBUTES`]: `crate::Options::ENABLE_HEADING_ATTRIBUTES`
+fn parse_inside_attribute_block(inside_attr_block: &str) -> Option<HeadingAttributes<'_>> {
+    let mut id = None;
+    let mut classes = Vec::new();
+    let mut attrs = Vec::new();
+
+    for attr in inside_attr_block.split_ascii_whitespace() {
+        // iterator returned by `str::split_ascii_whitespace` never emits empty
+        // strings, so taking first byte won't panic.
+        if attr.len() > 1 {
+            let first_byte = attr.as_bytes()[0];
+            if first_byte == b'#' {
+                id = Some(attr[1..].into());
+            } else if first_byte == b'.' {
+                classes.push(attr[1..].into());
+            } else {
+                let split = attr.split_once('=');
+                if let Some((key, value)) = split {
+                    attrs.push((key.into(), Some(value.into())));
+                } else {
+                    attrs.push((attr.into(), None));
+                }
+            }
+        }
+    }
+
+    Some(HeadingAttributes { id, classes, attrs })
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "simd"))]
+            None
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+pub(crate) fn scan_blockquote_start(data: &[u8]) -> Option<usize> {
+    if data.first().copied() == Some(b'>') {
+        let space = if data.get(1).copied() == Some(b' ') {
+            1
+        } else {
+            0
+        };
+        Some(1 + space)
+    } else {
+        None
+    }
+}
+
+/// return number of bytes scanned, delimiter, start index, and indent
+pub(crate) fn scan_listitem(bytes: &[u8]) -> Option<(usize, u8, usize, usize)> {
+    let mut c = *bytes.first()?;
+    let (w, start) = match c {
+        b'-' | b'+' | b'*' => (1, 0),
+        b'0'..=b'9' => {
+            let (length, start) = parse_decimal(bytes, 9);
+            c = *bytes.get(length)?;
+            if !(c == b'.' || c == b')') {
+                return None;
+            }
+            (length + 1, start)
+        }
+        _ => {
+            return None;
+        }
+    };
+    // TODO: replace calc_indent with scan_leading_whitespace, for tab correctness
+    let (mut postn, mut postindent) = calc_indent(&bytes[w..], 5);
+    if postindent == 0 {
+        scan_eol(&bytes[w..])?;
+        postindent += 1;
+    } else if postindent > 4 {
+        postn = 1;
+        postindent = 1;
+    }
+    if scan_blank_line(&bytes[w..]).is_some() {
+        postn = 0;
+        postindent = 1;
+    }
+    Some((w + postn, c, start, w + postindent))
+}
+
+// returns (number of bytes, parsed decimal)
+fn parse_decimal(bytes: &[u8], limit: usize) -> (usize, usize) {
+    match bytes
+        .iter()
+        .take(limit)
+        .take_while(|&&b| is_digit(b))
+        .try_fold((0, 0usize), |(count, acc), c| {
+            let digit = usize::from(c - b'0');
+            match acc
+                .checked_mul(10)
+                .and_then(|ten_acc| ten_acc.checked_add(digit))
+            {
+                Some(number) => Ok((count + 1, number)),
+                // stop early on overflow
+                None => Err((count, acc)),
+            }
+        }) {
+        Ok(p) | Err(p) => p,
+    }
+}
+
+// returns (number of bytes, parsed hex)
+fn parse_hex(bytes: &[u8], limit: usize) -> (usize, usize) {
+    match bytes
+        .iter()
+        .take(limit)
+        .try_fold((0, 0usize), |(count, acc), c| {
+            let mut c = *c;
+            let digit = if c.is_ascii_digit() {
+                usize::from(c - b'0')
+            } else {
+                // make lower case
+                c |= 0x20;
+                if (b'a'..=b'f').contains(&c) {
+                    usize::from(c - b'a' + 10)
+                } else {
+                    return Err((count, acc));
+                }
+            };
+            match acc
+                .checked_mul(16)
+                .and_then(|sixteen_acc| sixteen_acc.checked_add(digit))
+            {
+                Some(number) => Ok((count + 1, number)),
+                // stop early on overflow
+                None => Err((count, acc)),
+            }
+        }) {
+        Ok(p) | Err(p) => p,
+    }
+}
+
+fn char_from_codepoint(input: usize) -> Option<char> {
+    let codepoint = input.try_into().ok()?;
+    if codepoint == 0 {
+        return None;
+    }
+    char::from_u32(codepoint)
+}
+
+// doesn't bother to check data[0] == '&'
+pub(crate) fn scan_entity(bytes: &[u8]) -> (usize, Option<CowStr<'static>>) {
+    let mut end = 1;
+    if bytes.get(end) == Some(&b'#') {
+        end += 1;
+        let (bytecount, codepoint) = if end < bytes.len() && bytes[end] | 0x20 == b'x' {
+            end += 1;
+            parse_hex(&bytes[end..], 6)
+        } else {
+            parse_decimal(&bytes[end..], 7)
+        };
+        end += bytecount;
+        return if bytecount == 0 || bytes.get(end) != Some(&b';') {
+            (0, None)
+        } else {
+            (
+                end + 1,
+                Some(char_from_codepoint(codepoint).unwrap_or('\u{FFFD}').into()),
+            )
+        };
+    }
+    end += scan_while(&bytes[end..], is_ascii_alphanumeric);
+    if bytes.get(end) == Some(&b';') {
+        if let Some(value) = entities::get_entity(&bytes[1..end]) {
+            return (end + 1, Some(value.into()));
+        }
+    }
+    (0, None)
+}
+
+pub(crate) fn scan_wikilink_pipe(data: &str, start_ix: usize, len: usize) -> Option<(usize, &str)> {
+    let bytes = data.as_bytes();
+    let end_ix = std::cmp::min(start_ix + len, bytes.len());
+    let mut i = start_ix;
+
+    while i < end_ix {
+        if bytes[i] == b'|' {
+            return Some((i + 1, &data[start_ix..i]));
+        }
+        i += 1;
+    }
+    None
+}
+
+// note: dest returned is raw, still needs to be unescaped
+// TODO: check that nested parens are really not allowed for refdefs
+// TODO(performance): this func should probably its own unescaping
+pub(crate) fn scan_link_dest(
+    data: &str,
+    start_ix: usize,
+    max_next: usize,
+) -> Option<(usize, &str)> {
+    let bytes = &data.as_bytes()[start_ix..];
+    let mut i = scan_ch(bytes, b'<');
+
+    if i != 0 {
+        // pointy links
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\n' | b'\r' | b'<' => return None,
+                b'>' => return Some((i + 1, &data[(start_ix + 1)..(start_ix + i)])),
+                b'\\' if i + 1 < bytes.len() && is_ascii_punctuation(bytes[i + 1]) => {
+                    i += 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    } else {
+        // non-pointy links
+        let mut nest = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                0x0..=0x20 => {
+                    break;
+                }
+                b'(' => {
+                    if nest > max_next {
+                        return None;
+                    }
+                    nest += 1;
+                }
+                b')' => {
+                    if nest == 0 {
+                        break;
+                    }
+                    nest -= 1;
+                }
+                b'\\' if i + 1 < bytes.len() && is_ascii_punctuation(bytes[i + 1]) => {
+                    i += 1;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if nest != 0 {
+            return None;
+        }
+        Some((i, &data[start_ix..(start_ix + i)]))
+    }
+}
+
+/// Returns bytes scanned
+fn scan_attribute_name(data: &[u8]) -> Option<usize> {
+    let (&c, tail) = data.split_first()?;
+    if is_ascii_alpha(c) || c == b'_' || c == b':' {
+        Some(
+            1 + scan_while(tail, |c| {
+                is_ascii_alphanumeric(c) || c == b'_' || c == b'.' || c == b':' || c == b'-'
+            }),
+        )
+    } else {
+        None
+    }
+}
+
+/// Returns the index immediately following the attribute on success.
+/// The argument `buffer_ix` refers to the index into `data` from which we
+/// should copy into `buffer` when we find bytes to skip.
+fn scan_attribute(
+    data: &[u8],
+    mut ix: usize,
+    newline_handler: Option<&dyn Fn(&[u8]) -> usize>,
+    buffer: &mut Vec<u8>,
+    buffer_ix: &mut usize,
+) -> Option<usize> {
+    ix += scan_attribute_name(&data[ix..])?;
+    let ix_after_attribute = ix;
+    ix = scan_whitespace_with_newline_handler_without_buffer(data, ix, newline_handler)?;
+    if data.get(ix) == Some(&b'=') {
+3.8407833333333334 minutes used of 45.0

@@ -1,0 +1,671 @@
+        name: S,
+        mut options: FileOptions<T>,
+    ) -> ZipResult<()>
+    where
+        S: Into<String>,
+    {
+        if options.permissions.is_none() {
+            options.permissions = Some(0o755);
+        }
+        *options.permissions.as_mut().unwrap() |= 0o40000;
+        options.compression_method = Stored;
+        options.encrypt_with = None;
+
+        let name_as_string = name.into();
+        // Append a slash to the filename if it does not end with it.
+        let name_with_slash = match name_as_string.chars().last() {
+            Some('/') | Some('\\') => name_as_string,
+            _ => name_as_string + "/",
+        };
+
+        self.start_entry(name_with_slash, options, None)?;
+        self.writing_to_file = false;
+        self.switch_to_non_encrypting_writer()?;
+        Ok(())
+    }
+
+    /// Add a directory entry, taking a Path as argument.
+    ///
+    /// This function ensures that the '/' path separator is used and normalizes `.` and `..`. It
+    /// ignores any `..` or Windows drive letter that would produce a path outside the ZIP file's
+    /// root.
+    pub fn add_directory_from_path<T: FileOptionExtension, P: AsRef<Path>>(
+        &mut self,
+        path: P,
+        options: FileOptions<T>,
+    ) -> ZipResult<()> {
+        self.add_directory(path_to_string(path), options)
+    }
+
+    /// Finish the last file and write all other zip-structures
+    ///
+    /// This will return the writer, but one should normally not append any data to the end of the file.
+    /// Note that the zipfile will also be finished on drop.
+    pub fn finish(mut self) -> ZipResult<W> {
+        let _central_start = self.finalize()?;
+        let inner = mem::replace(&mut self.inner, Closed);
+        Ok(inner.unwrap())
+    }
+
+    /// Add a symlink entry.
+    ///
+    /// The zip archive will contain an entry for path `name` which is a symlink to `target`.
+    ///
+    /// No validation or normalization of the paths is performed. For best results,
+    /// callers should normalize `\` to `/` and ensure symlinks are relative to other
+    /// paths within the zip archive.
+    ///
+    /// WARNING: not all zip implementations preserve symlinks on extract. Some zip
+    /// implementations may materialize a symlink as a regular file, possibly with the
+    /// content incorrectly set to the symlink target. For maximum portability, consider
+    /// storing a regular file instead.
+    pub fn add_symlink<N: ToString, T: ToString, E: FileOptionExtension>(
+        &mut self,
+        name: N,
+        target: T,
+        mut options: FileOptions<E>,
+    ) -> ZipResult<()> {
+        if options.permissions.is_none() {
+            options.permissions = Some(0o777);
+        }
+        *options.permissions.as_mut().unwrap() |= S_IFLNK;
+        // The symlink target is stored as file content. And compressing the target path
+        // likely wastes space. So always store.
+        options.compression_method = Stored;
+
+        self.start_entry(name, options, None)?;
+        self.writing_to_file = true;
+        let result = self.write_all(target.to_string().as_bytes());
+        self.ok_or_abort_file(result)?;
+        self.writing_raw = false;
+        self.finish_file()?;
+
+        Ok(())
+    }
+
+    /// Add a symlink entry, taking Paths to the location and target as arguments.
+    ///
+    /// This function ensures that the '/' path separator is used and normalizes `.` and `..`. It
+    /// ignores any `..` or Windows drive letter that would produce a path outside the ZIP file's
+    /// root.
+    pub fn add_symlink_from_path<P: AsRef<Path>, T: AsRef<Path>, E: FileOptionExtension>(
+        &mut self,
+        path: P,
+        target: T,
+        options: FileOptions<E>,
+    ) -> ZipResult<()> {
+        self.add_symlink(path_to_string(path), path_to_string(target), options)
+    }
+
+    fn finalize(&mut self) -> ZipResult<u64> {
+        self.finish_file()?;
+
+        let mut central_start = self.write_central_and_footer()?;
+        let writer = self.inner.get_plain();
+        let footer_end = writer.stream_position()?;
+        let archive_end = writer.seek(SeekFrom::End(0))?;
+        if footer_end < archive_end {
+            // Data from an aborted file is past the end of the footer.
+
+            // Overwrite the magic so the footer is no longer valid.
+            writer.seek(SeekFrom::Start(central_start))?;
+            writer.write_u32_le(0)?;
+            writer.seek(SeekFrom::Start(
+                footer_end - size_of::<Zip32CDEBlock>() as u64 - self.comment.len() as u64,
+            ))?;
+            writer.write_u32_le(0)?;
+
+            // Rewrite the footer at the actual end.
+            let central_and_footer_size = footer_end - central_start;
+            writer.seek(SeekFrom::End(-(central_and_footer_size as i64)))?;
+            central_start = self.write_central_and_footer()?;
+            debug_assert!(self.inner.get_plain().stream_position()? == archive_end);
+        }
+
+        Ok(central_start)
+    }
+
+    fn write_central_and_footer(&mut self) -> Result<u64, ZipError> {
+        let writer = self.inner.get_plain();
+
+        let mut version_needed = MIN_VERSION as u16;
+        let central_start = writer.stream_position()?;
+        for file in self.files.values() {
+            write_central_directory_header(writer, file)?;
+            version_needed = version_needed.max(file.version_needed());
+        }
+        let central_size = writer.stream_position()? - central_start;
+        let is64 = self.files.len() > spec::ZIP64_ENTRY_THR
+            || central_size.max(central_start) > spec::ZIP64_BYTES_THR
+            || self.zip64_comment.is_some();
+
+        if is64 {
+            let comment = self.zip64_comment.clone().unwrap_or_default();
+
+            let zip64_footer = spec::Zip64CentralDirectoryEnd {
+                record_size: comment.len() as u64 + 44,
+                version_made_by: version_needed,
+                version_needed_to_extract: version_needed,
+                disk_number: 0,
+                disk_with_central_directory: 0,
+                number_of_files_on_this_disk: self.files.len() as u64,
+                number_of_files: self.files.len() as u64,
+                central_directory_size: central_size,
+                central_directory_offset: central_start,
+                extensible_data_sector: comment,
+            };
+
+            zip64_footer.write(writer)?;
+
+            let zip64_footer = spec::Zip64CentralDirectoryEndLocator {
+                disk_with_central_directory: 0,
+                end_of_central_directory_offset: central_start + central_size,
+                number_of_disks: 1,
+            };
+
+            zip64_footer.write(writer)?;
+        }
+
+        let number_of_files = self.files.len().min(spec::ZIP64_ENTRY_THR) as u16;
+        let footer = spec::Zip32CentralDirectoryEnd {
+            disk_number: 0,
+            disk_with_central_directory: 0,
+            zip_file_comment: self.comment.clone(),
+            number_of_files_on_this_disk: number_of_files,
+            number_of_files,
+            central_directory_size: central_size.min(spec::ZIP64_BYTES_THR) as u32,
+            central_directory_offset: central_start.min(spec::ZIP64_BYTES_THR) as u32,
+        };
+
+        footer.write(writer)?;
+        Ok(central_start)
+    }
+
+    fn index_by_name(&self, name: &str) -> ZipResult<usize> {
+        self.files.get_index_of(name).ok_or(ZipError::FileNotFound)
+    }
+
+    /// Adds another entry to the central directory referring to the same content as an existing
+    /// entry. The file's local-file header will still refer to it by its original name, so
+    /// unzipping the file will technically be unspecified behavior. [ZipArchive] ignores the
+    /// filename in the local-file header and treat the central directory as authoritative. However,
+    /// some other software (e.g. Minecraft) will refuse to extract a file copied this way.
+    pub fn shallow_copy_file(&mut self, src_name: &str, dest_name: &str) -> ZipResult<()> {
+        self.finish_file()?;
+        if src_name == dest_name {
+            return Err(invalid!("Trying to copy a file to itself"));
+        }
+        let src_index = self.index_by_name(src_name)?;
+        let mut dest_data = self.files[src_index].to_owned();
+        dest_data.file_name = dest_name.to_string().into();
+        dest_data.file_name_raw = dest_name.to_string().into_bytes().into();
+        dest_data.central_header_start = 0;
+        self.insert_file_data(dest_data)?;
+
+        Ok(())
+    }
+
+    /// Like `shallow_copy_file`, but uses Path arguments.
+    ///
+    /// This function ensures that the '/' path separator is used and normalizes `.` and `..`. It
+    /// ignores any `..` or Windows drive letter that would produce a path outside the ZIP file's
+    /// root.
+    pub fn shallow_copy_file_from_path<T: AsRef<Path>, U: AsRef<Path>>(
+        &mut self,
+        src_path: T,
+        dest_path: U,
+    ) -> ZipResult<()> {
+        self.shallow_copy_file(&path_to_string(src_path), &path_to_string(dest_path))
+    }
+}
+
+//! Types for reading ZIP archives
+
+#[cfg(feature = "aes-crypto")]
+use crate::aes::{AesReader, AesReaderValid};
+use crate::compression::{CompressionMethod, Decompressor};
+use crate::cp437::FromCp437;
+use crate::crc32::Crc32Reader;
+use crate::extra_fields::{ExtendedTimestamp, ExtraField, Ntfs};
+use crate::read::zip_archive::{Shared, SharedBuilder};
+use crate::result::invalid;
+use crate::result::{ZipError, ZipResult};
+use crate::spec::{self, CentralDirectoryEndInfo, DataAndPosition, FixedSizeBlock, Pod};
+use crate::types::{
+    AesMode, AesVendorVersion, DateTime, System, ZipCentralEntryBlock, ZipFileData,
+    ZipLocalEntryBlock,
+};
+use crate::write::SimpleFileOptions;
+use crate::zipcrypto::{ZipCryptoReader, ZipCryptoReaderValid, ZipCryptoValidator};
+use crate::ZIP64_BYTES_THR;
+use indexmap::IndexMap;
+use std::borrow::Cow;
+use std::ffi::OsStr;
+use std::fs::create_dir_all;
+use std::io::{self, copy, prelude::*, sink, SeekFrom};
+use std::mem;
+use std::mem::size_of;
+use std::ops::{Deref, Range};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+
+mod config;
+
+pub use config::*;
+
+/// Provides high level API for reading from a stream.
+pub(crate) mod stream;
+
+pub(crate) mod magic_finder;
+
+// Put the struct declaration in a private module to convince rustdoc to display ZipArchive nicely
+pub(crate) mod zip_archive {
+    use indexmap::IndexMap;
+    use std::sync::Arc;
+
+    /// Extract immutable data from `ZipArchive` to make it cheap to clone
+    #[derive(Debug)]
+    pub(crate) struct Shared {
+        pub(crate) files: IndexMap<Box<str>, super::ZipFileData>,
+        pub(super) offset: u64,
+        pub(super) dir_start: u64,
+        // This isn't yet used anywhere, but it is here for use cases in the future.
+        #[allow(dead_code)]
+        pub(super) config: super::Config,
+        pub(crate) comment: Box<[u8]>,
+        pub(crate) zip64_comment: Option<Box<[u8]>>,
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct SharedBuilder {
+        pub(crate) files: Vec<super::ZipFileData>,
+        pub(super) offset: u64,
+        pub(super) dir_start: u64,
+        // This isn't yet used anywhere, but it is here for use cases in the future.
+        #[allow(dead_code)]
+        pub(super) config: super::Config,
+    }
+
+    impl SharedBuilder {
+        pub fn build(self, comment: Box<[u8]>, zip64_comment: Option<Box<[u8]>>) -> Shared {
+            let mut index_map = IndexMap::with_capacity(self.files.len());
+            self.files.into_iter().for_each(|file| {
+                index_map.insert(file.file_name.clone(), file);
+            });
+            Shared {
+                files: index_map,
+                offset: self.offset,
+                dir_start: self.dir_start,
+                config: self.config,
+                comment,
+                zip64_comment,
+            }
+        }
+    }
+
+    /// ZIP archive reader
+    ///
+    /// At the moment, this type is cheap to clone if this is the case for the
+    /// reader it uses. However, this is not guaranteed by this crate and it may
+    /// change in the future.
+    ///
+    /// ```no_run
+    /// use std::io::prelude::*;
+    /// fn list_zip_contents(reader: impl Read + Seek) -> zip::result::ZipResult<()> {
+    ///     use zip::HasZipMetadata;
+    ///     let mut zip = zip::ZipArchive::new(reader)?;
+    ///
+    ///     for i in 0..zip.len() {
+    ///         let mut file = zip.by_index(i)?;
+    ///         println!("Filename: {}", file.name());
+    ///         std::io::copy(&mut file, &mut std::io::stdout())?;
+    ///     }
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    #[derive(Clone, Debug)]
+    pub struct ZipArchive<R> {
+        pub(super) reader: R,
+        pub(super) shared: Arc<Shared>,
+    }
+}
+
+#[cfg(feature = "aes-crypto")]
+use crate::aes::PWD_VERIFY_LENGTH;
+use crate::extra_fields::UnicodeExtraField;
+use crate::result::ZipError::InvalidPassword;
+use crate::spec::is_dir;
+use crate::types::ffi::{S_IFLNK, S_IFREG};
+use crate::unstable::{path_to_string, LittleEndianReadExt};
+pub use zip_archive::ZipArchive;
+
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum CryptoReader<'a, R: Read> {
+    Plaintext(io::Take<&'a mut R>),
+    ZipCrypto(ZipCryptoReaderValid<io::Take<&'a mut R>>),
+    #[cfg(feature = "aes-crypto")]
+    Aes {
+        reader: AesReaderValid<io::Take<&'a mut R>>,
+        vendor_version: AesVendorVersion,
+    },
+}
+
+impl<R: Read> Read for CryptoReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            CryptoReader::Plaintext(r) => r.read(buf),
+            CryptoReader::ZipCrypto(r) => r.read(buf),
+            #[cfg(feature = "aes-crypto")]
+            CryptoReader::Aes { reader: r, .. } => r.read(buf),
+        }
+    }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        match self {
+            CryptoReader::Plaintext(r) => r.read_to_end(buf),
+            CryptoReader::ZipCrypto(r) => r.read_to_end(buf),
+            #[cfg(feature = "aes-crypto")]
+            CryptoReader::Aes { reader: r, .. } => r.read_to_end(buf),
+        }
+    }
+
+    fn read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
+        match self {
+            CryptoReader::Plaintext(r) => r.read_to_string(buf),
+            CryptoReader::ZipCrypto(r) => r.read_to_string(buf),
+            #[cfg(feature = "aes-crypto")]
+            CryptoReader::Aes { reader: r, .. } => r.read_to_string(buf),
+        }
+    }
+}
+
+impl<'a, R: Read> CryptoReader<'a, R> {
+    /// Consumes this decoder, returning the underlying reader.
+    pub fn into_inner(self) -> io::Take<&'a mut R> {
+        match self {
+            CryptoReader::Plaintext(r) => r,
+            CryptoReader::ZipCrypto(r) => r.into_inner(),
+            #[cfg(feature = "aes-crypto")]
+            CryptoReader::Aes { reader: r, .. } => r.into_inner(),
+        }
+    }
+
+    /// Returns `true` if the data is encrypted using AE2.
+    pub const fn is_ae2_encrypted(&self) -> bool {
+        #[cfg(feature = "aes-crypto")]
+        return matches!(
+            self,
+            CryptoReader::Aes {
+                vendor_version: AesVendorVersion::Ae2,
+                ..
+            }
+        );
+        #[cfg(not(feature = "aes-crypto"))]
+        false
+    }
+}
+
+#[cold]
+fn invalid_state<T>() -> io::Result<T> {
+    Err(io::Error::other("ZipFileReader was in an invalid state"))
+}
+
+pub(crate) enum ZipFileReader<'a, R: Read> {
+    NoReader,
+    Raw(io::Take<&'a mut R>),
+    Compressed(Box<Crc32Reader<Decompressor<io::BufReader<CryptoReader<'a, R>>>>>),
+}
+
+impl<R: Read> Read for ZipFileReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            ZipFileReader::NoReader => invalid_state(),
+            ZipFileReader::Raw(r) => r.read(buf),
+            ZipFileReader::Compressed(r) => r.read(buf),
+        }
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        match self {
+            ZipFileReader::NoReader => invalid_state(),
+            ZipFileReader::Raw(r) => r.read_exact(buf),
+            ZipFileReader::Compressed(r) => r.read_exact(buf),
+        }
+    }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        match self {
+            ZipFileReader::NoReader => invalid_state(),
+            ZipFileReader::Raw(r) => r.read_to_end(buf),
+            ZipFileReader::Compressed(r) => r.read_to_end(buf),
+        }
+    }
+
+    fn read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
+        match self {
+            ZipFileReader::NoReader => invalid_state(),
+            ZipFileReader::Raw(r) => r.read_to_string(buf),
+            ZipFileReader::Compressed(r) => r.read_to_string(buf),
+        }
+    }
+}
+
+impl<'a, R: Read> ZipFileReader<'a, R> {
+    fn into_inner(self) -> io::Result<io::Take<&'a mut R>> {
+        match self {
+            ZipFileReader::NoReader => invalid_state(),
+            ZipFileReader::Raw(r) => Ok(r),
+            ZipFileReader::Compressed(r) => {
+                Ok(r.into_inner().into_inner()?.into_inner().into_inner())
+            }
+        }
+    }
+}
+
+/// A struct for reading a zip file
+pub struct ZipFile<'a, R: Read> {
+    pub(crate) data: Cow<'a, ZipFileData>,
+    pub(crate) reader: ZipFileReader<'a, R>,
+}
+
+/// A struct for reading and seeking a zip file
+pub struct ZipFileSeek<'a, R> {
+    data: Cow<'a, ZipFileData>,
+    reader: ZipFileSeekReader<'a, R>,
+}
+
+enum ZipFileSeekReader<'a, R> {
+    Raw(SeekableTake<'a, R>),
+}
+
+struct SeekableTake<'a, R> {
+    inner: &'a mut R,
+    inner_starting_offset: u64,
+    length: u64,
+    current_offset: u64,
+}
+
+impl<'a, R: Seek> SeekableTake<'a, R> {
+    pub fn new(inner: &'a mut R, length: u64) -> io::Result<Self> {
+        let inner_starting_offset = inner.stream_position()?;
+        Ok(Self {
+            inner,
+            inner_starting_offset,
+            length,
+            current_offset: 0,
+        })
+    }
+}
+
+impl<R: Seek> Seek for SeekableTake<'_, R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let offset = match pos {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::End(offset) => self.length.checked_add_signed(offset),
+            SeekFrom::Current(offset) => self.current_offset.checked_add_signed(offset),
+        };
+        match offset {
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid seek to a negative or overflowing position",
+            )),
+            Some(offset) => {
+                let clamped_offset = std::cmp::min(self.length, offset);
+                let new_inner_offset = self
+                    .inner
+                    .seek(SeekFrom::Start(self.inner_starting_offset + clamped_offset))?;
+                self.current_offset = new_inner_offset - self.inner_starting_offset;
+                Ok(self.current_offset)
+            }
+        }
+src/read.rs:69:        pub fn build(self, comment: Box<[u8]>, zip64_comment: Option<Box<[u8]>>) -> Shared {
+src/read.rs:164:    pub fn into_inner(self) -> io::Take<&'a mut R> {
+src/read.rs:174:    pub const fn is_ae2_encrypted(&self) -> bool {
+src/read.rs:269:    pub fn new(inner: &'a mut R, length: u64) -> io::Result<Self> {
+src/read.rs:378:            debug_assert_eq!(*data.data_start.get().unwrap(), data_start);
+src/read.rs:563:    pub fn decompressed_size(&self) -> Option<u128> {
+src/read.rs:719:    pub fn get_aes_verification_key_and_salt(
+src/read.rs:751:    pub fn new(reader: R) -> ZipResult<ZipArchive<R>> {
+src/read.rs:758:    pub fn with_config(config: Config, mut reader: R) -> ZipResult<ZipArchive<R>> {
+src/read.rs:780:    pub fn extract<P: AsRef<Path>>(&mut self, directory: P) -> ZipResult<()> {
+src/read.rs:842:    pub fn extract_unwrapped_root_dir<P: AsRef<Path>>(
+src/read.rs:949:    pub fn len(&self) -> usize {
+src/read.rs:954:    pub fn central_directory_start(&self) -> u64 {
+src/read.rs:959:    pub fn is_empty(&self) -> bool {
+src/read.rs:967:    pub fn offset(&self) -> u64 {
+src/read.rs:972:    pub fn comment(&self) -> &[u8] {
+src/read.rs:977:    pub fn zip64_comment(&self) -> Option<&[u8]> {
+src/read.rs:982:    pub fn file_names(&self) -> impl Iterator<Item = &str> {
+src/read.rs:989:    pub fn has_overlapping_files(&mut self) -> ZipResult<bool> {
+src/read.rs:1021:    pub fn by_name_decrypt(&mut self, name: &str, password: &[u8]) -> ZipResult<ZipFile<'_, R>> {
+src/read.rs:1026:    pub fn by_name(&mut self, name: &str) -> ZipResult<ZipFile<'_, R>> {
+src/read.rs:1032:    pub fn index_for_name(&self, name: &str) -> Option<usize> {
+src/read.rs:1049:    pub fn by_path_decrypt<T: AsRef<Path>>(
+src/read.rs:1060:    pub fn by_path<T: AsRef<Path>>(&mut self, path: T) -> ZipResult<ZipFile<'_, R>> {
+src/read.rs:1068:    pub fn index_for_path<T: AsRef<Path>>(&self, path: T) -> Option<usize> {
+src/read.rs:1074:    pub fn name_for_index(&self, index: usize) -> Option<&str> {
+src/read.rs:1082:    pub fn by_name_seek(&mut self, name: &str) -> ZipResult<ZipFileSeek<'_, R>> {
+src/read.rs:1087:    pub fn by_index_seek(&mut self, index: usize) -> ZipResult<ZipFileSeek<'_, R>> {
+src/read.rs:1135:    pub fn by_index_decrypt(
+src/read.rs:1144:    pub fn by_index(&mut self, file_number: usize) -> ZipResult<ZipFile<'_, R>> {
+src/read.rs:1149:    pub fn by_index_raw(&mut self, file_number: usize) -> ZipResult<ZipFile<'_, R>> {
+src/read.rs:1204:    pub fn root_dir(&self, filter: impl RootDirFilter) -> ZipResult<Option<PathBuf>> {
+src/read.rs:1271:    pub fn into_inner(self) -> R {
+src/read.rs:1565:    pub fn version_made_by(&self) -> (u8, u8) {
+src/read.rs:1584:    pub fn name(&self) -> &str {
+src/read.rs:1591:    pub fn name_raw(&self) -> &[u8] {
+src/read.rs:1602:    pub fn sanitized_name(&self) -> PathBuf {
+src/read.rs:1618:    pub fn mangled_name(&self) -> PathBuf {
+src/read.rs:1632:    pub fn enclosed_name(&self) -> Option<PathBuf> {
+src/read.rs:1754:    pub fn comment(&self) -> &str {
+src/read.rs:1759:    pub fn compression(&self) -> CompressionMethod {
+src/read.rs:1764:    pub fn encrypted(&self) -> bool {
+src/read.rs:1769:    pub fn compressed_size(&self) -> u64 {
+src/read.rs:1774:    pub fn size(&self) -> u64 {
+src/read.rs:1779:    pub fn last_modified(&self) -> Option<DateTime> {
+src/read.rs:1783:    pub fn is_dir(&self) -> bool {
+src/read.rs:1788:    pub fn is_symlink(&self) -> bool {
+src/read.rs:1794:    pub fn is_file(&self) -> bool {
+src/read.rs:1799:    pub fn unix_mode(&self) -> Option<u32> {
+src/read.rs:1804:    pub fn crc32(&self) -> u32 {
+src/read.rs:1809:    pub fn extra_data(&self) -> Option<&[u8]> {
+src/read.rs:1817:    pub fn data_start(&self) -> u64 {
+src/read.rs:1818:        *self.data.data_start.get().unwrap()
+src/read.rs:1822:    pub fn header_start(&self) -> u64 {
+src/read.rs:1826:    pub fn central_header_start(&self) -> u64 {
+src/read.rs:1832:    pub fn options(&self) -> SimpleFileOptions {
+src/read.rs:1857:    pub fn extra_data_fields(&self) -> impl Iterator<Item = &ExtraField> {
+src/read.rs:1937:pub fn read_zipfile_from_stream<R: Read>(reader: &mut R) -> ZipResult<Option<ZipFile<'_, R>>> {
+src/read.rs:2016:pub fn root_dir_common_filter(path: &Path) -> bool {
+src/read.rs:2100:            ZipArchive::new(Cursor::new(include_bytes!("../tests/data/zip64_demo.zip"))).unwrap();
+src/read.rs:2109:            ZipArchive::new(Cursor::new(include_bytes!("../tests/data/mimetype.zip"))).unwrap();
+src/read.rs:2111:        assert_eq!(reader.by_index(0).unwrap().central_header_start(), 77);
+src/read.rs:2120:            if read_zipfile_from_stream(&mut reader).unwrap().is_none() {
+src/read.rs:2132:            ZipArchive::new(Cursor::new(include_bytes!("../tests/data/mimetype.zip"))).unwrap();
+src/read.rs:2135:        let mut file1 = reader1.by_index(0).unwrap();
+src/read.rs:2136:        let mut file2 = reader2.by_index(0).unwrap();
+src/read.rs:2138:        let t = file1.last_modified().unwrap();
+src/read.rs:2156:        file1.read_exact(&mut buf1).unwrap();
+src/read.rs:2157:        file2.read_exact(&mut buf2).unwrap();
+src/read.rs:2158:        file1.read_exact(&mut buf3).unwrap();
+src/read.rs:2159:        file2.read_exact(&mut buf4).unwrap();
+src/read.rs:2173:        .unwrap();
+src/read.rs:2176:            let zip_file = zip.by_index(i).unwrap();
+src/read.rs:2177:            let full_name = zip_file.enclosed_name().unwrap();
+src/read.rs:2178:            let file_name = full_name.file_name().unwrap().to_str().unwrap();
+src/read.rs:2198:            ZipArchive::new(Cursor::new(file)).unwrap();
+src/read.rs:2212:        assert!(reader.is_err() || reader.unwrap().is_empty());
+src/read.rs:2255:        .unwrap();
+src/read.rs:2257:        let mut file = reader.by_index(0).unwrap();
+src/read.rs:2258:        assert_eq!(file.read(&mut decompressed).unwrap(), 12);
+src/read.rs:2275:            ZipArchive::new(Cursor::new(include_bytes!("../tests/data/chinese.zip"))).unwrap();
+src/read.rs:2276:        reader.by_name("七个房间.txt").unwrap();
+src/read.rs:2282:            ZipArchive::new(Cursor::new(include_bytes!("../tests/data/linux-7z.zip"))).unwrap();
+src/read.rs:2283:        reader.by_name("你好.txt").unwrap();
+src/read.rs:2291:        .unwrap();
+src/read.rs:2292:        reader.by_name("你好.txt").unwrap();
+src/types.rs:141:    pub fn default_for_write() -> Self {
+src/types.rs:150:    pub fn default_for_write() -> Self {
+src/types.rs:293:    pub fn try_from_msdos(datepart: u16, timepart: u16) -> Result<DateTime, DateTimeRangeError> {
+src/types.rs:319:    pub fn from_date_and_time(
+src/types.rs:358:    pub fn is_valid(&self) -> bool {
+src/types.rs:367:    pub fn from_time(dt: OffsetDateTime) -> Result<DateTime, DateTimeRangeError> {
+src/types.rs:372:    pub const fn timepart(&self) -> u16 {
+src/types.rs:377:    pub const fn datepart(&self) -> u16 {
+src/types.rs:384:    pub fn to_time(&self) -> Result<OffsetDateTime, ComponentRange> {
+src/types.rs:389:    pub const fn year(&self) -> u16 {
+src/types.rs:398:    pub const fn month(&self) -> u8 {
+src/types.rs:407:    pub const fn day(&self) -> u8 {
+src/types.rs:416:    pub const fn hour(&self) -> u8 {
+src/types.rs:425:    pub const fn minute(&self) -> u8 {
+src/types.rs:434:    pub const fn second(&self) -> u8 {
+src/types.rs:550:    pub fn data_start(&self, reader: &mut (impl Read + Seek + Sized)) -> ZipResult<u64> {
+src/types.rs:558:    pub fn is_dir(&self) -> bool {
+src/types.rs:562:    pub fn file_name_sanitized(&self) -> PathBuf {
+src/types.rs:641:    pub fn version_needed(&self) -> u16 {
+src/types.rs:804:        let system: u8 = (version_made_by >> 8).try_into().unwrap();
+src/types.rs:871:            field.min(spec::ZIP64_BYTES_THR).try_into().unwrap()
+src/types.rs:902:            file_name_length: self.file_name_raw.len().try_into().unwrap(),
+src/types.rs:908:        let extra_field_len: u16 = self.extra_field_len().try_into().unwrap();
+src/types.rs:909:        let central_extra_field_len: u16 = self.central_extra_field_len().try_into().unwrap();
+src/types.rs:928:                .unwrap(),
+src/types.rs:933:                .unwrap(),
+src/types.rs:934:            file_name_length: self.file_name_raw.len().try_into().unwrap(),
+src/types.rs:938:            file_comment_length: self.file_comment.len().try_into().unwrap(),
+src/types.rs:946:                .unwrap(),
+src/types.rs:1132:    pub fn full_size(&self) -> usize {
+src/types.rs:1137:    pub fn serialize(self) -> Box<[u8]> {
+src/types.rs:1252:    pub const fn salt_length(&self) -> usize {
+src/types.rs:1257:    pub const fn key_length(&self) -> usize {
+src/types.rs:1329:        let dt = DateTime::from_date_and_time(2107, 12, 31, 23, 59, 58).unwrap();
+src/types.rs:1338:        let dt = DateTime::from_date_and_time(2018, 11, 17, 10, 38, 30).unwrap();
+src/types.rs:1341:            DateTime::from_date_and_time(2018, 11, 17, 10, 38, 30).unwrap()
+src/types.rs:1352:        let dt = DateTime::from_date_and_time(2018, 11, 17, 10, 38, 30).unwrap();
+src/types.rs:1354:            dt.cmp(&DateTime::from_date_and_time(2018, 11, 17, 10, 38, 30).unwrap()),
+src/types.rs:1358:        assert!(dt < DateTime::from_date_and_time(2019, 11, 17, 10, 38, 30).unwrap());
+src/types.rs:1359:        assert!(dt > DateTime::from_date_and_time(2017, 11, 17, 10, 38, 30).unwrap());
+src/types.rs:1361:        assert!(dt < DateTime::from_date_and_time(2018, 12, 17, 10, 38, 30).unwrap());
+src/types.rs:1362:        assert!(dt > DateTime::from_date_and_time(2018, 10, 17, 10, 38, 30).unwrap());
+src/types.rs:1364:        assert!(dt < DateTime::from_date_and_time(2018, 11, 18, 10, 38, 30).unwrap());
+src/types.rs:1365:        assert!(dt > DateTime::from_date_and_time(2018, 11, 16, 10, 38, 30).unwrap());
+src/types.rs:1367:        assert!(dt < DateTime::from_date_and_time(2018, 11, 17, 11, 38, 30).unwrap());
+src/types.rs:1368:        assert!(dt > DateTime::from_date_and_time(2018, 11, 17, 9, 38, 30).unwrap());
+src/types.rs:1370:        assert!(dt < DateTime::from_date_and_time(2018, 11, 17, 10, 39, 30).unwrap());
+src/types.rs:1371:        assert!(dt > DateTime::from_date_and_time(2018, 11, 17, 10, 37, 30).unwrap());
+src/types.rs:1373:        assert!(dt < DateTime::from_date_and_time(2018, 11, 17, 10, 38, 32).unwrap());
+src/types.rs:1375:            dt.cmp(&DateTime::from_date_and_time(2018, 11, 17, 10, 38, 31).unwrap()),
+src/types.rs:1378:        assert!(dt > DateTime::from_date_and_time(2018, 11, 17, 10, 38, 29).unwrap());
+src/types.rs:1379:        assert!(dt > DateTime::from_date_and_time(2018, 11, 17, 10, 38, 28).unwrap());
+src/types.rs:1390:                DateTime::from_date_and_time(2018, 11, 17, 10, 38, 30).unwrap()
+src/types.rs:1397:                DateTime::from_date_and_time(2107, 12, 31, 23, 59, 58).unwrap()
+src/types.rs:1458:        let dt = DateTime::try_from(datetime!(2018-11-17 10:38:30 UTC)).unwrap();
+src/types.rs:1475:        let dt = DateTime::try_from(datetime!(2018-11-17 10:38:30)).unwrap();
+src/types.rs:1512:            OffsetDateTime::try_from(DateTime::try_from_msdos(0x4D71, 0x54CF).unwrap()).unwrap();
+src/types.rs:1525:            PrimitiveDateTime::try_from(DateTime::try_from_msdos(0x4D71, 0x54CF).unwrap()).unwrap();
+src/types.rs:1573:        let dt = DateTime::try_from(civil::datetime(2018, 11, 17, 10, 38, 30, 0)).unwrap();
+src/types.rs:1611:            civil::DateTime::try_from(DateTime::try_from_msdos(0x4D71, 0x54CF).unwrap()).unwrap();
+src/types.rs:1639:        let dt = DateTime::try_from_msdos(0x4D71, 0x54CF).unwrap();
+src/types.rs:1647:        let dt = DateTime::try_from((0x4D71, 0x54CF)).unwrap();
+src/types.rs:1657:            dt.to_time().unwrap().format(&Rfc3339).unwrap(),
+src/types.rs:1697:        let clock = OffsetDateTime::from_unix_timestamp(1_577_836_800).unwrap();

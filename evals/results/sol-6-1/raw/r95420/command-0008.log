@@ -1,0 +1,726 @@
+crate/Cargo.toml
+crate/LICENSE-APACHE
+crate/.codecov.yml
+crate/CHANGELOG.md
+crate/MIGRATION-GUIDE.md
+crate/tests/runtime_tokio.rs
+crate/tests/runtime_actix_rt2.rs
+crate/tests/entry_api_actix_rt2.rs
+crate/tests/entry_api_sync.rs
+crate/tests/entry_api_tokio.rs
+crate/Cargo.lock
+crate/build.rs
+crate/.devcontainer/ensure-rust-toolchains-installed.sh
+crate/.devcontainer/devcontainer.json
+crate/.ci_extras/remove-examples-msrv.sh
+crate/.ci_extras/pin-crate-vers-nightly.sh
+crate/.ci_extras/pin-crate-vers-kani.sh
+crate/.ci_extras/build_linux_cross.rs
+crate/.ci_extras/pin-crate-vers-msrv.sh
+crate/NOTICE
+crate/README.md
+crate/.cargo/config.toml
+crate/.gitignore
+crate/examples/counter_sync.rs
+crate/examples/bounded_counter_async.rs
+crate/examples/basics_async.rs
+crate/examples/counter_async.rs
+crate/examples/basics_sync.rs
+crate/examples/append_value_async.rs
+crate/examples/bounded_counter_sync.rs
+crate/examples/README.md
+crate/examples/reinsert_expired_entries_sync.rs
+crate/examples/jittered_expiry_policy_sync.rs
+crate/examples/cascading_drop_async.rs
+crate/examples/try_append_value_sync.rs
+crate/examples/append_value_sync.rs
+crate/examples/try_append_value_async.rs
+crate/examples/size_aware_eviction_sync.rs
+crate/examples/eviction_listener_sync.rs
+crate/.github/FUNDING.yml
+crate/.vscode/settings.json
+crate/LICENSE-MIT
+crate/src/policy.rs
+crate/src/notification.rs
+crate/src/lib.rs
+crate/src/sync.rs
+crate/src/future.rs
+crate/src/ops.rs
+crate/src/cht.rs
+crate/src/common.rs
+//! Segmented lock-free hash tables.
+//!
+//! Segmented hash tables divide their entries between a number of smaller
+//! logical hash tables, or segments. Each segment is entirely independent from
+//! the others, and entries are never relocated across segment boundaries.
+//!
+//! In the context of this crate, a segment refers specifically to an array of
+//! bucket pointers. The number of segments in a hash table is rounded up to the
+//! nearest power of two; this is so that selecting the segment for a key is no
+//! more than a right shift to select the most significant bits of a hashed key.
+//!
+//! Each segment is entirely independent from the others, all operations can be
+//! performed concurrently by multiple threads. Should a set of threads be
+//! operating on disjoint sets of segments, the only synchronization between
+//! them will be destructive interference as they access and update the bucket
+//! array pointer and length for each segment.
+//!
+//! Compared to the unsegmented hash tables in this crate, the segmented hash
+//! tables have higher concurrent write throughput for disjoint sets of keys.
+//! However, the segmented hash tables have slightly lower read and
+//! single-threaded write throughput. This is because the segmenting structure
+//! adds another layer of indirection between the hash table and its buckets.
+//!
+//! The idea for segmenting hash tables was inspired by the
+//! [`ConcurrentHashMap`] from OpenJDK 7, which consists of a number of
+//! separately-locked segments. OpenJDK 8 introduced a striped concurrent hash
+//! map that stripes a set of bucket locks across the set of buckets using the
+//! least significant bits of hashed keys.
+//!
+//! [`ConcurrentHashMap`]: https://github.com/openjdk-mirror/jdk7u-jdk/blob/master/src/share/classes/java/util/concurrent/ConcurrentHashMap.java
+
+use crate::cht::map::{
+    bucket::{self, BucketArray},
+    bucket_array_ref::BucketArrayRef,
+    DefaultHashBuilder,
+};
+
+use super::iter::{Iter, ScanningGet};
+
+use std::{
+    hash::{BuildHasher, Hash},
+    ptr,
+    sync::atomic::{self, AtomicUsize, Ordering},
+};
+
+use crossbeam_epoch::Atomic;
+use equivalent::Equivalent;
+
+/// A lock-free hash map implemented with segmented bucket pointer arrays, open
+/// addressing, and linear probing.
+///
+/// By default, `Cache` uses a hashing algorithm selected to provide resistance
+/// against HashDoS attacks.
+///
+/// The default hashing algorithm is the one used by `std::collections::HashMap`,
+/// which is currently SipHash 1-3.
+///
+/// While its performance is very competitive for medium sized keys, other hashing
+/// algorithms will outperform it for small keys such as integers as well as large
+/// keys such as long strings. However those algorithms will typically not protect
+/// against attacks such as HashDoS.
+///
+/// The hashing algorithm can be replaced on a per-`HashMap` basis using the
+/// [`default`], [`with_hasher`], [`with_capacity_and_hasher`],
+/// [`with_num_segments_and_hasher`], and
+/// [`with_num_segments_capacity_and_hasher`] methods. Many alternative
+/// algorithms are available on crates.io, such as the [`AHash`] crate.
+///
+/// The number of segments can be specified on a per-`HashMap` basis using the
+/// [`with_num_segments`], [`with_num_segments_and_capacity`],
+/// [`with_num_segments_and_hasher`], and
+/// [`with_num_segments_capacity_and_hasher`] methods. By default, the
+/// `num-cpus` feature is enabled and [`new`], [`with_capacity`],
+/// [`with_hasher`], and [`with_capacity_and_hasher`] will create maps with
+/// twice as many segments as the system has CPUs.
+///
+/// It is required that the keys implement the [`Eq`] and [`Hash`] traits,
+/// although this can frequently be achieved by using
+/// `#[derive(PartialEq, Eq, Hash)]`. If you implement these yourself, it is
+/// important that the following property holds:
+///
+/// ```text
+/// k1 == k2 -> hash(k1) == hash(k2)
+/// ```
+///
+/// In other words, if two keys are equal, their hashes must be equal.
+///
+/// It is a logic error for a key to be modified in such a way that the key's
+/// hash, as determined by the [`Hash`] trait, or its equality, as determined by
+/// the [`Eq`] trait, changes while it is in the map. This is normally only
+/// possible through [`Cell`], [`RefCell`], global state, I/O, or unsafe code.
+///
+/// [`AHash`]: https://crates.io/crates/ahash
+/// [`default`]: #method.default
+/// [`with_hasher`]: #method.with_hasher
+/// [`with_capacity`]: #method.with_capacity
+/// [`with_capacity_and_hasher`]: #method.with_capacity_and_hasher
+/// [`with_num_segments_and_hasher`]: #method.with_num_segments_and_hasher
+/// [`with_num_segments_capacity_and_hasher`]: #method.with_num_segments_capacity_and_hasher
+/// [`with_num_segments`]: #method.with_num_segments
+/// [`with_num_segments_and_capacity`]: #method.with_num_segments_and_capacity
+/// [`new`]: #method.new
+/// [`Eq`]: https://doc.rust-lang.org/std/cmp/trait.Eq.html
+/// [`Hash`]: https://doc.rust-lang.org/std/hash/trait.Hash.html
+/// [`Cell`]: https://doc.rust-lang.org/std/cell/struct.Ref.html
+/// [`RefCell`]: https://doc.rust-lang.org/std/cell/struct.RefCell.html
+pub(crate) struct HashMap<K, V, S = DefaultHashBuilder> {
+    segments: Box<[Segment<K, V>]>,
+    build_hasher: S,
+    len: AtomicUsize,
+    segment_shift: u32,
+}
+
+#[cfg(test)]
+impl<K, V> HashMap<K, V, DefaultHashBuilder> {
+    /// Creates an empty `HashMap` with the specified capacity.
+    ///
+    /// The hash map will be able to hold at least `capacity` elements without
+    /// reallocating any bucket pointer arrays. If `capacity` is 0, the hash map
+    /// will not allocate any bucket pointer arrays. However, it will always
+    /// allocate memory for segment pointers and lengths.
+    ///
+    /// The `HashMap` will be created with at least twice as many segments as
+    /// the system has CPUs.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_num_segments_capacity_and_hasher(
+            default_num_segments(),
+            capacity,
+            DefaultHashBuilder::default(),
+        )
+    }
+}
+
+impl<K, V, S> HashMap<K, V, S> {
+    /// Creates an empty `HashMap` with the specified number of segments, using
+    /// `build_hasher` to hash the keys.
+    ///
+    /// The hash map is initially created with a capacity of 0, so it will not
+    /// allocate bucket pointer arrays until it is first inserted into. However,
+    /// it will always allocate memory for segment pointers and lengths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is 0.
+    pub(crate) fn with_num_segments_and_hasher(num_segments: usize, build_hasher: S) -> Self {
+        Self::with_num_segments_capacity_and_hasher(num_segments, 0, build_hasher)
+    }
+
+    /// Creates an empty `HashMap` with the specified number of segments and
+    /// capacity, using `build_hasher` to hash the keys.
+    ///
+    /// The hash map will be able to hold at least `capacity` elements without
+    /// reallocating any bucket pointer arrays. If `capacity` is 0, the hash map
+    /// will not allocate any bucket pointer arrays. However, it will always
+    /// allocate memory for segment pointers and lengths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is 0.
+    pub(crate) fn with_num_segments_capacity_and_hasher(
+        num_segments: usize,
+        capacity: usize,
+        build_hasher: S,
+    ) -> Self {
+        assert!(num_segments > 0);
+
+        let actual_num_segments = num_segments.next_power_of_two();
+        let segment_shift = 64 - actual_num_segments.trailing_zeros();
+
+        let mut segments = Vec::with_capacity(actual_num_segments);
+
+        if capacity == 0 {
+            unsafe {
+                ptr::write_bytes(segments.as_mut_ptr(), 0, actual_num_segments);
+                segments.set_len(actual_num_segments);
+            }
+        } else {
+            let actual_capacity = (capacity * 2 / actual_num_segments).next_power_of_two();
+
+            for _ in 0..actual_num_segments {
+                segments.push(Segment {
+                    bucket_array: Atomic::new(BucketArray::with_length(0, actual_capacity)),
+                    len: AtomicUsize::new(0),
+                });
+            }
+        }
+
+        let segments = segments.into_boxed_slice();
+
+        Self {
+            segments,
+            build_hasher,
+            len: AtomicUsize::new(0),
+            segment_shift,
+        }
+    }
+
+    pub(crate) fn actual_num_segments(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Returns the number of elements in the map.
+    ///
+    /// # Safety
+    ///
+    /// This method on its own is safe, but other threads can add or remove
+    /// elements at any time.
+    pub(crate) fn len(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
+    }
+
+    /// Returns `true` if the map contains no elements.
+    ///
+    /// # Safety
+    ///
+    /// This method on its own is safe, but other threads can add or remove
+    /// elements at any time.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the number of elements the map can hold without reallocating any
+    /// bucket pointer arrays.
+    ///
+    /// Note that all mutating operations except removal will result in a bucket
+    /// being allocated or reallocated.
+    ///
+    /// # Safety
+    ///
+    /// This method on its own is safe, but other threads can increase the
+    /// capacity of each segment at any time by adding elements.
+    #[cfg(any(test, feature = "unstable-debug-counters"))]
+    pub(crate) fn capacity(&self) -> usize {
+        let guard = &crossbeam_epoch::pin();
+
+        self.segments
+            .iter()
+            .map(|s| s.bucket_array.load_consume(guard))
+            .map(|p| unsafe { p.as_ref() })
+            .map(|a| a.map_or(0, BucketArray::capacity))
+            .sum::<usize>()
+    }
+
+    #[cfg(test)]
+    /// Returns the number of segments in the map.
+    pub(crate) fn num_segments(&self) -> usize {
+        self.segments.len()
+    }
+}
+
+use std::sync::atomic::{self, AtomicBool, AtomicU16, AtomicU32, Ordering};
+
+use super::{AccessTime, KeyHash};
+use crate::common::time::{AtomicInstant, Instant};
+
+#[derive(Debug)]
+pub(crate) struct EntryInfo<K> {
+    key_hash: KeyHash<K>,
+    /// `is_admitted` indicates that the entry has been admitted to the cache. When
+    /// `false`, it means the entry is _temporary_ admitted to the cache or evicted
+    /// from the cache (so it should not have LRU nodes).
+    is_admitted: AtomicBool,
+    /// `entry_gen` (entry generation) is incremented every time the entry is updated
+    /// in the concurrent hash table.
+    entry_gen: AtomicU16,
+    /// `policy_gen` (policy generation) is incremented every time entry's `WriteOp`
+    /// is applied to the cache policies including the access-order queue (the LRU
+    /// deque).
+    policy_gen: AtomicU16,
+    last_accessed: AtomicInstant,
+    last_modified: AtomicInstant,
+    expiration_time: AtomicInstant,
+    policy_weight: AtomicU32,
+}
+
+impl<K> EntryInfo<K> {
+    #[inline]
+    pub(crate) fn new(key_hash: KeyHash<K>, timestamp: Instant, policy_weight: u32) -> Self {
+        #[cfg(feature = "unstable-debug-counters")]
+        super::debug_counters::InternalGlobalDebugCounters::entry_info_created();
+
+        Self {
+            key_hash,
+            is_admitted: AtomicBool::default(),
+            // `entry_gen` starts at 1 and `policy_gen` start at 0.
+            entry_gen: AtomicU16::new(1),
+            policy_gen: AtomicU16::new(0),
+            last_accessed: AtomicInstant::new(timestamp),
+            last_modified: AtomicInstant::new(timestamp),
+            expiration_time: AtomicInstant::default(),
+            policy_weight: AtomicU32::new(policy_weight),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn key_hash(&self) -> &KeyHash<K> {
+        &self.key_hash
+    }
+
+    #[inline]
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.is_admitted.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(crate) fn set_admitted(&self, value: bool) {
+        self.is_admitted.store(value, Ordering::Release);
+    }
+
+    /// Returns `true` if the `ValueEntry` having this `EntryInfo` is dirty.
+    ///
+    /// Dirty means that the entry has been updated in the concurrent hash table but
+    /// not yet in the cache policies such as access-order queue.
+    #[inline]
+    pub(crate) fn is_dirty(&self) -> bool {
+        let result =
+            self.entry_gen.load(Ordering::Relaxed) != self.policy_gen.load(Ordering::Relaxed);
+        atomic::fence(Ordering::Acquire);
+        result
+    }
+
+    #[inline]
+    pub(crate) fn entry_gen(&self) -> u16 {
+        self.entry_gen.load(Ordering::Acquire)
+    }
+
+    /// Increments the entry generation and returns the new value.
+    #[inline]
+    pub(crate) fn incr_entry_gen(&self) -> u16 {
+        // NOTE: This operation wraps around on overflow.
+        let prev = self.entry_gen.fetch_add(1, Ordering::AcqRel);
+        // Need to add `1` to the previous value to get the current value.
+        prev.wrapping_add(1)
+    }
+
+    /// Sets the policy generation to the given value.
+    #[inline]
+    pub(crate) fn set_policy_gen(&self, value: u16) {
+        let g = &self.policy_gen;
+        loop {
+            let current = g.load(Ordering::Acquire);
+
+            // Do not set the given value if it is smaller than the current value of
+            // `policy_gen`. Note that the current value may have been wrapped
+            // around. If the value is much larger than the current value, it is
+            // likely that the value of `policy_gen` has been wrapped around.
+            if current >= value || value.wrapping_sub(current) > u16::MAX / 2 {
+                break;
+            }
+
+            // Try to set the value.
+            if g.compare_exchange_weak(current, value, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn policy_weight(&self) -> u32 {
+        self.policy_weight.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn set_policy_weight(&self, size: u32) {
+        self.policy_weight.store(size, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn expiration_time(&self) -> Option<Instant> {
+        self.expiration_time.instant()
+    }
+
+    pub(crate) fn set_expiration_time(&self, time: Option<Instant>) {
+        if let Some(t) = time {
+            self.expiration_time.set_instant(t);
+        } else {
+            self.expiration_time.clear();
+        }
+    }
+}
+
+#[cfg(feature = "unstable-debug-counters")]
+impl<K> Drop for EntryInfo<K> {
+    fn drop(&mut self) {
+        super::debug_counters::InternalGlobalDebugCounters::entry_info_dropped();
+    }
+}
+
+impl<K> AccessTime for EntryInfo<K> {
+    #[inline]
+    fn last_accessed(&self) -> Option<Instant> {
+        self.last_accessed.instant()
+    }
+
+    #[inline]
+    fn set_last_accessed(&self, timestamp: Instant) {
+        self.last_accessed.set_instant(timestamp);
+    }
+
+    #[inline]
+    fn last_modified(&self) -> Option<Instant> {
+        self.last_modified.instant()
+    }
+
+    #[inline]
+    fn set_last_modified(&self, timestamp: Instant) {
+        self.last_modified.set_instant(timestamp);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::EntryInfo;
+
+    // Run with:
+    //   RUSTFLAGS='--cfg rustver' cargo test --lib --features sync -- common::concurrent::entry_info::test --nocapture
+    //   RUSTFLAGS='--cfg rustver' cargo test --lib --no-default-features --features sync -- common::concurrent::entry_info::test --nocapture
+    //
+    // Note: the size of the struct may change in a future version of Rust.
+    #[cfg_attr(
+        not(all(rustver, any(target_os = "linux", target_os = "macos"))),
+        ignore
+    )]
+    #[test]
+    fn check_struct_size() {
+        use std::mem::size_of;
+
+        #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+        enum TargetArch {
+            Linux64,
+            Linux32X86,
+            Linux32Arm,
+            Linux32Mips,
+            MacOS64,
+        }
+
+        use TargetArch::*;
+
+        #[allow(clippy::option_env_unwrap)]
+        // e.g. "1.64"
+        let ver =
+            option_env!("RUSTC_SEMVER").expect("RUSTC_SEMVER env var was not set at compile time");
+        let arch = if cfg!(target_os = "linux") {
+            if cfg!(target_pointer_width = "64") {
+                Linux64
+            } else if cfg!(target_pointer_width = "32") {
+                if cfg!(target_arch = "x86") {
+                    Linux32X86
+                } else if cfg!(target_arch = "arm") {
+                    Linux32Arm
+                } else if cfg!(target_arch = "mips") {
+                    Linux32Mips
+                } else {
+                    unimplemented!();
+                }
+            } else {
+                unimplemented!();
+            }
+        } else if cfg!(target_os = "macos") {
+            MacOS64
+        } else {
+            panic!("Unsupported target architecture");
+        };
+
+        let expected_sizes = match arch {
+            Linux64 | Linux32Arm | Linux32Mips => vec![("1.51", 56)],
+            Linux32X86 => vec![("1.51", 48)],
+            MacOS64 => vec![("1.62", 56)],
+        };
+use super::{arc::MiniArc, KeyHashDate, ValueEntry};
+use crate::common::{
+    deque::{DeqNode, Deque},
+    CacheRegion,
+};
+
+use std::ptr::NonNull;
+use tagptr::TagNonNull;
+
+pub(crate) struct Deques<K> {
+    pub(crate) window: Deque<KeyHashDate<K>>, //    Not used yet.
+    pub(crate) probation: Deque<KeyHashDate<K>>,
+    pub(crate) protected: Deque<KeyHashDate<K>>, // Not used yet.
+    pub(crate) write_order: Deque<KeyHashDate<K>>,
+}
+
+#[cfg(feature = "future")]
+// TODO: https://github.com/moka-rs/moka/issues/54
+#[allow(clippy::non_send_fields_in_send_ty)]
+// Multi-threaded async runtimes require base_cache::Inner to be Send, but it will
+// not be without this `unsafe impl`. This is because DeqNodes have NonNull
+// pointers.
+unsafe impl<K> Send for Deques<K> {}
+
+impl<K> Default for Deques<K> {
+    fn default() -> Self {
+        Self {
+            window: Deque::new(CacheRegion::Window),
+            probation: Deque::new(CacheRegion::MainProbation),
+            protected: Deque::new(CacheRegion::MainProtected),
+            write_order: Deque::new(CacheRegion::Other),
+        }
+    }
+}
+
+impl<K> Deques<K> {
+    pub(crate) fn select_mut(
+        &mut self,
+        selector: CacheRegion,
+    ) -> (&mut Deque<KeyHashDate<K>>, &mut Deque<KeyHashDate<K>>) {
+        match selector {
+            CacheRegion::Window => (&mut self.window, &mut self.write_order),
+            CacheRegion::MainProbation => (&mut self.probation, &mut self.write_order),
+            CacheRegion::MainProtected => (&mut self.protected, &mut self.write_order),
+            CacheRegion::Other => unreachable!(),
+        }
+    }
+
+    pub(crate) fn push_back_ao<V>(
+        &mut self,
+        region: CacheRegion,
+        khd: KeyHashDate<K>,
+        entry: &MiniArc<ValueEntry<K, V>>,
+    ) {
+        let node = Box::new(DeqNode::new(khd));
+        let node = match region {
+            CacheRegion::Window => self.window.push_back(node),
+            CacheRegion::MainProbation => self.probation.push_back(node),
+            CacheRegion::MainProtected => self.protected.push_back(node),
+            CacheRegion::Other => unreachable!(),
+        };
+        let tagged_node = TagNonNull::compose(node, region as usize);
+        entry.set_access_order_q_node(Some(tagged_node));
+    }
+
+    pub(crate) fn push_back_wo<V>(
+        &mut self,
+        kd: KeyHashDate<K>,
+        entry: &MiniArc<ValueEntry<K, V>>,
+    ) {
+        let node = Box::new(DeqNode::new(kd));
+        let node = self.write_order.push_back(node);
+        entry.set_write_order_q_node(Some(node));
+    }
+
+    pub(crate) fn move_to_back_ao<V>(&mut self, entry: &MiniArc<ValueEntry<K, V>>) {
+        if let Some(tagged_node) = entry.access_order_q_node() {
+            let (node, tag) = tagged_node.decompose();
+            let p = unsafe { node.as_ref() };
+            match tag.into() {
+                CacheRegion::Window if self.window.contains(p) => {
+                    unsafe { self.window.move_to_back(node) };
+                }
+                CacheRegion::MainProbation if self.probation.contains(p) => {
+                    unsafe { self.probation.move_to_back(node) };
+                }
+                CacheRegion::MainProtected if self.protected.contains(p) => {
+                    unsafe { self.protected.move_to_back(node) };
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    pub(crate) fn move_to_back_ao_in_deque<V>(
+        deq_name: &str,
+        deq: &mut Deque<KeyHashDate<K>>,
+        entry: &MiniArc<ValueEntry<K, V>>,
+    ) {
+        if let Some(tagged_node) = entry.access_order_q_node() {
+            let (node, tag) = tagged_node.decompose();
+            let p = unsafe { node.as_ref() };
+            assert_eq!(
+                deq.region(),
+                tag,
+                "move_to_back_ao_in_deque - node is not a member of {deq_name} deque. {p:?}"
+            );
+            if deq.contains(p) {
+                unsafe { deq.move_to_back(node) };
+            }
+        }
+    }
+
+    pub(crate) fn move_to_back_wo<V>(&mut self, entry: &MiniArc<ValueEntry<K, V>>) {
+        if let Some(node) = entry.write_order_q_node() {
+            let p = unsafe { node.as_ref() };
+            if self.write_order.contains(p) {
+                unsafe { self.write_order.move_to_back(node) };
+            }
+        }
+    }
+
+    pub(crate) fn move_to_back_wo_in_deque<V>(
+        deq: &mut Deque<KeyHashDate<K>>,
+        entry: &MiniArc<ValueEntry<K, V>>,
+    ) {
+        if let Some(node) = entry.write_order_q_node() {
+            let p = unsafe { node.as_ref() };
+            if deq.contains(p) {
+                unsafe { deq.move_to_back(node) };
+            }
+        }
+    }
+
+    pub(crate) fn unlink_ao<V>(&mut self, entry: &MiniArc<ValueEntry<K, V>>) {
+        if let Some(node) = entry.take_access_order_q_node() {
+            self.unlink_node_ao(node);
+        }
+    }
+
+    pub(crate) fn unlink_ao_from_deque<V>(
+        deq_name: &str,
+        deq: &mut Deque<KeyHashDate<K>>,
+        entry: &MiniArc<ValueEntry<K, V>>,
+    ) {
+        if let Some(node) = entry.take_access_order_q_node() {
+            unsafe { Self::unlink_node_ao_from_deque(deq_name, deq, node) };
+        }
+    }
+
+    pub(crate) fn unlink_wo<V>(deq: &mut Deque<KeyHashDate<K>>, entry: &MiniArc<ValueEntry<K, V>>) {
+        if let Some(node) = entry.take_write_order_q_node() {
+            Self::unlink_node_wo(deq, node);
+        }
+    }
+
+    pub(crate) fn unlink_node_ao(&mut self, tagged_node: TagNonNull<DeqNode<KeyHashDate<K>>, 2>) {
+        unsafe {
+            match tagged_node.decompose_tag().into() {
+                CacheRegion::Window => {
+                    Self::unlink_node_ao_from_deque("window", &mut self.window, tagged_node);
+                }
+                CacheRegion::MainProbation => {
+                    Self::unlink_node_ao_from_deque("probation", &mut self.probation, tagged_node);
+                }
+                CacheRegion::MainProtected => {
+                    Self::unlink_node_ao_from_deque("protected", &mut self.protected, tagged_node);
+                }
+                CacheRegion::Other => unreachable!(),
+            }
+        }
+    }
+
+    unsafe fn unlink_node_ao_from_deque(
+        deq_name: &str,
+        deq: &mut Deque<KeyHashDate<K>>,
+        tagged_node: TagNonNull<DeqNode<KeyHashDate<K>>, 2>,
+    ) {
+        let (node, tag) = tagged_node.decompose();
+        let p = node.as_ref();
+        assert_eq!(
+            deq.region(),
+            tag,
+            "unlink_node - node is not a member of {deq_name} deque. {p:?}"
+        );
+        if deq.contains(p) {
+            // https://github.com/moka-rs/moka/issues/64
+            deq.unlink_and_drop(node);
+        }
+    }
+
+    pub(crate) fn unlink_node_wo(
+        deq: &mut Deque<KeyHashDate<K>>,
+        node: NonNull<DeqNode<KeyHashDate<K>>>,
+    ) {
+        unsafe {
+            let p = node.as_ref();
+            if deq.contains(p) {
+                // https://github.com/moka-rs/moka/issues/64
+                deq.unlink_and_drop(node);
+            }
+        }
+    }
+}
+
+// TODO: Add tests and run Miri with them.

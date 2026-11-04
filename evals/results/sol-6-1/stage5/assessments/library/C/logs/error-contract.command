@@ -1,0 +1,1 @@
+env RUSTUP_AUTO_INSTALL=0 CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/work/tmp/C-candidate-target python3 /work/prepared/hidden/run.py --crate /work/candidates/C --run-dir /work/tmp/C-error-contract-jb6ck2gc --error-adapter /work/results/C/error_adapter.rs

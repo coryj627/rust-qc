@@ -1,0 +1,529 @@
+name: Clippy lints and Rustfmt
+
+on:
+  push:
+    paths-ignore:
+    - '.devcontainer/**'
+    - '.gitpod.yml'
+    - '.vscode/**'
+  schedule:
+    # Run against the last commit on the default branch on Friday at 7pm (UTC?)
+    - cron:  '0 19 * * 5'
+
+jobs:
+  pre_job:
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+    steps:
+      - id: skip_check
+        # https://github.com/marketplace/actions/skip-duplicate-actions
+        uses: fkirc/skip-duplicate-actions@v5
+        with:
+          concurrent_skipping: 'same_content'
+          do_not_skip: '["pull_request", "workflow_dispatch", "schedule"]'
+
+  test:
+    needs: pre_job
+    if: needs.pre_job.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      # Continue running other jobs in the matrix even if one fails.
+      fail-fast: false
+      matrix:
+        rust:
+          - toolchain: stable
+          - toolchain: beta
+            rustflags: '--cfg beta_clippy'
+
+    steps:
+      - name: Checkout Moka
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust.toolchain }}
+          components: rustfmt, clippy
+
+      - name: Run Clippy
+        run: cargo clippy --lib --tests --all-features --all-targets -- -D warnings
+        env:
+          RUSTFLAGS: ${{ matrix.rust.rustflags }}
+
+      - name: Run Rustfmt
+        if: ${{ matrix.rust.toolchain == 'stable' }}
+        run: cargo fmt --all -- --check
+name: CI
+
+on:
+  push:
+    paths-ignore:
+    - '.devcontainer/**'
+    - '.gitpod.yml'
+    - '.vscode/**'
+  pull_request:
+    paths-ignore:
+    - '.devcontainer/**'
+    - '.gitpod.yml'
+    - '.vscode/**'
+  schedule:
+    # Run against the last commit on the default branch on Friday at 8pm (UTC?)
+    - cron: '0 20 * * 5'
+
+jobs:
+  pre_job:
+    runs-on: ubuntu-latest
+    outputs:
+      should_skip: ${{ steps.skip_check.outputs.should_skip }}
+    steps:
+      - id: skip_check
+        # https://github.com/marketplace/actions/skip-duplicate-actions
+        uses: fkirc/skip-duplicate-actions@v5
+        with:
+          concurrent_skipping: 'same_content'
+          do_not_skip: '["pull_request", "workflow_dispatch", "schedule"]'
+
+  test:
+    needs: pre_job
+    if: needs.pre_job.outputs.should_skip != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      # Continue running other jobs in the matrix even if one fails.
+      fail-fast: false
+      matrix:
+        rust:
+          - stable
+          - beta
+          - 1.70.0  # MSRV
+          - nightly # For checking minimum version dependencies.
+
+    steps:
+      - name: Checkout Moka
+        uses: actions/checkout@v4
+
+      # https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners#standard-github-hosted-runners-for-public-repositories
+      # x86_64, 4 vCPUs, 16 GB RAM
+      - name: Show CPU into
+        run: |
+          echo "nproc: $(nproc)"
+          free -m
+          lscpu
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - name: Downgrade dependencies to minimal versions (Nightly only)
+        if: ${{ matrix.rust == 'nightly' }}
+        run: cargo update -Z minimal-versions
+
+      - name: Pin some dependencies to specific versions (Nightly only)
+        if: ${{ matrix.rust == 'nightly' }}
+        run: ./.ci_extras/pin-crate-vers-nightly.sh
+
+      - name: Pin some dependencies to specific versions (MSRV only)
+        if: ${{ matrix.rust == '1.70.0' }}
+        run: ./.ci_extras/pin-crate-vers-msrv.sh
+
+      - name: Remove some examples (MSRV only)
+        if: ${{ matrix.rust == '1.70.0' }}
+        run: ./.ci_extras/remove-examples-msrv.sh
+
+      - name: Show cargo tree
+        run: cargo tree --features 'sync, future'
+
+      - name: Run tests (debug, sync feature)
+        run: cargo test --features sync
+        env:
+          RUSTFLAGS: '--cfg rustver'
+
+      - name: Run tests (release, sync feature)
+        run: cargo test --release --features sync
+        env:
+          RUSTFLAGS: '--cfg rustver'
+
+      - name: Run tests (sync feature, key lock test for notification)
+        run: cargo test --release --lib --features sync sync::cache::tests::test_key_lock_used_by_immediate_removal_notifications -- --exact --ignored
+
+      - name: Run tests (sync feature, drop value after eviction for sync::Cache)
+        run: cargo test --release --lib --features sync sync::cache::tests::drop_value_immediately_after_eviction -- --exact --ignored
+
+      - name: Run tests (sync feature, drop value after eviction for sync::SegmentedCache)
+        run: cargo test --release --lib --features sync sync::segment::tests::drop_value_immediately_after_eviction -- --exact --ignored
+
+      - name: Run tests (sync feature, drop cache)
+        run: cargo test --release --lib --features sync sync::cache::tests::ensure_gc_runs_when_dropping_cache -- --exact --ignored
+
+      - name: Run tests (future feature, but no sync feature)
+        run: cargo test --features future
+
+      - name: Run tests (release, future feature, but no sync feature)
+        run: cargo test --release --features future
+
+      - name: Run tests (future, sync and logging features)
+        run: cargo test --features 'future, sync, logging'
+use equivalent::Equivalent;
+
+use super::{cache::Cache, CacheBuilder, OwnedKeyEntrySelector, RefKeyEntrySelector};
+use crate::common::concurrent::Weigher;
+use crate::common::time::Clock;
+use crate::{
+    common::{
+        iter::{Iter, ScanningGet},
+        HousekeeperConfig,
+    },
+    notification::EvictionListener,
+    policy::{EvictionPolicy, ExpirationPolicy},
+    Entry, Policy, PredicateError,
+};
+
+use std::{
+    collections::hash_map::RandomState,
+    fmt,
+    hash::{BuildHasher, Hash, Hasher},
+    sync::Arc,
+};
+
+/// A thread-safe concurrent in-memory cache, with multiple internal segments.
+///
+/// `SegmentedCache` has multiple internal [`Cache`][cache-struct] instances for
+/// increased concurrent update performance. However, it has little overheads on
+/// retrievals and updates for managing these segments.
+///
+/// For usage examples, see the document of the [`Cache`][cache-struct].
+///
+/// [cache-struct]: ./struct.Cache.html
+///
+pub struct SegmentedCache<K, V, S = RandomState> {
+    inner: Arc<Inner<K, V, S>>,
+}
+
+unsafe impl<K, V, S> Send for SegmentedCache<K, V, S>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+    S: Send,
+{
+}
+
+unsafe impl<K, V, S> Sync for SegmentedCache<K, V, S>
+where
+    K: Send + Sync,
+    V: Send + Sync,
+    S: Sync,
+{
+}
+
+impl<K, V, S> Clone for SegmentedCache<K, V, S> {
+    /// Makes a clone of this shared cache.
+    ///
+    /// This operation is cheap as it only creates thread-safe reference counted
+    /// pointers to the shared internal data structures.
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<K, V, S> fmt::Debug for SegmentedCache<K, V, S>
+where
+    K: fmt::Debug + Eq + Hash + Send + Sync + 'static,
+    V: fmt::Debug + Clone + Send + Sync + 'static,
+    // TODO: Remove these bounds from S.
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut d_map = f.debug_map();
+
+        for (k, v) in self {
+            d_map.entry(&k, &v);
+        }
+
+        d_map.finish()
+    }
+}
+
+impl<K, V> SegmentedCache<K, V, RandomState>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    /// Constructs a new `SegmentedCache<K, V>` that has multiple internal
+    /// segments and will store up to the `max_capacity`.
+    ///
+    /// To adjust various configuration knobs such as `initial_capacity` or
+    /// `time_to_live`, use the [`CacheBuilder`][builder-struct].
+    ///
+    /// [builder-struct]: ./struct.CacheBuilder.html
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is 0.
+    pub fn new(max_capacity: u64, num_segments: usize) -> Self {
+        let build_hasher = RandomState::default();
+        Self::with_everything(
+            None,
+            Some(max_capacity),
+            None,
+            num_segments,
+            build_hasher,
+            None,
+            EvictionPolicy::default(),
+            None,
+            ExpirationPolicy::default(),
+            HousekeeperConfig::default(),
+            false,
+            Clock::default(),
+        )
+    }
+
+    /// Returns a [`CacheBuilder`][builder-struct], which can builds a
+    /// `SegmentedCache` with various configuration knobs.
+    ///
+    /// [builder-struct]: ./struct.CacheBuilder.html
+    pub fn builder(num_segments: usize) -> CacheBuilder<K, V, SegmentedCache<K, V, RandomState>> {
+        CacheBuilder::default().segments(num_segments)
+    }
+}
+
+impl<K, V, S> SegmentedCache<K, V, S> {
+    /// Returns cache’s name.
+    pub fn name(&self) -> Option<&str> {
+        self.inner.segments[0].name()
+    }
+
+    /// Returns a read-only cache policy of this cache.
+    ///
+    /// At this time, cache policy cannot be modified after cache creation.
+    /// A future version may support to modify it.
+    pub fn policy(&self) -> Policy {
+        let mut policy = self.inner.segments[0].policy();
+        policy.set_max_capacity(self.inner.desired_capacity);
+        policy.set_num_segments(self.inner.segments.len());
+        policy
+    }
+
+    /// Returns an approximate number of entries in this cache.
+    ///
+    /// The value returned is _an estimate_; the actual count may differ if there are
+    /// concurrent insertions or removals, or if some entries are pending removal due
+    /// to expiration. This inaccuracy can be mitigated by performing a
+    /// `run_pending_tasks` first.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use moka::sync::SegmentedCache;
+    ///
+    /// let cache = SegmentedCache::new(10, 4);
+    /// cache.insert('n', "Netherland Dwarf");
+    /// cache.insert('l', "Lop Eared");
+    /// cache.insert('d', "Dutch");
+    ///
+    /// // Ensure an entry exists.
+    /// assert!(cache.contains_key(&'n'));
+    ///
+    /// // However, followings may print stale number zeros instead of threes.
+    /// println!("{}", cache.entry_count());   // -> 0
+    /// println!("{}", cache.weighted_size()); // -> 0
+    ///
+    /// // To mitigate the inaccuracy, call `run_pending_tasks` method to run
+    /// // pending internal tasks.
+    /// cache.run_pending_tasks();
+    ///
+    /// // Followings will print the actual numbers.
+    /// println!("{}", cache.entry_count());   // -> 3
+    /// println!("{}", cache.weighted_size()); // -> 3
+    /// ```
+    ///
+    pub fn entry_count(&self) -> u64 {
+        self.inner
+            .segments
+            .iter()
+            .map(|seg| seg.entry_count())
+            .sum()
+    }
+
+    /// Returns an approximate total weighted size of entries in this cache.
+    ///
+    /// The value returned is _an estimate_; the actual size may differ if there are
+    /// concurrent insertions or removals, or if some entries are pending removal due
+    /// to expiration. This inaccuracy can be mitigated by performing a
+    /// `run_pending_tasks` first. See [`entry_count`](#method.entry_count) for a
+    /// sample code.
+    pub fn weighted_size(&self) -> u64 {
+        self.inner
+            .segments
+            .iter()
+            .map(|seg| seg.weighted_size())
+            .sum()
+    }
+}
+
+impl<K, V, S> SegmentedCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is 0.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_everything(
+        name: Option<String>,
+        max_capacity: Option<u64>,
+        initial_capacity: Option<usize>,
+        num_segments: usize,
+        build_hasher: S,
+        weigher: Option<Weigher<K, V>>,
+        eviction_policy: EvictionPolicy,
+        eviction_listener: Option<EvictionListener<K, V>>,
+        expiration_policy: ExpirationPolicy<K, V>,
+        housekeeper_config: HousekeeperConfig,
+        invalidator_enabled: bool,
+        clock: Clock,
+    ) -> Self {
+        Self {
+            inner: Arc::new(Inner::new(
+                name,
+                max_capacity,
+                initial_capacity,
+                num_segments,
+                build_hasher,
+                weigher,
+                eviction_policy,
+                eviction_listener,
+                expiration_policy,
+                housekeeper_config,
+                invalidator_enabled,
+                clock,
+            )),
+        }
+    }
+
+    /// Returns `true` if the cache contains a value for the key.
+    ///
+    /// Unlike the `get` method, this method is not considered a cache read operation,
+    /// so it does not update the historic popularity estimator or reset the idle
+    /// timer for the key.
+    ///
+    /// The key may be any borrowed form of the cache's key type, but `Hash` and `Eq`
+    /// on the borrowed form _must_ match those for the key type.
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+use std::time::Duration;
+
+pub(crate) const MAX_NANOS: u64 = u64::MAX - 1;
+
+/// `Instant` represents a point in time since the `Clock` was created. It has
+/// nanosecond precision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Instant {
+    elapsed_ns: u64,
+}
+
+impl Instant {
+    pub(crate) fn from_nanos(nanos: u64) -> Instant {
+        debug_assert!(nanos <= MAX_NANOS);
+        Instant { elapsed_ns: nanos }
+    }
+
+    pub(crate) fn from_duration_since_clock_start(duration: Duration) -> Instant {
+        Instant::from_nanos(Self::duration_to_saturating_nanoseconds(duration))
+    }
+
+    pub(crate) fn as_nanos(&self) -> u64 {
+        self.elapsed_ns
+    }
+
+    /// Converts a `std::time::Duration` to nanoseconds, saturating to
+    /// `MAX_NANOSECONDS` (`u64::MAX - 1`) if the duration is too large.
+    /// (`Duration::as_nanos` returns `u128`)
+    ///
+    /// Note that `u64::MAX - 1` is used here instead of `u64::MAX` because
+    /// `u64::MAX` is used by `moka`'s `AtomicTime` to indicate the time is unset.
+    pub(crate) fn duration_to_saturating_nanoseconds(duration: Duration) -> u64 {
+        u64::try_from(duration.as_nanos())
+            .map(|n| n.min(MAX_NANOS))
+            .unwrap_or(MAX_NANOS)
+    }
+
+    pub(crate) fn saturating_add(&self, duration: Duration) -> Instant {
+        let dur_ms = Self::duration_to_saturating_nanoseconds(duration);
+        Instant::from_nanos(self.elapsed_ns.saturating_add(dur_ms).min(MAX_NANOS))
+    }
+
+    pub(crate) fn saturating_duration_since(&self, earlier: Self) -> Duration
+    where
+        Self: Sized,
+    {
+        Duration::from_nanos(self.elapsed_ns.saturating_sub(earlier.elapsed_ns))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_saturating_add() {
+        let instant = Instant::from_nanos(100_000);
+        let duration = Duration::from_nanos(50_000);
+        let result = instant.saturating_add(duration);
+        assert_eq!(result, Instant::from_nanos(150_000));
+
+        let instant = Instant::from_nanos(u64::MAX - 10_000);
+        let duration = Duration::from_nanos(12_000);
+        let result = instant.saturating_add(duration);
+        assert_eq!(result, Instant::from_nanos(u64::MAX - 1));
+    }
+
+    #[test]
+    fn test_saturating_duration_since() {
+        let instant = Instant::from_nanos(100_000);
+        let earlier = Instant::from_nanos(60_000);
+        let result = instant.saturating_duration_since(earlier);
+        assert_eq!(result, Duration::from_nanos(40_000));
+
+        let instant = Instant::from_nanos(60_000);
+        let earlier = Instant::from_nanos(100_000);
+        let result = instant.saturating_duration_since(earlier);
+        assert_eq!(result, Duration::ZERO);
+    }
+}
+     89 src/cht/iter.rs
+     10 src/cht/map.rs
+   1797 src/cht/segment.rs
+    114 src/cht/test_util.rs
+     16 src/common/builder_utils.rs
+    386 src/common/concurrent.rs
+    783 src/common/deque.rs
+     92 src/common/entry.rs
+     31 src/common/error.rs
+    401 src/common/frequency_sketch.rs
+    149 src/common/iter.rs
+     81 src/common/test_utils.rs
+     10 src/common/time.rs
+    802 src/common/timer_wheel.rs
+   3535 src/future/base_cache.rs
+    489 src/future/builder.rs
+   5761 src/future/cache.rs
+   1318 src/future/entry_selector.rs
+    215 src/future/housekeeper.rs
+    391 src/future/invalidator.rs
+     94 src/future/key_lock.rs
+     78 src/future/notifier.rs
+    667 src/future/value_initializer.rs
+     64 src/notification/notifier.rs
+   3294 src/sync/base_cache.rs
+    618 src/sync/builder.rs
+   5132 src/sync/cache.rs
+   1097 src/sync/entry_selector.rs
+    385 src/sync/invalidator.rs
+     94 src/sync/key_lock.rs
+   2005 src/sync/segment.rs
+    390 src/sync/value_initializer.rs
+  30388 total

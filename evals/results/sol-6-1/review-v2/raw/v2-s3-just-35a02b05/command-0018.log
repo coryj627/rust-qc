@@ -1,0 +1,846 @@
+use super::*;
+
+#[derive(Debug)]
+pub(crate) struct Source<'src> {
+  pub(crate) file_depth: u32,
+  pub(crate) file_path: Vec<PathBuf>,
+  pub(crate) import_offsets: Vec<usize>,
+  pub(crate) namepath: Option<Namepath<'src>>,
+  pub(crate) path: PathBuf,
+  pub(crate) working_directory: PathBuf,
+}
+
+impl<'src> Source<'src> {
+  pub(crate) fn root(path: &Path) -> Self {
+    Self {
+      file_depth: 0,
+      file_path: vec![path.into()],
+      import_offsets: Vec::new(),
+      namepath: None,
+      path: path.into(),
+      working_directory: path.parent().unwrap().into(),
+    }
+  }
+
+  pub(crate) fn import(&self, path: PathBuf, import_offset: usize) -> Self {
+    Self {
+      file_depth: self.file_depth + 1,
+      file_path: self
+        .file_path
+        .clone()
+        .into_iter()
+        .chain(iter::once(path.clone()))
+        .collect(),
+      import_offsets: self
+        .import_offsets
+        .iter()
+        .copied()
+        .chain(iter::once(import_offset))
+        .collect(),
+      namepath: self.namepath.clone(),
+      path,
+      working_directory: self.working_directory.clone(),
+    }
+  }
+
+  pub(crate) fn module(&self, name: Name<'src>, path: PathBuf) -> Self {
+    Self {
+      file_depth: self.file_depth + 1,
+      file_path: self
+        .file_path
+        .clone()
+        .into_iter()
+        .chain(iter::once(path.clone()))
+        .collect(),
+      import_offsets: Vec::new(),
+      namepath: Some(
+        self
+          .namepath
+          .as_ref()
+          .map_or_else(|| name.into(), |namepath| namepath.join(name)),
+      ),
+      path: path.clone(),
+      working_directory: path.parent().unwrap().into(),
+    }
+  }
+}
+use super::*;
+
+pub(crate) struct Loader {
+  paths: Arena<PathBuf>,
+  srcs: Arena<String>,
+}
+
+impl Loader {
+  pub(crate) fn new() -> Self {
+    Self {
+      srcs: Arena::new(),
+      paths: Arena::new(),
+    }
+  }
+
+  pub(crate) fn load<'src>(
+    &'src self,
+    config: &Config,
+    root: &Path,
+    path: &Path,
+  ) -> RunResult<'src, (&'src Path, &'src str)> {
+    Config::warn_non_unicode_path(config.color, "justfile", path);
+
+    let src = fs::read_to_string(path).map_err(|io_error| Error::Load {
+      path: path.into(),
+      io_error,
+    })?;
+
+    let relative = path.strip_prefix(root.parent().unwrap()).unwrap_or(path);
+
+    Ok((self.paths.alloc(relative.into()), self.srcs.alloc(src)))
+  }
+}
+use super::*;
+
+pub(crate) fn which(context: function::Context, name: &str) -> Result<Option<String>, String> {
+  let name = Path::new(name);
+
+  let paths = match name.components().count() {
+    0 => return Err("empty command".into()),
+    1 => {
+      // cmd is a regular command
+      env::split_paths(&env::var_os("PATH").ok_or("`PATH` environment variable not set")?)
+        .map(|path| path.join(name))
+        .collect()
+    }
+    _ => {
+      // cmd contains a path separator, treat it as a path
+      vec![name.into()]
+    }
+  };
+
+  for mut path in paths {
+    if path.is_relative() {
+      // This candidate is a relative path, either because the user invoked `which("rel/path")`,
+      // or because there was a relative path in `PATH`. Resolve it to an absolute path,
+      // relative to the working directory of the just invocation.
+      path = context.execution_context.working_directory().join(path);
+    }
+
+    path = path.lexiclean();
+
+    let mut candidates = vec![path.clone()];
+
+    if cfg!(windows) && path.extension().is_none() {
+      if let Some(pathext) = env::var_os("PATHEXT") {
+        let pathext = pathext.to_str().ok_or_else(|| {
+          format!(
+            "`PATHEXT` environment variable is not valid unicode: {}",
+            pathext.to_string_lossy(),
+          )
+        })?;
+
+        for extension in pathext.split(';') {
+          let extension = extension
+            .strip_prefix('.')
+            .ok_or_else(|| format!("`PATHEXT` entry `{extension}` does not start with `.`"))?;
+          candidates.push(path.with_extension(extension));
+        }
+      }
+    }
+
+    for candidate in candidates {
+      if is_executable::is_executable(&candidate) {
+        return candidate
+          .to_str()
+          .map(|candidate| Some(candidate.into()))
+          .ok_or_else(|| {
+            format!(
+              "Executable path is not valid unicode: {}",
+              candidate.display()
+            )
+          });
+      }
+    }
+  }
+
+  Ok(None)
+}
+use {super::*, std::path::Component};
+
+const DEFAULT_JUSTFILE_NAME: &str = JUSTFILE_NAMES[0];
+pub(crate) const JUSTFILE_NAMES: [&str; 2] = ["justfile", ".justfile"];
+const PROJECT_ROOT_CHILDREN: &[&str] = &[".bzr", ".git", ".hg", ".svn", "_darcs"];
+
+#[derive(Debug)]
+pub(crate) struct Search {
+  pub(crate) justfile: PathBuf,
+  pub(crate) working_directory: PathBuf,
+}
+
+impl Search {
+  fn global_justfile_paths() -> Vec<(PathBuf, &'static str)> {
+    let mut paths = Vec::new();
+
+    if let Some(config_dir) = dirs::config_dir() {
+      paths.push((config_dir.join("just"), DEFAULT_JUSTFILE_NAME));
+    }
+
+    if let Some(home_dir) = dirs::home_dir() {
+      paths.push((home_dir.join(".config").join("just"), DEFAULT_JUSTFILE_NAME));
+
+      for justfile_name in JUSTFILE_NAMES {
+        paths.push((home_dir.clone(), justfile_name));
+      }
+    }
+
+    paths
+  }
+
+  /// Find justfile given search configuration and invocation directory
+  pub(crate) fn search(config: &Config) -> SearchResult<Self> {
+    match &config.search_config {
+      SearchConfig::FromInvocationDirectory => {
+        Self::find_in_directory(config, &config.invocation_directory)
+      }
+      SearchConfig::FromSearchDirectory { search_directory } => {
+        let search_directory = Self::clean(&config.invocation_directory, search_directory);
+        let justfile = Self::justfile(config, &search_directory)?;
+        let working_directory = Self::working_directory_from_justfile(&justfile)?;
+        Ok(Self {
+          justfile,
+          working_directory,
+        })
+      }
+      SearchConfig::GlobalJustfile => Ok(Self {
+        justfile: Self::find_global_justfile()?,
+        working_directory: Self::project_root(config, &config.invocation_directory)?,
+      }),
+      SearchConfig::WithJustfile { justfile } => {
+        let justfile = Self::clean(&config.invocation_directory, justfile);
+        let working_directory = Self::working_directory_from_justfile(&justfile)?;
+        Ok(Self {
+          justfile,
+          working_directory,
+        })
+      }
+      SearchConfig::WithJustfileAndWorkingDirectory {
+        justfile,
+        working_directory,
+      } => Ok(Self {
+        justfile: Self::clean(&config.invocation_directory, justfile),
+        working_directory: Self::clean(&config.invocation_directory, working_directory),
+      }),
+    }
+  }
+
+  fn find_global_justfile() -> SearchResult<PathBuf> {
+    for (directory, filename) in Self::global_justfile_paths() {
+      if let Ok(read_dir) = fs::read_dir(&directory) {
+        for entry in read_dir {
+          let entry = entry.map_err(|io_error| SearchError::Io {
+            io_error,
+            directory: directory.clone(),
+          })?;
+          if let Some(candidate) = entry.file_name().to_str() {
+            if candidate.eq_ignore_ascii_case(filename) {
+              return Ok(entry.path());
+            }
+          }
+        }
+      }
+    }
+
+    Err(SearchError::GlobalJustfileNotFound)
+  }
+
+  /// Find justfile starting from parent directory of current justfile
+  pub(crate) fn search_parent_directory(&self, config: &Config) -> SearchResult<Self> {
+    let parent = self
+      .justfile
+      .parent()
+      .and_then(|path| path.parent())
+      .ok_or_else(|| SearchError::JustfileHadNoParent {
+        path: self.justfile.clone(),
+      })?;
+    Self::find_in_directory(config, parent)
+  }
+
+  /// Find justfile starting in given directory searching upwards in directory tree
+  fn find_in_directory(config: &Config, starting_dir: &Path) -> SearchResult<Self> {
+    let justfile = Self::justfile(config, starting_dir)?;
+    let working_directory = Self::working_directory_from_justfile(&justfile)?;
+    Ok(Self {
+      justfile,
+      working_directory,
+    })
+  }
+
+  /// Get working directory and justfile path for newly-initialized justfile
+  pub(crate) fn init(config: &Config) -> SearchResult<Self> {
+    let default_justfile_name = || {
+      config
+        .justfile_names
+        .as_ref()
+        .and_then(|names| names.first().map(String::as_str))
+        .unwrap_or(DEFAULT_JUSTFILE_NAME)
+    };
+
+    match &config.search_config {
+      SearchConfig::FromInvocationDirectory => {
+        let working_directory = Self::project_root(config, &config.invocation_directory)?;
+        let justfile = working_directory.join(default_justfile_name());
+        Ok(Self {
+          justfile,
+          working_directory,
+        })
+      }
+      SearchConfig::FromSearchDirectory { search_directory } => {
+        let search_directory = Self::clean(&config.invocation_directory, search_directory);
+        let working_directory = Self::project_root(config, &search_directory)?;
+        let justfile = working_directory.join(default_justfile_name());
+        Ok(Self {
+          justfile,
+          working_directory,
+        })
+      }
+      SearchConfig::GlobalJustfile => Err(SearchError::GlobalJustfileInit),
+      SearchConfig::WithJustfile { justfile } => {
+        let justfile = Self::clean(&config.invocation_directory, justfile);
+        let working_directory = Self::working_directory_from_justfile(&justfile)?;
+        Ok(Self {
+          justfile,
+          working_directory,
+        })
+      }
+      SearchConfig::WithJustfileAndWorkingDirectory {
+        justfile,
+        working_directory,
+      } => Ok(Self {
+        justfile: Self::clean(&config.invocation_directory, justfile),
+        working_directory: Self::clean(&config.invocation_directory, working_directory),
+      }),
+    }
+  }
+
+  /// Search upwards from `directory` for a file whose name matches one of
+  /// `JUSTFILE_NAMES`
+  fn justfile(config: &Config, directory: &Path) -> SearchResult<PathBuf> {
+    for directory in directory.ancestors() {
+      let mut candidates = BTreeSet::new();
+
+      let entries = fs::read_dir(directory).map_err(|io_error| SearchError::Io {
+        io_error,
+        directory: directory.to_owned(),
+      })?;
+
+      for entry in entries {
+        let entry = entry.map_err(|io_error| SearchError::Io {
+          io_error,
+          directory: directory.to_owned(),
+        })?;
+        if let Some(name) = entry.file_name().to_str() {
+          let justfile_names: Box<dyn Iterator<Item = &str>> =
+            if let Some(justfile_names) = &config.justfile_names {
+              Box::new(justfile_names.iter().map(String::as_str))
+            } else {
+              Box::new(JUSTFILE_NAMES.into_iter())
+            };
+
+          for justfile_name in justfile_names {
+            if name.eq_ignore_ascii_case(justfile_name) {
+              candidates.insert(entry.path());
+            }
+          }
+        }
+      }
+
+      match candidates.len() {
+        0 => {}
+        1 => return Ok(candidates.into_iter().next().unwrap()),
+        _ => return Err(SearchError::MultipleCandidates { candidates }),
+      }
+
+      if let Some(ceiling) = &config.ceiling {
+        if directory == ceiling {
+          break;
+        }
+      }
+    }
+
+    Err(SearchError::NotFound)
+  }
+
+  fn clean(invocation_directory: &Path, path: &Path) -> PathBuf {
+    let path = invocation_directory.join(path);
+
+    let mut clean = Vec::new();
+
+    for component in path.components() {
+      if component == Component::ParentDir {
+        if let Some(Component::Normal(_)) = clean.last() {
+          clean.pop();
+        }
+      } else {
+        clean.push(component);
+      }
+    }
+
+    clean.into_iter().collect()
+  }
+
+  /// Search upwards from `directory` for the root directory of a software
+  /// project, as determined by the presence of one of the version control
+  /// system directories given in `PROJECT_ROOT_CHILDREN`
+  fn project_root(config: &Config, directory: &Path) -> SearchResult<PathBuf> {
+    for directory in directory.ancestors() {
+      let entries = fs::read_dir(directory).map_err(|io_error| SearchError::Io {
+        io_error,
+        directory: directory.to_owned(),
+      })?;
+
+      for entry in entries {
+        let entry = entry.map_err(|io_error| SearchError::Io {
+          io_error,
+          directory: directory.to_owned(),
+        })?;
+        for project_root_child in PROJECT_ROOT_CHILDREN.iter().copied() {
+          if entry.file_name() == project_root_child {
+            return Ok(directory.to_owned());
+          }
+        }
+      }
+
+      if let Some(ceiling) = &config.ceiling {
+        if directory == ceiling {
+          break;
+        }
+      }
+    }
+
+    Ok(directory.to_owned())
+  }
+
+  fn working_directory_from_justfile(justfile: &Path) -> SearchResult<PathBuf> {
+    Ok(
+      justfile
+        .parent()
+        .ok_or_else(|| SearchError::JustfileHadNoParent {
+          path: justfile.to_path_buf(),
+        })?
+        .to_owned(),
+    )
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn clean() {
+    let cases = &[
+      ("/", "foo", "/foo"),
+      ("/bar", "/foo", "/foo"),
+      if cfg!(windows) {
+        ("//foo", "bar//baz", "//foo\\bar\\baz")
+      } else {
+        ("/", "..", "/")
+      },
+      ("/", "/..", "/"),
+      ("/..", "", "/"),
+      ("/../../../..", "../../../", "/"),
+      ("/.", "./", "/"),
+      ("/foo/../", "bar", "/bar"),
+      ("/foo/bar", "..", "/foo"),
+      ("/foo/bar/", "..", "/foo"),
+    ];
+
+    for (prefix, suffix, want) in cases {
+      let have = Search::clean(Path::new(prefix), Path::new(suffix));
+      assert_eq!(have, Path::new(want));
+    }
+  }
+}
+use {super::*, clap_mangen::Man};
+
+pub const INIT_JUSTFILE: &str = "\
+# https://just.systems
+
+default:
+    echo 'Hello, world!'
+";
+
+static BACKTICK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new("(`.*?`)|(`[^`]*$)").unwrap());
+
+const CHOOSER_CANCELLED_EXIT_STATUS: i32 = 130;
+
+#[derive(PartialEq, Clone, Debug, IntoStaticStr)]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum Subcommand {
+  Changelog,
+  Choose {
+    chooser: Option<PathBuf>,
+  },
+  Command {
+    arguments: Vec<OsString>,
+    binary: OsString,
+  },
+  Completions {
+    shell: Shell,
+  },
+  Dump {
+    format: DumpFormat,
+  },
+  Edit,
+  Evaluate {
+    format: EvaluateFormat,
+    path: Modulepath,
+  },
+  Format,
+  Groups,
+  Init,
+  List {
+    path: Modulepath,
+  },
+  Man,
+  Request {
+    request: Request,
+  },
+  Run {
+    arguments: Vec<String>,
+  },
+  Show {
+    path: Modulepath,
+  },
+  Summary,
+  Usage {
+    path: Modulepath,
+  },
+  Variables,
+}
+
+impl Default for Subcommand {
+  fn default() -> Self {
+    Self::Run {
+      arguments: Vec::new(),
+    }
+  }
+}
+
+impl Subcommand {
+  pub(crate) fn execute<'src>(&self, config: &Config, loader: &'src Loader) -> RunResult<'src> {
+    use Subcommand::*;
+
+    match self {
+      Changelog => {
+        Self::changelog();
+        return Ok(());
+      }
+      Completions { shell } => {
+        Self::completions(*shell);
+        return Ok(());
+      }
+      Init => return Self::init(config),
+      Man => return Self::man(),
+      Request { request } => return Self::request(request),
+      _ => {}
+    }
+
+    let search = Search::search(config)?;
+
+    if matches!(self, Edit) {
+      return Self::edit(&search);
+    }
+
+    if matches!(self, Format) {
+      return Self::format(config, loader, &search);
+    }
+
+    let compilation = Self::compile(config, loader, &search)?;
+    let justfile = &compilation.justfile;
+
+    match self {
+      Choose { chooser } => {
+        Self::choose(
+          chooser.as_deref(),
+          config,
+          justfile,
+          &compilation.overrides,
+          &search,
+        )?;
+      }
+      Command { .. } | Evaluate { .. } => {
+        justfile.run(config, &search, &[], &compilation.overrides)?;
+      }
+      Dump { format } => Self::dump(config, compilation, *format)?,
+      Groups => Self::groups(config, justfile),
+      List { path } => Self::list(config, justfile, path)?,
+      Run { arguments } => Self::run(config, loader, search, compilation, arguments)?,
+      Show { path } => Self::show(config, justfile, path)?,
+      Summary => Self::summary(config, justfile),
+      Usage { path } => Self::usage(config, justfile, path)?,
+      Variables => Self::variables(justfile),
+      Changelog | Completions { .. } | Edit | Format | Init | Man | Request { .. } => {
+        unreachable!()
+      }
+    }
+
+    Ok(())
+  }
+
+  fn groups(config: &Config, justfile: &Justfile) {
+    println!("Recipe groups:");
+    for group in justfile.public_groups(config) {
+      println!("{}{group}", config.list_prefix);
+    }
+  }
+
+  pub(crate) fn name(&self) -> &'static str {
+    self.into()
+  }
+
+  fn run<'src>(
+    config: &Config,
+    loader: &'src Loader,
+    mut search: Search,
+    mut compilation: Compilation<'src>,
+    arguments: &[String],
+  ) -> RunResult<'src> {
+    let starting_parent = search.justfile.parent().as_ref().unwrap().lexiclean();
+
+    loop {
+      let justfile = &compilation.justfile;
+      let fallback = justfile.settings.fallback
+        && matches!(
+          config.search_config,
+          SearchConfig::FromInvocationDirectory | SearchConfig::FromSearchDirectory { .. }
+        );
+
+      let result = justfile.run(config, &search, arguments, &compilation.overrides);
+
+      if fallback {
+        if let Err(err @ (Error::UnknownRecipe { .. } | Error::UnknownSubmodule { .. })) = result {
+          search = search.search_parent_directory(config).map_err(|_| err)?;
+
+          if config.verbosity.loquacious() {
+            eprintln!(
+              "Trying {}",
+              starting_parent
+                .strip_prefix(search.justfile.parent().unwrap())
+                .unwrap()
+                .components()
+                .map(|_| path::Component::ParentDir)
+                .collect::<PathBuf>()
+                .join(search.justfile.file_name().unwrap())
+                .display()
+            );
+          }
+
+          compilation = Self::compile(config, loader, &search)?;
+
+          continue;
+        }
+      }
+
+      if config.allow_missing
+        && matches!(
+          result,
+          Err(Error::UnknownRecipe { .. } | Error::UnknownSubmodule { .. })
+        )
+      {
+        return Ok(());
+      }
+
+      return result;
+    }
+  }
+
+  fn compile<'src>(
+    config: &Config,
+    loader: &'src Loader,
+    search: &Search,
+  ) -> RunResult<'src, Compilation<'src>> {
+    let compilation = Compiler::compile(config, loader, &search.justfile)?;
+
+    compilation.justfile.check_unstable(config)?;
+
+    if config.verbosity.loud() {
+      for warning in &compilation.justfile.warnings {
+        eprintln!("{}", warning.color_display(config.color.stderr()));
+      }
+    }
+
+    Ok(compilation)
+  }
+
+  fn changelog() {
+    write!(io::stdout(), "{}", include_str!("../CHANGELOG.md")).ok();
+  }
+
+  fn choose<'src>(
+    chooser: Option<&Path>,
+    config: &Config,
+    justfile: &Justfile<'src>,
+    overrides: &HashMap<Number, String>,
+    search: &Search,
+  ) -> RunResult<'src> {
+    let groups = config.groups.iter().cloned().collect::<BTreeSet<String>>();
+    let mut recipes = Vec::<&Recipe>::new();
+    let mut stack = vec![justfile];
+    while let Some(module) = stack.pop() {
+      recipes.extend(module.public_recipes(config).iter().filter(|recipe| {
+        recipe.min_arguments() == 0
+          && (groups.is_empty() || groups.intersection(&recipe.groups()).next().is_some())
+      }));
+      stack.extend(module.modules.values());
+    }
+
+    if recipes.is_empty() {
+      return Err(Error::NoChoosableRecipes);
+    }
+
+    let chooser = if let Some(chooser) = chooser {
+      OsString::from(chooser)
+use super::*;
+
+pub(crate) struct Completer<'run, 'src> {
+  config: Config,
+  current: &'run str,
+  justfile: Justfile<'src>,
+}
+
+impl<'run, 'src> Completer<'run, 'src> {
+  fn candidate_recipes(&self) -> Vec<CompletionCandidate> {
+    let mut candidates = Vec::new();
+
+    for recipe in self.justfile.public_recipes_recursive(&self.config) {
+      let path = recipe.recipe_path().to_string();
+
+      if path.starts_with(self.current) {
+        candidates.push(CompletionCandidate::new(path).help(recipe.doc.as_ref().map(Into::into)));
+      }
+    }
+
+    if self.config.complete_aliases {
+      for (alias, modulepath) in self.justfile.public_aliases_recursive(&self.config) {
+        let name = modulepath.join(alias.name.lexeme());
+        if name.starts_with(self.current) {
+          candidates
+            .push(CompletionCandidate::new(name).help(alias.target.doc.as_ref().map(Into::into)));
+        }
+      }
+    }
+
+    candidates
+  }
+
+  pub(crate) fn complete_argument(current: &OsStr) -> Vec<CompletionCandidate> {
+    let loader = Loader::new();
+
+    let Some(completer) = Completer::new(current, &loader) else {
+      return Vec::new();
+    };
+
+    let mut candidates = completer.candidate_recipes();
+
+    for (name, binding) in &completer.justfile.assignments {
+      if !binding.private && name.starts_with(completer.current) {
+        candidates.push(CompletionCandidate::new(format!("{name}=")));
+      }
+    }
+
+    candidates.extend(PathCompleter::any().complete(current));
+
+    candidates
+  }
+
+  pub(crate) fn complete_group(current: &OsStr) -> Vec<CompletionCandidate> {
+    let loader = Loader::new();
+
+    let Some(completer) = Completer::new(current, &loader) else {
+      return Vec::new();
+    };
+
+    completer
+      .justfile
+      .public_groups(&completer.config)
+      .into_iter()
+      .filter(|group| group.starts_with(completer.current))
+      .map(CompletionCandidate::new)
+      .collect()
+  }
+
+  pub(crate) fn complete_recipe(current: &OsStr) -> Vec<CompletionCandidate> {
+    let loader = Loader::new();
+
+    let Some(completer) = Completer::new(current, &loader) else {
+      return Vec::new();
+    };
+
+    completer.candidate_recipes()
+  }
+
+  pub(crate) fn complete_variable(current: &OsStr) -> Vec<CompletionCandidate> {
+    let loader = Loader::new();
+
+    let Some(completer) = Completer::new(current, &loader) else {
+      return Vec::new();
+    };
+
+    completer
+      .justfile
+      .assignments
+      .into_iter()
+      .filter(|(name, binding)| !binding.private && name.starts_with(completer.current))
+      .map(|(name, _)| CompletionCandidate::new(name))
+      .collect()
+  }
+
+  fn config() -> Option<Config> {
+    let mut args = env::args_os().collect::<Vec<OsString>>();
+
+    args.drain(1..3);
+
+    let matches = Arguments::command()
+      .ignore_errors(true)
+      .try_get_matches_from(args)
+      .ok()?;
+
+    let arguments = Arguments::from_arg_matches(&matches).ok()?;
+
+    Config::from_arguments(arguments).ok()
+  }
+
+  fn new(current: &'run OsStr, loader: &'src Loader) -> Option<Self> {
+    Self::try_new(current.to_str()?, loader).ok()
+  }
+
+  fn try_new(current: &'run str, loader: &'src Loader) -> RunResult<'src, Self> {
+    let config = if let Some(config) = Self::config() {
+      config
+    } else {
+      Config::new()?
+    };
+
+    let search = Search::search(&config)?;
+
+    let compilation = Compiler::compile(&config, loader, &search.justfile)?;
+
+    Ok(Completer {
+      config,
+      current,
+      justfile: compilation.justfile,
+    })
+  }
+}
+tests/completions.rs:376:fn private_aliases_excluded() {
+tests/edit.rs:146:/// Test that editor working directory is the same as edited justfile
+tests/list.rs:295:fn module_recipe_list_alignment_ignores_private_recipes() {
+tests/misc.rs:1232:fn private_aliases_are_not_suggested() {
+tests/private.rs:43:fn private_attribute_for_module() {
+27:  pub(crate) test_round_trip: bool,
+51:      test_round_trip: true,
+136:    self.stderr_regex = Some(Regex::new(&format!("^(?s){}$", stderr_regex.as_ref())).unwrap());
+151:    self.stdout_regex = Some(Regex::new(&format!("(?s)^{}$", stdout_regex.as_ref())).unwrap());
+155:  pub(crate) fn test_round_trip(mut self, test_round_trip: bool) -> Self {
+156:    self.test_round_trip = test_round_trip;
+324:    if self.test_round_trip && status == 0 {
+375:    .justfile(format!("x := {expression}"))

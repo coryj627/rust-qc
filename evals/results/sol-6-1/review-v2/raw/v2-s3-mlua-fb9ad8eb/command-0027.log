@@ -1,0 +1,754 @@
+    pub fn environment(&self) -> Option<Table> {
+        let lua = self.0.lua.lock();
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            assert_stack(state, 1);
+
+            lua.push_ref(&self.0);
+            if ffi::lua_iscfunction(state, -1) != 0 {
+                return None;
+            }
+
+            #[cfg(any(feature = "lua51", feature = "luajit", feature = "luau"))]
+            ffi::lua_getfenv(state, -1);
+            #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
+            for i in 1..=255 {
+                // Traverse upvalues until we find the _ENV one
+                match ffi::lua_getupvalue(state, -1, i) {
+                    s if s.is_null() => break,
+                    s if std::ffi::CStr::from_ptr(s as _) == c"_ENV" => break,
+                    _ => ffi::lua_pop(state, 1),
+                }
+            }
+
+            if ffi::lua_type(state, -1) != ffi::LUA_TTABLE {
+                return None;
+            }
+            Some(Table(lua.pop_ref()))
+        }
+    }
+
+    /// Sets the environment of the Lua function.
+    ///
+    /// The environment is a table that is used as the global environment for the function.
+    /// Returns `true` if environment successfully changed, `false` otherwise.
+    ///
+    /// This function does nothing for Rust/C functions.
+    pub fn set_environment(&self, env: Table) -> Result<bool> {
+        let lua = self.0.lua.lock();
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            check_stack(state, 2)?;
+
+            lua.push_ref(&self.0);
+            if ffi::lua_iscfunction(state, -1) != 0 {
+                return Ok(false);
+            }
+
+            #[cfg(any(feature = "lua51", feature = "luajit", feature = "luau"))]
+            {
+                lua.push_ref(&env.0);
+                ffi::lua_setfenv(state, -2);
+            }
+            #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
+            for i in 1..=255 {
+                match ffi::lua_getupvalue(state, -1, i) {
+                    s if s.is_null() => return Ok(false),
+                    s if std::ffi::CStr::from_ptr(s as _) == c"_ENV" => {
+                        ffi::lua_pop(state, 1);
+                        // Create an anonymous function with the new environment
+                        let f_with_env = lua
+                            .lua()
+                            .load("return _ENV")
+                            .set_environment(env)
+                            .try_cache()
+                            .into_function()?;
+                        lua.push_ref(&f_with_env.0);
+                        ffi::lua_upvaluejoin(state, -2, i, -1, 1);
+                        break;
+                    }
+                    _ => ffi::lua_pop(state, 1),
+                }
+            }
+
+            Ok(true)
+        }
+    }
+
+    /// Returns information about the function.
+    ///
+    /// Corresponds to the `>Sn` what mask for [`lua_getinfo`] when applied to the function.
+    ///
+    /// [`lua_getinfo`]: https://www.lua.org/manual/5.4/manual.html#lua_getinfo
+    pub fn info(&self) -> FunctionInfo {
+        let lua = self.0.lua.lock();
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            assert_stack(state, 1);
+
+            let mut ar: ffi::lua_Debug = mem::zeroed();
+            lua.push_ref(&self.0);
+            #[cfg(not(feature = "luau"))]
+            let res = ffi::lua_getinfo(state, cstr!(">Sn"), &mut ar);
+            #[cfg(feature = "luau")]
+            let res = ffi::lua_getinfo(state, -1, cstr!("sn"), &mut ar);
+            mlua_assert!(res != 0, "lua_getinfo failed with `>Sn`");
+
+            FunctionInfo {
+                name: ptr_to_lossy_str(ar.name).map(|s| s.into_owned()),
+                #[cfg(not(feature = "luau"))]
+                name_what: match ptr_to_str(ar.namewhat) {
+                    Some("") => None,
+                    val => val,
+                },
+            // If the string does not contain any uppercase ASCII letters, return it as is
+            return 1;
+        }
+        callback_error_ext(state, ptr::null_mut(), true, |extra, _| {
+            let s = (s.to_bytes().iter())
+                .map(|&c| c.to_ascii_lowercase())
+                .collect::<bstr::BString>();
+            (*extra).raw_lua().push(s).map(|_| 1)
+        })
+    }
+
+    let (error, r#type, to_lowercase) = unsafe {
+        lua.exec_raw::<(Function, Function, Function)>((), move |state| {
+            ffi::lua_pushcfunctiond(state, error, cstr!("error"));
+            ffi::lua_pushcfunctiond(state, r#type, cstr!("type"));
+            ffi::lua_pushcfunctiond(state, to_lowercase, cstr!("to_lowercase"));
+        })
+    }?;
+
+    // Prepare environment for the "require" function
+    let env = lua.create_table_with_capacity(0, 7)?;
+    env.raw_set("get_cache_key", get_cache_key)?;
+    env.raw_set("find_current_file", find_current_file)?;
+    env.raw_set("proxyrequire", proxyrequire)?;
+    env.raw_set("REGISTERED_MODULES", registered_modules)?;
+    env.raw_set("LOADER_CACHE", loader_cache)?;
+    env.raw_set("error", error)?;
+    env.raw_set("type", r#type)?;
+    env.raw_set("to_lowercase", to_lowercase)?;
+
+    lua.load(
+        r#"
+        local path = ...
+        if type(path) ~= "string" then
+            error("bad argument #1 to 'require' (string expected, got " .. type(path) .. ")")
+        end
+
+        -- Check if the module (path) is explicitly registered
+        local maybe_result = REGISTERED_MODULES[to_lowercase(path)]
+        if maybe_result ~= nil then
+            return maybe_result
+        end
+
+        local loader = proxyrequire(path, find_current_file())
+        local cache_key = get_cache_key()
+        -- Check if the loader result is already cached
+        local result = LOADER_CACHE[cache_key]
+        if result ~= nil then
+            return result
+        end
+
+        -- Call the loader function and cache the result
+        result = loader()
+        if result == nil then
+            result = true
+        end
+        LOADER_CACHE[cache_key] = result
+        return result
+        "#,
+    )
+    .try_cache()
+    .set_name("=__mlua_require")
+    .set_environment(env)
+    .into_function()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::TextRequirer;
+
+    #[test]
+    fn test_path_normalize() {
+        for (input, expected) in [
+            // Basic formatting checks
+            ("", "./"),
+            (".", "./"),
+            ("a/relative/path", "./a/relative/path"),
+            // Paths containing extraneous '.' and '/' symbols
+            ("./remove/extraneous/symbols/", "./remove/extraneous/symbols"),
+            ("./remove/extraneous//symbols", "./remove/extraneous/symbols"),
+            ("./remove/extraneous/symbols/.", "./remove/extraneous/symbols"),
+            ("./remove/extraneous/./symbols", "./remove/extraneous/symbols"),
+            ("../remove/extraneous/symbols/", "../remove/extraneous/symbols"),
+            ("../remove/extraneous//symbols", "../remove/extraneous/symbols"),
+            ("../remove/extraneous/symbols/.", "../remove/extraneous/symbols"),
+            ("../remove/extraneous/./symbols", "../remove/extraneous/symbols"),
+            ("/remove/extraneous/symbols/", "/remove/extraneous/symbols"),
+            ("/remove/extraneous//symbols", "/remove/extraneous/symbols"),
+            ("/remove/extraneous/symbols/.", "/remove/extraneous/symbols"),
+            ("/remove/extraneous/./symbols", "/remove/extraneous/symbols"),
+            // Paths containing '..'
+            ("./remove/me/..", "./remove"),
+            ("./remove/me/../", "./remove"),
+            ("../remove/me/..", "../remove"),
+            ("../remove/me/../", "../remove"),
+            ("/remove/me/..", "/remove"),
+            ("/remove/me/../", "/remove"),
+            ("./..", "../"),
+            ("./../", "../"),
+            ("../..", "../../"),
+            ("../../", "../../"),
+            // '..' disappears if path is absolute and component is non-erasable
+            ("/../", "/"),
+        ] {
+            let path = TextRequirer::normalize_path(input.as_ref());
+            assert_eq!(
+                &path,
+                expected.as_ref() as &Path,
+                "wrong normalization for {input}"
+            );
+        }
+    }
+}
+    ///
+    /// Returns the previous mode. More information about the generational GC
+    /// can be found in the Lua 5.4 [documentation][lua_doc].
+    ///
+    /// [lua_doc]: https://www.lua.org/manual/5.4/manual.html#2.5.2
+    #[cfg(feature = "lua54")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "lua54")))]
+    pub fn gc_gen(&self, minor_multiplier: c_int, major_multiplier: c_int) -> GCMode {
+        let lua = self.lock();
+        let state = lua.main_state();
+        let prev_mode = unsafe { ffi::lua_gc(state, ffi::LUA_GCGEN, minor_multiplier, major_multiplier) };
+        match prev_mode {
+            ffi::LUA_GCGEN => GCMode::Generational,
+            ffi::LUA_GCINC => GCMode::Incremental,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Sets a default Luau compiler (with custom options).
+    ///
+    /// This compiler will be used by default to load all Lua chunks
+    /// including via `require` function.
+    ///
+    /// See [`Compiler`] for details and possible options.
+    #[cfg(any(feature = "luau", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    pub fn set_compiler(&self, compiler: Compiler) {
+        let lua = self.lock();
+        unsafe { (*lua.extra.get()).compiler = Some(compiler) };
+    }
+
+    /// Toggles JIT compilation mode for new chunks of code.
+    ///
+    /// By default JIT is enabled. Changing this option does not have any effect on
+    /// already loaded functions.
+    #[cfg(any(feature = "luau-jit", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau-jit")))]
+    pub fn enable_jit(&self, enable: bool) {
+        let lua = self.lock();
+        unsafe { (*lua.extra.get()).enable_jit = enable };
+    }
+
+    /// Sets Luau feature flag (global setting).
+    ///
+    /// See https://github.com/luau-lang/luau/blob/master/CONTRIBUTING.md#feature-flags for details.
+    #[cfg(feature = "luau")]
+    #[doc(hidden)]
+    #[allow(clippy::result_unit_err)]
+    pub fn set_fflag(name: &str, enabled: bool) -> StdResult<(), ()> {
+        if let Ok(name) = std::ffi::CString::new(name) {
+            if unsafe { ffi::luau_setfflag(name.as_ptr(), enabled as c_int) != 0 } {
+                return Ok(());
+            }
+        }
+        Err(())
+    }
+
+    /// Returns Lua source code as a `Chunk` builder type.
+    ///
+    /// In order to actually compile or run the resulting code, you must call [`Chunk::exec`] or
+    /// similar on the returned builder. Code is not even parsed until one of these methods is
+    /// called.
+    ///
+    /// [`Chunk::exec`]: crate::Chunk::exec
+    #[track_caller]
+    pub fn load<'a>(&self, chunk: impl AsChunk + 'a) -> Chunk<'a> {
+        self.load_with_location(chunk, Location::caller())
+    }
+
+    pub(crate) fn load_with_location<'a>(
+        &self,
+        (*extra.get()).set_lua(&rawlua);
+        if owned {
+            // If Lua state is managed by us, then make internal `RawLua` reference "weak"
+            XRc::decrement_strong_count(XRc::as_ptr(&rawlua));
+        } else {
+            // If Lua state is not managed by us, then keep internal `RawLua` reference "strong"
+            // but `Extra` reference weak (it will be collected from registry at lua_close time)
+            XRc::decrement_strong_count(XRc::as_ptr(&extra));
+        }
+
+        rawlua
+    }
+
+    unsafe fn try_from_ptr(state: *mut ffi::lua_State) -> Option<XRc<ReentrantMutex<Self>>> {
+        match ExtraData::get(state) {
+            extra if extra.is_null() => None,
+            extra => Some(XRc::clone(&(*extra).lua().raw)),
+        }
+    }
+
+    /// Marks the Lua state as safe.
+    #[inline(always)]
+    pub(super) fn mark_safe(&self) {
+        unsafe { (*self.extra.get()).safe = true };
+    }
+
+    /// Loads the specified subset of the standard libraries into an existing Lua state.
+    ///
+    /// Use the [`StdLib`] flags to specify the libraries you want to load.
+    ///
+    /// [`StdLib`]: crate::StdLib
+    pub(super) unsafe fn load_std_libs(&self, libs: StdLib) -> Result<()> {
+        let is_safe = (*self.extra.get()).safe;
+
+        #[cfg(not(feature = "luau"))]
+        if is_safe && libs.contains(StdLib::DEBUG) {
+            return Err(Error::SafetyError(
+                "the unsafe `debug` module can't be loaded in safe mode".to_string(),
+            ));
+        }
+        #[cfg(feature = "luajit")]
+        if is_safe && libs.contains(StdLib::FFI) {
+            return Err(Error::SafetyError(
+                "the unsafe `ffi` module can't be loaded in safe mode".to_string(),
+            ));
+        }
+
+        let res = load_std_libs(self.main_state(), libs);
+
+        // If `package` library loaded into a safe lua state then disable C modules
+        #[cfg(not(feature = "luau"))]
+        if is_safe {
+            let curr_libs = (*self.extra.get()).libs;
+            if (curr_libs ^ (curr_libs | libs)).contains(StdLib::PACKAGE) {
+                mlua_expect!(self.lua().disable_c_modules(), "Error disabling C modules");
+            }
+        }
+        #[cfg(feature = "luau")]
+        let _ = is_safe;
+        unsafe { (*self.extra.get()).libs |= libs };
+
+        res
+    }
+
+    /// Private version of [`Lua::try_set_app_data`]
+    #[inline]
+    pub(crate) fn set_priv_app_data<T: MaybeSend + 'static>(&self, data: T) -> Option<T> {
+        let extra = unsafe { &*self.extra.get() };
+        extra.app_data_priv.insert(data)
+    }
+
+    /// Private version of [`Lua::app_data_ref`]
+    #[track_caller]
+    #[inline]
+    pub(crate) fn priv_app_data_ref<T: 'static>(&self) -> Option<AppDataRef<'_, T>> {
+        let extra = unsafe { &*self.extra.get() };
+        extra.app_data_priv.borrow(None)
+    }
+
+    /// Private version of [`Lua::app_data_mut`]
+    #[track_caller]
+    #[inline]
+    pub(crate) fn priv_app_data_mut<T: 'static>(&self) -> Option<AppDataRefMut<'_, T>> {
+        let extra = unsafe { &*self.extra.get() };
+        extra.app_data_priv.borrow_mut(None)
+    }
+
+    /// See [`Lua::create_registry_value`]
+    #[inline]
+    pub(crate) fn owns_registry_value(&self, key: &RegistryKey) -> bool {
+        let registry_unref_list = unsafe { &(*self.extra.get()).registry_unref_list };
+        Arc::ptr_eq(&key.unref_list, registry_unref_list)
+    }
+
+    pub(crate) fn load_chunk(
+        &self,
+        name: Option<&CStr>,
+        env: Option<&Table>,
+        mode: Option<ChunkMode>,
+        source: &[u8],
+    ) -> Result<Function> {
+        let state = self.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            check_stack(state, 3)?;
+
+            let name = name.map(CStr::as_ptr).unwrap_or(ptr::null());
+            let mode = match mode {
+                Some(ChunkMode::Binary) => cstr!("b"),
+                Some(ChunkMode::Text) => cstr!("t"),
+                None => cstr!("bt"),
+            };
+            let status = if self.unlikely_memory_error() {
+                self.load_chunk_inner(state, name, env, mode, source)
+            } else {
+                // Luau and Lua 5.2 can trigger an exception during chunk loading
+                protect_lua!(state, 0, 1, |state| {
+                    self.load_chunk_inner(state, name, env, mode, source)
+                })?
+            };
+            match status {
+                ffi::LUA_OK => Ok(Function(self.pop_ref())),
+                err => Err(pop_error(state, err)),
+            }
+        }
+    }
+
+    pub(crate) unsafe fn load_chunk_inner(
+        &self,
+        state: *mut ffi::lua_State,
+        name: *const c_char,
+        env: Option<&Table>,
+        mode: *const c_char,
+        source: &[u8],
+    ) -> c_int {
+        let status = ffi::luaL_loadbufferenv(
+            state,
+            source.as_ptr() as *const c_char,
+            source.len(),
+            name,
+            mode,
+            match env {
+                Some(env) => {
+                    self.push_ref(&env.0);
+                    -1
+                }
+    {
+        let state = self.state();
+        let _sg = StackGuard::new(state);
+        check_stack(state, 6)?;
+
+        let iter = iter.into_iter();
+        let lower_bound = iter.size_hint().0;
+        let protect = !self.unlikely_memory_error();
+        push_table(state, 0, lower_bound, protect)?;
+        for (k, v) in iter {
+            self.push(k)?;
+            self.push(v)?;
+            if protect {
+                protect_lua!(state, 3, 1, fn(state) ffi::lua_rawset(state, -3))?;
+            } else {
+                ffi::lua_rawset(state, -3);
+            }
+        }
+
+        Ok(Table(self.pop_ref()))
+    }
+
+    /// See [`Lua::create_sequence_from`]
+    pub(crate) unsafe fn create_sequence_from<T, I>(&self, iter: I) -> Result<Table>
+    where
+        T: IntoLua,
+        I: IntoIterator<Item = T>,
+    {
+        let state = self.state();
+        let _sg = StackGuard::new(state);
+        check_stack(state, 5)?;
+
+        let iter = iter.into_iter();
+        let lower_bound = iter.size_hint().0;
+        let protect = !self.unlikely_memory_error();
+        push_table(state, lower_bound, 0, protect)?;
+        for (i, v) in iter.enumerate() {
+            self.push(v)?;
+            if protect {
+                protect_lua!(state, 2, 1, |state| {
+                    ffi::lua_rawseti(state, -2, (i + 1) as Integer);
+                })?;
+            } else {
+                ffi::lua_rawseti(state, -2, (i + 1) as Integer);
+            }
+        }
+
+        Ok(Table(self.pop_ref()))
+    }
+
+    /// Wraps a Lua function into a new thread (or coroutine).
+    ///
+    /// Takes function by reference.
+    pub(crate) unsafe fn create_thread(&self, func: &Function) -> Result<Thread> {
+        let state = self.state();
+        let _sg = StackGuard::new(state);
+        check_stack(state, 3)?;
+
+        let protect = !self.unlikely_memory_error();
+        #[cfg(feature = "luau")]
+        let protect = protect || (*self.extra.get()).thread_creation_callback.is_some();
+
+        let thread_state = if !protect {
+            ffi::lua_newthread(state)
+        } else {
+            protect_lua!(state, 0, 1, |state| ffi::lua_newthread(state))?
+        };
+
+        // Inherit global hook if set
+        #[cfg(not(feature = "luau"))]
+        self.set_thread_hook(thread_state, HookKind::Global)?;
+
+        let thread = Thread(self.pop_ref(), thread_state);
+        ffi::lua_xpush(self.ref_thread(), thread_state, func.0.index);
+        Ok(thread)
+    }
+
+    /// Wraps a Lua function into a new or recycled thread (coroutine).
+    #[cfg(feature = "async")]
+    pub(crate) unsafe fn create_recycled_thread(&self, func: &Function) -> Result<Thread> {
+        if let Some(index) = (*self.extra.get()).thread_pool.pop() {
+            let thread_state = ffi::lua_tothread(self.ref_thread(), *index.0);
+            ffi::lua_xpush(self.ref_thread(), thread_state, func.0.index);
+
+            #[cfg(feature = "luau")]
+            {
+                // Inherit `LUA_GLOBALSINDEX` from the caller
+                ffi::lua_xpush(self.state(), thread_state, ffi::LUA_GLOBALSINDEX);
+                ffi::lua_replace(thread_state, ffi::LUA_GLOBALSINDEX);
+            }
+
+            return Ok(Thread(ValueRef::new(self, index), thread_state));
+        }
+
+        self.create_thread(func)
+    }
+
+    /// Returns the thread to the pool for later use.
+    #[cfg(feature = "async")]
+    pub(crate) unsafe fn recycle_thread(&self, thread: &mut Thread) {
+        let extra = &mut *self.extra.get();
+        if extra.thread_pool.len() < extra.thread_pool.capacity() {
+            if let Some(index) = thread.0.index_count.take() {
+                extra.thread_pool.push(index);
+            }
+        }
+    }
+
+    /// Pushes a value that implements `IntoLua` onto the Lua stack.
+    ///
+    /// Uses up to 2 stack spaces to push a single value, does not call `checkstack`.
+    #[inline(always)]
+    pub(crate) unsafe fn push(&self, value: impl IntoLua) -> Result<()> {
+        value.push_into_stack(self)
+    }
+
+use mlua::{Error, Function, Lua, Result, String, Table, Variadic};
+
+#[test]
+fn test_function_call() -> Result<()> {
+    let lua = Lua::new();
+
+    let concat = lua
+        .load(r#"function(arg1, arg2) return arg1 .. arg2 end"#)
+        .eval::<Function>()?;
+    assert_eq!(concat.call::<String>(("foo", "bar"))?, "foobar");
+
+    Ok(())
+}
+
+#[test]
+fn test_function_call_error() -> Result<()> {
+    let lua = Lua::new();
+
+    let concat_err = lua
+        .load(r#"function(arg1, arg2) error("concat error") end"#)
+        .eval::<Function>()?;
+    match concat_err.call::<String>(("foo", "bar")) {
+        Err(Error::RuntimeError(msg)) if msg.contains("concat error") => {}
+        other => panic!("unexpected result: {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_function_bind() -> Result<()> {
+    let lua = Lua::new();
+
+    let globals = lua.globals();
+    lua.load(
+        r#"
+        function concat(...)
+            local res = ""
+            for _, s in pairs({...}) do
+                res = res..s
+            end
+            return res
+        end
+    "#,
+    )
+    .exec()?;
+
+    let mut concat = globals.get::<Function>("concat")?;
+    concat = concat.bind("foo")?;
+    concat = concat.bind("bar")?;
+    concat = concat.bind(("baz", "baf"))?;
+    assert_eq!(concat.call::<String>(())?, "foobarbazbaf");
+    assert_eq!(concat.call::<String>(("hi", "wut"))?, "foobarbazbafhiwut");
+
+    let mut concat2 = globals.get::<Function>("concat")?;
+    concat2 = concat2.bind(())?;
+    assert_eq!(concat2.call::<String>(())?, "");
+    assert_eq!(concat2.call::<String>(("ab", "cd"))?, "abcd");
+
+    Ok(())
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn test_function_bind_error() -> Result<()> {
+    let lua = Lua::new();
+
+    let func = lua.load(r#"function(...) end"#).eval::<Function>()?;
+    assert!(func.bind(Variadic::from_iter(1..1000000)).is_err());
+    assert!(func.call::<()>(Variadic::from_iter(1..1000000)).is_err());
+
+    Ok(())
+}
+
+#[test]
+fn test_function_environment() -> Result<()> {
+    let lua = Lua::new();
+    let globals = lua.globals();
+
+    // We must not get or set environment for C functions
+    let rust_func = lua.create_function(|_, ()| Ok("hello"))?;
+    assert_eq!(rust_func.environment(), None);
+    assert_eq!(rust_func.set_environment(globals.clone()).ok(), Some(false));
+
+    // Test getting Lua function environment
+    globals.set("hello", "global")?;
+    let lua_func = lua
+        .load(
+            r#"
+        local t = ""
+        return function()
+            -- two upvalues
+            return t .. hello
+        end
+    "#,
+        )
+        .eval::<Function>()?;
+    let lua_func2 = lua.load("return hello").into_function()?;
+    assert_eq!(lua_func.call::<String>(())?, "global");
+    assert_eq!(lua_func.environment().as_ref(), Some(&globals));
+
+    // Test changing the environment
+    let env = lua.create_table_from([("hello", "local")])?;
+    assert!(lua_func.set_environment(env.clone())?);
+    assert_eq!(lua_func.call::<String>(())?, "local");
+    assert_eq!(lua_func2.call::<String>(())?, "global");
+
+    // More complex case
+    lua.load(
+        r#"
+        local number = 15
+        function lucky() return tostring("number is "..number) end
+        new_env = {
+            tostring = function() return tostring(number) end,
+        }
+    "#,
+    )
+    .exec()?;
+    let lucky = globals.get::<Function>("lucky")?;
+    assert_eq!(lucky.call::<String>(())?, "number is 15");
+    let new_env = globals.get::<Table>("new_env")?;
+    lucky.set_environment(new_env)?;
+    assert_eq!(lucky.call::<String>(())?, "15");
+
+    // Test inheritance
+    let lua_func2 = lua
+        .load(r#"return function() return (function() return hello end)() end"#)
+        .eval::<Function>()?;
+    assert!(lua_func2.set_environment(env.clone())?);
+    lua.gc_collect()?;
+    assert_eq!(lua_func2.call::<String>(())?, "local");
+
+    // Test getting environment set by chunk loader
+    let chunk = lua
+        .load("return hello")
+        .set_environment(lua.create_table_from([("hello", "chunk")])?)
+        .into_function()?;
+    assert_eq!(chunk.environment().unwrap().get::<String>("hello")?, "chunk");
+
+    Ok(())
+}
+
+#[test]
+fn test_function_info() -> Result<()> {
+    let lua = Lua::new();
+
+    let globals = lua.globals();
+    lua.load(
+        r#"
+        function function1()
+            return function() end
+        end
+    "#,
+    )
+    .set_name("source1")
+    .exec()?;
+
+    let function1 = globals.get::<Function>("function1")?;
+    let function2 = function1.call::<Function>(())?;
+    let function3 = lua.create_function(|_, ()| Ok(()))?;
+
+    let function1_info = function1.info();
+    #[cfg(feature = "luau")]
+    assert_eq!(function1_info.name.as_deref(), Some("function1"));
+    assert_eq!(function1_info.source.as_deref(), Some("source1"));
+    assert_eq!(function1_info.line_defined, Some(2));
+    #[cfg(not(feature = "luau"))]
+    assert_eq!(function1_info.last_line_defined, Some(4));
+    #[cfg(feature = "luau")]
+    assert_eq!(function1_info.last_line_defined, None);
+    assert_eq!(function1_info.what, "Lua");
+
+    let function2_info = function2.info();
+    assert_eq!(function2_info.name, None);
+    assert_eq!(function2_info.source.as_deref(), Some("source1"));
+    assert_eq!(function2_info.line_defined, Some(3));
+    #[cfg(not(feature = "luau"))]
+    assert_eq!(function2_info.last_line_defined, Some(3));
+    #[cfg(feature = "luau")]
+    assert_eq!(function2_info.last_line_defined, None);
+    assert_eq!(function2_info.what, "Lua");
+
+    let function3_info = function3.info();
+    assert_eq!(function3_info.name, None);
+    assert_eq!(function3_info.source.as_deref(), Some("=[C]"));
+    assert_eq!(function3_info.line_defined, None);
+    assert_eq!(function3_info.last_line_defined, None);
+    assert_eq!(function3_info.what, "C");
+
+    let print_info = globals.get::<Function>("print")?.info();
+    #[cfg(feature = "luau")]
+    assert_eq!(print_info.name.as_deref(), Some("print"));
+    assert_eq!(print_info.source.as_deref(), Some("=[C]"));
+    assert_eq!(print_info.what, "C");
+    assert_eq!(print_info.line_defined, None);
+
+    Ok(())
+}
+
+#[cfg(not(feature = "luau"))]

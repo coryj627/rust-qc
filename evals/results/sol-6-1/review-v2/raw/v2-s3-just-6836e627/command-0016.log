@@ -1,0 +1,896 @@
+      if let Some((token, attributes)) = attributes {
+        return Err(token.error(CompileErrorKind::ExtraneousAttributes {
+          count: attributes.len(),
+        }));
+      }
+
+      if unterminated {
+        if let Some(comment) = self.accept(Comment)? {
+          self.items.push(Item::Comment(comment.lexeme().trim_end()));
+        }
+
+        if !self.next_is(Eof) {
+          self.expect(Eol)?;
+          self.items.push(Item::Newline);
+        }
+      }
+    }
+
+    if self.next_token != self.tokens.len() {
+      return Err(self.internal_error(format!(
+        "Parse completed with {} unparsed tokens",
+        self.tokens.len() - self.next_token,
+      ))?);
+    }
+
+    Ok(Ast {
+      items: self.items,
+      module_path: self.module_namepath.map(Into::into).unwrap_or_default(),
+      unstable_features: self.unstable_features,
+      warnings: Vec::new(),
+      working_directory: self.working_directory.into(),
+    })
+  }
+
+  fn parse_item(
+    &mut self,
+    attributes: &mut Option<(Token<'src>, AttributeSet<'src>)>,
+  ) -> CompileResult<'src, Item<'src>> {
+    let mut take_attributes = || {
+      attributes
+        .take()
+        .map(|(_token, attributes)| attributes)
+        .unwrap_or_default()
+    };
+
+    let item = if let Some(comment) = self.accept(Comment)? {
+      Item::Comment(comment.lexeme().trim_end())
+    } else if self.accepted(Eol)? {
+      Item::Newline
+    } else if self.next_is(Identifier) {
+      let next = self.next()?;
+      match Keyword::from_lexeme(next.lexeme()) {
+        Some(Keyword::Alias) if self.next_are(&[Identifier, Identifier, ColonEquals]) => {
+          Item::Alias(self.parse_alias(take_attributes())?)
+        }
+        Some(Keyword::Eager) if self.next_are(&[Identifier, Identifier, ColonEquals]) => {
+          self.presume_keyword(Keyword::Eager)?;
+          Item::Assignment(self.parse_assignment(take_attributes(), true, false)?)
+        }
+        Some(Keyword::Export) if self.next_are(&[Identifier, Identifier, ColonEquals]) => {
+          self.presume_keyword(Keyword::Export)?;
+          Item::Assignment(self.parse_assignment(take_attributes(), false, true)?)
+        }
+        Some(Keyword::Unexport) if self.line_is(&[Identifier, Identifier]) => {
+          self.presume_keyword(Keyword::Unexport)?;
+          let name = self.parse_name()?;
+          Item::Unexport { name }
+        }
+        Some(Keyword::Import)
+          if self.next_are(&[Identifier, Identifier, StringToken])
+            || self.next_are(&[Identifier, QuestionMark])
+            || self.next_are(&[Identifier, StringToken]) =>
+        {
+          self.presume_keyword(Keyword::Import)?;
+          let optional = self.accepted(QuestionMark)?;
+          let relative = self.parse_string_literal()?;
+          Item::Import {
+            absolute: None,
+            optional,
+            relative,
+          }
+        }
+        Some(Keyword::Mod)
+          if self.line_is(&[Identifier, Identifier])
+            || self.next_are(&[Identifier, Identifier, Identifier, StringToken])
+            || self.next_are(&[Identifier, Identifier, StringToken])
+            || self.next_are(&[Identifier, QuestionMark]) =>
+        {
+          self.presume_keyword(Keyword::Mod)?;
+
+          let optional = self.accepted(QuestionMark)?;
+
+          let name = self.parse_name()?;
+
+          let relative = if self.next_is(StringToken) || self.next_are(&[Identifier, StringToken]) {
+            Some(self.parse_string_literal()?)
+          } else {
+            None
+          };
+
+          let attributes = take_attributes();
+
+          attributes.ensure_valid_attributes(
+            "Module",
+            *name,
+            &[
+              AttributeDiscriminant::Doc,
+              AttributeDiscriminant::Group,
+              AttributeDiscriminant::Private,
+            ],
+          )?;
+
+          let doc = self.take_doc_comment(&attributes);
+
+          let private = attributes.contains(AttributeDiscriminant::Private);
+
+          let mut groups = Vec::new();
+          for attribute in attributes {
+            if let Attribute::Group(group) = attribute {
+              groups.push(group);
+            }
+          }
+
+          Item::Module {
+            absolute: None,
+            doc,
+            groups,
+            name,
+            optional,
+            private,
+            relative,
+          }
+        }
+        Some(Keyword::Set)
+          if self.next_are(&[Identifier, Identifier, ColonEquals])
+            || self.line_is(&[Identifier, Identifier]) =>
+        {
+          Item::Set(self.parse_set()?)
+        }
+        _ => {
+          if self.next_are(&[Identifier, ParenL]) {
+            Item::Function(self.parse_function_definition()?)
+          } else if self.next_are(&[Identifier, ColonEquals]) {
+            Item::Assignment(self.parse_assignment(take_attributes(), false, false)?)
+          } else {
+            Item::Recipe(self.parse_recipe(take_attributes(), false)?)
+          }
+        }
+      }
+    } else if self.accepted(At)? {
+      Item::Recipe(self.parse_recipe(take_attributes(), true)?)
+    } else {
+      return Err(self.unexpected_token()?);
+    };
+
+    Ok(item)
+  }
+
+  /// Parse an alias, e.g `alias name := target`
+  fn parse_alias(
+    &mut self,
+    attributes: AttributeSet<'src>,
+  ) -> CompileResult<'src, Alias<'src, Namepath<'src>>> {
+    self.presume_keyword(Keyword::Alias)?;
+    let name = self.parse_name()?;
+    self.presume_any(&[Equals, ColonEquals])?;
+    let target = self.parse_namepath()?;
+
+    attributes.ensure_valid_attributes("Alias", *name, &[AttributeDiscriminant::Private])?;
+
+    Ok(Alias {
+      attributes,
+      name,
+      target,
+    })
+  }
+
+  fn parse_function_definition(&mut self) -> CompileResult<'src, FunctionDefinition<'src>> {
+    self
+      .unstable_features
+      .insert(UnstableFeature::UserDefinedFunction);
+
+    let name = self.parse_name()?;
+
+    self.presume(ParenL)?;
+
+    let mut parameters = Vec::new();
+    while !self.next_is(ParenR) {
+      parameters.push((self.parse_name()?, self.numerator.next()));
+      if !self.accepted(Comma)? {
+        break;
+      }
+    }
+
+    self.expect(ParenR)?;
+
+    self.expect(ColonEquals)?;
+
+    let body = self.parse_expression()?;
+
+    Ok(FunctionDefinition {
+      body,
+      name,
+      parameters,
+    })
+  }
+  fn format<'src>(config: &Config, loader: &'src Loader, search: &Search) -> RunResult<'src> {
+    let root = search.justfile.parent().unwrap();
+
+    let (path, src) = loader.load(config, root, &search.justfile)?;
+
+    let ast = Parser::parse_source(
+      &mut Numerator::new(),
+      path,
+      &Source::root(&search.justfile),
+      src,
+    )?;
+
+    let formatted = ast
+      .color_display(config.color.use_color(UseColor::Never))
+      .to_string();
+
+    if formatted == src {
+      return Ok(());
+    }
+
+    if config.check {
+      if !config.verbosity.quiet() {
+        use similar::{ChangeTag, TextDiff};
+
+        let diff = TextDiff::configure()
+          .algorithm(similar::Algorithm::Patience)
+          .diff_lines(src, &formatted);
+
+        for op in diff.ops() {
+          for change in diff.iter_changes(op) {
+            let (symbol, color) = match change.tag() {
+              ChangeTag::Delete => ("-", config.color.stdout().diff_deleted()),
+              ChangeTag::Equal => (" ", config.color.stdout()),
+              ChangeTag::Insert => ("+", config.color.stdout().diff_added()),
+            };
+
+            print!("{}{symbol}{change}{}", color.prefix(), color.suffix());
+          }
+        }
+      }
+
+      Err(Error::FormatCheckFoundDiff)
+    } else {
+      fs::write(&search.justfile, formatted).map_err(|io_error| Error::WriteJustfile {
+        justfile: search.justfile.clone(),
+        io_error,
+      })?;
+
+      if config.verbosity.loud() {
+        eprintln!("Wrote justfile to `{}`", search.justfile.display());
+      }
+
+      Ok(())
+    }
+  }
+
+#[test]
+fn private_variable() {
+  Test::new()
+    .justfile(
+      "
+        [private]
+        foo := 'bar'
+      ",
+    )
+    .arg("--dump")
+    .stdout(
+      "
+        [private]
+        foo := 'bar'
+      ",
+    )
+    .success();
+}
+
+#[test]
+fn module_groups_are_preserved() {
+  Test::new()
+    .justfile(
+      r#"
+        [group('bar')]
+        [group("baz")]
+        mod foo
+      "#,
+    )
+    .write("foo.just", "")
+    .arg("--dump")
+    .stdout(
+      r#"
+        [group: 'bar']
+        [group: "baz"]
+        mod foo
+      "#,
+    )
+    .success();
+}
+
+#[test]
+fn module_docs_are_preserved() {
+  Test::new()
+    .justfile(
+      "
+        # bar
+        mod foo
+      ",
+    )
+    .write("foo.just", "")
+    .arg("--dump")
+    .stdout(
+      "
+        # bar
+        mod foo
+      ",
+    )
+    .success();
+}
+
+#[test]
+fn arg_attribute_long() {
+  Test::new()
+    .justfile(
+      "
+        [arg('bar', long='bar')]
+        @foo bar:
+      ",
+    )
+    .arg("--dump")
+    .stdout(
+      "
+        [arg('bar', long='bar')]
+        @foo bar:
+use super::*;
+
+#[test]
+fn unused_assignments_are_evaluated_without_lazy() {
+  Test::new()
+    .justfile(
+      "
+        x := `exit 1`
+
+        foo:
+      ",
+    )
+    .stderr(
+      "
+        error: Backtick failed with exit code 1
+         ——▶ justfile:1:6
+          │
+        1 │ x := `exit 1`
+          │      ^^^^^^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn unused_assignment_not_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        x := `exit 1`
+
+        foo:
+          @echo foo
+      ",
+    )
+    .stdout("foo\n")
+    .success();
+}
+
+#[test]
+fn used_assignment_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        x := `exit 1`
+
+        foo:
+          @echo {{x}}
+      ",
+    )
+    .stderr(
+      "
+        error: Backtick failed with exit code 1
+         ——▶ justfile:3:6
+          │
+        3 │ x := `exit 1`
+          │      ^^^^^^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn transitively_used_assignment_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        x := `exit 1`
+        y := x
+
+        foo:
+          @echo {{y}}
+      ",
+    )
+    .stderr(
+      "
+        error: Backtick failed with exit code 1
+         ——▶ justfile:3:6
+          │
+        3 │ x := `exit 1`
+          │      ^^^^^^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn assignment_used_in_parameter_default_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        x := `exit 1`
+
+        foo val=x:
+      ",
+    )
+    .stderr(
+      "
+        error: Backtick failed with exit code 1
+         ——▶ justfile:3:6
+          │
+        3 │ x := `exit 1`
+          │      ^^^^^^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn assignment_used_in_dependency_argument_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        x := `exit 1`
+
+        foo: (bar x)
+
+        bar val:
+      ",
+    )
+    .stderr(
+      "
+        error: Backtick failed with exit code 1
+         ——▶ justfile:3:6
+          │
+        3 │ x := `exit 1`
+          │      ^^^^^^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn assignment_in_body_interpolation_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        x := `exit 1`
+
+        foo:
+          @echo {{x}}
+      ",
+    )
+    .stderr(
+      "
+        error: Backtick failed with exit code 1
+         ——▶ justfile:3:6
+          │
+        3 │ x := `exit 1`
+          │      ^^^^^^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn multiple_invocations_evaluate_union() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        x := 'foo'
+        y := 'bar'
+        z := `exit 1`
+
+        a:
+          @echo {{x}}
+
+        b:
+          @echo {{y}}
+      ",
+    )
+    .args(["a", "b"])
+    .stdout("foo\nbar\n")
+    .success();
+}
+
+#[test]
+fn assignment_used_in_dependency_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        x := `exit 1`
+
+        foo: bar
+
+        bar:
+          @echo {{x}}
+      ",
+    )
+    .stderr(
+      "
+        error: Backtick failed with exit code 1
+         ——▶ justfile:3:6
+          │
+        3 │ x := `exit 1`
+          │      ^^^^^^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn assignment_used_in_transitive_dependency_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        x := `exit 1`
+
+        foo: bar
+
+        bar: baz
+
+        baz:
+          @echo {{x}}
+      ",
+    )
+    .stderr(
+      "
+        error: Backtick failed with exit code 1
+         ——▶ justfile:3:6
+          │
+        3 │ x := `exit 1`
+          │      ^^^^^^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn exported_assignment_is_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        export x := 'FOO'
+
+        bar:
+          @echo $x
+      ",
+    )
+    .stdout("FOO\n")
+    .success();
+}
+
+#[test]
+fn assignment_with_set_export_is_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+        set export
+
+        x := 'FOO'
+
+        bar:
+          @echo $x
+      ",
+    )
+    .stdout("FOO\n")
+    .success();
+}
+
+#[test]
+fn eager_assignments_are_evaluated() {
+  Test::new()
+    .justfile(
+      "
+        set lazy
+
+        eager x := `exit 1`
+
+        foo:
+      ",
+    )
+    .stderr(
+      "
+        error: Backtick failed with exit code 1
+         ——▶ justfile:3:12
+          │
+        3 │ eager x := `exit 1`
+          │            ^^^^^^^^
+      ",
+    )
+    .failure();
+}
+use super::*;
+
+/// A binding of `name` to `value`
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct Binding<'src, V = String> {
+  pub(crate) eager: bool,
+  pub(crate) export: bool,
+  #[serde(skip)]
+  pub(crate) file_depth: u32,
+  pub(crate) name: Name<'src>,
+  #[serde(skip)]
+  pub(crate) number: Number,
+  #[serde(skip)]
+  pub(crate) prelude: bool,
+  pub(crate) private: bool,
+  pub(crate) value: V,
+}
+
+impl<'src, V> Keyed<'src> for Binding<'src, V> {
+  fn key(&self) -> &'src str {
+    self.name.lexeme()
+  }
+}
+use super::*;
+
+/// An expression. Note that the Just language grammar has both an `expression`
+/// production of additions (`a + b`) and values, and a `value` production of
+/// all other value types (for example strings, function calls, and
+/// parenthetical groups).
+///
+/// The parser parses both values and expressions into `Expression`s.
+#[derive(PartialEq, Eq, Debug, Clone, Ord, PartialOrd)]
+pub(crate) enum Expression<'src> {
+  /// `lhs && rhs`
+  And { lhs: Box<Self>, rhs: Box<Self> },
+  /// `assert(condition, error)`
+  Assert {
+    name: Name<'src>,
+    condition: Condition<'src>,
+    error: Box<Self>,
+  },
+  /// `contents`
+  Backtick {
+    contents: String,
+    token: Token<'src>,
+  },
+  /// `name(arguments)`
+  Call {
+    name: Name<'src>,
+    arguments: Vec<Expression<'src>>,
+  },
+  /// `lhs + rhs`
+  Concatenation { lhs: Box<Self>, rhs: Box<Self> },
+  /// `if condition { then } else { otherwise }`
+  Conditional {
+    condition: Condition<'src>,
+    then: Box<Self>,
+    otherwise: Box<Self>,
+  },
+  // `f"format string"`
+  FormatString {
+    start: StringLiteral<'src>,
+    expressions: Vec<(Self, StringLiteral<'src>)>,
+  },
+  /// `(contents)`
+  Group { contents: Box<Self> },
+  /// `lhs / rhs`
+  Join {
+    lhs: Option<Box<Self>>,
+    rhs: Box<Self>,
+  },
+  /// `lhs || rhs`
+  Or { lhs: Box<Self>, rhs: Box<Self> },
+  /// `"string_literal"` or `'string_literal'`
+  StringLiteral { string_literal: StringLiteral<'src> },
+  /// `variable`
+  Variable { name: Name<'src> },
+}
+
+impl<'src> Expression<'src> {
+  pub(crate) fn references<'a>(&'a self) -> References<'a, 'src> {
+    References::new(self)
+  }
+}
+
+impl Display for Expression<'_> {
+  fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    match self {
+      Self::And { lhs, rhs } => write!(f, "{lhs} && {rhs}"),
+      Self::Assert {
+        condition, error, ..
+      } => write!(f, "assert({condition}, {error})"),
+      Self::Backtick { token, .. } => write!(f, "{}", token.lexeme()),
+      Self::Call { name, arguments } => {
+        write!(f, "{name}(")?;
+        for (i, argument) in arguments.iter().enumerate() {
+          if i > 0 {
+            write!(f, ", ")?;
+          }
+          write!(f, "{argument}")?;
+        }
+        write!(f, ")")
+      }
+      Self::Concatenation { lhs, rhs } => write!(f, "{lhs} + {rhs}"),
+      Self::Conditional {
+        condition,
+        then,
+        otherwise,
+      } => {
+        if let Self::Conditional { .. } = **otherwise {
+          write!(f, "if {condition} {{ {then} }} else {otherwise}")
+        } else {
+          write!(f, "if {condition} {{ {then} }} else {{ {otherwise} }}")
+        }
+      }
+      Self::FormatString { start, expressions } => {
+        write!(f, "{start}")?;
+
+        for (expression, string) in expressions {
+          write!(f, "{expression}{string}")?;
+        }
+
+        Ok(())
+      }
+      Self::Group { contents } => write!(f, "({contents})"),
+      Self::Join { lhs: None, rhs } => write!(f, "/ {rhs}"),
+      Self::Join {
+        lhs: Some(lhs),
+        rhs,
+      } => write!(f, "{lhs} / {rhs}"),
+      Self::Or { lhs, rhs } => write!(f, "{lhs} || {rhs}"),
+      Self::StringLiteral { string_literal } => write!(f, "{string_literal}"),
+      Self::Variable { name } => write!(f, "{name}"),
+    }
+  }
+}
+
+impl Serialize for Expression<'_> {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: Serializer,
+  {
+    match self {
+      Self::And { lhs, rhs } => {
+        let mut seq = serializer.serialize_seq(None)?;
+        seq.serialize_element("and")?;
+        seq.serialize_element(lhs)?;
+        seq.serialize_element(rhs)?;
+        seq.end()
+      }
+      Self::Assert {
+        condition, error, ..
+      } => {
+        let mut seq: <S as Serializer>::SerializeSeq = serializer.serialize_seq(None)?;
+        seq.serialize_element("assert")?;
+        seq.serialize_element(condition)?;
+        seq.serialize_element(error)?;
+        seq.end()
+      }
+      Self::Backtick { contents, .. } => {
+        let mut seq = serializer.serialize_seq(None)?;
+        seq.serialize_element("evaluate")?;
+        seq.serialize_element(contents)?;
+        seq.end()
+      }
+      Self::Call { name, arguments } => {
+        let mut seq = serializer.serialize_seq(None)?;
+        seq.serialize_element("call")?;
+        seq.serialize_element(name)?;
+        for argument in arguments {
+          seq.serialize_element(argument)?;
+        }
+        seq.end()
+      }
+      Self::Concatenation { lhs, rhs } => {
+        let mut seq = serializer.serialize_seq(None)?;
+        seq.serialize_element("concatenate")?;
+        seq.serialize_element(lhs)?;
+        seq.serialize_element(rhs)?;
+        seq.end()
+      }
+      Self::Conditional {
+        condition,
+        then,
+        otherwise,
+      } => {
+        let mut seq = serializer.serialize_seq(None)?;
+        seq.serialize_element("if")?;
+        seq.serialize_element(condition)?;
+        seq.serialize_element(then)?;
+        seq.serialize_element(otherwise)?;
+        seq.end()
+      }
+      Self::FormatString { start, expressions } => {
+        let mut seq = serializer.serialize_seq(None)?;
+        seq.serialize_element("format")?;
+        seq.serialize_element(start)?;
+        for (expression, string) in expressions {
+          seq.serialize_element(expression)?;
+          seq.serialize_element(string)?;
+        }
+        seq.end()
+      }
+      Self::Group { contents } => contents.serialize(serializer),
+      Self::Join { lhs, rhs } => {
+        let mut seq = serializer.serialize_seq(None)?;
+        seq.serialize_element("join")?;
+        seq.serialize_element(lhs)?;
+        seq.serialize_element(rhs)?;
+        seq.end()
+      }
+      Self::Or { lhs, rhs } => {
+        let mut seq = serializer.serialize_seq(None)?;
+        seq.serialize_element("or")?;
+        seq.serialize_element(lhs)?;
+        seq.serialize_element(rhs)?;
+        seq.end()
+      }
+      Self::StringLiteral { string_literal } => string_literal.serialize(serializer),
+      Self::Variable { name } => {
+        let mut seq = serializer.serialize_seq(None)?;
+        seq.serialize_element("variable")?;
+        seq.serialize_element(name)?;
+        seq.end()
+      }
+    }
+  }
+}
+use super::*;
+
+#[test]
+fn datetime() {
+  Test::new()
+    .justfile(
+      "
+        x := datetime('%Y-%m-%d %z')
+      ",
+    )
+    .args(["--eval", "x"])
+    .stdout_regex(r"\d\d\d\d-\d\d-\d\d [+-]\d\d\d\d")
+    .success();
+}
+
+#[test]
+fn datetime_utc() {
+  Test::new()
+    .justfile(
+      "
+        x := datetime_utc('%Y-%m-%d %Z')
+      ",
+    )
+    .args(["--eval", "x"])
+    .stdout_regex(r"\d\d\d\d-\d\d-\d\d UTC")
+    .success();
+}

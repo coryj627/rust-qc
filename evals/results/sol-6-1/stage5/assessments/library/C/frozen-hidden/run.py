@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Run independent downstream integration tests without editing the product."""
+import argparse
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tomllib
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--crate", type=Path, required=True)
+parser.add_argument("--run-dir", type=Path, required=True)
+parser.add_argument("--error-adapter", type=Path)
+args = parser.parse_args()
+root = Path("/work").resolve()
+
+def in_workspace(path):
+    path = path.resolve()
+    if not path.is_relative_to(root):
+        parser.error(f"path must be within /work: {path}")
+    return path
+
+crate = in_workspace(args.crate)
+run_dir = in_workspace(args.run_dir)
+if not run_dir.is_relative_to(root / "tmp") or run_dir == root / "tmp":
+    parser.error("--run-dir must be a child of /work/tmp")
+if crate == run_dir or run_dir in crate.parents or crate in run_dir.parents:
+    parser.error("crate and run-dir must be disjoint")
+if not (crate / "Cargo.toml").is_file():
+    parser.error(f"missing product manifest: {crate / 'Cargo.toml'}")
+try:
+    manifest = tomllib.loads((crate / "Cargo.toml").read_text(encoding="utf-8"))
+except (OSError, tomllib.TOMLDecodeError) as error:
+    parser.error(f"cannot read product manifest: {error}")
+package_name = manifest.get("package", {}).get("name")
+if not isinstance(package_name, str) or not package_name:
+    parser.error("the product manifest must identify the library package")
+library_name = manifest.get("lib", {}).get("name", package_name.replace("-", "_"))
+if library_name != "byte_span":
+    parser.error(f"required Rust library is byte_span; manifest exposes {library_name!r}")
+adapter = in_workspace(args.error_adapter) if args.error_adapter else None
+if adapter and not adapter.is_file():
+    parser.error(f"missing adapter: {adapter}")
+# Never delete an arbitrary user directory or carry over tests from a prior run.
+run_dir.mkdir(parents=True, exist_ok=True)
+if any(run_dir.iterdir()):
+    parser.error("--run-dir must be empty or absent; choose a fresh directory")
+(run_dir / "src").mkdir()
+(run_dir / "tests" / "support").mkdir(parents=True)
+# Escape a path as a TOML basic string without relying on third-party packages.
+def toml_string(value):
+    import json
+    return json.dumps(str(value), ensure_ascii=False)
+
+(run_dir / "Cargo.toml").write_text(
+    '[package]\nname = "byte-span-independent-checks"\nversion = "0.0.0"\nedition = "2021"\n'
+    '[workspace]\n[dependencies]\nbyte_span = { package = ' + toml_string(package_name) + ', path = ' + toml_string(crate) + ' }\n',
+    encoding="utf-8",
+)
+(run_dir / "src" / "lib.rs").write_text("// Downstream test harness.\n", encoding="utf-8")
+here = Path(__file__).resolve().parent
+shutil.copyfile(here / "public_api.rs", run_dir / "tests" / "public_api.rs")
+if adapter:
+    shutil.copyfile(here / "error_contract.rs", run_dir / "tests" / "error_contract.rs")
+    shutil.copyfile(adapter, run_dir / "tests" / "support" / "error_adapter.rs")
+else:
+    print("ERROR-CATEGORY CHECKS NOT RUN: supply a reviewed public-API adapter; this is not a product failure.", flush=True)
+env = os.environ.copy()
+env["RUSTUP_AUTO_INSTALL"] = "0"
+env["CARGO_NET_OFFLINE"] = "true"
+env["CARGO_TARGET_DIR"] = str(run_dir / "target")
+command = ["cargo", "test", "--offline", "--no-fail-fast", "--manifest-path", str(run_dir / "Cargo.toml"), "--", "--test-threads=1"]
+print("RUN:", " ".join(command), flush=True)
+completed = subprocess.run(command, env=env, check=False)
+sys.exit(completed.returncode)

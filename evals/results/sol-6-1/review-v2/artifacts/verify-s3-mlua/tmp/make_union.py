@@ -1,0 +1,53 @@
+import json,collections
+passages={x['id']:x for x in json.load(open('/work/report-passages.json'))}
+items=[]
+def ids(*ranges):
+ out=[]
+ for r in ranges:
+  if isinstance(r,int):out.append(r)
+  else:out.extend(range(r[0],r[1]+1))
+ return [f'P{x:04d}' for x in sorted(set(out))]
+def add(title,loc,sources,status,severity,note,noise=None):
+ reports=''.join(sorted({passages[x]['report'] for x in sources}))
+ items.append(dict(item=title,loc=loc,sources=sources,reports=reports,status=status,severity=severity,noise_class=noise,note=note))
+add('Sync userdata shared borrows become exclusive with send','src/userdata/util.rs:33',ids(1,(4,10),111,120,130,142,154,(176,181),251),'ran','medium','String overlapping borrows return UserDataBorrowError; existing send and wrapper tests fail. Extracted detector returns false for String/u64 on stable and nightly, debug and optimized.')
+add('Table::clear leaves a stack root','src/table.rs:417',ids((12,18),117,141,(194,199)),'ran','medium','Lua 5.4 weak-value regression retains the cleared table after dropping its handle and collecting twice; untouched control is collected. Luau control passes. Non-Luau code lacks stack restoration.')
+add('Permissive Serde drops supported nulls','src/serde/de.rs:756',ids((19,26),118,143,(169,175)),'ran','high','On Lua 5.4 and Luau, both conversion directions change {present:null,items:[null,1]} into {items:[1]}; default-option controls preserve it. The skip predicate includes null lightuserdata.')
+add('Table equality accepts longer slices and arrays','src/table.rs:914',ids((27,33),121,145,(188,193)),'ran','medium','On Lua 5.4 and Luau, {1,2} equals [1,2,3] and an empty table equals [1]. Equal-length and shorter-slice controls behave correctly; the final return omits the length check.')
+add('Numeric sets fail their own round-trip conversion','src/conversion.rs:1078',ids((34,40),119,(182,187)),'ran','medium','HashSet<i32> and BTreeSet<i32> containing 1,2,3 fail with boolean-to-i32 errors on Lua 5.4 and Luau; string-set control passes. Membership tables are misclassified as sequences, also at line 1102.')
+add('Tuple variants omit the array metatable','src/serde/ser.rs:290',ids((41,43),(45,48)),'ran','medium','Default serialization of an empty tuple variant produces {Empty:{}} instead of {Empty:[]} on Lua 5.4 and Luau. Tuple-variant table creation bypasses the enabled array-metatable option.')
+add('Nil fields shift subsequent tuple-variant fields','src/serde/ser.rs:456',ids((41,43),(45,48),144),'ran','high','With serialize_none_to_null(false), Items(None,7) stores 7 at index 1 on Lua 5.4 and Luau; the ordinary-tuple control keeps it at index 2. raw_push recomputes the insertion index after nil.')
+add('Failed Luau vector-to-array conversion omits destructors','src/conversion.rs:960',ids((49,55)),'ran','medium','A custom conversion accepts component 1 and rejects component 2: the destructor count is zero for a vector, one for the table control. MaybeUninit elements have no cleanup guard on early return.')
+add('Luau buffer relative seeks overflow before validation','src/buffer.rs:136',ids((56,62),124,149,(206,211)),'ran','low','Debug tests panic on both End(i64::MAX) and Current(i64::MAX) from position 1 in a three-byte buffer. Ordinary invalid-seek control returns Err; release behavior was not tested.')
+add('Documentation links to disabled async APIs','src/lib.rs:42',ids((63,69),111,(212,217),254),'not-defect',None,'Strict baseline rustdoc fails on three async links at lines 42-44; enabling async removes those diagnostics. This is documentation/build hygiene.','skill-requested-hygiene')
+add('Documentation cannot resolve the sandbox link','src/thread.rs:447',ids((63,69),111,125,152,154,(212,217),(254,256)),'not-defect',None,'Normal expanded-feature docs warn that Lua is not in scope for Lua::sandbox; -D warnings turns it into an error. This is a broken documentation reference.','skill-requested-hygiene')
+add('Documentation Debug link is ambiguous','src/state.rs:880',ids((63,69),111,125,152,154,(212,217),(254,256)),'not-defect',None,'Normal docs warn that Debug names both a struct and derive macro; strict docs fail. Qualifying the link is documentation/build hygiene.','skill-requested-hygiene')
+add('Path lookup rejects the minimum integer key','src/util/path.rs:81',ids((71,77),151,(225,230)),'ran','low','Lua 5.4 accepts the i64::MIN table key, but its bracket path returns integer overflow; adjacent-minimum and maximum controls pass. Positive signed accumulation overflows before negation.')
+add('Strict Clippy rejects redundant pointer casts on aarch64','src/conversion.rs:534',ids((78,84),111,(231,235),254),'not-defect',None,'Reproduced four unnecessary_cast diagnostics: conversion.rs:534/667, string.rs:133, util/mod.rs:279. Here c_char is u8; these casts do not change runtime behavior.','skill-requested-hygiene')
+add('Strict Clippy rejects a redundant formatting borrow','src/error.rs:300',ids((78,84),111,(231,235),254),'not-defect',None,'Reproduced useless_borrows_in_formatting under -D warnings. The extra reference has no behavioral consequence.','skill-requested-hygiene')
+add('Public documentation omits items and error sections','src/traits.rs:17',ids((85,90),93,(236,239)),'not-defect',None,'Independent advisory Clippy reproduces 22 missing_docs, 116 missing_errors_doc and one missing_panics_doc diagnostics. Representative source omissions are documentation housekeeping.','skill-requested-hygiene')
+add('Function::bind allegedly drops a trailing nil','src/function.rs:207',ids(91),'refuted',None,'Regression returns all five arguments (11,nil,33,nil,44), with select count 5, on Lua 5.4 and Luau. The saved explicit upvalue count preserves trailing nils.')
+add('Serde allegedly rejects shared acyclic child tables','src/serde/de.rs:745',ids(92),'refuted',None,'Default deserialization of two fields sharing one child succeeds on Lua 5.4 and Luau. RecursionGuard removes each table pointer on drop before visiting the sibling.')
+add('Public wrapper types lack Debug','src/chunk.rs:137',ids((94,100),(240,243)),'not-defect',None,'Advisory Clippy reproduces 16 sites, including hidden helpers; source confirms exported Chunk, WeakLua, VmState and iterators lack Debug. This is optional public-API style, not a violated contract.','skill-requested-hygiene')
+add('Unsafe operations lack local invariant comments','src/userdata/ref.rs:72',ids((101,107),244,(246,248)),'not-defect',None,'Advisory Clippy reproduces 180 undocumented_unsafe_blocks diagnostics; inspected transmute sites lack local rationale. This is comment/maintainability housekeeping; no runtime defect is claimed or established.','skill-requested-hygiene')
+add('Failed AnyUserData::take allegedly destroys borrowed data','src/userdata.rs:696',ids(116),'refuted',None,'Borrow-conflicting take returns UserDataBorrowMutError, then borrowing and taking the original 42 succeeds after release. Source checks has_exclusive_access before calling take_userdata; Lua 5.4 and Luau controls pass.')
+add('Userdata equality ignores metamethods across different metatables','src/userdata.rs:955',ids(122),'ran','medium','Two userdata types with the first defining true __eq compare true in Lua 5.4 but false through Value::equals. The early metatable-inequality return contradicts the documented first/second lookup.')
+add('Metatable iteration converts restricted values before filtering','src/userdata.rs:1039',ids(123),'ran','medium','For empty userdata, visible Value entries are all strings, but pairs::<String>() errors converting a hidden boolean/function on Lua 5.4/Luau. TablePairs converts V before restricted keys are skipped.')
+add('Narrow integer stack conversion allegedly wraps values','src/conversion.rs:864',ids(128),'refuted',None,'Evaluating 256 and -1 as u8 returns FromLuaConversionError; 255 succeeds on Lua 5.4 and Luau. The fast path uses num_traits::cast and explicitly rejects out-of-range results.')
+add('Invalid table keys abort instead of returning errors','src/table.rs:258',ids(140,157,(162,167),259),'ran','high','Separate Lua 5.4 tests for nil/NaN through set/raw_set and nil through create_table_from each terminate with SIGABRT. An 8 MiB limit control returns errors. Unprotected lua_rawset is also at state/raw.rs:575.')
+add('Mixed integer/float equality loses integer precision','src/value.rs:617',ids(146),'ran','medium','Integer(9007199254740993) compares equal to Number(9007199254740992.0) through PartialEq and equals; Lua 5.4 returns false. Casting the integer to f64 erases the difference.')
+add('Fixed Serde tuples reject trailing unsupported values despite skipping','src/serde/de.rs:312',ids(147),'ran','medium','With deny_unsupported_types(false), {1,2,function() end} converts to Vec [1,2] but fails conversion to (i32,i32) with invalid length 3, on Lua 5.4 and Luau. Final validation bypasses skip logic.')
+add('Removing a thread hook retains its callback capture','src/state.rs:624',ids(148,(219,224)),'ran','low','Both main-thread and coroutine removal tests leave a captured Arc at strong count 2 after two collections. remove_hook only disables lua_sethook; it leaves the callback registry entry installed.')
+add('Boolean closing errors are inverted during thread reset','src/util/mod.rs:251',ids(150),'ran','low','Resetting a yielded Lua 5.4 thread whose pending __close calls error(true) returns runtime error: false. The utility tests lua_toboolean != 1 instead of != 0.')
+add('Luau vector Serde accepts a tuple with too few components','src/serde/de.rs:300',ids((200,205)),'ran','medium','A three-component vector succeeds as (f32,f32), while an equivalent table rejects the target and a three-element tuple succeeds. The vector branch never checks remaining components after the visitor.')
+add('Replacing a nil registry key allegedly leaves nil','src/state.rs:1915',ids(245),'refuted',None,'Creating a nil RegistryKey, replacing it with alpha and reading String returns alpha on Lua 5.4 and Luau. The LUA_REFNIL branch creates a new registry key and updates the id.')
+with open('/work/tmp/union.jsonl','w') as f:
+ for item in items:f.write(json.dumps(item,separators=(',',':'))+'\n')
+print('items',len(items),'statuses',dict(collections.Counter(x['status'] for x in items)))
+print('reports',dict(collections.Counter(r for x in items for r in x['reports'])))
+used={p for x in items for p in x['sources']}
+for pid,p in passages.items():
+ # Print uncovered narrative claims, excluding generic headings and verification blocks.
+ n=int(pid[1:])
+ if (n<108 or 115<=n<=125 or n==128 or 139<=n<=152 or 159<=n<=248) and pid not in used:
+  print('unassigned',pid,repr(p['text'][:100]))

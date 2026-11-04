@@ -1,0 +1,1099 @@
+use crate::build::CheckoutBuilder;
+use crate::util::{self, Binding};
+use crate::{panic, raw, IntoCString, Oid, Signature, StashApplyProgress, StashFlags};
+use libc::{c_char, c_int, c_void, size_t};
+use std::ffi::{c_uint, CStr, CString};
+use std::mem;
+
+/// Stash application options structure
+pub struct StashSaveOptions<'a> {
+    message: Option<CString>,
+    flags: Option<StashFlags>,
+    stasher: Signature<'a>,
+    pathspec: Vec<CString>,
+    pathspec_ptrs: Vec<*const c_char>,
+    raw_opts: raw::git_stash_save_options,
+}
+
+impl<'a> StashSaveOptions<'a> {
+    /// Creates a default
+    pub fn new(stasher: Signature<'a>) -> Self {
+        let mut opts = Self {
+            message: None,
+            flags: None,
+            stasher,
+            pathspec: Vec::new(),
+            pathspec_ptrs: Vec::new(),
+            raw_opts: unsafe { mem::zeroed() },
+        };
+        assert_eq!(
+            unsafe {
+                raw::git_stash_save_options_init(
+                    &mut opts.raw_opts,
+                    raw::GIT_STASH_SAVE_OPTIONS_VERSION,
+                )
+            },
+            0
+        );
+        opts
+    }
+
+    /// Customize optional `flags` field
+    pub fn flags(&mut self, flags: Option<StashFlags>) -> &mut Self {
+        self.flags = flags;
+        self
+    }
+
+    /// Add to the array of paths patterns to build the stash.
+    pub fn pathspec<T: IntoCString>(&mut self, pathspec: T) -> &mut Self {
+        let s = util::cstring_to_repo_path(pathspec).unwrap();
+        self.pathspec_ptrs.push(s.as_ptr());
+        self.pathspec.push(s);
+        self
+    }
+
+    /// Acquire a pointer to the underlying raw options.
+    ///
+    /// This function is unsafe as the pointer is only valid so long as this
+    /// structure is not moved, modified, or used elsewhere.
+    pub unsafe fn raw(&mut self) -> *const raw::git_stash_save_options {
+        self.raw_opts.flags = self.flags.unwrap_or_else(StashFlags::empty).bits() as c_uint;
+        self.raw_opts.message = crate::call::convert(&self.message);
+        self.raw_opts.paths.count = self.pathspec_ptrs.len() as size_t;
+        self.raw_opts.paths.strings = self.pathspec_ptrs.as_ptr() as *mut _;
+        self.raw_opts.stasher = self.stasher.raw();
+
+        &self.raw_opts as *const _
+    }
+}
+
+/// Stash application progress notification function.
+///
+/// Return `true` to continue processing, or `false` to
+/// abort the stash application.
+// FIXME: This probably should have been pub(crate) since it is not used anywhere.
+pub type StashApplyProgressCb<'a> = dyn FnMut(StashApplyProgress) -> bool + 'a;
+
+/// This is a callback function you can provide to iterate over all the
+/// stashed states that will be invoked per entry.
+// FIXME: This probably should have been pub(crate) since it is not used anywhere.
+pub type StashCb<'a> = dyn FnMut(usize, &str, &Oid) -> bool + 'a;
+
+/// Stash application options structure
+pub struct StashApplyOptions<'cb> {
+    progress: Option<Box<StashApplyProgressCb<'cb>>>,
+    checkout_options: Option<CheckoutBuilder<'cb>>,
+    raw_opts: raw::git_stash_apply_options,
+}
+
+impl<'cb> Default for StashApplyOptions<'cb> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'cb> StashApplyOptions<'cb> {
+    /// Creates a default set of merge options.
+    pub fn new() -> StashApplyOptions<'cb> {
+        let mut opts = StashApplyOptions {
+            progress: None,
+            checkout_options: None,
+            raw_opts: unsafe { mem::zeroed() },
+        };
+        assert_eq!(
+            unsafe { raw::git_stash_apply_init_options(&mut opts.raw_opts, 1) },
+            0
+        );
+        opts
+    }
+
+    /// Set stash application flag to GIT_STASH_APPLY_REINSTATE_INDEX
+    pub fn reinstantiate_index(&mut self) -> &mut StashApplyOptions<'cb> {
+        self.raw_opts.flags = raw::GIT_STASH_APPLY_REINSTATE_INDEX as u32;
+        self
+    }
+
+    /// Options to use when writing files to the working directory
+    pub fn checkout_options(&mut self, opts: CheckoutBuilder<'cb>) -> &mut StashApplyOptions<'cb> {
+        self.checkout_options = Some(opts);
+        self
+    }
+
+    /// Optional callback to notify the consumer of application progress.
+    ///
+    /// Return `true` to continue processing, or `false` to
+    /// abort the stash application.
+    pub fn progress_cb<C>(&mut self, callback: C) -> &mut StashApplyOptions<'cb>
+    where
+        C: FnMut(StashApplyProgress) -> bool + 'cb,
+    {
+        self.progress = Some(Box::new(callback) as Box<StashApplyProgressCb<'cb>>);
+        self.raw_opts.progress_cb = Some(stash_apply_progress_cb);
+        self.raw_opts.progress_payload = self as *mut _ as *mut _;
+        self
+    }
+
+    /// Pointer to a raw git_stash_apply_options
+    pub fn raw(&mut self) -> &raw::git_stash_apply_options {
+        unsafe {
+            if let Some(opts) = self.checkout_options.as_mut() {
+                opts.configure(&mut self.raw_opts.checkout_options);
+            }
+        }
+        &self.raw_opts
+    }
+}
+
+pub(crate) struct StashCbData<'a> {
+    pub callback: &'a mut StashCb<'a>,
+}
+
+pub(crate) extern "C" fn stash_cb(
+    index: size_t,
+    message: *const c_char,
+    stash_id: *const raw::git_oid,
+    payload: *mut c_void,
+) -> c_int {
+    panic::wrap(|| unsafe {
+        let data = &mut *(payload as *mut StashCbData<'_>);
+        let res = {
+            let callback = &mut data.callback;
+            callback(
+                index,
+                CStr::from_ptr(message).to_str().unwrap(),
+                &Binding::from_raw(stash_id),
+            )
+        };
+
+        if res {
+            0
+        } else {
+            1
+        }
+    })
+    .unwrap_or(1)
+}
+
+fn convert_progress(progress: raw::git_stash_apply_progress_t) -> StashApplyProgress {
+    match progress {
+        raw::GIT_STASH_APPLY_PROGRESS_NONE => StashApplyProgress::None,
+        raw::GIT_STASH_APPLY_PROGRESS_LOADING_STASH => StashApplyProgress::LoadingStash,
+        raw::GIT_STASH_APPLY_PROGRESS_ANALYZE_INDEX => StashApplyProgress::AnalyzeIndex,
+        raw::GIT_STASH_APPLY_PROGRESS_ANALYZE_MODIFIED => StashApplyProgress::AnalyzeModified,
+        raw::GIT_STASH_APPLY_PROGRESS_ANALYZE_UNTRACKED => StashApplyProgress::AnalyzeUntracked,
+        raw::GIT_STASH_APPLY_PROGRESS_CHECKOUT_UNTRACKED => StashApplyProgress::CheckoutUntracked,
+        raw::GIT_STASH_APPLY_PROGRESS_CHECKOUT_MODIFIED => StashApplyProgress::CheckoutModified,
+        raw::GIT_STASH_APPLY_PROGRESS_DONE => StashApplyProgress::Done,
+
+        _ => StashApplyProgress::None,
+    }
+}
+
+extern "C" fn stash_apply_progress_cb(
+    progress: raw::git_stash_apply_progress_t,
+    payload: *mut c_void,
+) -> c_int {
+    panic::wrap(|| unsafe {
+        let options = &mut *(payload as *mut StashApplyOptions<'_>);
+        let res = {
+            let callback = options.progress.as_mut().unwrap();
+            callback(convert_progress(progress))
+        };
+
+        if res {
+            0
+        } else {
+            -1
+        }
+    })
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::stash::{StashApplyOptions, StashSaveOptions};
+    use crate::test::repo_init;
+    use crate::{IndexAddOption, Repository, StashFlags, Status};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn make_stash<C>(next: C)
+    where
+        C: FnOnce(&mut Repository),
+    {
+        let (_td, mut repo) = repo_init();
+        let signature = repo.signature().unwrap();
+
+        let p = Path::new(repo.workdir().unwrap()).join("file_b.txt");
+        println!("using path {:?}", p);
+
+        fs::write(&p, "data".as_bytes()).unwrap();
+
+        let rel_p = Path::new("file_b.txt");
+        assert!(repo.status_file(&rel_p).unwrap() == Status::WT_NEW);
+
+        repo.stash_save(&signature, "msg1", Some(StashFlags::INCLUDE_UNTRACKED))
+            .unwrap();
+
+        assert!(repo.status_file(&rel_p).is_err());
+
+        let mut count = 0;
+        repo.stash_foreach(|index, name, _oid| {
+            count += 1;
+            assert!(index == 0);
+            assert!(name == "On main: msg1");
+            true
+        })
+        .unwrap();
+
+        assert!(count == 1);
+        next(&mut repo);
+    }
+
+    fn count_stash(repo: &mut Repository) -> usize {
+        let mut count = 0;
+        repo.stash_foreach(|_, _, _| {
+            count += 1;
+            true
+        })
+        .unwrap();
+        count
+    }
+
+    #[test]
+    fn smoke_stash_save_drop() {
+        make_stash(|repo| {
+            repo.stash_drop(0).unwrap();
+            assert!(count_stash(repo) == 0)
+        })
+    }
+
+    #[test]
+    fn smoke_stash_save_pop() {
+        make_stash(|repo| {
+            repo.stash_pop(0, None).unwrap();
+            assert!(count_stash(repo) == 0)
+        })
+    }
+
+    #[test]
+    fn smoke_stash_save_apply() {
+        make_stash(|repo| {
+            let mut options = StashApplyOptions::new();
+            options.progress_cb(|progress| {
+                println!("{:?}", progress);
+                true
+            });
+
+            repo.stash_apply(0, Some(&mut options)).unwrap();
+            assert!(count_stash(repo) == 1)
+        })
+    }
+
+    #[test]
+    fn test_stash_save2_msg_none() {
+        let (_td, mut repo) = repo_init();
+        let signature = repo.signature().unwrap();
+
+        let p = Path::new(repo.workdir().unwrap()).join("file_b.txt");
+
+        fs::write(&p, "data".as_bytes()).unwrap();
+
+        repo.stash_save2(&signature, None, Some(StashFlags::INCLUDE_UNTRACKED))
+            .unwrap();
+
+        let mut stash_name = String::new();
+        repo.stash_foreach(|index, name, _oid| {
+            assert_eq!(index, 0);
+            stash_name = name.to_string();
+            true
+        })
+        .unwrap();
+
+        assert!(stash_name.starts_with("WIP on main:"));
+    }
+
+    fn create_file(r: &Repository, name: &str, data: &str) -> PathBuf {
+        let p = Path::new(r.workdir().unwrap()).join(name);
+        fs::write(&p, data).unwrap();
+        p
+    }
+
+    #[test]
+    fn test_stash_save_ext() {
+        let (_td, mut repo) = repo_init();
+        let signature = repo.signature().unwrap();
+
+        create_file(&repo, "file_a", "foo");
+        create_file(&repo, "file_b", "foo");
+
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+
+        assert_eq!(repo.statuses(None).unwrap().len(), 2);
+
+        let mut opt = StashSaveOptions::new(signature);
+        opt.pathspec("file_a");
+        repo.stash_save_ext(Some(&mut opt)).unwrap();
+
+        assert_eq!(repo.statuses(None).unwrap().len(), 0);
+
+        repo.stash_pop(0, None).unwrap();
+
+        assert_eq!(repo.statuses(None).unwrap().len(), 1);
+    }
+}
+use libc::{c_int, c_uint, c_void};
+use std::ffi::CString;
+use std::marker;
+
+use crate::util::Binding;
+use crate::{panic, raw, Error, Oid, Repository, Sort};
+
+/// A revwalk allows traversal of the commit graph defined by including one or
+/// more leaves and excluding one or more roots.
+pub struct Revwalk<'repo> {
+    raw: *mut raw::git_revwalk,
+    _marker: marker::PhantomData<&'repo Repository>,
+}
+
+/// A `Revwalk` with an associated "hide callback", see `with_hide_callback`
+pub struct RevwalkWithHideCb<'repo, 'cb, C>
+where
+    C: FnMut(Oid) -> bool,
+{
+    revwalk: Revwalk<'repo>,
+    _marker: marker::PhantomData<&'cb C>,
+}
+
+extern "C" fn revwalk_hide_cb<C>(commit_id: *const raw::git_oid, payload: *mut c_void) -> c_int
+where
+    C: FnMut(Oid) -> bool,
+{
+    panic::wrap(|| unsafe {
+        let hide_cb = payload as *mut C;
+        if (*hide_cb)(Oid::from_raw(commit_id)) {
+            1
+        } else {
+            0
+        }
+    })
+    .unwrap_or(-1)
+}
+
+impl<'repo, 'cb, C: FnMut(Oid) -> bool> RevwalkWithHideCb<'repo, 'cb, C> {
+    /// Consumes the `RevwalkWithHideCb` and returns the contained `Revwalk`.
+    ///
+    /// Note that this will reset the `Revwalk`.
+    pub fn into_inner(mut self) -> Result<Revwalk<'repo>, Error> {
+        self.revwalk.reset()?;
+        Ok(self.revwalk)
+    }
+}
+
+impl<'repo> Revwalk<'repo> {
+    /// Reset a revwalk to allow re-configuring it.
+    ///
+    /// The revwalk is automatically reset when iteration of its commits
+    /// completes.
+    pub fn reset(&mut self) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_revwalk_reset(self.raw()));
+        }
+        Ok(())
+    }
+
+    /// Set the order in which commits are visited.
+    pub fn set_sorting(&mut self, sort_mode: Sort) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_revwalk_sorting(
+                self.raw(),
+                sort_mode.bits() as c_uint
+            ));
+        }
+        Ok(())
+    }
+
+    /// Simplify the history by first-parent
+    ///
+    /// No parents other than the first for each commit will be enqueued.
+    pub fn simplify_first_parent(&mut self) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_revwalk_simplify_first_parent(self.raw));
+        }
+        Ok(())
+    }
+
+    /// Mark a commit to start traversal from.
+    ///
+    /// The given OID must belong to a commitish on the walked repository.
+    ///
+    /// The given commit will be used as one of the roots when starting the
+    /// revision walk. At least one commit must be pushed onto the walker before
+    /// a walk can be started.
+    pub fn push(&mut self, oid: Oid) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_revwalk_push(self.raw(), oid.raw()));
+        }
+        Ok(())
+    }
+
+    /// Push the repository's HEAD
+    ///
+    /// For more information, see `push`.
+    pub fn push_head(&mut self) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_revwalk_push_head(self.raw()));
+        }
+        Ok(())
+    }
+
+    /// Push matching references
+    ///
+    /// The OIDs pointed to by the references that match the given glob pattern
+    /// will be pushed to the revision walker.
+    ///
+    /// A leading 'refs/' is implied if not present as well as a trailing `/ \
+    /// *` if the glob lacks '?', ' \ *' or '['.
+    ///
+    /// Any references matching this glob which do not point to a commitish
+    /// will be ignored.
+    pub fn push_glob(&mut self, glob: &str) -> Result<(), Error> {
+        let glob = CString::new(glob)?;
+        unsafe {
+            try_call!(raw::git_revwalk_push_glob(self.raw, glob));
+        }
+        Ok(())
+    }
+
+    /// Push and hide the respective endpoints of the given range.
+    ///
+    /// The range should be of the form `<commit>..<commit>` where each
+    /// `<commit>` is in the form accepted by `revparse_single`. The left-hand
+    /// commit will be hidden and the right-hand commit pushed.
+    pub fn push_range(&mut self, range: &str) -> Result<(), Error> {
+        let range = CString::new(range)?;
+        unsafe {
+            try_call!(raw::git_revwalk_push_range(self.raw, range));
+        }
+        Ok(())
+    }
+
+    /// Push the OID pointed to by a reference
+    ///
+    /// The reference must point to a commitish.
+    pub fn push_ref(&mut self, reference: &str) -> Result<(), Error> {
+        let reference = CString::new(reference)?;
+        unsafe {
+            try_call!(raw::git_revwalk_push_ref(self.raw, reference));
+        }
+        Ok(())
+    }
+
+    /// Mark a commit as not of interest to this revwalk.
+    pub fn hide(&mut self, oid: Oid) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_revwalk_hide(self.raw(), oid.raw()));
+        }
+        Ok(())
+    }
+
+    /// Hide all commits for which the callback returns true from
+    /// the walk.
+    pub fn with_hide_callback<'cb, C>(
+        self,
+        callback: &'cb mut C,
+    ) -> Result<RevwalkWithHideCb<'repo, 'cb, C>, Error>
+    where
+        C: FnMut(Oid) -> bool,
+    {
+        let r = RevwalkWithHideCb {
+            revwalk: self,
+            _marker: marker::PhantomData,
+        };
+        unsafe {
+            raw::git_revwalk_add_hide_cb(
+                r.revwalk.raw(),
+                Some(revwalk_hide_cb::<C>),
+                callback as *mut _ as *mut c_void,
+            );
+        };
+        Ok(r)
+    }
+
+    /// Hide the repository's HEAD
+    ///
+    /// For more information, see `hide`.
+    pub fn hide_head(&mut self) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_revwalk_hide_head(self.raw()));
+        }
+        Ok(())
+    }
+
+    /// Hide matching references.
+    ///
+    /// The OIDs pointed to by the references that match the given glob pattern
+    /// and their ancestors will be hidden from the output on the revision walk.
+    ///
+    /// A leading 'refs/' is implied if not present as well as a trailing `/ \
+    /// *` if the glob lacks '?', ' \ *' or '['.
+    ///
+    /// Any references matching this glob which do not point to a commitish
+    /// will be ignored.
+    pub fn hide_glob(&mut self, glob: &str) -> Result<(), Error> {
+        let glob = CString::new(glob)?;
+        unsafe {
+            try_call!(raw::git_revwalk_hide_glob(self.raw, glob));
+        }
+        Ok(())
+    }
+
+    /// Hide the OID pointed to by a reference.
+    ///
+    /// The reference must point to a commitish.
+    pub fn hide_ref(&mut self, reference: &str) -> Result<(), Error> {
+        let reference = CString::new(reference)?;
+        unsafe {
+            try_call!(raw::git_revwalk_hide_ref(self.raw, reference));
+        }
+        Ok(())
+    }
+}
+
+impl<'repo> Binding for Revwalk<'repo> {
+    type Raw = *mut raw::git_revwalk;
+    unsafe fn from_raw(raw: *mut raw::git_revwalk) -> Revwalk<'repo> {
+        Revwalk {
+            raw,
+            _marker: marker::PhantomData,
+        }
+    }
+    fn raw(&self) -> *mut raw::git_revwalk {
+        self.raw
+    }
+}
+
+impl<'repo> Drop for Revwalk<'repo> {
+    fn drop(&mut self) {
+        unsafe { raw::git_revwalk_free(self.raw) }
+    }
+}
+
+impl<'repo> Iterator for Revwalk<'repo> {
+    type Item = Result<Oid, Error>;
+    fn next(&mut self) -> Option<Result<Oid, Error>> {
+        let mut out: raw::git_oid = raw::git_oid {
+            id: [0; raw::GIT_OID_RAWSZ],
+        };
+        unsafe {
+            try_call_iter!(raw::git_revwalk_next(&mut out, self.raw()));
+            Some(Ok(Binding::from_raw(&out as *const _)))
+        }
+    }
+}
+
+impl<'repo, 'cb, C: FnMut(Oid) -> bool> Iterator for RevwalkWithHideCb<'repo, 'cb, C> {
+    type Item = Result<Oid, Error>;
+    fn next(&mut self) -> Option<Result<Oid, Error>> {
+        let out = self.revwalk.next();
+        crate::panic::check();
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn smoke() {
+        let (_td, repo) = crate::test::repo_init();
+        let head = repo.head().unwrap();
+        let target = head.target().unwrap();
+
+        let mut walk = repo.revwalk().unwrap();
+        walk.push(target).unwrap();
+
+        let oids: Vec<crate::Oid> = walk.by_ref().collect::<Result<Vec<_>, _>>().unwrap();
+
+        assert_eq!(oids.len(), 1);
+        assert_eq!(oids[0], target);
+
+        walk.reset().unwrap();
+        walk.push_head().unwrap();
+        assert_eq!(walk.by_ref().count(), 1);
+
+        walk.reset().unwrap();
+        walk.push_head().unwrap();
+        walk.hide_head().unwrap();
+        assert_eq!(walk.by_ref().count(), 0);
+    }
+
+    #[test]
+    fn smoke_hide_cb() {
+        let (_td, repo) = crate::test::repo_init();
+        let head = repo.head().unwrap();
+        let target = head.target().unwrap();
+
+        let mut walk = repo.revwalk().unwrap();
+        walk.push(target).unwrap();
+
+        let oids: Vec<crate::Oid> = walk.by_ref().collect::<Result<Vec<_>, _>>().unwrap();
+
+        assert_eq!(oids.len(), 1);
+        assert_eq!(oids[0], target);
+
+        walk.reset().unwrap();
+        walk.push_head().unwrap();
+        assert_eq!(walk.by_ref().count(), 1);
+
+        walk.reset().unwrap();
+        walk.push_head().unwrap();
+
+        let mut hide_cb = |oid| oid == target;
+        let mut walk = walk.with_hide_callback(&mut hide_cb).unwrap();
+
+        assert_eq!(walk.by_ref().count(), 0);
+
+        let mut walk = walk.into_inner().unwrap();
+        walk.push_head().unwrap();
+        assert_eq!(walk.by_ref().count(), 1);
+    }
+}
+use libc::{c_char, c_uint, size_t};
+use std::ffi::CString;
+use std::iter::FusedIterator;
+use std::marker;
+use std::mem;
+use std::ops::Range;
+use std::str;
+
+use crate::util::{self, Binding};
+use crate::{raw, DiffDelta, IntoCString, Repository, Status};
+
+/// Options that can be provided to `repo.statuses()` to control how the status
+/// information is gathered.
+pub struct StatusOptions {
+    raw: raw::git_status_options,
+    pathspec: Vec<CString>,
+    ptrs: Vec<*const c_char>,
+}
+
+/// Enumeration of possible methods of what can be shown through a status
+/// operation.
+#[derive(Copy, Clone)]
+pub enum StatusShow {
+    /// Only gives status based on HEAD to index comparison, not looking at
+    /// working directory changes.
+    Index,
+
+    /// Only gives status based on index to working directory comparison, not
+    /// comparing the index to the HEAD.
+    Workdir,
+
+    /// The default, this roughly matches `git status --porcelain` regarding
+    /// which files are included and in what order.
+    IndexAndWorkdir,
+}
+
+/// A container for a list of status information about a repository.
+///
+/// Each instance appears as if it were a collection, having a length and
+/// allowing indexing, as well as providing an iterator.
+pub struct Statuses<'repo> {
+    raw: *mut raw::git_status_list,
+
+    // Hm, not currently present, but can't hurt?
+    _marker: marker::PhantomData<&'repo Repository>,
+}
+
+/// An iterator over the statuses in a `Statuses` instance.
+pub struct StatusIter<'statuses> {
+    statuses: &'statuses Statuses<'statuses>,
+    range: Range<usize>,
+}
+
+/// A structure representing an entry in the `Statuses` structure.
+///
+/// Instances are created through the `.iter()` method or the `.get()` method.
+pub struct StatusEntry<'statuses> {
+    raw: *const raw::git_status_entry,
+    _marker: marker::PhantomData<&'statuses DiffDelta<'statuses>>,
+}
+
+impl Default for StatusOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StatusOptions {
+    /// Creates a new blank set of status options.
+    pub fn new() -> StatusOptions {
+        unsafe {
+            let mut raw = mem::zeroed();
+            let r = raw::git_status_init_options(&mut raw, raw::GIT_STATUS_OPTIONS_VERSION);
+            assert_eq!(r, 0);
+            StatusOptions {
+                raw,
+                pathspec: Vec::new(),
+                ptrs: Vec::new(),
+            }
+        }
+    }
+
+    /// Select the files on which to report status.
+    ///
+    /// The default, if unspecified, is to show the index and the working
+    /// directory.
+    pub fn show(&mut self, show: StatusShow) -> &mut StatusOptions {
+        self.raw.show = match show {
+            StatusShow::Index => raw::GIT_STATUS_SHOW_INDEX_ONLY,
+            StatusShow::Workdir => raw::GIT_STATUS_SHOW_WORKDIR_ONLY,
+            StatusShow::IndexAndWorkdir => raw::GIT_STATUS_SHOW_INDEX_AND_WORKDIR,
+        };
+        self
+    }
+
+    /// Add a path pattern to match (using fnmatch-style matching).
+    ///
+    /// If the `disable_pathspec_match` option is given, then this is a literal
+    /// path to match. If this is not called, then there will be no patterns to
+    /// match and the entire directory will be used.
+    pub fn pathspec<T: IntoCString>(&mut self, pathspec: T) -> &mut StatusOptions {
+        let s = util::cstring_to_repo_path(pathspec).unwrap();
+        self.ptrs.push(s.as_ptr());
+        self.pathspec.push(s);
+        self
+    }
+
+    fn flag(&mut self, flag: raw::git_status_opt_t, val: bool) -> &mut StatusOptions {
+        if val {
+            self.raw.flags |= flag as c_uint;
+        } else {
+            self.raw.flags &= !(flag as c_uint);
+        }
+        self
+    }
+
+    /// Flag whether untracked files will be included.
+    ///
+    /// Untracked files will only be included if the workdir files are included
+    /// in the status "show" option.
+    pub fn include_untracked(&mut self, include: bool) -> &mut StatusOptions {
+        self.flag(raw::GIT_STATUS_OPT_INCLUDE_UNTRACKED, include)
+    }
+
+    /// Flag whether ignored files will be included.
+    ///
+    /// The files will only be included if the workdir files are included
+    /// in the status "show" option.
+    pub fn include_ignored(&mut self, include: bool) -> &mut StatusOptions {
+        self.flag(raw::GIT_STATUS_OPT_INCLUDE_IGNORED, include)
+    }
+
+    /// Flag to include unmodified files.
+    pub fn include_unmodified(&mut self, include: bool) -> &mut StatusOptions {
+        self.flag(raw::GIT_STATUS_OPT_INCLUDE_UNMODIFIED, include)
+    }
+
+    /// Flag that submodules should be skipped.
+    ///
+    /// This only applies if there are no pending typechanges to the submodule
+    /// (either from or to another type).
+    pub fn exclude_submodules(&mut self, exclude: bool) -> &mut StatusOptions {
+        self.flag(raw::GIT_STATUS_OPT_EXCLUDE_SUBMODULES, exclude)
+    }
+
+    /// Flag that all files in untracked directories should be included.
+    ///
+    /// Normally if an entire directory is new then just the top-level directory
+    /// is included (with a trailing slash on the entry name).
+    pub fn recurse_untracked_dirs(&mut self, include: bool) -> &mut StatusOptions {
+        self.flag(raw::GIT_STATUS_OPT_RECURSE_UNTRACKED_DIRS, include)
+    }
+
+    /// Indicates that the given paths should be treated as literals paths, note
+    /// patterns.
+    pub fn disable_pathspec_match(&mut self, include: bool) -> &mut StatusOptions {
+        self.flag(raw::GIT_STATUS_OPT_DISABLE_PATHSPEC_MATCH, include)
+    }
+
+    /// Indicates that the contents of ignored directories should be included in
+    /// the status.
+    pub fn recurse_ignored_dirs(&mut self, include: bool) -> &mut StatusOptions {
+        self.flag(raw::GIT_STATUS_OPT_RECURSE_IGNORED_DIRS, include)
+    }
+
+    /// Indicates that rename detection should be processed between the head.
+    pub fn renames_head_to_index(&mut self, include: bool) -> &mut StatusOptions {
+        self.flag(raw::GIT_STATUS_OPT_RENAMES_HEAD_TO_INDEX, include)
+    }
+
+    /// Indicates that rename detection should be run between the index and the
+    /// working directory.
+    pub fn renames_index_to_workdir(&mut self, include: bool) -> &mut StatusOptions {
+        self.flag(raw::GIT_STATUS_OPT_RENAMES_INDEX_TO_WORKDIR, include)
+    }
+
+    /// Override the native case sensitivity for the file system and force the
+    /// output to be in case sensitive order.
+    pub fn sort_case_sensitively(&mut self, include: bool) -> &mut StatusOptions {
+        self.flag(raw::GIT_STATUS_OPT_SORT_CASE_SENSITIVELY, include)
+    }
+
+    /// Override the native case sensitivity for the file system and force the
+    /// output to be in case-insensitive order.
+    pub fn sort_case_insensitively(&mut self, include: bool) -> &mut StatusOptions {
+        self.flag(raw::GIT_STATUS_OPT_SORT_CASE_INSENSITIVELY, include)
+    }
+
+    /// Indicates that rename detection should include rewritten files.
+    pub fn renames_from_rewrites(&mut self, include: bool) -> &mut StatusOptions {
+        self.flag(raw::GIT_STATUS_OPT_RENAMES_FROM_REWRITES, include)
+    }
+
+    /// Bypasses the default status behavior of doing a "soft" index reload.
+    pub fn no_refresh(&mut self, include: bool) -> &mut StatusOptions {
+        self.flag(raw::GIT_STATUS_OPT_NO_REFRESH, include)
+    }
+
+    /// Refresh the stat cache in the index for files are unchanged but have
+    /// out of date stat information in the index.
+    ///
+    /// This will result in less work being done on subsequent calls to fetching
+    /// the status.
+    pub fn update_index(&mut self, include: bool) -> &mut StatusOptions {
+        self.flag(raw::GIT_STATUS_OPT_UPDATE_INDEX, include)
+    }
+
+    // erm...
+    #[allow(missing_docs)]
+    pub fn include_unreadable(&mut self, include: bool) -> &mut StatusOptions {
+        self.flag(raw::GIT_STATUS_OPT_INCLUDE_UNREADABLE, include)
+    }
+
+    // erm...
+    #[allow(missing_docs)]
+    pub fn include_unreadable_as_untracked(&mut self, include: bool) -> &mut StatusOptions {
+        self.flag(raw::GIT_STATUS_OPT_INCLUDE_UNREADABLE_AS_UNTRACKED, include)
+    }
+
+    /// Set threshold above which similar files will be considered renames.
+    ///
+    /// This is equivalent to the `-M` option. Defaults to 50.
+    pub fn rename_threshold(&mut self, threshold: u16) -> &mut StatusOptions {
+        self.raw.rename_threshold = threshold;
+        self
+    }
+
+    /// Get a pointer to the inner list of status options.
+    ///
+    /// This function is unsafe as the returned structure has interior pointers
+    /// and may no longer be valid if these options continue to be mutated.
+    pub unsafe fn raw(&mut self) -> *const raw::git_status_options {
+        self.raw.pathspec.strings = self.ptrs.as_ptr() as *mut _;
+        self.raw.pathspec.count = self.ptrs.len() as size_t;
+        &self.raw
+    }
+}
+
+impl<'repo> Statuses<'repo> {
+    /// Gets a status entry from this list at the specified index.
+    ///
+    /// Returns `None` if the index is out of bounds.
+    pub fn get(&self, index: usize) -> Option<StatusEntry<'_>> {
+        unsafe {
+            let p = raw::git_status_byindex(self.raw, index as size_t);
+            Binding::from_raw_opt(p)
+        }
+    }
+
+    /// Gets the count of status entries in this list.
+    ///
+    /// If there are no changes in status (according to the options given
+    /// when the status list was created), this should return 0.
+    pub fn len(&self) -> usize {
+        unsafe { raw::git_status_list_entrycount(self.raw) as usize }
+    }
+
+    /// Return `true` if there is no status entry in this list.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns an iterator over the statuses in this list.
+    pub fn iter(&self) -> StatusIter<'_> {
+        StatusIter {
+            statuses: self,
+            range: 0..self.len(),
+        }
+    }
+}
+
+impl<'repo> Binding for Statuses<'repo> {
+    type Raw = *mut raw::git_status_list;
+    unsafe fn from_raw(raw: *mut raw::git_status_list) -> Statuses<'repo> {
+        Statuses {
+            raw,
+            _marker: marker::PhantomData,
+        }
+    }
+    fn raw(&self) -> *mut raw::git_status_list {
+        self.raw
+    }
+}
+
+impl<'repo> Drop for Statuses<'repo> {
+    fn drop(&mut self) {
+        unsafe {
+            raw::git_status_list_free(self.raw);
+        }
+    }
+}
+
+impl<'a> Iterator for StatusIter<'a> {
+    type Item = StatusEntry<'a>;
+    fn next(&mut self) -> Option<StatusEntry<'a>> {
+        self.range.next().and_then(|i| self.statuses.get(i))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.range.size_hint()
+    }
+}
+impl<'a> DoubleEndedIterator for StatusIter<'a> {
+    fn next_back(&mut self) -> Option<StatusEntry<'a>> {
+        self.range.next_back().and_then(|i| self.statuses.get(i))
+    }
+}
+impl<'a> FusedIterator for StatusIter<'a> {}
+impl<'a> ExactSizeIterator for StatusIter<'a> {}
+
+impl<'a> IntoIterator for &'a Statuses<'a> {
+    type Item = StatusEntry<'a>;
+    type IntoIter = StatusIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'statuses> StatusEntry<'statuses> {
+    /// Access the bytes for this entry's corresponding pathname
+    pub fn path_bytes(&self) -> &[u8] {
+        unsafe {
+            if (*self.raw).head_to_index.is_null() {
+                crate::opt_bytes(self, (*(*self.raw).index_to_workdir).old_file.path)
+            } else {
+                crate::opt_bytes(self, (*(*self.raw).head_to_index).old_file.path)
+            }
+            .unwrap()
+        }
+    }
+
+    /// Access this entry's path name as a string.
+    ///
+    /// Returns `None` if the path is not valid utf-8.
+    pub fn path(&self) -> Option<&str> {
+        str::from_utf8(self.path_bytes()).ok()
+    }
+
+    /// Access the status flags for this file
+    pub fn status(&self) -> Status {
+        Status::from_bits_truncate(unsafe { (*self.raw).status as u32 })
+    }
+
+    /// Access detailed information about the differences between the file in
+    /// HEAD and the file in the index.
+    pub fn head_to_index(&self) -> Option<DiffDelta<'statuses>> {
+        unsafe { Binding::from_raw_opt((*self.raw).head_to_index) }
+    }
+
+    /// Access detailed information about the differences between the file in
+    /// the index and the file in the working directory.
+    pub fn index_to_workdir(&self) -> Option<DiffDelta<'statuses>> {
+        unsafe { Binding::from_raw_opt((*self.raw).index_to_workdir) }
+    }
+}
+
+impl<'statuses> Binding for StatusEntry<'statuses> {
+    type Raw = *const raw::git_status_entry;
+
+    unsafe fn from_raw(raw: *const raw::git_status_entry) -> StatusEntry<'statuses> {
+        StatusEntry {
+            raw,
+            _marker: marker::PhantomData,
+        }
+    }
+    fn raw(&self) -> *const raw::git_status_entry {
+        self.raw
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StatusOptions;
+    use std::fs::File;
+    use std::io::prelude::*;
+    use std::path::Path;
+
+    #[test]
+    fn smoke() {
+        let (td, repo) = crate::test::repo_init();
+        assert_eq!(repo.statuses(None).unwrap().len(), 0);
+        File::create(&td.path().join("foo")).unwrap();
+        let statuses = repo.statuses(None).unwrap();
+        assert_eq!(statuses.iter().count(), 1);
+        let status = statuses.iter().next().unwrap();
+        assert_eq!(status.path(), Some("foo"));
+        assert!(status.status().contains(crate::Status::WT_NEW));
+        assert!(!status.status().contains(crate::Status::INDEX_NEW));
+        assert!(status.head_to_index().is_none());
+        let diff = status.index_to_workdir().unwrap();
+        assert_eq!(diff.old_file().path_bytes().unwrap(), b"foo");
+        assert_eq!(diff.new_file().path_bytes().unwrap(), b"foo");
+    }
+
+    #[test]
+    fn filter() {
+        let (td, repo) = crate::test::repo_init();
+        t!(File::create(&td.path().join("foo")));
+        t!(File::create(&td.path().join("bar")));
+        let mut opts = StatusOptions::new();
+        opts.include_untracked(true).pathspec("foo");
+
+        let statuses = t!(repo.statuses(Some(&mut opts)));
+        assert_eq!(statuses.iter().count(), 1);
+        let status = statuses.iter().next().unwrap();
+        assert_eq!(status.path(), Some("foo"));
+    }
+
+    #[test]
+    fn gitignore() {
+        let (td, repo) = crate::test::repo_init();
+        t!(t!(File::create(td.path().join(".gitignore"))).write_all(b"foo\n"));
+        assert!(!t!(repo.status_should_ignore(Path::new("bar"))));
+        assert!(t!(repo.status_should_ignore(Path::new("foo"))));
+    }
+
+    #[test]
+    fn status_file() {
+        let (td, repo) = crate::test::repo_init();
+        assert!(repo.status_file(Path::new("foo")).is_err());
+        if cfg!(windows) {
+            assert!(repo.status_file(Path::new("bar\\foo.txt")).is_err());
+        }
+        t!(File::create(td.path().join("foo")));
+        if cfg!(windows) {
+            t!(::std::fs::create_dir_all(td.path().join("bar")));
+            t!(File::create(td.path().join("bar").join("foo.txt")));
+        }
+        let status = t!(repo.status_file(Path::new("foo")));
+        assert!(status.contains(crate::Status::WT_NEW));
+        if cfg!(windows) {
+            let status = t!(repo.status_file(Path::new("bar\\foo.txt")));
+            assert!(status.contains(crate::Status::WT_NEW));
+        }
+    }
+}

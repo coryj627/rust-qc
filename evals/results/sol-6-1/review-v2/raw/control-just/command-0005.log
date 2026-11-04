@@ -1,0 +1,898 @@
+        let b = self.evaluate_expression(&arguments[1])?;
+        let c = self.evaluate_expression(&arguments[2])?;
+        f(self.function_context(name).unwrap(), &a, &b, &c)
+      }
+    }
+    .map_err(|message| Error::FunctionCall {
+      function: name,
+      message,
+    })
+  }
+
+  pub(crate) fn evaluate_expression(
+    &mut self,
+    expression: &Expression<'src>,
+  ) -> RunResult<'src, String> {
+    match expression {
+      Expression::And { lhs, rhs } => {
+        let lhs = self.evaluate_expression(lhs)?;
+        if lhs.is_empty() {
+          return Ok(String::new());
+        }
+        self.evaluate_expression(rhs)
+      }
+      Expression::Assert {
+        condition,
+        error,
+        name,
+      } => {
+        if self.evaluate_condition(condition)? {
+          Ok(String::new())
+        } else {
+          Err(Error::Assert {
+            message: self.evaluate_expression(error)?,
+            name: *name,
+          })
+        }
+      }
+      Expression::Backtick { contents, token } => {
+        let context = self.context(ConstError::Backtick(*token))?;
+
+        if context.config.dry_run {
+          return Ok(format!("`{contents}`"));
+        }
+
+        Self::run_command(context, &self.env, &self.scope, contents, None).map_err(|output_error| {
+          Error::Backtick {
+            token: *token,
+            output_error,
+          }
+        })
+      }
+      Expression::Call { name, arguments } => {
+        let module = self.context(ConstError::FunctionCall(*name))?.module;
+        if let Some(function) = module.functions.get(name.lexeme()) {
+          self.evaluate_defined_function(function, arguments)
+        } else if let Some(builtin) = function::get(name.lexeme()) {
+          self.evaluate_builtin_function(*name, builtin, arguments)
+        } else {
+          unreachable!();
+        }
+      }
+      Expression::Concatenation { lhs, rhs } => {
+        let lhs = self.evaluate_expression(lhs)?;
+        let rhs = self.evaluate_expression(rhs)?;
+        Ok(lhs + &rhs)
+      }
+      Expression::Conditional {
+        condition,
+        then,
+        otherwise,
+      } => {
+        if self.evaluate_condition(condition)? {
+          self.evaluate_expression(then)
+        } else {
+          self.evaluate_expression(otherwise)
+        }
+      }
+      Expression::FormatString { start, expressions } => {
+        let mut value = start.cooked.clone();
+
+        for (expression, string) in expressions {
+          value.push_str(&self.evaluate_expression(expression)?);
+          value.push_str(&string.cooked);
+        }
+
+        if start.kind.indented {
+          Ok(unindent(&value))
+        } else {
+          Ok(value)
+        }
+      }
+      Expression::Group { contents } => self.evaluate_expression(contents),
+      Expression::Join { lhs: None, rhs } => Ok("/".to_string() + &self.evaluate_expression(rhs)?),
+      Expression::Join {
+        lhs: Some(lhs),
+        rhs,
+      } => {
+        let lhs = self.evaluate_expression(lhs)?;
+        let rhs = self.evaluate_expression(rhs)?;
+        Ok(lhs + "/" + &rhs)
+      }
+      Expression::Or { lhs, rhs } => {
+        let lhs = self.evaluate_expression(lhs)?;
+        if !lhs.is_empty() {
+          return Ok(lhs);
+        }
+        self.evaluate_expression(rhs)
+      }
+      Expression::StringLiteral { string_literal } => Ok(string_literal.cooked.clone()),
+      Expression::Variable { name, .. } => {
+        let variable = name.lexeme();
+        if let Some(value) = self.scope.value(variable) {
+          Ok(value.to_owned())
+        } else if self.non_const_assignments.contains_key(name.lexeme()) {
+          Err(ConstError::Variable(*name).into())
+        } else if let Some(assignment) = self
+          .assignments
+          .and_then(|assignments| assignments.get(variable))
+        {
+          Ok(self.evaluate_assignment(assignment)?.to_owned())
+        } else {
+          Err(Error::internal(format!(
+            "attempted to evaluate undefined variable `{variable}`"
+          )))
+        }
+      }
+    }
+  }
+
+  fn evaluate_condition(&mut self, condition: &Condition<'src>) -> RunResult<'src, bool> {
+    let lhs_value = self.evaluate_expression(&condition.lhs)?;
+    let rhs_value = self.evaluate_expression(&condition.rhs)?;
+    let condition = match condition.operator {
+      ConditionalOperator::Equality => lhs_value == rhs_value,
+      ConditionalOperator::Inequality => lhs_value != rhs_value,
+      ConditionalOperator::RegexMatch => Regex::new(&rhs_value)
+        .map_err(|source| Error::RegexCompile { source })?
+        .is_match(&lhs_value),
+      ConditionalOperator::RegexMismatch => !Regex::new(&rhs_value)
+        .map_err(|source| Error::RegexCompile { source })?
+        .is_match(&lhs_value),
+    };
+    Ok(condition)
+  }
+
+  pub(crate) fn run_command(
+    context: &ExecutionContext,
+    env: &BTreeMap<String, String>,
+    scope: &Scope,
+    command: &str,
+    args: Option<&[String]>,
+  ) -> Result<String, OutputError> {
+    let mut cmd = context.module.settings.shell_command(context.config);
+
+    cmd.arg(command);
+
+    if let Some(args) = args {
+      if ShellKind::from(&cmd).takes_shell_name() {
+        cmd.arg(command);
+      }
+
+      cmd.args(args);
+    }
+
+    cmd
+      .current_dir(context.working_directory())
+      .export(
+        &context.module.settings,
+        context.dotenv,
+        scope,
+        &context.module.unexports,
+      )
+      .stdin(Stdio::inherit())
+      .stderr(if context.config.verbosity.quiet() {
+        Stdio::null()
+      } else {
+        Stdio::inherit()
+      })
+      .stdout(Stdio::piped());
+
+    for (key, value) in env {
+      cmd.env(key, value);
+    }
+
+    cmd.output_guard_stdout()
+  }
+
+  pub(crate) fn evaluate_line(
+    &mut self,
+    line: &Line<'src>,
+    continued: bool,
+  ) -> RunResult<'src, String> {
+    let mut evaluated = String::new();
+    for (i, fragment) in line.fragments.iter().enumerate() {
+      match fragment {
+        Fragment::Text { token } => {
+          let lexeme = token
+            .lexeme()
+            .replace(Lexer::INTERPOLATION_ESCAPE, Lexer::INTERPOLATION_START);
+
+          if i == 0 && continued {
+            evaluated += lexeme.trim_start();
+          } else {
+            evaluated += &lexeme;
+          }
+        }
+        Fragment::Interpolation { expression } => {
+          evaluated += &self.evaluate_expression(expression)?;
+        }
+      }
+    }
+    Ok(evaluated)
+  }
+
+  pub(crate) fn evaluate_parameters(
+    arguments: &[Vec<String>],
+    context: &ExecutionContext<'src, 'run>,
+    is_dependency: bool,
+    parameters: &[Parameter<'src>],
+    recipe: &Recipe<'src>,
+    scope: &'run Scope<'src, 'run>,
+  ) -> RunResult<'src, (Scope<'src, 'run>, Vec<String>)> {
+    let env = recipe
+      .attributes
+      .iter()
+      .filter_map(|attribute| {
+        if let Attribute::Env(key, value) = attribute {
+          Some((key.cooked.clone(), value.cooked.clone()))
+        } else {
+          None
+        }
+      })
+      .collect();
+
+    let mut evaluator = Self::new(context, env, is_dependency, scope);
+
+    let mut positional = Vec::new();
+
+    if arguments.len() != parameters.len() {
+      return Err(Error::internal("arguments do not match parameter count"));
+    }
+
+    for (parameter, group) in parameters.iter().zip(arguments) {
+      let values = if group.is_empty() {
+        if let Some(ref default) = parameter.default {
+          let value = evaluator.evaluate_expression(default)?;
+      let mut evaluated = String::new();
+      let mut continued = false;
+
+      let comment_line = settings.ignore_comments && line.is_comment();
+      let sigils = line.sigils(settings);
+
+      loop {
+        if lines.peek().is_none() {
+          break;
+        }
+        let line = lines.next().unwrap();
+        line_number += 1;
+        if !comment_line {
+          evaluated += &evaluator.evaluate_line(line, continued)?;
+        }
+        if line.is_continuation() && !comment_line {
+          continued = true;
+          evaluated.pop();
+        } else {
+          break;
+        }
+      }
+
+      if comment_line {
+        continue;
+      }
+
+      let mut command = evaluated.as_str();
+
+      command = &command[sigils.len()..];
+
+      if command.is_empty() {
+        continue;
+      }
+
+      let guard = sigils.contains(&Sigil::Guard);
+      let infallible = sigils.contains(&Sigil::Infallible);
+      let quiet = sigils.contains(&Sigil::Quiet);
+
+      if config.dry_run
+        || config.verbosity.loquacious()
+        || config.timestamp
+        || !((quiet ^ self.quiet)
+          || (settings.quiet && !self.no_quiet())
+          || config.verbosity.quiet())
+      {
+        let color = if config.highlight {
+          config.color.command(config.command_color)
+        } else {
+          config.color
+        }
+        .stderr();
+
+        if let Some(timestamp) = config.timestamp() {
+          eprint!("[{}] ", color.paint(&timestamp));
+        }
+
+        eprintln!("{}", color.paint(command));
+      }
+
+      if config.dry_run {
+        continue;
+      }
+
+      let mut cmd = settings.shell_command(config);
+
+      if let Some(working_directory) = self.working_directory(context) {
+        cmd.current_dir(working_directory);
+      }
+
+      cmd.arg(command);
+
+      if self.takes_positional_arguments(settings) {
+        cmd.arg(self.name.lexeme());
+        cmd.args(positional);
+      }
+
+      if config.verbosity.quiet() {
+        cmd.stderr(Stdio::null());
+        cmd.stdout(Stdio::null());
+      }
+
+      for attribute in &self.attributes {
+        if let Attribute::Env(key, value) = attribute {
+          cmd.env(&key.cooked, &value.cooked);
+        }
+      }
+
+      cmd.export(settings, context.dotenv, scope, &context.module.unexports);
+
+      let (result, caught) = cmd.status_guard();
+
+      match result {
+        Ok(exit_status) => {
+          if let Some(code) = exit_status.code() {
+            if code != 0 {
+              if guard {
+                if code == 1 {
+                  return Ok(());
+                }
+
+                return Err(Error::GuardCode {
+                  recipe: self.name(),
+                  line_number,
+                  code,
+                });
+              } else if !infallible {
+                return Err(Error::Code {
+                  recipe: self.name(),
+                  line_number: Some(line_number),
+                  code,
+                  print_message: self.print_exit_message(settings),
+                });
+              }
+            }
+          } else if !infallible {
+            return Err(Error::from_signal(
+              exit_status,
+              Some(line_number),
+              self.print_exit_message(settings),
+              self.name(),
+            ));
+          }
+        }
+        Err(io_error) => {
+          return Err(Error::ShellIo {
+            io_error,
+            recipe: self.name(),
+            shell: settings.shell(config).0.into(),
+          });
+        }
+      }
+
+      if !infallible {
+        if let Some(signal) = caught {
+          return Err(Error::Interrupted { signal });
+        }
+      }
+    }
+  }
+
+  pub(crate) fn run_script<'run>(
+    &self,
+    context: &ExecutionContext<'src, 'run>,
+    scope: &Scope<'src, 'run>,
+    positional: &[String],
+/work/crate/src/function.rs:59:    "env_var_or_default" => Binary(env_var_or_default),
+/work/crate/src/function.rs:103:    "trim" => Unary(trim),
+/work/crate/src/function.rs:104:    "trim_end" => Unary(trim_end),
+/work/crate/src/function.rs:105:    "trim_end_match" => Binary(trim_end_match),
+/work/crate/src/function.rs:106:    "trim_end_matches" => Binary(trim_end_matches),
+/work/crate/src/function.rs:107:    "trim_start" => Unary(trim_start),
+/work/crate/src/function.rs:108:    "trim_start_match" => Binary(trim_start_match),
+/work/crate/src/function.rs:109:    "trim_start_matches" => Binary(trim_start_matches),
+/work/crate/src/function.rs:267:fn env(context: Context, key: &str, default: Option<&str>) -> FunctionResult {
+/work/crate/src/function.rs:269:    Some(val) => env_var_or_default(context, key, val),
+/work/crate/src/function.rs:274:fn env_var(context: Context, key: &str) -> FunctionResult {
+/work/crate/src/function.rs:290:fn env_var_or_default(context: Context, key: &str, default: &str) -> FunctionResult {
+/work/crate/src/function.rs:627:fn trim(_context: Context, s: &str) -> FunctionResult {
+/work/crate/src/function.rs:628:  Ok(s.trim().to_owned())
+/work/crate/src/function.rs:631:fn trim_end(_context: Context, s: &str) -> FunctionResult {
+/work/crate/src/function.rs:632:  Ok(s.trim_end().to_owned())
+/work/crate/src/function.rs:635:fn trim_end_match(_context: Context, s: &str, pat: &str) -> FunctionResult {
+/work/crate/src/function.rs:639:fn trim_end_matches(_context: Context, s: &str, pat: &str) -> FunctionResult {
+/work/crate/src/function.rs:640:  Ok(s.trim_end_matches(pat).to_owned())
+/work/crate/src/function.rs:643:fn trim_start(_context: Context, s: &str) -> FunctionResult {
+/work/crate/src/function.rs:644:  Ok(s.trim_start().to_owned())
+/work/crate/src/function.rs:647:fn trim_start_match(_context: Context, s: &str, pat: &str) -> FunctionResult {
+/work/crate/src/function.rs:651:fn trim_start_matches(_context: Context, s: &str, pat: &str) -> FunctionResult {
+/work/crate/src/function.rs:652:  Ok(s.trim_start_matches(pat).to_owned())
+/work/crate/src/evaluator.rs:501:            evaluated += lexeme.trim_start();
+use super::*;
+
+#[test]
+fn pattern_match() {
+  Test::new()
+    .justfile(
+      "
+        [arg('bar', pattern='BAR')]
+        foo bar:
+      ",
+    )
+    .args(["foo", "BAR"])
+    .success();
+}
+
+#[test]
+fn pattern_mismatch() {
+  Test::new()
+    .justfile(
+      "
+        [arg('bar', pattern='BAR')]
+        foo bar:
+      ",
+    )
+    .args(["foo", "bar"])
+    .stderr(
+      "
+        error: Argument `bar` passed to recipe `foo` parameter `bar` does not match pattern 'BAR'
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn patterns_are_regulare_expressions() {
+  Test::new()
+    .justfile(
+      r"
+        [arg('bar', pattern='\d+')]
+        foo bar:
+      ",
+    )
+    .args(["foo", r"\d+"])
+    .stderr(
+      r"
+        error: Argument `\d+` passed to recipe `foo` parameter `bar` does not match pattern '\d+'
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn pattern_must_match_entire_string() {
+  Test::new()
+    .justfile(
+      "
+        [arg('bar', pattern='bar')]
+        foo bar:
+      ",
+    )
+    .args(["foo", "xbarx"])
+    .stderr(
+      "
+        error: Argument `xbarx` passed to recipe `foo` parameter `bar` does not match pattern 'bar'
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn pattern_invalid_regex_error() {
+  Test::new()
+    .justfile(
+      "
+        [arg('bar', pattern='{')]
+        foo bar:
+      ",
+    )
+    .stderr(
+      "
+        error: Failed to parse argument pattern
+         ——▶ justfile:1:21
+          │
+        1 │ [arg('bar', pattern='{')]
+          │                     ^^^
+        caused by: regex parse error:
+            {
+            ^
+        error: repetition operator missing expression
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn dump() {
+  Test::new()
+    .justfile(
+      "
+        [arg('bar', pattern='BAR')]
+        foo bar:
+      ",
+    )
+    .arg("--dump")
+    .stdout(
+      "
+        [arg('bar', pattern='BAR')]
+        foo bar:
+      ",
+    )
+    .success();
+}
+
+#[test]
+fn duplicate_attribute_error() {
+  Test::new()
+    .justfile(
+      "
+        [arg('bar', pattern='BAR')]
+        [arg('bar', pattern='BAR')]
+        foo bar:
+      ",
+    )
+    .args(["foo", "BAR"])
+    .stderr(
+      "
+        error: Recipe attribute for argument `bar` first used on line 1 is duplicated on line 2
+         ——▶ justfile:2:2
+          │
+        2 │ [arg('bar', pattern='BAR')]
+          │  ^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn extra_keyword_error() {
+  Test::new()
+    .justfile(
+      "
+        [arg('bar', pattern='BAR', foo='foo')]
+        foo bar:
+      ",
+    )
+    .args(["foo", "BAR"])
+    .stderr(
+      "
+        error: Unknown keyword `foo` for `arg` attribute
+         ——▶ justfile:1:28
+          │
+        1 │ [arg('bar', pattern='BAR', foo='foo')]
+          │                            ^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn unknown_argument_error() {
+  Test::new()
+    .justfile(
+      "
+        [arg('bar', pattern='BAR')]
+        foo:
+      ",
+    )
+    .arg("foo")
+    .stderr(
+      "
+        error: Argument attribute for undefined argument `bar`
+         ——▶ justfile:1:6
+          │
+        1 │ [arg('bar', pattern='BAR')]
+          │      ^^^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn split_across_multiple_lines() {
+  Test::new()
+    .justfile(
+      "
+        [arg(
+          'bar',
+          pattern='BAR'
+        )]
+        foo bar:
+      ",
+    )
+    .args(["foo", "BAR"])
+    .success();
+}
+
+#[test]
+fn optional_trailing_comma() {
+  Test::new()
+    .justfile(
+      "
+        [arg(
+          'bar',
+          pattern='BAR',
+        )]
+        foo bar:
+      ",
+    )
+    .args(["foo", "BAR"])
+    .success();
+}
+
+#[test]
+fn positional_arguments_cannot_follow_keyword_arguments() {
+  Test::new()
+    .justfile(
+      "
+        [arg(pattern='BAR', 'bar')]
+        foo bar:
+      ",
+    )
+    .args(["foo", "BAR"])
+    .stderr(
+      "
+        error: Positional attribute arguments cannot follow keyword attribute arguments
+         ——▶ justfile:1:21
+          │
+        1 │ [arg(pattern='BAR', 'bar')]
+          │                     ^^^^^
+      ",
+    )
+    .failure();
+}
+
+#[test]
+fn pattern_mismatches_are_caught_before_running_dependencies() {
+  Test::new()
+    .justfile(
+      "
+        baz:
+use super::*;
+
+#[track_caller]
+fn evaluate(expression: &str, expected: &str) {
+  Test::new()
+    .justfile(format!("x := {expression}"))
+    .env("JUST_UNSTABLE", "1")
+    .args(["--evaluate", "x"])
+    .stdout(expected)
+    .success();
+}
+
+#[test]
+fn logical_operators_are_unstable() {
+  Test::new()
+    .justfile("x := 'foo' && 'bar'")
+    .args(["--evaluate", "x"])
+    .stderr_regex(r"error: The logical operators `&&` and `\|\|` are currently unstable. .*")
+    .failure();
+
+  Test::new()
+    .justfile("x := 'foo' || 'bar'")
+    .args(["--evaluate", "x"])
+    .stderr_regex(r"error: The logical operators `&&` and `\|\|` are currently unstable. .*")
+    .failure();
+}
+
+#[test]
+fn and_returns_empty_string_if_lhs_is_empty() {
+  evaluate("'' && 'hello'", "");
+}
+
+#[test]
+fn and_returns_rhs_if_lhs_is_non_empty() {
+  evaluate("'hello' && 'goodbye'", "goodbye");
+}
+
+#[test]
+fn and_has_lower_precedence_than_plus() {
+  evaluate("'' && 'goodbye' + 'foo'", "");
+
+  evaluate("'foo' + 'hello' && 'goodbye'", "goodbye");
+
+  evaluate("'foo' + '' && 'goodbye'", "goodbye");
+
+  evaluate("'foo' + 'hello' && 'goodbye' + 'bar'", "goodbyebar");
+}
+
+#[test]
+fn or_returns_rhs_if_lhs_is_empty() {
+  evaluate("'' || 'hello'", "hello");
+}
+
+#[test]
+fn or_returns_lhs_if_lhs_is_non_empty() {
+  evaluate("'hello' || 'goodbye'", "hello");
+}
+
+#[test]
+fn or_has_lower_precedence_than_plus() {
+  evaluate("'' || 'goodbye' + 'foo'", "goodbyefoo");
+
+  evaluate("'foo' + 'hello' || 'goodbye'", "foohello");
+
+  evaluate("'foo' + '' || 'goodbye'", "foo");
+
+  evaluate("'foo' + 'hello' || 'goodbye' + 'bar'", "foohello");
+}
+
+#[test]
+fn and_has_higher_precedence_than_or() {
+  evaluate("('' && 'foo') || 'bar'", "bar");
+  evaluate("'' && 'foo' || 'bar'", "bar");
+  evaluate("'a' && 'b' || 'c'", "b");
+}
+
+#[test]
+fn nesting() {
+  evaluate("'' || '' || '' || '' || 'foo'", "foo");
+  evaluate("'foo' && 'foo' && 'foo' && 'foo' && 'bar'", "bar");
+}
+use super::*;
+
+pub(crate) enum Executor<'a> {
+  Command(Interpreter<String>),
+  Shebang(Shebang<'a>),
+}
+
+impl Executor<'_> {
+  pub(crate) fn command<'src>(
+    &self,
+    config: &Config,
+    path: &Path,
+    recipe: &'src str,
+    working_directory: Option<&Path>,
+  ) -> RunResult<'src, Command> {
+    match self {
+      Self::Command(interpreter) => {
+        let mut command = Command::resolve(&interpreter.command);
+
+        if let Some(working_directory) = working_directory {
+          command.current_dir(working_directory);
+        }
+
+        for arg in &interpreter.arguments {
+          command.arg(arg);
+        }
+
+        command.arg(path);
+
+        Ok(command)
+      }
+      Self::Shebang(shebang) => {
+        // make script executable
+        Platform::set_execute_permission(path).map_err(|error| Error::TempdirIo {
+          recipe,
+          io_error: error,
+        })?;
+
+        // create command to run script
+        Platform::make_shebang_command(config, path, *shebang, working_directory).map_err(
+          |output_error| Error::Cygpath {
+            recipe,
+            output_error,
+          },
+        )
+      }
+    }
+  }
+
+  fn shell_kind(&self) -> ShellKind {
+    match self {
+      Self::Command(interpreter) => &interpreter.command,
+      Self::Shebang(shebang) => shebang.interpreter_filename(),
+    }
+    .into()
+  }
+
+  pub(crate) fn script_filename(&self, recipe: &str, extension: Option<&str>) -> String {
+    format!(
+      "{recipe}{}",
+      extension.unwrap_or_else(|| self.shell_kind().extension()),
+    )
+  }
+
+  pub(crate) fn error<'src>(&self, io_error: io::Error, recipe: &'src str) -> Error<'src> {
+    match self {
+      Self::Command(Interpreter { command, arguments }) => {
+        let mut command = command.clone();
+
+        for arg in arguments {
+          command.push(' ');
+          command.push_str(arg);
+        }
+
+        Error::Script {
+          command,
+          io_error,
+          recipe,
+        }
+      }
+      Self::Shebang(shebang) => Error::Shebang {
+        argument: shebang.argument.map(String::from),
+        command: shebang.interpreter.to_owned(),
+        io_error,
+        recipe,
+      },
+    }
+  }
+
+  // Script text for `recipe` given evaluated `lines` including blanks so line
+  // numbers in errors from generated script match justfile source lines.
+  pub(crate) fn script<D>(&self, recipe: &Recipe<D>, lines: &[String]) -> String {
+    let mut script = String::new();
+    let mut n = 0;
+    let shebangs = recipe
+      .body
+      .iter()
+      .take_while(|line| line.is_shebang())
+      .count();
+
+    if let Self::Shebang(shebang) = self {
+      for shebang_line in &lines[..shebangs] {
+        if shebang.include_shebang_line() {
+          script.push_str(shebang_line);
+        }
+        script.push('\n');
+        n += 1;
+      }
+    }
+
+    for (line, text) in recipe.body.iter().zip(lines).skip(n) {
+      while n < line.number {
+        script.push('\n');
+        n += 1;
+      }
+
+      script.push_str(text);
+      script.push('\n');
+      n += 1;
+    }
+
+    script
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn shebang_script_filename() {
+    #[track_caller]
+    fn case(interpreter: &str, recipe: &str, extension: Option<&str>, expected: &str) {
+      assert_eq!(
+        Executor::Shebang(Shebang::new(&format!("#!{interpreter}")).unwrap())
+          .script_filename(recipe, extension),
+        expected
+      );
+      assert_eq!(
+        Executor::Command(Interpreter {
+          command: interpreter.into(),
+          arguments: Vec::new()
+        })
+        .script_filename(recipe, extension),
+        expected
+      );
+    }
+
+    case("bar", "foo", Some(".sh"), "foo.sh");
+    case("pwsh.exe", "foo", Some(".sh"), "foo.sh");
+    case("cmd.exe", "foo", Some(".sh"), "foo.sh");
+    case("powershell", "foo", None, "foo.ps1");
+    case("pwsh", "foo", None, "foo.ps1");
+    case("powershell.exe", "foo", None, "foo.ps1");
+    case("pwsh.exe", "foo", None, "foo.ps1");
+    case("cmd", "foo", None, "foo.bat");
+    case("cmd.exe", "foo", None, "foo.bat");
+    case("bar", "foo", None, "foo");
+  }
+}

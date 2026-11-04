@@ -1,0 +1,792 @@
+            .flow
+            .available()
+            .add(self.in_flight_data)?
+            .checked_size();
+        if target > current {
+            self.flow.assign_capacity(target - current)?;
+        } else {
+            self.flow.claim_capacity(current - target)?;
+        }
+
+        // If changing the target capacity means we gained a bunch of capacity,
+        // enough that we went over the update threshold, then schedule sending
+        // a connection WINDOW_UPDATE.
+        if self.flow.unclaimed_capacity().is_some() {
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_local_settings(
+        &mut self,
+        settings: &frame::Settings,
+        store: &mut Store,
+    ) -> Result<(), proto::Error> {
+        if let Some(val) = settings.is_extended_connect_protocol_enabled() {
+            self.is_extended_connect_protocol_enabled = val;
+        }
+
+        if let Some(target) = settings.initial_window_size() {
+            let old_sz = self.init_window_sz;
+            self.init_window_sz = target;
+
+            tracing::trace!("update_initial_window_size; new={}; old={}", target, old_sz,);
+
+            // Per RFC 7540 §6.9.2:
+            //
+            // In addition to changing the flow-control window for streams that are
+            // not yet active, a SETTINGS frame can alter the initial flow-control
+            // window size for streams with active flow-control windows (that is,
+            // streams in the "open" or "half-closed (remote)" state). When the
+            // value of SETTINGS_INITIAL_WINDOW_SIZE changes, a receiver MUST adjust
+            // the size of all stream flow-control windows that it maintains by the
+            // difference between the new value and the old value.
+            //
+            // A change to `SETTINGS_INITIAL_WINDOW_SIZE` can cause the available
+            // space in a flow-control window to become negative. A sender MUST
+            // track the negative flow-control window and MUST NOT send new
+            // flow-controlled frames until it receives WINDOW_UPDATE frames that
+            // cause the flow-control window to become positive.
+
+            match target.cmp(&old_sz) {
+                Ordering::Less => {
+                    // We must decrease the (local) window on every open stream.
+                    let dec = old_sz - target;
+                    tracing::trace!("decrementing all windows; dec={}", dec);
+
+                    store.try_for_each(|mut stream| {
+                        stream
+                            .recv_flow
+                            .dec_recv_window(dec)
+                            .map_err(proto::Error::library_go_away)?;
+                        Ok::<_, proto::Error>(())
+                    })?;
+                }
+                Ordering::Greater => {
+                    // We must increase the (local) window on every open stream.
+                    let inc = target - old_sz;
+                    tracing::trace!("incrementing all windows; inc={}", inc);
+                    store.try_for_each(|mut stream| {
+                        // XXX: Shouldn't the peer have already noticed our
+                        // overflow and sent us a GOAWAY?
+                        stream
+                            .recv_flow
+                            .inc_window(inc)
+                            .map_err(proto::Error::library_go_away)?;
+                        stream
+                            .recv_flow
+                            .assign_capacity(inc)
+                            .map_err(proto::Error::library_go_away)?;
+                        Ok::<_, proto::Error>(())
+                    })?;
+                }
+                Ordering::Equal => (),
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn is_end_stream(&self, stream: &store::Ptr) -> bool {
+        if !stream.state.is_recv_end_stream() {
+            return false;
+        }
+
+        stream.pending_recv.is_empty()
+    }
+
+    pub fn recv_data(&mut self, frame: frame::Data, stream: &mut store::Ptr) -> Result<(), Error> {
+        let sz = frame.payload().len();
+
+        // This should have been enforced at the codec::FramedRead layer, so
+        // this is just a sanity check.
+        assert!(sz <= MAX_WINDOW_SIZE as usize);
+
+        let sz = sz as WindowSize;
+
+        let is_ignoring_frame = stream.state.is_local_error();
+
+        if !is_ignoring_frame && !stream.state.is_recv_streaming() {
+            // TODO: There are cases where this can be a stream error of
+            // STREAM_CLOSED instead...
+
+            // Receiving a DATA frame when not expecting one is a protocol
+            // error.
+            proto_err!(conn: "unexpected DATA frame; stream={:?}", stream.id);
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+        }
+
+        tracing::trace!(
+            "recv_data; size={}; connection={}; stream={}",
+            sz,
+            self.flow.window_size(),
+            stream.recv_flow.window_size()
+        );
+
+        if is_ignoring_frame {
+            tracing::trace!(
+                "recv_data; frame ignored on locally reset {:?} for some time",
+                stream.id,
+            );
+            return self.ignore_data(sz);
+        }
+
+        // Ensure that there is enough capacity on the connection before acting
+        // on the stream.
+        self.consume_connection_window(sz)?;
+
+        if stream.recv_flow.window_size() < sz {
+            // http://httpwg.org/specs/rfc7540.html#WINDOW_UPDATE
+            // > A receiver MAY respond with a stream error (Section 5.4.2) or
+            // > connection error (Section 5.4.1) of type FLOW_CONTROL_ERROR if
+            // > it is unable to accept a frame.
+            //
+            // So, for violating the **stream** window, we can send either a
+            // stream or connection error. We've opted to send a stream
+            // error.
+            return Err(Error::library_reset(stream.id, Reason::FLOW_CONTROL_ERROR));
+        }
+
+        if stream.dec_content_length(frame.payload().len()).is_err() {
+            proto_err!(stream:
+                "recv_data: content-length overflow; stream={:?}; len={:?}",
+                stream.id,
+                frame.payload().len(),
+            );
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
+        }
+
+        if frame.is_end_stream() {
+            if stream.ensure_content_length_zero().is_err() {
+                proto_err!(stream:
+                    "recv_data: content-length underflow; stream={:?}; len={:?}",
+                    stream.id,
+                    frame.payload().len(),
+                );
+                return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
+            }
+
+            if stream.state.recv_close().is_err() {
+                proto_err!(conn: "recv_data: failed to transition to closed state; stream={:?}", stream.id);
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+            }
+        }
+
+        // Received a frame, but no one cared about it. fix issue#648
+        if !stream.is_recv {
+            tracing::trace!(
+                "recv_data; frame ignored on stream release {:?} for some time",
+                stream.id,
+            );
+            self.release_connection_capacity(sz, &mut None);
+            return Ok(());
+        }
+
+        // Update stream level flow control
+        stream
+            .recv_flow
+            .send_data(sz)
+            .map_err(proto::Error::library_go_away)?;
+
+        // Track the data as in-flight
+        stream.in_flight_recv_data += sz;
+
+        let event = Event::Data(frame.into_payload());
+
+        // Push the frame onto the recv buffer
+        stream.pending_recv.push_back(&mut self.buffer, event);
+        stream.notify_recv();
+
+        Ok(())
+    }
+
+    pub fn ignore_data(&mut self, sz: WindowSize) -> Result<(), Error> {
+        // Ensure that there is enough capacity on the connection...
+        self.consume_connection_window(sz)?;
+
+        // Since we are ignoring this frame,
+        // we aren't returning the frame to the user. That means they
+        // have no way to release the capacity back to the connection. So
+        // we have to release it automatically.
+        //
+        // This call doesn't send a WINDOW_UPDATE immediately, just marks
+        // the capacity as available to be reclaimed. When the available
+        // capacity meets a threshold, a WINDOW_UPDATE is then sent.
+        self.release_connection_capacity(sz, &mut None);
+        Ok(())
+    }
+
+    pub fn consume_connection_window(&mut self, sz: WindowSize) -> Result<(), Error> {
+        if self.flow.window_size() < sz {
+            tracing::debug!(
+                "connection error FLOW_CONTROL_ERROR -- window_size ({:?}) < sz ({:?});",
+                self.flow.window_size(),
+                sz,
+            );
+            return Err(Error::library_go_away(Reason::FLOW_CONTROL_ERROR));
+        }
+
+        // Update connection level flow control
+        self.flow.send_data(sz).map_err(Error::library_go_away)?;
+
+        // Track the data as in-flight
+        self.in_flight_data += sz;
+        Ok(())
+    }
+
+    pub fn recv_push_promise(
+        &mut self,
+        frame: frame::PushPromise,
+        stream: &mut store::Ptr,
+    ) -> Result<(), Error> {
+        stream.state.reserve_remote()?;
+        if frame.is_over_size() {
+            // A frame is over size if the decoded header block was bigger than
+            // SETTINGS_MAX_HEADER_LIST_SIZE.
+            //
+            // > A server that receives a larger header block than it is willing
+            // > to handle can send an HTTP 431 (Request Header Fields Too
+            // > Large) status code [RFC6585]. A client can discard responses
+            // > that it cannot process.
+            //
+            // So, if peer is a server, we'll send a 431. In either case,
+            // an error is recorded, which will send a PROTOCOL_ERROR,
+            // since we don't want any of the data frames either.
+            tracing::debug!(
+                "stream error PROTOCOL_ERROR -- recv_push_promise: \
+                 headers frame is over size; promised_id={:?};",
+                frame.promised_id(),
+            );
+            return Err(Error::library_reset(
+                frame.promised_id(),
+                Reason::PROTOCOL_ERROR,
+            ));
+        }
+
+        let promised_id = frame.promised_id();
+        let (pseudo, fields) = frame.into_parts();
+        let req = crate::server::Peer::convert_poll_message(pseudo, fields, promised_id)?;
+
+        if let Err(e) = frame::PushPromise::validate_request(&req) {
+            use PushPromiseHeaderError::*;
+            match e {
+                NotSafeAndCacheable => proto_err!(
+                    stream:
+                    "recv_push_promise: method {} is not safe and cacheable; promised_id={:?}",
+                    req.method(),
+                    promised_id,
+                ),
+                InvalidContentLength(e) => proto_err!(
+                    stream:
+                    "recv_push_promise; promised request has invalid content-length {:?}; promised_id={:?}",
+                    e,
+                    promised_id,
+                ),
+            }
+            return Err(Error::library_reset(promised_id, Reason::PROTOCOL_ERROR));
+        }
+
+        use super::peer::PollMessage::*;
+        stream
+            .pending_recv
+            .push_back(&mut self.buffer, Event::Headers(Server(req)));
+        stream.notify_recv();
+        stream.notify_push();
+        Ok(())
+    }
+
+    /// Ensures that `id` is not in the `Idle` state.
+    pub fn ensure_not_idle(&self, id: StreamId) -> Result<(), Reason> {
+        if let Ok(next) = self.next_stream_id {
+            if id >= next {
+                tracing::debug!(
+                    "stream ID implicitly closed, PROTOCOL_ERROR; stream={:?}",
+                    id
+                );
+                return Err(Reason::PROTOCOL_ERROR);
+            }
+        }
+        // if next_stream_id is overflowed, that's ok.
+use crate::codec::UserError;
+use crate::frame::{Reason, StreamId};
+use crate::{client, server};
+
+use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
+use crate::proto::*;
+
+use bytes::Bytes;
+use futures_core::Stream;
+use std::io;
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::io::AsyncRead;
+
+/// An H2 connection
+#[derive(Debug)]
+pub(crate) struct Connection<T, P, B: Buf = Bytes>
+where
+    P: Peer,
+{
+    /// Read / write frame values
+    codec: Codec<T, Prioritized<B>>,
+
+    inner: ConnectionInner<P, B>,
+}
+
+// Extracted part of `Connection` which does not depend on `T`. Reduces the amount of duplicated
+// method instantiations.
+#[derive(Debug)]
+struct ConnectionInner<P, B: Buf = Bytes>
+where
+    P: Peer,
+{
+    /// Tracks the connection level state transitions.
+    state: State,
+
+    /// An error to report back once complete.
+    ///
+    /// This exists separately from State in order to support
+    /// graceful shutdown.
+    error: Option<frame::GoAway>,
+
+    /// Pending GOAWAY frames to write.
+    go_away: GoAway,
+
+    /// Ping/pong handler
+    ping_pong: PingPong,
+
+    /// Connection settings
+    settings: Settings,
+
+    /// Stream state handler
+    streams: Streams<B, P>,
+
+    /// A `tracing` span tracking the lifetime of the connection.
+    span: tracing::Span,
+
+    /// Client or server
+    _phantom: PhantomData<P>,
+}
+
+struct DynConnection<'a, B: Buf = Bytes> {
+    state: &'a mut State,
+
+    go_away: &'a mut GoAway,
+
+    streams: DynStreams<'a, B>,
+
+    error: &'a mut Option<frame::GoAway>,
+
+    ping_pong: &'a mut PingPong,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Config {
+    pub next_stream_id: StreamId,
+    pub initial_max_send_streams: usize,
+    pub max_send_buffer_size: usize,
+    pub reset_stream_duration: Duration,
+    pub reset_stream_max: usize,
+    pub remote_reset_stream_max: usize,
+    pub local_error_reset_streams_max: Option<usize>,
+    pub settings: frame::Settings,
+}
+
+#[derive(Debug)]
+enum State {
+    /// Currently open in a sane state
+    Open,
+
+    /// The codec must be flushed
+    Closing(Reason, Initiator),
+
+    /// In a closed state
+    Closed(Reason, Initiator),
+}
+
+impl<T, P, B> Connection<T, P, B>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+    P: Peer,
+    B: Buf,
+{
+    pub fn new(codec: Codec<T, Prioritized<B>>, config: Config) -> Connection<T, P, B> {
+        fn streams_config(config: &Config) -> streams::Config {
+            streams::Config {
+                initial_max_send_streams: config.initial_max_send_streams,
+                local_max_buffer_size: config.max_send_buffer_size,
+                local_next_stream_id: config.next_stream_id,
+                local_push_enabled: config.settings.is_push_enabled().unwrap_or(true),
+                extended_connect_protocol_enabled: config
+                    .settings
+                    .is_extended_connect_protocol_enabled()
+                    .unwrap_or(false),
+                local_reset_duration: config.reset_stream_duration,
+                local_reset_max: config.reset_stream_max,
+                remote_reset_max: config.remote_reset_stream_max,
+                remote_init_window_sz: DEFAULT_INITIAL_WINDOW_SIZE,
+                remote_max_initiated: config
+                    .settings
+                    .max_concurrent_streams()
+                    .map(|max| max as usize),
+                local_max_error_reset_streams: config.local_error_reset_streams_max,
+            }
+        }
+        let streams = Streams::new(streams_config(&config));
+        Connection {
+            codec,
+            inner: ConnectionInner {
+                state: State::Open,
+                error: None,
+                go_away: GoAway::new(),
+                ping_pong: PingPong::new(),
+                settings: Settings::new(config.settings),
+                streams,
+                span: tracing::debug_span!("Connection", peer = %P::NAME),
+                _phantom: PhantomData,
+            },
+        }
+    }
+
+    /// connection flow control
+    pub(crate) fn set_target_window_size(&mut self, size: WindowSize) {
+        let _res = self.inner.streams.set_target_connection_window_size(size);
+        // TODO: proper error handling
+        debug_assert!(_res.is_ok());
+    }
+
+    /// Send a new SETTINGS frame with an updated initial window size.
+    pub(crate) fn set_initial_window_size(&mut self, size: WindowSize) -> Result<(), UserError> {
+        let mut settings = frame::Settings::default();
+        settings.set_initial_window_size(Some(size));
+        self.inner.settings.send_settings(settings)
+    }
+
+    /// Send a new SETTINGS frame with extended CONNECT protocol enabled.
+    pub(crate) fn set_enable_connect_protocol(&mut self) -> Result<(), UserError> {
+        let mut settings = frame::Settings::default();
+        settings.set_enable_connect_protocol(Some(1));
+        self.inner.settings.send_settings(settings)
+    }
+
+    /// Returns the maximum number of concurrent streams that may be initiated
+    /// by this peer.
+    pub(crate) fn max_send_streams(&self) -> usize {
+        self.inner.streams.max_send_streams()
+    }
+
+    /// Returns the maximum number of concurrent streams that may be initiated
+    /// by the remote peer.
+    pub(crate) fn max_recv_streams(&self) -> usize {
+        self.inner.streams.max_recv_streams()
+    }
+
+    #[cfg(feature = "unstable")]
+    pub fn num_wired_streams(&self) -> usize {
+        self.inner.streams.num_wired_streams()
+    }
+
+    /// Returns `Ready` when the connection is ready to receive a frame.
+    ///
+    /// Returns `Error` as this may raise errors that are caused by delayed
+    /// processing of received frames.
+    fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+        let _e = self.inner.span.enter();
+        let span = tracing::trace_span!("poll_ready");
+        let _e = span.enter();
+        // The order of these calls don't really matter too much
+        ready!(self.inner.ping_pong.send_pending_pong(cx, &mut self.codec))?;
+        ready!(self.inner.ping_pong.send_pending_ping(cx, &mut self.codec))?;
+        ready!(self
+            .inner
+            .settings
+            .poll_send(cx, &mut self.codec, &mut self.inner.streams))?;
+        ready!(self.inner.streams.send_pending_refusal(cx, &mut self.codec))?;
+
+        Poll::Ready(Ok(()))
+    }
+
+    /// Send any pending GOAWAY frames.
+    ///
+    /// This will return `Some(reason)` if the connection should be closed
+    /// afterwards. If this is a graceful shutdown, this returns `None`.
+    fn poll_go_away(&mut self, cx: &mut Context) -> Poll<Option<io::Result<Reason>>> {
+        self.inner.go_away.send_pending_go_away(cx, &mut self.codec)
+    }
+
+    pub fn go_away_from_user(&mut self, e: Reason) {
+        self.inner.as_dyn().go_away_from_user(e)
+    }
+
+    fn take_error(&mut self, ours: Reason, initiator: Initiator) -> Result<(), Error> {
+        let (debug_data, theirs) = self
+            .inner
+            .error
+            .take()
+            .as_ref()
+            .map_or((Bytes::new(), Reason::NO_ERROR), |frame| {
+                (frame.debug_data().clone(), frame.reason())
+            });
+
+        match (ours, theirs) {
+            (Reason::NO_ERROR, Reason::NO_ERROR) => Ok(()),
+            (ours, Reason::NO_ERROR) => Err(Error::GoAway(Bytes::new(), ours, initiator)),
+            // If both sides reported an error, give their
+            // error back to th user. We assume our error
+            // was a consequence of their error, and less
+            // important.
+[package]
+name = "h2-tests"
+version = "0.1.0"
+authors = ["Carl Lerche <<email>>"]
+publish = false
+edition = "2018"
+
+[dependencies]
+
+[dev-dependencies]
+h2-support = { path = "../h2-support" }
+tracing = "0.1.13"
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+tokio = { version = "1", features = ["macros", "net", "rt", "io-util", "rt-multi-thread"] }
+use futures::{StreamExt, TryStreamExt};
+use h2_support::prelude::*;
+use h2_support::util::yield_once;
+
+// In this case, the stream & connection both have capacity, but capacity is not
+// explicitly requested.
+#[tokio::test]
+async fn send_data_without_requesting_capacity() {
+    h2_support::trace_init!();
+
+    let payload = vec![0; 1024];
+
+    let mock = mock_io::Builder::new()
+        .handshake()
+        .write(&[
+            // POST /
+            0, 0, 16, 1, 4, 0, 0, 0, 1, 131, 135, 65, 139, 157, 41, 172, 75, 143, 168, 233, 25, 151,
+            33, 233, 132,
+        ])
+        .write(&[
+            // DATA
+            0, 4, 0, 0, 1, 0, 0, 0, 1,
+        ])
+        .write(&payload[..])
+        .write(frames::SETTINGS_ACK)
+        // Read response
+        .read(&[0, 0, 1, 1, 5, 0, 0, 0, 1, 0x89])
+        .build();
+
+    let (mut client, mut h2) = client::handshake(mock).await.unwrap();
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("https://http2.akamai.com/")
+        .body(())
+        .unwrap();
+
+    let (response, mut stream) = client.send_request(request, false).unwrap();
+
+    // The capacity should be immediately allocated
+    assert_eq!(stream.capacity(), 0);
+
+    // Send the data
+    stream.send_data(payload.into(), true).unwrap();
+
+    // Get the response
+    let resp = h2.run(response).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    h2.await.unwrap();
+}
+
+#[tokio::test]
+async fn release_capacity_sends_window_update() {
+    h2_support::trace_init!();
+
+    let payload = vec![0u8; 16_384];
+    let payload_len = payload.len();
+
+    let (io, mut srv) = mock::new();
+
+    let mock = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200)).await;
+        srv.send_frame(frames::data(1, &payload[..])).await;
+        srv.send_frame(frames::data(1, &payload[..])).await;
+        srv.send_frame(frames::data(1, &payload[..])).await;
+        srv.recv_frame(frames::window_update(0, 32_768)).await;
+        srv.recv_frame(frames::window_update(1, 32_768)).await;
+        srv.send_frame(frames::data(1, &payload[..]).eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+
+        let req = async move {
+            let resp = client.send_request(request, true).unwrap().0.await.unwrap();
+            // Get the response
+            assert_eq!(resp.status(), StatusCode::OK);
+            let mut body = resp.into_parts().1;
+
+            // read some body to use up window size to below half
+            let buf = body.data().await.unwrap().unwrap();
+            assert_eq!(buf.len(), payload_len);
+
+            let buf = body.data().await.unwrap().unwrap();
+            assert_eq!(buf.len(), payload_len);
+
+            let buf = body.data().await.unwrap().unwrap();
+            assert_eq!(buf.len(), payload_len);
+            body.flow_control().release_capacity(buf.len() * 2).unwrap();
+
+            let buf = body.data().await.unwrap().unwrap();
+            assert_eq!(buf.len(), payload_len);
+        };
+
+        join(
+            async move {
+                h2.await.unwrap();
+            },
+            req,
+        )
+        .await
+    };
+    join(mock, h2).await;
+}
+
+#[tokio::test]
+async fn release_capacity_of_small_amount_does_not_send_window_update() {
+    h2_support::trace_init!();
+
+    let payload = [0; 16];
+
+    let (io, mut srv) = mock::new();
+
+    let mock = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200)).await;
+        srv.send_frame(frames::data(1, &payload[..]).eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+
+        let req = async move {
+            let resp = client.send_request(request, true).unwrap().0.await.unwrap();
+use std::fmt;
+
+use bytes::{BufMut, Bytes};
+
+use crate::frame::{self, Error, Head, Kind, Reason, StreamId};
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct GoAway {
+    last_stream_id: StreamId,
+    error_code: Reason,
+    debug_data: Bytes,
+}
+
+impl GoAway {
+    pub fn new(last_stream_id: StreamId, reason: Reason) -> Self {
+        GoAway {
+            last_stream_id,
+            error_code: reason,
+            debug_data: Bytes::new(),
+        }
+    }
+
+    pub fn with_debug_data(last_stream_id: StreamId, reason: Reason, debug_data: Bytes) -> Self {
+        Self {
+            last_stream_id,
+            error_code: reason,
+            debug_data,
+        }
+    }
+
+    pub fn last_stream_id(&self) -> StreamId {
+        self.last_stream_id
+    }
+
+    pub fn reason(&self) -> Reason {
+        self.error_code
+    }
+
+    pub fn debug_data(&self) -> &Bytes {
+        &self.debug_data
+    }
+
+    pub fn load(payload: &[u8]) -> Result<GoAway, Error> {
+        if payload.len() < 8 {
+            return Err(Error::BadFrameSize);
+        }
+
+        let (last_stream_id, _) = StreamId::parse(&payload[..4]);
+        let error_code = unpack_octets_4!(payload, 4, u32);
+        let debug_data = Bytes::copy_from_slice(&payload[8..]);
+
+        Ok(GoAway {
+            last_stream_id,
+            error_code: error_code.into(),
+            debug_data,
+        })
+    }
+
+    pub fn encode<B: BufMut>(&self, dst: &mut B) {
+        tracing::trace!("encoding GO_AWAY; code={:?}", self.error_code);
+        let head = Head::new(Kind::GoAway, 0, StreamId::zero());
+        head.encode(8 + self.debug_data.len(), dst);
+        dst.put_u32(self.last_stream_id.into());
+        dst.put_u32(self.error_code.into());
+        dst.put(self.debug_data.slice(..));
+    }
+}
+
+impl<B> From<GoAway> for frame::Frame<B> {
+    fn from(src: GoAway) -> Self {
+        frame::Frame::GoAway(src)
+    }
+}
+
+impl fmt::Debug for GoAway {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut builder = f.debug_struct("GoAway");
+        builder.field("error_code", &self.error_code);
+        builder.field("last_stream_id", &self.last_stream_id);
+
+        if !self.debug_data.is_empty() {
+            builder.field("debug_data", &self.debug_data);
+        }
+
+        builder.finish()
+    }
+}

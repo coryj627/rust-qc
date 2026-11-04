@@ -1,0 +1,827 @@
+
+        self.header_block.encode(&head, dst, |_| {})
+    }
+}
+
+// ===== impl Pseudo =====
+
+impl Pseudo {
+    pub fn request(method: Method, uri: Uri, protocol: Option<Protocol>) -> Self {
+        let parts = uri::Parts::from(uri);
+
+        let (scheme, path) = if method == Method::CONNECT && protocol.is_none() {
+            (None, None)
+        } else {
+            let path = parts
+                .path_and_query
+                .map(|v| BytesStr::from(v.as_str()))
+                .unwrap_or(BytesStr::from_static(""));
+
+            let path = if !path.is_empty() {
+                path
+            } else if method == Method::OPTIONS {
+                BytesStr::from_static("*")
+            } else {
+                BytesStr::from_static("/")
+            };
+
+            (parts.scheme, Some(path))
+        };
+
+        let mut pseudo = Pseudo {
+            method: Some(method),
+            scheme: None,
+            authority: None,
+            path,
+            protocol,
+            status: None,
+        };
+
+        // If the URI includes a scheme component, add it to the pseudo headers
+        if let Some(scheme) = scheme {
+            pseudo.set_scheme(scheme);
+        }
+
+        // If the URI includes an authority component, add it to the pseudo
+        // headers
+        if let Some(authority) = parts.authority {
+            pseudo.set_authority(BytesStr::from(authority.as_str()));
+        }
+
+        pseudo
+    }
+
+    pub fn response(status: StatusCode) -> Self {
+        Pseudo {
+            method: None,
+            scheme: None,
+            authority: None,
+            path: None,
+            protocol: None,
+            status: Some(status),
+        }
+    }
+
+    #[cfg(feature = "unstable")]
+    pub fn set_status(&mut self, value: StatusCode) {
+        self.status = Some(value);
+    }
+
+    pub fn set_scheme(&mut self, scheme: uri::Scheme) {
+        let bytes_str = match scheme.as_str() {
+            "http" => BytesStr::from_static("http"),
+            "https" => BytesStr::from_static("https"),
+            s => BytesStr::from(s),
+        };
+        self.scheme = Some(bytes_str);
+    }
+
+    #[cfg(feature = "unstable")]
+    pub fn set_protocol(&mut self, protocol: Protocol) {
+        self.protocol = Some(protocol);
+    }
+
+    pub fn set_authority(&mut self, authority: BytesStr) {
+        self.authority = Some(authority);
+    }
+
+    /// Whether it has status 1xx
+    pub(crate) fn is_informational(&self) -> bool {
+        self.status
+            .map_or(false, |status| status.is_informational())
+    }
+}
+
+// ===== impl EncodingHeaderBlock =====
+
+impl EncodingHeaderBlock {
+    fn encode<F>(mut self, head: &Head, dst: &mut EncodeBuf<'_>, f: F) -> Option<Continuation>
+    where
+        F: FnOnce(&mut EncodeBuf<'_>),
+    {
+        let head_pos = dst.get_ref().len();
+
+        // At this point, we don't know how big the h2 frame will be.
+        // So, we write the head with length 0, then write the body, and
+        // finally write the length once we know the size.
+        head.encode(0, dst);
+
+        let payload_pos = dst.get_ref().len();
+
+        f(dst);
+
+        // Now, encode the header payload
+        let continuation = if self.hpack.len() > dst.remaining_mut() {
+            dst.put((&mut self.hpack).take(dst.remaining_mut()));
+
+            Some(Continuation {
+                stream_id: head.stream_id(),
+                header_block: self,
+            })
+        } else {
+            dst.put_slice(&self.hpack);
+
+            None
+        };
+
+        // Compute the header block length
+        let payload_len = (dst.get_ref().len() - payload_pos) as u64;
+
+        // Write the frame length
+        let payload_len_be = payload_len.to_be_bytes();
+        assert!(payload_len_be[0..5].iter().all(|b| *b == 0));
+        (dst.get_mut()[head_pos..head_pos + 3]).copy_from_slice(&payload_len_be[5..]);
+
+        if continuation.is_some() {
+            // There will be continuation frames, so the `is_end_headers` flag
+            // must be unset
+            debug_assert!(dst.get_ref()[head_pos + 4] & END_HEADERS == END_HEADERS);
+
+            dst.get_mut()[head_pos + 4] -= END_HEADERS;
+        }
+
+        continuation
+    }
+}
+
+// ===== impl Iter =====
+
+impl Iterator for Iter {
+    type Item = hpack::Header<Option<HeaderName>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use crate::hpack::Header::*;
+
+        if let Some(ref mut pseudo) = self.pseudo {
+            if let Some(method) = pseudo.method.take() {
+                return Some(Method(method));
+            }
+
+            if let Some(scheme) = pseudo.scheme.take() {
+                return Some(Scheme(scheme));
+            }
+
+            if let Some(authority) = pseudo.authority.take() {
+                return Some(Authority(authority));
+            }
+
+            if let Some(path) = pseudo.path.take() {
+                return Some(Path(path));
+            }
+
+            if let Some(protocol) = pseudo.protocol.take() {
+                return Some(Protocol(protocol));
+            }
+
+            if let Some(status) = pseudo.status.take() {
+                return Some(Status(status));
+            }
+        }
+
+        self.pseudo = None;
+
+        self.fields
+            .next()
+            .map(|(name, value)| Field { name, value })
+    }
+}
+
+// ===== impl HeadersFlag =====
+
+impl HeadersFlag {
+use super::{DecoderError, NeedMore};
+use crate::ext::Protocol;
+
+use bytes::Bytes;
+use http::header::{HeaderName, HeaderValue};
+use http::{Method, StatusCode};
+use std::fmt;
+
+/// HTTP/2 Header
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum Header<T = HeaderName> {
+    Field { name: T, value: HeaderValue },
+    // TODO: Change these types to `http::uri` types.
+    Authority(BytesStr),
+    Method(Method),
+    Scheme(BytesStr),
+    Path(BytesStr),
+    Protocol(Protocol),
+    Status(StatusCode),
+}
+
+/// The header field name
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub enum Name<'a> {
+    Field(&'a HeaderName),
+    Authority,
+    Method,
+    Scheme,
+    Path,
+    Protocol,
+    Status,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Eq, PartialEq, Default)]
+pub struct BytesStr(Bytes);
+
+pub fn len(name: &HeaderName, value: &HeaderValue) -> usize {
+    let n: &str = name.as_ref();
+    32 + n.len() + value.len()
+}
+
+impl Header<Option<HeaderName>> {
+    pub fn reify(self) -> Result<Header, HeaderValue> {
+        use self::Header::*;
+
+        Ok(match self {
+            Field {
+                name: Some(n),
+                value,
+            } => Field { name: n, value },
+            Field { name: None, value } => return Err(value),
+            Authority(v) => Authority(v),
+            Method(v) => Method(v),
+            Scheme(v) => Scheme(v),
+            Path(v) => Path(v),
+            Protocol(v) => Protocol(v),
+            Status(v) => Status(v),
+        })
+    }
+}
+
+impl Header {
+    pub fn new(name: Bytes, value: Bytes) -> Result<Header, DecoderError> {
+        if name.is_empty() {
+            return Err(DecoderError::NeedMore(NeedMore::UnexpectedEndOfStream));
+        }
+        if name[0] == b':' {
+            match &name[1..] {
+                b"authority" => {
+                    let value = BytesStr::try_from(value)?;
+                    Ok(Header::Authority(value))
+                }
+                b"method" => {
+                    let method = Method::from_bytes(&value)?;
+                    Ok(Header::Method(method))
+                }
+                b"scheme" => {
+                    let value = BytesStr::try_from(value)?;
+                    Ok(Header::Scheme(value))
+                }
+                b"path" => {
+                    let value = BytesStr::try_from(value)?;
+                    Ok(Header::Path(value))
+                }
+                b"protocol" => {
+                    let value = Protocol::try_from(value)?;
+                    Ok(Header::Protocol(value))
+                }
+                b"status" => {
+                    let status = StatusCode::from_bytes(&value)?;
+                    Ok(Header::Status(status))
+                }
+                _ => Err(DecoderError::InvalidPseudoheader),
+            }
+        } else {
+            // HTTP/2 requires lower case header names
+            let name = HeaderName::from_lowercase(&name)?;
+            let value = HeaderValue::from_bytes(&value)?;
+
+            Ok(Header::Field { name, value })
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match *self {
+            Header::Field {
+                ref name,
+                ref value,
+            } => len(name, value),
+            Header::Authority(ref v) => 32 + 10 + v.len(),
+            Header::Method(ref v) => 32 + 7 + v.as_ref().len(),
+            Header::Scheme(ref v) => 32 + 7 + v.len(),
+            Header::Path(ref v) => 32 + 5 + v.len(),
+            Header::Protocol(ref v) => 32 + 9 + v.as_str().len(),
+            Header::Status(_) => 32 + 7 + 3,
+        }
+    }
+
+    /// Returns the header name
+    pub fn name(&self) -> Name<'_> {
+        match *self {
+            Header::Field { ref name, .. } => Name::Field(name),
+            Header::Authority(..) => Name::Authority,
+            Header::Method(..) => Name::Method,
+            Header::Scheme(..) => Name::Scheme,
+            Header::Path(..) => Name::Path,
+            Header::Protocol(..) => Name::Protocol,
+            Header::Status(..) => Name::Status,
+        }
+    }
+
+    pub fn value_slice(&self) -> &[u8] {
+        match *self {
+            Header::Field { ref value, .. } => value.as_ref(),
+            Header::Authority(ref v) => v.as_ref(),
+            Header::Method(ref v) => v.as_ref().as_ref(),
+            Header::Scheme(ref v) => v.as_ref(),
+            Header::Path(ref v) => v.as_ref(),
+            Header::Protocol(ref v) => v.as_ref(),
+            Header::Status(ref v) => v.as_str().as_ref(),
+        }
+    }
+
+    pub fn value_eq(&self, other: &Header) -> bool {
+        match *self {
+            Header::Field { ref value, .. } => {
+                let a = value;
+                match *other {
+                    Header::Field { ref value, .. } => a == value,
+                    _ => false,
+                }
+            }
+            Header::Authority(ref a) => match *other {
+                Header::Authority(ref b) => a == b,
+                _ => false,
+            },
+            Header::Method(ref a) => match *other {
+                Header::Method(ref b) => a == b,
+                _ => false,
+            },
+            Header::Scheme(ref a) => match *other {
+                Header::Scheme(ref b) => a == b,
+                _ => false,
+            },
+            Header::Path(ref a) => match *other {
+                Header::Path(ref b) => a == b,
+                _ => false,
+            },
+            Header::Protocol(ref a) => match *other {
+                Header::Protocol(ref b) => a == b,
+                _ => false,
+            },
+            Header::Status(ref a) => match *other {
+                Header::Status(ref b) => a == b,
+                _ => false,
+            },
+        }
+    }
+
+    pub fn is_sensitive(&self) -> bool {
+        match *self {
+            Header::Field { ref value, .. } => value.is_sensitive(),
+            // TODO: Technically these other header values can be sensitive too.
+            _ => false,
+        }
+    }
+
+    pub fn skip_value_index(&self) -> bool {
+        use http::header;
+
+        match *self {
+            Header::Field { ref name, .. } => matches!(
+                *name,
+                header::AGE
+                    | header::AUTHORIZATION
+                    | header::CONTENT_LENGTH
+                    | header::ETAG
+                    | header::IF_MODIFIED_SINCE
+                    | header::IF_NONE_MATCH
+                    | header::LOCATION
+                    | header::COOKIE
+                    | header::SET_COOKIE
+            ),
+            Header::Path(..) => true,
+            _ => false,
+        }
+    }
+}
+
+// Mostly for tests
+impl From<Header> for Header<Option<HeaderName>> {
+    fn from(src: Header) -> Self {
+        match src {
+            Header::Field { name, value } => Header::Field {
+                name: Some(name),
+                value,
+            },
+            Header::Authority(v) => Header::Authority(v),
+            Header::Method(v) => Header::Method(v),
+            Header::Scheme(v) => Header::Scheme(v),
+            Header::Path(v) => Header::Path(v),
+            Header::Protocol(v) => Header::Protocol(v),
+            Header::Status(v) => Header::Status(v),
+        }
+    }
+}
+
+impl<'a> Name<'a> {
+    pub fn into_entry(self, value: Bytes) -> Result<Header, DecoderError> {
+        match self {
+            Name::Field(name) => Ok(Header::Field {
+                name: name.clone(),
+                value: HeaderValue::from_bytes(&value)?,
+            }),
+            Name::Authority => Ok(Header::Authority(BytesStr::try_from(value)?)),
+            Name::Method => Ok(Header::Method(Method::from_bytes(&value)?)),
+            Name::Scheme => Ok(Header::Scheme(BytesStr::try_from(value)?)),
+            Name::Path => Ok(Header::Path(BytesStr::try_from(value)?)),
+            Name::Protocol => Ok(Header::Protocol(Protocol::try_from(value)?)),
+            Name::Status => {
+                match StatusCode::from_bytes(&value) {
+                    Ok(status) => Ok(Header::Status(status)),
+                    // TODO: better error handling
+                    Err(_) => Err(DecoderError::InvalidStatusCode),
+                }
+            }
+        }
+    }
+
+use super::Header;
+
+use fnv::FnvHasher;
+use http::header;
+use http::method::Method;
+
+use std::collections::VecDeque;
+use std::hash::{Hash, Hasher};
+use std::{cmp, mem};
+
+/// HPACK encoder table
+#[derive(Debug)]
+pub struct Table {
+    mask: usize,
+    indices: Vec<Option<Pos>>,
+    slots: VecDeque<Slot>,
+    inserted: usize,
+    // Size is in bytes
+    size: usize,
+    max_size: usize,
+}
+
+#[derive(Debug)]
+pub enum Index {
+    // The header is already fully indexed
+    Indexed(usize, Header),
+
+    // The name is indexed, but not the value
+    Name(usize, Header),
+
+    // The full header has been inserted into the table.
+    Inserted(usize),
+
+    // Only the value has been inserted (hpack table idx, slots idx)
+    InsertedValue(usize, usize),
+
+    // The header is not indexed by this table
+    NotIndexed(Header),
+}
+
+#[derive(Debug)]
+struct Slot {
+    hash: HashValue,
+    header: Header,
+    next: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct Pos {
+    index: usize,
+    hash: HashValue,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+struct HashValue(usize);
+
+const MAX_SIZE: usize = 1 << 16;
+const DYN_OFFSET: usize = 62;
+
+macro_rules! probe_loop {
+    ($probe_var: ident < $len: expr, $body: expr) => {
+        debug_assert!($len > 0);
+        loop {
+            if $probe_var < $len {
+                $body
+                $probe_var += 1;
+            } else {
+                $probe_var = 0;
+            }
+        }
+    };
+}
+
+impl Table {
+    pub fn new(max_size: usize, capacity: usize) -> Table {
+        if capacity == 0 {
+            Table {
+                mask: 0,
+                indices: vec![],
+                slots: VecDeque::new(),
+                inserted: 0,
+                size: 0,
+                max_size,
+            }
+        } else {
+            let capacity = cmp::max(to_raw_capacity(capacity).next_power_of_two(), 8);
+
+            Table {
+                mask: capacity.wrapping_sub(1),
+                indices: vec![None; capacity],
+                slots: VecDeque::with_capacity(usable_capacity(capacity)),
+                inserted: 0,
+                size: 0,
+                max_size,
+            }
+        }
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        usable_capacity(self.indices.len())
+    }
+
+    pub fn max_size(&self) -> usize {
+        self.max_size
+    }
+
+    /// Gets the header stored in the table
+    pub fn resolve<'a>(&'a self, index: &'a Index) -> &'a Header {
+        use self::Index::*;
+
+        match *index {
+            Indexed(_, ref h) => h,
+            Name(_, ref h) => h,
+            Inserted(idx) => &self.slots[idx].header,
+            InsertedValue(_, idx) => &self.slots[idx].header,
+            NotIndexed(ref h) => h,
+        }
+    }
+
+    pub fn resolve_idx(&self, index: &Index) -> usize {
+        use self::Index::*;
+
+        match *index {
+            Indexed(idx, ..) => idx,
+            Name(idx, ..) => idx,
+            Inserted(idx) => idx + DYN_OFFSET,
+            InsertedValue(_name_idx, slot_idx) => slot_idx + DYN_OFFSET,
+            NotIndexed(_) => panic!("cannot resolve index"),
+        }
+    }
+
+    /// Index the header in the HPACK table.
+    pub fn index(&mut self, header: Header) -> Index {
+        // Check the static table
+        let statik = index_static(&header);
+
+        // Don't index certain headers. This logic is borrowed from nghttp2.
+        if header.skip_value_index() {
+            // Right now, if this is true, the header name is always in the
+            // static table. At some point in the future, this might not be true
+            // and this logic will need to be updated.
+            debug_assert!(statik.is_some(), "skip_value_index requires a static name",);
+            return Index::new(statik, header);
+        }
+
+        // If the header is already indexed by the static table, return that
+        if let Some((n, true)) = statik {
+            return Index::Indexed(n, header);
+        }
+
+        // Don't index large headers
+        if header.len() * 4 > self.max_size * 3 {
+            return Index::new(statik, header);
+        }
+
+        self.index_dynamic(header, statik)
+    }
+
+    fn index_dynamic(&mut self, header: Header, statik: Option<(usize, bool)>) -> Index {
+        debug_assert!(self.assert_valid_state("one"));
+
+        if header.len() + self.size < self.max_size || !header.is_sensitive() {
+            // Only grow internal storage if needed
+            self.reserve_one();
+        }
+
+        if self.indices.is_empty() {
+            // If `indices` is not empty, then it is impossible for all
+            // `indices` entries to be `Some`. So, we only need to check for the
+            // empty case.
+            return Index::new(statik, header);
+        }
+
+        let hash = hash_header(&header);
+
+        let desired_pos = desired_pos(self.mask, hash);
+        let mut probe = desired_pos;
+        let mut dist = 0;
+
+        // Start at the ideal position, checking all slots
+        probe_loop!(probe < self.indices.len(), {
+            if let Some(pos) = self.indices[probe] {
+                // The slot is already occupied, but check if it has a lower
+                // displacement.
+                let their_dist = probe_distance(self.mask, pos.hash, probe);
+
+                let slot_idx = pos.index.wrapping_add(self.inserted);
+
+                if their_dist < dist {
+                    // Index robinhood
+                    return self.index_vacant(header, hash, dist, probe, statik);
+                } else if pos.hash == hash && self.slots[slot_idx].header.name() == header.name() {
+                    // Matching name, check values
+                    return self.index_occupied(header, hash, pos.index, statik.map(|(n, _)| n));
+                }
+            } else {
+                return self.index_vacant(header, hash, dist, probe, statik);
+            }
+
+            dist += 1;
+        });
+    }
+
+    fn index_occupied(
+        &mut self,
+        header: Header,
+        hash: HashValue,
+        mut index: usize,
+        statik: Option<usize>,
+    ) -> Index {
+        debug_assert!(self.assert_valid_state("top"));
+
+        // There already is a match for the given header name. Check if a value
+        // matches. The header will also only be inserted if the table is not at
+        // capacity.
+        loop {
+            // Compute the real index into the VecDeque
+            let real_idx = index.wrapping_add(self.inserted);
+
+
+async fn bind_connection<T>(io: &mut T) -> Result<(), crate::Error>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    tracing::debug!("binding client connection");
+
+    let msg: &'static [u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    io.write_all(msg).await.map_err(crate::Error::from_io)?;
+
+    tracing::debug!("client connection bound");
+
+    Ok(())
+}
+
+impl<T, B> Connection<T, B>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+    B: Buf,
+{
+    async fn handshake2(
+        mut io: T,
+        builder: Builder,
+    ) -> Result<(SendRequest<B>, Connection<T, B>), crate::Error> {
+        bind_connection(&mut io).await?;
+
+        // Create the codec
+        let mut codec = Codec::new(io);
+
+        if let Some(max) = builder.settings.max_frame_size() {
+            codec.set_max_recv_frame_size(max as usize);
+        }
+
+        if let Some(max) = builder.settings.max_header_list_size() {
+            codec.set_max_recv_header_list_size(max as usize);
+        }
+
+        // Send initial settings frame
+        codec
+            .buffer(builder.settings.clone().into())
+            .expect("invalid SETTINGS frame");
+
+        let inner = proto::Connection::new(
+            codec,
+            proto::Config {
+                next_stream_id: builder.stream_id,
+                initial_max_send_streams: builder.initial_max_send_streams,
+                max_send_buffer_size: builder.max_send_buffer_size,
+                reset_stream_duration: builder.reset_stream_duration,
+                reset_stream_max: builder.reset_stream_max,
+                remote_reset_stream_max: builder.pending_accept_reset_stream_max,
+                local_error_reset_streams_max: builder.local_max_error_reset_streams,
+                settings: builder.settings.clone(),
+            },
+        );
+        let send_request = SendRequest {
+            inner: inner.streams().clone(),
+            pending: None,
+        };
+
+        let mut connection = Connection { inner };
+        if let Some(sz) = builder.initial_target_connection_window_size {
+            connection.set_target_window_size(sz);
+        }
+
+        Ok((send_request, connection))
+use crate::codec::SendError;
+use crate::frame::{Reason, StreamId};
+
+use bytes::Bytes;
+use std::fmt;
+use std::io;
+
+/// Either an H2 reason  or an I/O error
+#[derive(Clone, Debug)]
+pub enum Error {
+    Reset(StreamId, Reason, Initiator),
+    GoAway(Bytes, Reason, Initiator),
+    Io(io::ErrorKind, Option<String>),
+}
+
+pub struct GoAway {
+    pub debug_data: Bytes,
+    pub reason: Reason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Initiator {
+    User,
+    Library,
+    Remote,
+}
+
+impl Error {
+    pub(crate) fn is_local(&self) -> bool {
+        match *self {
+            Self::Reset(_, _, initiator) | Self::GoAway(_, _, initiator) => initiator.is_local(),
+            Self::Io(..) => true,
+        }
+    }
+
+    pub(crate) fn user_go_away(reason: Reason) -> Self {
+        Self::GoAway(Bytes::new(), reason, Initiator::User)
+    }
+
+    pub(crate) fn library_reset(stream_id: StreamId, reason: Reason) -> Self {
+        Self::Reset(stream_id, reason, Initiator::Library)
+    }
+
+    pub(crate) fn library_go_away(reason: Reason) -> Self {
+        Self::GoAway(Bytes::new(), reason, Initiator::Library)
+    }
+
+    pub(crate) fn library_go_away_data(reason: Reason, debug_data: impl Into<Bytes>) -> Self {
+        Self::GoAway(debug_data.into(), reason, Initiator::Library)
+    }
+
+    pub(crate) fn remote_reset(stream_id: StreamId, reason: Reason) -> Self {
+        Self::Reset(stream_id, reason, Initiator::Remote)
+    }
+
+    pub(crate) fn remote_go_away(debug_data: Bytes, reason: Reason) -> Self {
+        Self::GoAway(debug_data, reason, Initiator::Remote)
+    }
+}
+
+impl Initiator {
+    fn is_local(&self) -> bool {
+        match *self {
+            Self::User | Self::Library => true,
+            Self::Remote => false,
+        }
+    }
+
+    pub(crate) fn is_library(&self) -> bool {
+        matches!(self, Self::Library)
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Self::Reset(_, reason, _) | Self::GoAway(_, reason, _) => reason.fmt(fmt),
+            Self::Io(_, Some(ref inner)) => inner.fmt(fmt),
+            Self::Io(kind, None) => io::Error::from(kind).fmt(fmt),
+        }
+    }
+}
+
+impl From<io::ErrorKind> for Error {
+    fn from(src: io::ErrorKind) -> Self {
+        Error::Io(src, None)
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(src: io::Error) -> Self {
+        Error::Io(src.kind(), src.get_ref().map(|inner| inner.to_string()))
+    }
+}
+
+impl From<Error> for SendError {
+    fn from(src: Error) -> Self {
+        Self::Connection(src)
+    }
+}

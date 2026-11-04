@@ -1,0 +1,812 @@
+8.974966666666667 minutes used of 45.0
+use super::{header::BytesStr, huffman, Header};
+use crate::frame;
+
+use bytes::{Buf, Bytes, BytesMut};
+use http::header;
+use http::method::{self, Method};
+use http::status::{self, StatusCode};
+
+use std::cmp;
+use std::collections::VecDeque;
+use std::io::Cursor;
+use std::str::Utf8Error;
+
+/// Decodes headers using HPACK
+#[derive(Debug)]
+pub struct Decoder {
+    // Protocol indicated that the max table size will update
+    max_size_update: Option<usize>,
+    last_max_update: usize,
+    table: Table,
+    buffer: BytesMut,
+}
+
+/// Represents all errors that can be encountered while performing the decoding
+/// of an HPACK header set.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum DecoderError {
+    InvalidRepresentation,
+    InvalidIntegerPrefix,
+    InvalidTableIndex,
+    InvalidHuffmanCode,
+    InvalidUtf8,
+    InvalidStatusCode,
+    InvalidPseudoheader,
+    InvalidMaxDynamicSize,
+    IntegerOverflow,
+    NeedMore(NeedMore),
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum NeedMore {
+    UnexpectedEndOfStream,
+    IntegerUnderflow,
+    StringUnderflow,
+}
+
+enum Representation {
+    /// Indexed header field representation
+    ///
+    /// An indexed header field representation identifies an entry in either the
+    /// static table or the dynamic table (see Section 2.3).
+    ///
+    /// # Header encoding
+    ///
+    /// ```text
+    ///   0   1   2   3   4   5   6   7
+    /// +---+---+---+---+---+---+---+---+
+    /// | 1 |        Index (7+)         |
+    /// +---+---------------------------+
+    /// ```
+    Indexed,
+
+    /// Literal Header Field with Incremental Indexing
+    ///
+    /// A literal header field with incremental indexing representation results
+    /// in appending a header field to the decoded header list and inserting it
+    /// as a new entry into the dynamic table.
+    ///
+    /// # Header encoding
+    ///
+    /// ```text
+    ///   0   1   2   3   4   5   6   7
+    /// +---+---+---+---+---+---+---+---+
+    /// | 0 | 1 |      Index (6+)       |
+    /// +---+---+-----------------------+
+    /// | H |     Value Length (7+)     |
+    /// +---+---------------------------+
+    /// | Value String (Length octets)  |
+    /// +-------------------------------+
+    /// ```
+    LiteralWithIndexing,
+
+    /// Literal Header Field without Indexing
+    ///
+    /// A literal header field without indexing representation results in
+    /// appending a header field to the decoded header list without altering the
+    /// dynamic table.
+    ///
+    /// # Header encoding
+    ///
+    /// ```text
+    ///   0   1   2   3   4   5   6   7
+    /// +---+---+---+---+---+---+---+---+
+    /// | 0 | 0 | 0 | 0 |  Index (4+)   |
+    /// +---+---+-----------------------+
+    /// | H |     Value Length (7+)     |
+    /// +---+---------------------------+
+    /// | Value String (Length octets)  |
+    /// +-------------------------------+
+    /// ```
+    LiteralWithoutIndexing,
+
+    /// Literal Header Field Never Indexed
+    ///
+    /// A literal header field never-indexed representation results in appending
+    /// a header field to the decoded header list without altering the dynamic
+    /// table. Intermediaries MUST use the same representation for encoding this
+    /// header field.
+    ///
+    /// ```text
+    ///   0   1   2   3   4   5   6   7
+    /// +---+---+---+---+---+---+---+---+
+    /// | 0 | 0 | 0 | 1 |  Index (4+)   |
+    /// +---+---+-----------------------+
+    /// | H |     Value Length (7+)     |
+    /// +---+---------------------------+
+    /// | Value String (Length octets)  |
+    /// +-------------------------------+
+    /// ```
+    LiteralNeverIndexed,
+
+    /// Dynamic Table Size Update
+    ///
+    /// A dynamic table size update signals a change to the size of the dynamic
+    /// table.
+    ///
+    /// # Header encoding
+    ///
+    /// ```text
+    ///   0   1   2   3   4   5   6   7
+    /// +---+---+---+---+---+---+---+---+
+    /// | 0 | 0 | 1 |   Max size (5+)   |
+    /// +---+---------------------------+
+    /// ```
+    SizeUpdate,
+}
+
+#[derive(Debug)]
+struct Table {
+    entries: VecDeque<Header>,
+    size: usize,
+    max_size: usize,
+}
+
+struct StringMarker {
+    offset: usize,
+    len: usize,
+    string: Option<Bytes>,
+}
+
+// ===== impl Decoder =====
+
+impl Decoder {
+    /// Creates a new `Decoder` with all settings set to default values.
+    pub fn new(size: usize) -> Decoder {
+use super::table::{Index, Table};
+use super::{huffman, Header};
+
+use bytes::{BufMut, BytesMut};
+use http::header::{HeaderName, HeaderValue};
+
+#[derive(Debug)]
+pub struct Encoder {
+    table: Table,
+    size_update: Option<SizeUpdate>,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum SizeUpdate {
+    One(usize),
+    Two(usize, usize), // min, max
+}
+
+impl Encoder {
+    pub fn new(max_size: usize, capacity: usize) -> Encoder {
+        Encoder {
+            table: Table::new(max_size, capacity),
+            size_update: None,
+        }
+    }
+
+    /// Queues a max size update.
+    ///
+    /// The next call to `encode` will include a dynamic size update frame.
+    pub fn update_max_size(&mut self, val: usize) {
+        match self.size_update {
+            Some(SizeUpdate::One(old)) => {
+                if val > old {
+                    if old > self.table.max_size() {
+                        self.size_update = Some(SizeUpdate::One(val));
+                    } else {
+                        self.size_update = Some(SizeUpdate::Two(old, val));
+                    }
+                } else {
+                    self.size_update = Some(SizeUpdate::One(val));
+                }
+            }
+            Some(SizeUpdate::Two(min, _)) => {
+                if val < min {
+                    self.size_update = Some(SizeUpdate::One(val));
+                } else {
+                    self.size_update = Some(SizeUpdate::Two(min, val));
+                }
+            }
+            None => {
+                if val != self.table.max_size() {
+                    // Don't bother writing a frame if the value already matches
+                    // the table's max size.
+                    self.size_update = Some(SizeUpdate::One(val));
+                }
+            }
+        }
+    }
+
+    /// Encode a set of headers into the provide buffer
+    pub fn encode<I>(&mut self, headers: I, dst: &mut BytesMut)
+    where
+        I: IntoIterator<Item = Header<Option<HeaderName>>>,
+    {
+        let span = tracing::trace_span!("hpack::encode");
+        let _e = span.enter();
+
+        self.encode_size_updates(dst);
+
+        let mut last_index = None;
+
+        for header in headers {
+            match header.reify() {
+                // The header has an associated name. In which case, try to
+                // index it in the table.
+                Ok(header) => {
+                    let index = self.table.index(header);
+                    self.encode_header(&index, dst);
+
+                    last_index = Some(index);
+                }
+                // The header does not have an associated name. This means that
+                // the name is the same as the previously yielded header. In
+                // which case, we skip table lookup and just use the same index
+                // as the previous entry.
+                Err(value) => {
+                    self.encode_header_without_name(
+                        last_index.as_ref().unwrap_or_else(|| {
+                            panic!("encoding header without name, but no previous index to use for name");
+                        }),
+                        &value,
+                        dst,
+                    );
+                }
+            }
+        }
+    }
+
+    fn encode_size_updates(&mut self, dst: &mut BytesMut) {
+        match self.size_update.take() {
+            Some(SizeUpdate::One(val)) => {
+                self.table.resize(val);
+                encode_size_update(val, dst);
+            }
+            Some(SizeUpdate::Two(min, max)) => {
+                self.table.resize(min);
+                self.table.resize(max);
+                encode_size_update(min, dst);
+                encode_size_update(max, dst);
+            }
+            None => {}
+        }
+    }
+
+    fn encode_header(&mut self, index: &Index, dst: &mut BytesMut) {
+        match *index {
+            Index::Indexed(idx, _) => {
+                encode_int(idx, 7, 0x80, dst);
+            }
+            Index::Name(idx, _) => {
+                let header = self.table.resolve(index);
+
+                encode_not_indexed(idx, header.value_slice(), header.is_sensitive(), dst);
+            }
+            Index::Inserted(_) => {
+                let header = self.table.resolve(index);
+
+                assert!(!header.is_sensitive());
+
+                dst.put_u8(0b0100_0000);
+
+                encode_str(header.name().as_slice(), dst);
+                encode_str(header.value_slice(), dst);
+            }
+            Index::InsertedValue(idx, _) => {
+                let header = self.table.resolve(index);
+
+                assert!(!header.is_sensitive());
+
+                encode_int(idx, 6, 0b0100_0000, dst);
+                encode_str(header.value_slice(), dst);
+            }
+            Index::NotIndexed(_) => {
+                let header = self.table.resolve(index);
+
+                encode_not_indexed2(
+                    header.name().as_slice(),
+                    header.value_slice(),
+                    header.is_sensitive(),
+                    dst,
+                );
+            }
+        }
+    }
+
+    fn encode_header_without_name(
+        &mut self,
+        last: &Index,
+        value: &HeaderValue,
+        dst: &mut BytesMut,
+    ) {
+        match *last {
+            Index::Indexed(..)
+            | Index::Name(..)
+            | Index::Inserted(..)
+            | Index::InsertedValue(..) => {
+                let idx = self.table.resolve_idx(last);
+
+                encode_not_indexed(idx, value.as_ref(), value.is_sensitive(), dst);
+            }
+            Index::NotIndexed(_) => {
+                let last = self.table.resolve(last);
+
+                encode_not_indexed2(
+                    last.name().as_slice(),
+                    value.as_ref(),
+                    value.is_sensitive(),
+                    dst,
+                );
+            }
+        }
+    }
+}
+
+impl Default for Encoder {
+    fn default() -> Encoder {
+        Encoder::new(4096, 0)
+    }
+}
+
+fn encode_size_update(val: usize, dst: &mut BytesMut) {
+    encode_int(val, 5, 0b0010_0000, dst)
+}
+
+fn encode_not_indexed(name: usize, value: &[u8], sensitive: bool, dst: &mut BytesMut) {
+    if sensitive {
+        encode_int(name, 4, 0b10000, dst);
+    } else {
+        encode_int(name, 4, 0, dst);
+    }
+                    self.actions.recv.ignore_data(sz)?;
+                    return Err(Error::library_reset(id, Reason::STREAM_CLOSED));
+                }
+
+                proto_err!(conn: "recv_data: stream not found; id={:?}", id);
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+            }
+        };
+
+        let actions = &mut self.actions;
+        let mut send_buffer = send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        self.counts.transition(stream, |counts, stream| {
+            let sz = frame.payload().len();
+            let res = actions.recv.recv_data(frame, stream);
+
+            // Any stream error after receiving a DATA frame means
+            // we won't give the data to the user, and so they can't
+            // release the capacity. We do it automatically.
+            if let Err(Error::Reset(..)) = res {
+                actions
+                    .recv
+                    .release_connection_capacity(sz as WindowSize, &mut None);
+            }
+            actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
+        })
+    }
+
+    fn recv_reset<B>(
+        &mut self,
+        send_buffer: &SendBuffer<B>,
+        frame: frame::Reset,
+    ) -> Result<(), Error> {
+        let id = frame.stream_id();
+
+        if id.is_zero() {
+            proto_err!(conn: "recv_reset: invalid stream ID 0");
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+        }
+
+        // The GOAWAY process has begun. All streams with a greater ID than
+        // specified as part of GOAWAY should be ignored.
+        if id > self.actions.recv.max_stream_id() {
+            tracing::trace!(
+                "id ({:?}) > max_stream_id ({:?}), ignoring RST_STREAM",
+                id,
+                self.actions.recv.max_stream_id()
+            );
+            return Ok(());
+        }
+
+        let stream = match self.store.find_mut(&id) {
+            Some(stream) => stream,
+            None => {
+                // TODO: Are there other error cases?
+                self.actions
+                    .ensure_not_idle(self.counts.peer(), id)
+                    .map_err(Error::library_go_away)?;
+
+                return Ok(());
+            }
+        };
+
+        let mut send_buffer = send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        let actions = &mut self.actions;
+
+        self.counts.transition(stream, |counts, stream| {
+            actions.recv.recv_reset(frame, stream, counts)?;
+            actions.send.handle_error(send_buffer, stream, counts);
+            assert!(stream.state.is_closed());
+            Ok(())
+        })
+    }
+
+    fn recv_window_update<B>(
+        &mut self,
+        send_buffer: &SendBuffer<B>,
+        frame: frame::WindowUpdate,
+    ) -> Result<(), Error> {
+        let id = frame.stream_id();
+
+        let mut send_buffer = send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        if id.is_zero() {
+            self.actions
+                .send
+                .recv_connection_window_update(frame, &mut self.store, &mut self.counts)
+                .map_err(Error::library_go_away)?;
+        } else {
+            // The remote may send window updates for streams that the local now
+            // considers closed. It's ok...
+            if let Some(mut stream) = self.store.find_mut(&id) {
+                let res = self
+                    .actions
+                    .send
+                    .recv_stream_window_update(
+                        frame.size_increment(),
+                        send_buffer,
+                        &mut stream,
+                        &mut self.counts,
+                        &mut self.actions.task,
+                    )
+                    .map_err(|reason| Error::library_reset(id, reason));
+
+                return self.actions.reset_on_recv_stream_err(
+                    send_buffer,
+                    &mut stream,
+                    &mut self.counts,
+                    res,
+                );
+            } else {
+                self.actions
+                    .ensure_not_idle(self.counts.peer(), id)
+                    .map_err(Error::library_go_away)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_error<B>(&mut self, send_buffer: &SendBuffer<B>, err: proto::Error) -> StreamId {
+        let actions = &mut self.actions;
+        let counts = &mut self.counts;
+        let mut send_buffer = send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        let last_processed_id = actions.recv.last_processed_id();
+
+        self.store.for_each(|stream| {
+            counts.transition(stream, |counts, stream| {
+                actions.recv.handle_error(&err, &mut *stream);
+                actions.send.handle_error(send_buffer, stream, counts);
+            })
+        });
+
+        actions.conn_error = Some(err);
+
+        last_processed_id
+    }
+
+    fn recv_go_away<B>(
+        &mut self,
+        send_buffer: &SendBuffer<B>,
+        frame: &frame::GoAway,
+    ) -> Result<(), Error> {
+        let actions = &mut self.actions;
+        let counts = &mut self.counts;
+        let mut send_buffer = send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        let last_stream_id = frame.last_stream_id();
+
+        actions.send.recv_go_away(last_stream_id)?;
+
+        let err = Error::remote_go_away(frame.debug_data().clone(), frame.reason());
+
+        self.store.for_each(|stream| {
+            if stream.id > last_stream_id {
+                counts.transition(stream, |counts, stream| {
+                    actions.recv.handle_error(&err, &mut *stream);
+                    actions.send.handle_error(send_buffer, stream, counts);
+                })
+            }
+        });
+
+        actions.conn_error = Some(err);
+
+use super::*;
+
+#[derive(Debug)]
+pub(super) struct Counts {
+    /// Acting as a client or server. This allows us to track which values to
+    /// inc / dec.
+    peer: peer::Dyn,
+
+    /// Maximum number of locally initiated streams
+    max_send_streams: usize,
+
+    /// Current number of remote initiated streams
+    num_send_streams: usize,
+
+    /// Maximum number of remote initiated streams
+    max_recv_streams: usize,
+
+    /// Current number of locally initiated streams
+    num_recv_streams: usize,
+
+    /// Maximum number of pending locally reset streams
+    max_local_reset_streams: usize,
+
+    /// Current number of pending locally reset streams
+    num_local_reset_streams: usize,
+
+    /// Max number of "pending accept" streams that were remotely reset
+    max_remote_reset_streams: usize,
+
+    /// Current number of "pending accept" streams that were remotely reset
+    num_remote_reset_streams: usize,
+
+    /// Maximum number of locally reset streams due to protocol error across
+    /// the lifetime of the connection.
+    ///
+    /// When this gets exceeded, we issue GOAWAYs.
+    max_local_error_reset_streams: Option<usize>,
+
+    /// Total number of locally reset streams due to protocol error across the
+    /// lifetime of the connection.
+    num_local_error_reset_streams: usize,
+}
+
+impl Counts {
+    /// Create a new `Counts` using the provided configuration values.
+    pub fn new(peer: peer::Dyn, config: &Config) -> Self {
+        Counts {
+            peer,
+            max_send_streams: config.initial_max_send_streams,
+            num_send_streams: 0,
+            max_recv_streams: config.remote_max_initiated.unwrap_or(usize::MAX),
+            num_recv_streams: 0,
+            max_local_reset_streams: config.local_reset_max,
+            num_local_reset_streams: 0,
+            max_remote_reset_streams: config.remote_reset_max,
+            num_remote_reset_streams: 0,
+            max_local_error_reset_streams: config.local_max_error_reset_streams,
+            num_local_error_reset_streams: 0,
+        }
+    }
+
+    /// Returns true when the next opened stream will reach capacity of outbound streams
+    ///
+    /// The number of client send streams is incremented in prioritize; send_request has to guess if
+    /// it should wait before allowing another request to be sent.
+    pub fn next_send_stream_will_reach_capacity(&self) -> bool {
+        self.max_send_streams <= (self.num_send_streams + 1)
+    }
+
+    /// Returns the current peer
+    pub fn peer(&self) -> peer::Dyn {
+        self.peer
+    }
+
+    pub fn has_streams(&self) -> bool {
+        self.num_send_streams != 0 || self.num_recv_streams != 0
+    }
+
+    /// Returns true if we can issue another local reset due to protocol error.
+    pub fn can_inc_num_local_error_resets(&self) -> bool {
+        if let Some(max) = self.max_local_error_reset_streams {
+            max > self.num_local_error_reset_streams
+        } else {
+            true
+        }
+    }
+
+    pub fn inc_num_local_error_resets(&mut self) {
+        assert!(self.can_inc_num_local_error_resets());
+
+        // Increment the number of remote initiated streams
+        self.num_local_error_reset_streams += 1;
+    }
+
+    pub(crate) fn max_local_error_resets(&self) -> Option<usize> {
+        self.max_local_error_reset_streams
+    }
+
+    /// Returns true if the receive stream concurrency can be incremented
+    pub fn can_inc_num_recv_streams(&self) -> bool {
+        self.max_recv_streams > self.num_recv_streams
+    }
+
+    /// Increments the number of concurrent receive streams.
+    ///
+    /// # Panics
+    ///
+    /// Panics on failure as this should have been validated before hand.
+    pub fn inc_num_recv_streams(&mut self, stream: &mut store::Ptr) {
+        assert!(self.can_inc_num_recv_streams());
+        assert!(!stream.is_counted);
+
+        // Increment the number of remote initiated streams
+        self.num_recv_streams += 1;
+        stream.is_counted = true;
+    }
+
+    /// Returns true if the send stream concurrency can be incremented
+    pub fn can_inc_num_send_streams(&self) -> bool {
+        self.max_send_streams > self.num_send_streams
+    }
+
+    /// Increments the number of concurrent send streams.
+    ///
+    /// # Panics
+    ///
+    /// Panics on failure as this should have been validated before hand.
+    pub fn inc_num_send_streams(&mut self, stream: &mut store::Ptr) {
+        assert!(self.can_inc_num_send_streams());
+        assert!(!stream.is_counted);
+
+        // Increment the number of remote initiated streams
+        self.num_send_streams += 1;
+        stream.is_counted = true;
+    }
+
+    /// Returns true if the number of pending reset streams can be incremented.
+    pub fn can_inc_num_reset_streams(&self) -> bool {
+        self.max_local_reset_streams > self.num_local_reset_streams
+    }
+
+    /// Increments the number of pending reset streams.
+    ///
+    /// # Panics
+    ///
+    /// Panics on failure as this should have been validated before hand.
+    pub fn inc_num_reset_streams(&mut self) {
+        assert!(self.can_inc_num_reset_streams());
+
+        self.num_local_reset_streams += 1;
+    }
+
+    pub(crate) fn max_remote_reset_streams(&self) -> usize {
+        self.max_remote_reset_streams
+    }
+
+    /// Returns true if the number of pending REMOTE reset streams can be
+    /// incremented.
+    pub(crate) fn can_inc_num_remote_reset_streams(&self) -> bool {
+        self.max_remote_reset_streams > self.num_remote_reset_streams
+    }
+
+    /// Increments the number of pending REMOTE reset streams.
+    ///
+    /// # Panics
+    ///
+    /// Panics on failure as this should have been validated before hand.
+    pub(crate) fn inc_num_remote_reset_streams(&mut self) {
+        assert!(self.can_inc_num_remote_reset_streams());
+
+        self.num_remote_reset_streams += 1;
+    }
+
+    pub(crate) fn dec_num_remote_reset_streams(&mut self) {
+        assert!(self.num_remote_reset_streams > 0);
+
+        self.num_remote_reset_streams -= 1;
+    }
+
+    pub fn apply_remote_settings(&mut self, settings: &frame::Settings, is_initial: bool) {
+        match settings.max_concurrent_streams() {
+            Some(val) => self.max_send_streams = val as usize,
+            None if is_initial => self.max_send_streams = usize::MAX,
+            None => {}
+        }
+    }
+
+    /// Run a block of code that could potentially transition a stream's state.
+    ///
+    /// If the stream state transitions to closed, this function will perform
+    /// all necessary cleanup.
+    ///
+    /// TODO: Is this function still needed?
+    pub fn transition<F, U>(&mut self, mut stream: store::Ptr, f: F) -> U
+    where
+        F: FnOnce(&mut Self, &mut store::Ptr) -> U,
+    {
+        // TODO: Does this need to be computed before performing the action?
+        let is_pending_reset = stream.is_pending_reset_expiration();
+
+        // Run the action
+        let ret = f(self, &mut stream);
+
+        self.transition_after(stream, is_pending_reset);
+
+        ret
+    }
+
+    // TODO: move this to macro?
+    pub fn transition_after(&mut self, mut stream: store::Ptr, is_reset_counted: bool) {
+        tracing::trace!(
+            "transition_after; stream={:?}; state={:?}; is_closed={:?}; \
+             pending_send_empty={:?}; buffered_send_data={}; \
+             num_recv={}; num_send={}",
+            stream.id,
+            stream.state,
+            stream.is_closed(),
+            stream.pending_send.is_empty(),
+            stream.buffered_send_data,
+            self.num_recv_streams,
+            self.num_send_streams
+        );
+
+        if stream.is_closed() {
+            if !stream.is_pending_reset_expiration() {
+                stream.unlink();
+                if is_reset_counted {
+                    self.dec_num_reset_streams();
+                }
+            }
+
+            if !stream.state.is_scheduled_reset() && stream.is_counted {
+                tracing::trace!("dec_num_streams; stream={:?}", stream.id);
+                // Decrement the number of active streams.
+                self.dec_num_streams(&mut stream);
+            }
+        }
+
+        // Release the stream if it requires releasing
+        if stream.is_released() {
+            stream.remove();
+        }
+    }
+
+    /// Returns the maximum number of streams that can be initiated by this
+    /// peer.
+    pub(crate) fn max_send_streams(&self) -> usize {
+        self.max_send_streams
+    }
+
+    /// Returns the maximum number of streams that can be initiated by the
+    /// remote peer.
+    pub(crate) fn max_recv_streams(&self) -> usize {
+        self.max_recv_streams
+    }
+
+    fn dec_num_streams(&mut self, stream: &mut store::Ptr) {
+        assert!(stream.is_counted);
+
+        if self.peer.is_local_init(stream.id) {
+            assert!(self.num_send_streams > 0);
+            self.num_send_streams -= 1;
+            stream.is_counted = false;
+        } else {
+            assert!(self.num_recv_streams > 0);
+            self.num_recv_streams -= 1;
+            stream.is_counted = false;
+        }
+    }
+
+    fn dec_num_reset_streams(&mut self) {
+        assert!(self.num_local_reset_streams > 0);
+        self.num_local_reset_streams -= 1;
+    }
+}
+
+impl Drop for Counts {
+    fn drop(&mut self) {
+        use std::thread;
+
+        if !thread::panicking() {
+            debug_assert!(!self.has_streams());
+        }
+    }
+}

@@ -1,0 +1,936 @@
+    pub(crate) fn do_insert_with_hash(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        value: V,
+    ) -> (WriteOp<K, V>, Instant) {
+        let weight = self.inner.weigh(&key, &value);
+        let op_cnt1 = Rc::new(AtomicU8::new(0));
+        let op_cnt2 = Rc::clone(&op_cnt1);
+        let mut op1 = None;
+        let mut op2 = None;
+
+        // Lock the key for update if blocking removal notification is enabled.
+        let kl = self.maybe_key_lock(&key);
+        let _klg = &kl.as_ref().map(|kl| kl.lock());
+
+        let ts = self.current_time();
+
+        // TODO: Instead using Arc<AtomicU8> to check if the actual operation was
+        // insert or update, check the return value of insert_with_or_modify. If it
+        // is_some, the value was updated, otherwise the value was inserted.
+
+        // Since the cache (cht::SegmentedHashMap) employs optimistic locking
+        // strategy, insert_with_or_modify() may get an insert/modify operation
+        // conflicted with other concurrent hash table operations. In that case, it
+        // has to retry the insertion or modification, so on_insert and/or on_modify
+        // closures can be executed more than once. In order to identify the last
+        // call of these closures, we use a shared counter (op_cnt{1,2}) here to
+        // record a serial number on a WriteOp, and consider the WriteOp with the
+        // largest serial number is the one made by the last call of the closures.
+        self.inner.cache.insert_with_or_modify(
+            Arc::clone(&key),
+            hash,
+            // on_insert
+            || {
+                let (entry, gen) = self.new_value_entry(&key, hash, value.clone(), ts, weight);
+                let ins_op = WriteOp::new_upsert(&key, hash, &entry, gen, 0, weight);
+                let cnt = op_cnt1.fetch_add(1, Ordering::Relaxed);
+                op1 = Some((cnt, ins_op));
+                entry
+            },
+            // on_modify
+            |_k, old_entry| {
+                let old_weight = old_entry.policy_weight();
+
+                // Create this OldEntryInfo _before_ creating a new ValueEntry, so
+                // that the OldEntryInfo can preserve the old EntryInfo's
+                // last_accessed and last_modified timestamps.
+                let old_info = OldEntryInfo::new(old_entry);
+                let (entry, gen) = self.new_value_entry_from(value.clone(), ts, weight, old_entry);
+                let upd_op = WriteOp::new_upsert(&key, hash, &entry, gen, old_weight, weight);
+                let cnt = op_cnt2.fetch_add(1, Ordering::Relaxed);
+                op2 = Some((cnt, old_info, upd_op));
+                entry
+            },
+        );
+
+        match (op1, op2) {
+            (Some((_cnt, ins_op)), None) => self.do_post_insert_steps(ts, &key, ins_op),
+            (Some((cnt1, ins_op)), Some((cnt2, ..))) if cnt1 > cnt2 => {
+                self.do_post_insert_steps(ts, &key, ins_op)
+            }
+            (_, Some((_cnt, old_info, upd_op))) => {
+                self.do_post_update_steps(ts, key, old_info, upd_op)
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+
+    fn do_post_insert_steps(
+        &self,
+        ts: Instant,
+        key: &Arc<K>,
+        ins_op: WriteOp<K, V>,
+    ) -> (WriteOp<K, V>, Instant) {
+        if let (Some(expiry), WriteOp::Upsert { value_entry, .. }) =
+            (&self.inner.expiration_policy.expiry(), &ins_op)
+        {
+            Self::expire_after_create(expiry, key, value_entry, ts, self.inner.clock());
+        }
+        (ins_op, ts)
+    }
+
+    fn do_post_update_steps(
+        &self,
+        ts: Instant,
+        key: Arc<K>,
+        old_info: OldEntryInfo<K, V>,
+        upd_op: WriteOp<K, V>,
+    ) -> (WriteOp<K, V>, Instant) {
+        if let (Some(expiry), WriteOp::Upsert { value_entry, .. }) =
+            (&self.inner.expiration_policy.expiry(), &upd_op)
+        {
+            Self::expire_after_read_or_update(
+                |k, v, t, d| expiry.expire_after_update(k, v, t, d),
+                &key,
+                value_entry,
+                self.inner.expiration_policy.time_to_live(),
+                self.inner.expiration_policy.time_to_idle(),
+                ts,
+                self.inner.clock(),
+            );
+        }
+
+        if self.is_removal_notifier_enabled() {
+            self.inner.notify_upsert(
+                key,
+                &old_info.entry,
+                old_info.last_accessed,
+                old_info.last_modified,
+            );
+        }
+        crossbeam_epoch::pin().flush();
+        (upd_op, ts)
+    }
+
+    #[inline]
+    fn apply_reads_if_needed(&self, inner: &Inner<K, V, S>, now: Instant) {
+        let len = self.read_op_ch.len();
+
+        if let Some(hk) = &self.housekeeper {
+            if Self::should_apply_reads(hk, len, now) {
+                hk.try_run_pending_tasks(inner);
+            }
+        }
+    }
+
+    #[inline]
+    fn should_apply_reads(hk: &HouseKeeperArc, ch_len: usize, now: Instant) -> bool {
+        hk.should_apply_reads(ch_len, now)
+    }
+
+    #[inline]
+    fn should_apply_writes(hk: &HouseKeeperArc, ch_len: usize, now: Instant) -> bool {
+        hk.should_apply_writes(ch_len, now)
+    }
+}
+
+impl<K, V, S> BaseCache<K, V, S> {
+    #[inline]
+    fn new_value_entry(
+        &self,
+        key: &Arc<K>,
+        hash: u64,
+        value: V,
+        timestamp: Instant,
+        policy_weight: u32,
+    ) -> (MiniArc<ValueEntry<K, V>>, u16) {
+        let key_hash = KeyHash::new(Arc::clone(key), hash);
+        let info = MiniArc::new(EntryInfo::new(key_hash, timestamp, policy_weight));
+        let gen: u16 = info.entry_gen();
+        (MiniArc::new(ValueEntry::new(value, info)), gen)
+    }
+
+    #[inline]
+    fn new_value_entry_from(
+        &self,
+        value: V,
+        timestamp: Instant,
+        policy_weight: u32,
+        other: &ValueEntry<K, V>,
+    ) -> (MiniArc<ValueEntry<K, V>>, u16) {
+        let info = MiniArc::clone(other.entry_info());
+        // To prevent this updated ValueEntry from being evicted by an expiration
+        // policy, increment the entry generation.
+        let gen = info.incr_entry_gen();
+        info.set_last_accessed(timestamp);
+        info.set_last_modified(timestamp);
+        info.set_policy_weight(policy_weight);
+        (MiniArc::new(ValueEntry::new_from(value, info, other)), gen)
+    }
+
+    fn expire_after_create(
+        expiry: &Arc<dyn Expiry<K, V> + Send + Sync + 'static>,
+        key: &K,
+impl<K, V, S> BaseCache<K, V, S> {
+    #[inline]
+    fn new_value_entry(
+        &self,
+        key: &Arc<K>,
+        hash: u64,
+        value: V,
+        timestamp: Instant,
+        policy_weight: u32,
+    ) -> (MiniArc<ValueEntry<K, V>>, u16) {
+        let key_hash = KeyHash::new(Arc::clone(key), hash);
+        let info = MiniArc::new(EntryInfo::new(key_hash, timestamp, policy_weight));
+        let gen: u16 = info.entry_gen();
+        (MiniArc::new(ValueEntry::new(value, info)), gen)
+    }
+
+    #[inline]
+    fn new_value_entry_from(
+        &self,
+        value: V,
+        timestamp: Instant,
+        policy_weight: u32,
+        other: &ValueEntry<K, V>,
+    ) -> (MiniArc<ValueEntry<K, V>>, u16) {
+        let info = MiniArc::clone(other.entry_info());
+        // To prevent this updated ValueEntry from being evicted by an expiration
+        // policy, increment the entry generation.
+        let gen = info.incr_entry_gen();
+        info.set_last_accessed(timestamp);
+        info.set_last_modified(timestamp);
+        info.set_policy_weight(policy_weight);
+        (MiniArc::new(ValueEntry::new_from(value, info, other)), gen)
+    }
+
+    fn expire_after_create(
+        expiry: &Arc<dyn Expiry<K, V> + Send + Sync + 'static>,
+        key: &K,
+        value_entry: &ValueEntry<K, V>,
+        ts: Instant,
+        clock: &Clock,
+    ) {
+        let duration =
+            expiry.expire_after_create(key, &value_entry.value, clock.to_std_instant(ts));
+        let expiration_time = duration.map(|duration| ts.saturating_add(duration));
+        value_entry
+            .entry_info()
+            .set_expiration_time(expiration_time);
+    }
+
+    fn expire_after_read_or_update(
+        expiry: impl FnOnce(&K, &V, StdInstant, Option<Duration>) -> Option<Duration>,
+        key: &K,
+        value_entry: &ValueEntry<K, V>,
+        ttl: Option<Duration>,
+        tti: Option<Duration>,
+        ts: Instant,
+        clock: &Clock,
+    ) -> bool {
+        let current_time = clock.to_std_instant(ts);
+        let ei = &value_entry.entry_info();
+
+        let exp_time = IntoIterator::into_iter([
+            ei.expiration_time(),
+            ttl.and_then(|dur| ei.last_modified().map(|ts| ts.saturating_add(dur))),
+            tti.and_then(|dur| ei.last_accessed().map(|ts| ts.saturating_add(dur))),
+        ])
+        .flatten()
+        .min();
+
+        let current_duration = exp_time.and_then(|time| {
+            let std_time = clock.to_std_instant(time);
+            std_time.checked_duration_since(current_time)
+        });
+
+        let duration = expiry(key, &value_entry.value, current_time, current_duration);
+
+        if duration != current_duration {
+            let expiration_time = duration.map(|duration| ts.saturating_add(duration));
+            value_entry
+                .entry_info()
+                .set_expiration_time(expiration_time);
+            // The `expiration_time` has changed from `None` to `Some` or vice versa.
+            true
+        } else {
+            false
+        }
+    }
+}
+
+//
+// for testing
+//
+#[cfg(test)]
+impl<K, V, S> BaseCache<K, V, S>
+where
+    where
+        F: Future<Output = Result<V, E>>,
+        E: Send + Sync + 'static,
+    {
+        let k = if need_key {
+            Some(Arc::clone(&key))
+        } else {
+            None
+        };
+
+        let type_id = ValueInitializer::<K, V, S>::type_id_for_try_get_with::<E>();
+        let post_init = ValueInitializer::<K, V, S>::post_init_for_try_get_with;
+
+        match self
+            .value_initializer
+            .try_init_or_read(&key, hash, type_id, self, never_ignore(), init, post_init)
+            .await
+        {
+            InitResult::Initialized(v) => {
+                crossbeam_epoch::pin().flush();
+                Ok(Entry::new(k, v, true, false))
+            }
+            InitResult::ReadExisting(v) => Ok(Entry::new(k, v, false, false)),
+            InitResult::InitErr(e) => {
+                crossbeam_epoch::pin().flush();
+                Err(e)
+            }
+        }
+    }
+
+    pub(crate) async fn insert_with_hash(&self, key: Arc<K>, hash: u64, value: V) {
+        if self.base.is_map_disabled() {
+            return;
+        }
+
+        let (op, ts) = self.base.do_insert_with_hash(key, hash, value).await;
+        let mut cancel_guard = CancelGuard::new(&self.base.interrupted_op_ch_snd, ts);
+        cancel_guard.set_op(op.clone());
+
+        let should_block;
+        #[cfg(not(test))]
+        {
+            should_block = false;
+        }
+        #[cfg(test)]
+        {
+            should_block = self.schedule_write_op_should_block.load(Ordering::Acquire);
+        }
+
+        let hk = self.base.housekeeper.as_ref();
+        let event = self.base.write_op_ch_ready_event();
+
+        BaseCache::<K, V, S>::schedule_write_op(
+            &self.base.inner,
+            &self.base.write_op_ch,
+            event,
+            op,
+            ts,
+            hk,
+            should_block,
+        )
+        .await
+        .expect("Failed to schedule write op for insert");
+        cancel_guard.clear();
+    }
+
+    pub(crate) async fn compute_with_hash_and_fun<F, Fut>(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        f: F,
+    ) -> compute::CompResult<K, V>
+    where
+        F: FnOnce(Option<Entry<K, V>>) -> Fut,
+        Fut: Future<Output = compute::Op<V>>,
+    {
+        let post_init = ValueInitializer::<K, V, S>::post_init_for_compute_with;
+        match self
+            .value_initializer
+            .try_compute(key, hash, self, f, post_init, true)
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => unreachable!(),
+        }
+    }
+
+    pub(crate) async fn try_compute_with_hash_and_fun<F, Fut, E>(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        f: F,
+    ) -> Result<compute::CompResult<K, V>, E>
+    where
+        F: FnOnce(Option<Entry<K, V>>) -> Fut,
+        Fut: Future<Output = Result<compute::Op<V>, E>>,
+        E: Send + Sync + 'static,
+    {
+        let post_init = ValueInitializer::<K, V, S>::post_init_for_try_compute_with;
+        self.value_initializer
+            .try_compute(key, hash, self, f, post_init, true)
+            .await
+    }
+
+    pub(crate) async fn try_compute_if_nobody_else_with_hash_and_fun<F, Fut, E>(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        f: F,
+    ) -> Result<compute::CompResult<K, V>, E>
+    where
+        F: FnOnce(Option<Entry<K, V>>) -> Fut,
+        Fut: Future<Output = Result<compute::Op<V>, E>>,
+        E: Send + Sync + 'static,
+    {
+        let post_init = ValueInitializer::<K, V, S>::post_init_for_try_compute_with_if_nobody_else;
+        self.value_initializer
+            .try_compute_if_nobody_else(key, hash, self, f, post_init, true)
+            .await
+    }
+
+    pub(crate) async fn upsert_with_hash_and_fun<F, Fut>(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        f: F,
+    ) -> Entry<K, V>
+    where
+        F: FnOnce(Option<Entry<K, V>>) -> Fut,
+        Fut: Future<Output = V>,
+    {
+        let post_init = ValueInitializer::<K, V, S>::post_init_for_upsert_with;
+        match self
+            .value_initializer
+            .try_compute(key, hash, self, f, post_init, false)
+            .await
+        {
+            Ok(CompResult::Inserted(entry) | CompResult::ReplacedWith(entry)) => entry,
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) async fn invalidate_with_hash<Q>(
+        &self,
+        key: &Q,
+        hash: u64,
+        need_value: bool,
+    ) -> Option<V>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        use futures_util::FutureExt;
+
+        self.base.retry_interrupted_ops().await;
+
+        // Lock the key for removal if blocking removal notification is enabled.
+        let mut kl = None;
+        let mut klg = None;
+        if self.base.is_removal_notifier_enabled() {
+            // To lock the key, we have to get Arc<K> for key (&Q).
+            //
+            // TODO: Enhance this if possible. This is rather hack now because
+            // it cannot prevent race conditions like this:
+            //
+            // 1. We miss the key because it does not exist. So we do not lock
+            //    the key.
+            // 2. Somebody else (other thread) inserts the key.
+            // 3. We remove the entry for the key, but without the key lock!
+            //
+            if let Some(arc_key) = self.base.get_key_with_hash(key, hash) {
+                kl = self.base.maybe_key_lock(&arc_key);
+                klg = if let Some(lock) = &kl {
+                    Some(lock.lock().await)
+                } else {
+                    None
+                };
+            }
+        }
+
+        match self.base.remove_entry(key, hash) {
+            None => None,
+            Some(kv) => {
+                let now = self.base.current_time();
+
+                let maybe_v = if need_value {
+                    Some(kv.entry.value.clone())
+                } else {
+                    None
+                };
+
+                let info = kv.entry.entry_info();
+                let entry_gen = info.incr_entry_gen();
+
+                let op: WriteOp<K, V> = WriteOp::Remove {
+                    kv_entry: kv.clone(),
+                    entry_gen,
+                };
+
+                // Async Cancellation Safety: To ensure the below future should be
+                // executed even if our caller async task is cancelled, we create a
+                // cancel guard for the future (and the op). If our caller is
+                // cancelled while we are awaiting for the future, the cancel guard
+                // will save the future and the op to the interrupted_op_ch channel,
+                // so that we can resume/retry later.
+                let mut cancel_guard = CancelGuard::new(&self.base.interrupted_op_ch_snd, now);
+
+                if self.base.is_removal_notifier_enabled() {
+                    let future = self
+                        .base
+                        .notify_invalidate(&kv.key, &kv.entry)
+                        .boxed()
+                        .shared();
+                    cancel_guard.set_future_and_op(future.clone(), op.clone());
+                    // Send notification to the eviction listener.
+                    future.await;
+                    cancel_guard.unset_future();
+                } else {
+                    cancel_guard.set_op(op.clone());
+                }
+
+                // Drop the locks before scheduling write op to avoid a potential
+                // dead lock. (Scheduling write can do spin lock when the queue is
+                // full, and queue will be drained by the housekeeping thread that
+                // can lock the same key)
+                std::mem::drop(klg);
+                std::mem::drop(kl);
+
+                let should_block;
+                #[cfg(not(test))]
+                {
+                    should_block = false;
+                }
+                #[cfg(test)]
+                {
+                    should_block = self.schedule_write_op_should_block.load(Ordering::Acquire);
+                }
+
+                let event = self.base.write_op_ch_ready_event();
+                let hk = self.base.housekeeper.as_ref();
+
+                BaseCache::<K, V, S>::schedule_write_op(
+                    &self.base.inner,
+                    &self.base.write_op_ch,
+                    event,
+                    op,
+                    now,
+                    hk,
+                    should_block,
+                )
+                .await
+                .expect("Failed to schedule write op for remove");
+                cancel_guard.clear();
+
+                crossbeam_epoch::pin().flush();
+                maybe_v
+            }
+        }
+    }
+}
+
+// For unit tests.
+// For unit tests.
+#[cfg(test)]
+impl<K, V, S> Cache<K, V, S> {
+    pub(crate) fn is_table_empty(&self) -> bool {
+        self.entry_count() == 0
+    }
+
+    pub(crate) fn is_waiter_map_empty(&self) -> bool {
+        self.value_initializer.waiter_count() == 0
+    }
+}
+
+#[cfg(test)]
+impl<K, V, S> Cache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn invalidation_predicate_count(&self) -> usize {
+use super::{Cache, SegmentedCache};
+use crate::{
+    common::{builder_utils, concurrent::Weigher, time::Clock, HousekeeperConfig},
+    notification::{EvictionListener, RemovalCause},
+    policy::{EvictionPolicy, ExpirationPolicy},
+    Expiry,
+};
+
+use std::{
+    collections::hash_map::RandomState,
+    hash::{BuildHasher, Hash},
+    marker::PhantomData,
+    sync::Arc,
+    time::Duration,
+};
+
+/// Builds a [`Cache`][cache-struct] or [`SegmentedCache`][seg-cache-struct]
+/// with various configuration knobs.
+///
+/// [cache-struct]: ./struct.Cache.html
+/// [seg-cache-struct]: ./struct.SegmentedCache.html
+///
+/// # Example: Expirations
+///
+/// ```rust
+/// use moka::sync::Cache;
+/// use std::time::Duration;
+///
+/// let cache = Cache::builder()
+///     // Max 10,000 entries
+///     .max_capacity(10_000)
+///     // Time to live (TTL): 30 minutes
+///     .time_to_live(Duration::from_secs(30 * 60))
+///     // Time to idle (TTI):  5 minutes
+///     .time_to_idle(Duration::from_secs( 5 * 60))
+///     // Create the cache.
+///     .build();
+///
+/// // This entry will expire after 5 minutes (TTI) if there is no get().
+/// cache.insert(0, "zero");
+///
+/// // This get() will extend the entry life for another 5 minutes.
+/// cache.get(&0);
+///
+/// // Even though we keep calling get(), the entry will expire
+/// // after 30 minutes (TTL) from the insert().
+/// ```
+///
+#[must_use]
+pub struct CacheBuilder<K, V, C> {
+    name: Option<String>,
+    max_capacity: Option<u64>,
+    initial_capacity: Option<usize>,
+    num_segments: Option<usize>,
+    weigher: Option<Weigher<K, V>>,
+    eviction_policy: EvictionPolicy,
+    eviction_listener: Option<EvictionListener<K, V>>,
+    expiration_policy: ExpirationPolicy<K, V>,
+    housekeeper_config: HousekeeperConfig,
+    invalidator_enabled: bool,
+    clock: Clock,
+    cache_type: PhantomData<C>,
+}
+
+impl<K, V> Default for CacheBuilder<K, V, Cache<K, V, RandomState>>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    fn default() -> Self {
+        Self {
+            name: None,
+            max_capacity: None,
+            initial_capacity: None,
+            num_segments: None,
+            weigher: None,
+            eviction_listener: None,
+            eviction_policy: EvictionPolicy::default(),
+            expiration_policy: ExpirationPolicy::default(),
+            housekeeper_config: HousekeeperConfig::default(),
+            invalidator_enabled: false,
+            clock: Clock::default(),
+            cache_type: PhantomData,
+        }
+    }
+}
+
+impl<K, V> CacheBuilder<K, V, Cache<K, V, RandomState>>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    /// Construct a new `CacheBuilder` that will be used to build a `Cache` or
+    /// `SegmentedCache` holding up to `max_capacity` entries.
+    pub fn new(max_capacity: u64) -> Self {
+        Self {
+            max_capacity: Some(max_capacity),
+            ..Default::default()
+        }
+    }
+
+    /// Sets the number of segments of the cache.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is zero.
+    pub fn segments(
+        self,
+        num_segments: usize,
+    ) -> CacheBuilder<K, V, SegmentedCache<K, V, RandomState>> {
+        assert!(num_segments != 0);
+
+        CacheBuilder {
+            name: self.name,
+            max_capacity: self.max_capacity,
+            initial_capacity: self.initial_capacity,
+            num_segments: Some(num_segments),
+            weigher: self.weigher,
+            eviction_policy: self.eviction_policy,
+            eviction_listener: self.eviction_listener,
+            expiration_policy: self.expiration_policy,
+            housekeeper_config: self.housekeeper_config,
+            invalidator_enabled: self.invalidator_enabled,
+            clock: self.clock,
+            cache_type: PhantomData,
+        }
+    }
+
+    /// Builds a `Cache<K, V>`.
+    ///
+    /// If you want to build a `SegmentedCache<K, V>`, call `segments` method before
+    /// calling this method.
+    ///
+    /// # Panics
+    ///
+    /// Panics if configured with either `time_to_live` or `time_to_idle` higher than
+    /// 1000 years. This is done to protect against overflow when computing key
+    /// expiration.
+    pub fn build(self) -> Cache<K, V, RandomState> {
+        let build_hasher = RandomState::default();
+        let exp = &self.expiration_policy;
+        builder_utils::ensure_expirations_or_panic(exp.time_to_live(), exp.time_to_idle());
+        Cache::with_everything(
+            self.name,
+            self.max_capacity,
+            self.initial_capacity,
+            build_hasher,
+            self.weigher,
+            self.eviction_policy,
+            self.eviction_listener,
+            self.expiration_policy,
+            self.housekeeper_config,
+            self.invalidator_enabled,
+            self.clock,
+        )
+    }
+
+    /// Builds a `Cache<K, V, S>` with the given `hasher` of type `S`.
+    ///
+    /// # Examples
+    ///
+    /// This example uses AHash hasher from [AHash][ahash-crate] crate.
+    ///
+    /// [ahash-crate]: https://crates.io/crates/ahash
+    ///
+    /// ```rust
+    /// // Cargo.toml
+    /// // [dependencies]
+    /// // ahash = "0.8"
+    /// // moka = ...
+    ///
+    /// use moka::sync::Cache;
+    ///
+    /// // The type of this cache is: Cache<i32, String, ahash::RandomState>
+    /// let cache = Cache::builder()
+    ///     .max_capacity(100)
+    ///     .build_with_hasher(ahash::RandomState::default());
+    /// cache.insert(1, "one".to_string());
+    /// ```
+    ///
+    /// Note: If you need to add a type annotation to your cache, you must use the
+    /// form of `Cache<K, V, S>` instead of `Cache<K, V>`. That `S` is the type of
+    /// the build hasher, and its default is the `RandomState` from
+    /// `std::collections::hash_map` module . If you use a different build hasher,
+    /// you must specify `S` explicitly.
+    ///
+    /// Here is a good example:
+    ///
+    /// ```rust
+    /// # use moka::sync::Cache;
+    /// # let cache = Cache::builder()
+    /// #     .build_with_hasher(ahash::RandomState::default());
+    /// struct Good {
+    ///     // Specifying the type in Cache<K, V, S> format.
+    ///     cache: Cache<i32, String, ahash::RandomState>,
+    /// }
+    ///
+    /// // Storing the cache from above example. This should compile.
+    /// Good { cache };
+    /// ```
+    ///
+    /// Here is a bad example. This struct cannot store the above cache because it
+    /// does not specify `S`:
+    ///
+    /// ```compile_fail
+    /// # use moka::sync::Cache;
+    /// # let cache = Cache::builder()
+    /// #     .build_with_hasher(ahash::RandomState::default());
+    /// struct Bad {
+    ///     // Specifying the type in Cache<K, V> format.
+    ///     cache: Cache<i32, String>,
+    /// }
+    ///
+    /// // This should not compile.
+    /// Bad { cache };
+    /// // => error[E0308]: mismatched types
+    /// //    expected struct `std::collections::hash_map::RandomState`,
+    /// //       found struct `ahash::RandomState`
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if configured with either `time_to_live` or `time_to_idle` higher than
+    /// 1000 years. This is done to protect against overflow when computing key
+    /// expiration.
+    pub fn build_with_hasher<S>(self, hasher: S) -> Cache<K, V, S>
+    where
+        S: BuildHasher + Clone + Send + Sync + 'static,
+    {
+        let exp = &self.expiration_policy;
+        builder_utils::ensure_expirations_or_panic(exp.time_to_live(), exp.time_to_idle());
+        Cache::with_everything(
+            self.name,
+            self.max_capacity,
+            self.initial_capacity,
+            hasher,
+            self.weigher,
+            self.eviction_policy,
+            self.eviction_listener,
+            self.expiration_policy,
+            self.housekeeper_config,
+            self.invalidator_enabled,
+            self.clock,
+        )
+    }
+}
+
+impl<K, V> CacheBuilder<K, V, SegmentedCache<K, V, RandomState>>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    /// Builds a `SegmentedCache<K, V>`.
+    ///
+    /// If you want to build a `Cache<K, V>`, do not call `segments` method before
+    /// calling this method.
+    ///
+    /// # Panics
+    ///
+    /// Panics if configured with either `time_to_live` or `time_to_idle` higher than
+use std::time::Duration;
+
+pub(crate) mod builder_utils;
+pub(crate) mod concurrent;
+pub(crate) mod deque;
+pub(crate) mod entry;
+pub(crate) mod error;
+pub(crate) mod frequency_sketch;
+pub(crate) mod iter;
+pub(crate) mod time;
+pub(crate) mod timer_wheel;
+
+#[cfg(test)]
+pub(crate) mod test_utils;
+
+use self::concurrent::constants::{
+    DEFAULT_EVICTION_BATCH_SIZE, DEFAULT_MAINTENANCE_TASK_TIMEOUT_MILLIS,
+    DEFAULT_MAX_LOG_SYNC_REPEATS,
+};
+
+// Note: `CacheRegion` cannot have more than four enum variants. This is because
+// `crate::{sync,unsync}::DeqNodes` uses a `tagptr::TagNonNull<DeqNode<T>, 2>`
+// pointer, where the 2-bit tag is `CacheRegion`.
+#[derive(Clone, Copy, Debug, Eq)]
+pub(crate) enum CacheRegion {
+    Window = 0,
+    MainProbation = 1,
+    MainProtected = 2,
+    Other = 3,
+}
+
+impl From<usize> for CacheRegion {
+    fn from(n: usize) -> Self {
+        match n {
+            0 => Self::Window,
+            1 => Self::MainProbation,
+            2 => Self::MainProtected,
+            3 => Self::Other,
+            _ => panic!("No such CacheRegion variant for {n}"),
+        }
+    }
+}
+
+impl CacheRegion {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Window => "window",
+            Self::MainProbation => "main probation",
+            Self::MainProtected => "main protected",
+            Self::Other => "other",
+        }
+    }
+}
+
+impl PartialEq<Self> for CacheRegion {
+    fn eq(&self, other: &Self) -> bool {
+        core::mem::discriminant(self) == core::mem::discriminant(other)
+    }
+}
+
+impl PartialEq<usize> for CacheRegion {
+    fn eq(&self, other: &usize) -> bool {
+        *self as usize == *other
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct HousekeeperConfig {
+    /// The timeout duration for the `run_pending_tasks` method. This is a safe-guard
+    /// to prevent cache read/write operations (that may call `run_pending_tasks`
+    /// internally) from being blocked for a long time when the user wrote a slow
+    /// eviction listener closure.
+    ///
+    /// Used only when the eviction listener closure is set for the cache instance.
+    ///
+    /// Default: `DEFAULT_MAINTENANCE_TASK_TIMEOUT_MILLIS`
+    pub(crate) maintenance_task_timeout: Duration,
+    /// The maximum repeat count for receiving operation logs from the read and write
+    /// log channels. Default: `MAX_LOG_SYNC_REPEATS`.
+    pub(crate) max_log_sync_repeats: u32,
+    /// The batch size of entries to be processed by each internal eviction method.
+    /// Default: `EVICTION_BATCH_SIZE`.
+    pub(crate) eviction_batch_size: u32,
+}
+
+impl Default for HousekeeperConfig {
+    fn default() -> Self {
+        Self {
+            maintenance_task_timeout: Duration::from_millis(
+                DEFAULT_MAINTENANCE_TASK_TIMEOUT_MILLIS,
+            ),
+            max_log_sync_repeats: DEFAULT_MAX_LOG_SYNC_REPEATS as u32,
+            eviction_batch_size: DEFAULT_EVICTION_BATCH_SIZE,
+        }
+    }
+}
+
+impl HousekeeperConfig {
+    #[cfg(test)]
+    pub(crate) fn new(
+        maintenance_task_timeout: Option<Duration>,
+        max_log_sync_repeats: Option<u32>,
+        eviction_batch_size: Option<u32>,
+    ) -> Self {
+        Self {
+            maintenance_task_timeout: maintenance_task_timeout.unwrap_or(Duration::from_millis(
+                DEFAULT_MAINTENANCE_TASK_TIMEOUT_MILLIS,
+            )),
+            max_log_sync_repeats: max_log_sync_repeats
+                .unwrap_or(DEFAULT_MAX_LOG_SYNC_REPEATS as u32),
+            eviction_batch_size: eviction_batch_size.unwrap_or(DEFAULT_EVICTION_BATCH_SIZE),
+        }
+    }
+}
+
+// Ensures the value fits in a range of `128u32..=u32::MAX`.
+pub(crate) fn sketch_capacity(max_capacity: u64) -> u32 {
+    max_capacity.try_into().unwrap_or(u32::MAX).max(128)
+}
+
+#[cfg(test)]
+pub(crate) fn available_parallelism() -> usize {
+    use std::{num::NonZeroUsize, thread::available_parallelism};
+    available_parallelism().map(NonZeroUsize::get).unwrap_or(1)
+}

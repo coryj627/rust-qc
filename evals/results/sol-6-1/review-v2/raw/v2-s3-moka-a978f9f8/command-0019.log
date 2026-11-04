@@ -1,0 +1,902 @@
+
+    /// Removes a timer event for this node if present.
+    pub(crate) fn deschedule(&mut self, node: NonNull<DeqNode<TimerNode<K>>>) {
+        debug_assert!(self.is_enabled());
+        unsafe {
+            self.unlink_timer(node);
+            Self::drop_node(node);
+        }
+    }
+
+    /// Removes a timer event for this node if present.
+    ///
+    /// IMPORTANT: This method does not drop the node.
+    unsafe fn unlink_timer(&mut self, mut node: NonNull<DeqNode<TimerNode<K>>>) {
+        // SAFETY: The self (`TimerWheel`) is the only owner of the node, and we have
+        // `&mut self` here. We are the only one who can mutate the node.
+        let p = node.as_mut();
+        if let entry @ TimerNode::Entry { .. } = &mut p.element {
+            if let Some((level, index)) = entry.position() {
+                self.wheels[level][index].unlink(node);
+                entry.unset_position();
+            }
+        } else {
+            unreachable!();
+        }
+    }
+
+    unsafe fn drop_node(node: NonNull<DeqNode<TimerNode<K>>>) {
+        std::mem::drop(Box::from_raw(node.as_ptr()));
+    }
+
+    /// Advances the timer wheel to the current time, and returns an iterator over
+    /// timer events.
+    pub(crate) fn advance(
+        &mut self,
+        current_time: Instant,
+    ) -> impl Iterator<Item = TimerEvent<K>> + '_ {
+        debug_assert!(self.is_enabled());
+
+        let previous_time = self.current;
+        self.current = current_time;
+        TimerEventsIter::new(self, previous_time, current_time)
+    }
+
+    /// Returns a pointer to the timer event (cache entry) at the front of the queue.
+    /// Returns `None` if the front node is a sentinel.
+    fn pop_timer_node(&mut self, level: usize, index: usize) -> Option<Box<DeqNode<TimerNode<K>>>> {
+        let deque = &mut self.wheels[level][index];
+        if let Some(node) = deque.peek_front() {
+            if node.element.is_sentinel() {
+                return None;
+            }
+        }
+
+        deque.pop_front()
+    }
+
+    /// Reset the positions of the nodes in the queue at the given level and index.
+    /// When done, the sentinel is at the back of the queue.
+    fn reset_timer_node_positions(&mut self, level: usize, index: usize) {
+        let deque = &mut self.wheels[level][index];
+        debug_assert!(
+            deque.len() > 0,
+            "BUG: The queue is empty. level: {level}, index: {index}"
+        );
+
+        // Rotate the nodes in the queue until we see the sentinel at the back of the
+        // queue.
+        while !deque.peek_back().unwrap().element.is_sentinel() {
+            deque.move_front_to_back();
+        }
+    }
+
+    /// Returns the bucket indices to locate the bucket that the timer event
+    /// should be added to.
+    fn bucket_indices(&self, time: Instant) -> (usize, usize) {
+        let duration_nanos = self.duration_nanos_since_last_advanced(time);
+        let time_nanos = self.time_nanos(time);
+        for level in 0..=NUM_LEVELS {
+            if duration_nanos < SPANS[level + 1] {
+                let ticks = time_nanos >> SHIFT[level];
+                let index = ticks & (BUCKET_COUNTS[level] - 1);
+                return (level, index as usize);
+            }
+        }
+        (OVERFLOW_QUEUE_INDEX, 0)
+    }
+
+    // Returns nano-seconds between the given `time` and the time when this timer
+    // wheel was advanced. If the `time` is earlier than other, returns zero.
+    fn duration_nanos_since_last_advanced(&self, time: Instant) -> u64 {
+        // If `time` is earlier than `self.current`, use zero. This could happen
+        // when a user provided `Expiry` method returned zero or a very short
+        // duration.
+        time.saturating_duration_since(self.current).as_nanos() as u64
+    }
+
+    // Returns nano-seconds between the given `time` and `self.origin`, the time when
+    // this timer wheel was created.
+    //
+    // - If the `time` is earlier than other, returns zero.
+    // - If the `time` is later than `self.origin + u64::MAX`, returns `u64::MAX`,
+    //   which is ~584 years in nanoseconds.
+    //
+    fn time_nanos(&self, time: Instant) -> u64 {
+        let nanos_u128 = time
+            // If `time` is earlier than `self.origin`, use zero. This would never
+            // happen in practice as there should be some delay between the timer
+            // wheel was created and the first timer event is scheduled. But we will
+            // do this just in case.
+            .saturating_duration_since(self.origin)
+            .as_nanos();
+
+        // Convert an `u128` into an `u64`. If the value is too large, use `u64::MAX`
+        // (~584 years)
+        nanos_u128.try_into().unwrap_or(u64::MAX)
+    }
+}
+
+/// A timer event, which is either an expired/rescheduled cache entry, or a
+/// descheduled timer. `TimerWheel::advance` method returns an iterator over timer
+/// events.
+#[derive(Debug)]
+pub(crate) enum TimerEvent<K> {
+    /// This cache entry has expired.
+    Expired(Box<DeqNode<TimerNode<K>>>),
+    // This cache entry has been rescheduled. Rescheduling includes moving a timer
+    // from one wheel to another in a lower level of the hierarchy. (This variant
+    // is mainly used for testing)
+    #[cfg(test)]
+    Rescheduled(MiniArc<EntryInfo<K>>),
+    #[cfg(not(test))]
+    Rescheduled(()),
+    /// This timer node (containing a cache entry) has been removed from the timer.
+    /// (This variant is mainly used for testing)
+    Descheduled,
+}
+
+/// An iterator over expired cache entries.
+pub(crate) struct TimerEventsIter<'iter, K> {
+    timer_wheel: &'iter mut TimerWheel<K>,
+    previous_time: Instant,
+    current_time: Instant,
+    is_done: bool,
+    level: usize,
+    index: u8,
+    end_index: u8,
+    index_mask: u64,
+    is_new_level: bool,
+    is_new_index: bool,
+}
+
+impl<'iter, K> TimerEventsIter<'iter, K> {
+    fn new(
+        timer_wheel: &'iter mut TimerWheel<K>,
+        previous_time: Instant,
+        current_time: Instant,
+    ) -> Self {
+        Self {
+            timer_wheel,
+            previous_time,
+            current_time,
+            is_done: false,
+            level: 0,
+            index: 0,
+            end_index: 0,
+            index_mask: 0,
+            is_new_level: true,
+            is_new_index: true,
+        }
+    }
+}
+
+impl<K> Drop for TimerEventsIter<'_, K> {
+    fn drop(&mut self) {
+        if !self.is_done {
+            // This iterator was dropped before consuming all events. Reset the
+            // `current` to the time when the timer wheel was last successfully
+            // advanced.
+            self.timer_wheel.current = self.previous_time;
+        }
+    }
+}
+
+impl<K> Iterator for TimerEventsIter<'_, K> {
+    type Item = TimerEvent<K>;
+
+    /// NOTE: When necessary, this iterator will unset the timer node pointer in the
+    /// `ValueEntry`.
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.is_done {
+            return None;
+        }
+
+        loop {
+            if self.is_new_level {
+                let previous_time_nanos = self.timer_wheel.time_nanos(self.previous_time);
+                let current_time_nanos = self.timer_wheel.time_nanos(self.current_time);
+                let previous_ticks = previous_time_nanos >> SHIFT[self.level];
+                let current_ticks = current_time_nanos >> SHIFT[self.level];
+
+                if current_ticks <= previous_ticks {
+                    self.is_done = true;
+                    return None;
+                }
+
+                self.index_mask = BUCKET_COUNTS[self.level] - 1;
+                self.index = (previous_ticks & self.index_mask) as u8;
+                let steps =
+                    (current_ticks - previous_ticks + 1).min(BUCKET_COUNTS[self.level]) as u8;
+                self.end_index = self.index + steps;
+
+                self.is_new_level = false;
+                self.is_new_index = true;
+
+                // dbg!(self.level, self.index, self.end_index);
+            }
+
+            let i = self.index & self.index_mask as u8;
+
+            if self.is_new_index {
+                // Move the sentinel to the back of the queue.
+                self.timer_wheel
+                    .reset_timer_node_positions(self.level, i as usize);
+
+                self.is_new_index = false;
+            }
+
+            // Pop the next timer event (cache entry) from the queue at the current
+            // level and index.
+            //
+            // We will repeat processing this level until we see the sentinel.
+            // (`pop_timer_node` will return `None` when it sees the sentinel)
+            if let Some(node) = self.timer_wheel.pop_timer_node(self.level, i as usize) {
+                let expiration_time = node.as_ref().element.entry_info().expiration_time();
+                if let Some(t) = expiration_time {
+                    if t <= self.current_time {
+                        // The cache entry has expired. Unset the timer node from
+                        // the ValueEntry and return the node.
+                        node.as_ref().element.unset_timer_node_in_deq_nodes();
+                        return Some(TimerEvent::Expired(node));
+                    }
+
+                    // The cache entry has not expired. Reschedule it.
+                    let node_p = NonNull::new(Box::into_raw(node)).expect("Got a null ptr");
+
+                    #[cfg(test)]
+                    // Get the entry info before rescheduling (mutating) the node to
+                    // avoid Stacked Borrows/Tree Borrows violations on `node_p`.
+                    let entry_info =
+                        MiniArc::clone(unsafe { node_p.as_ref() }.element.entry_info());
+
+                    match self.timer_wheel.schedule_existing_node(node_p) {
+                        ReschedulingResult::Rescheduled => {
+                            #[cfg(test)]
+                            return Some(TimerEvent::Rescheduled(entry_info));
+                            #[cfg(not(test))]
+                            return Some(TimerEvent::Rescheduled(()));
+                        }
+                        ReschedulingResult::Removed(node) => {
+                            // The timer event has been removed from the timer
+                            // wheel. Unset the timer node from the ValueEntry.
+                            node.as_ref().element.unset_timer_node_in_deq_nodes();
+                            return Some(TimerEvent::Descheduled);
+                        }
+                    }
+                }
+            } else {
+                // Done with the current queue. Move to the next index
+                // and/or next level.
+                self.index += 1;
+                self.is_new_index = true;
+
+                if self.index >= self.end_index {
+                    self.level += 1;
+                    // No more levels to process. We are done.
+                    if self.level >= BUCKET_COUNTS.len() {
+                        self.is_done = true;
+                        return None;
+                    }
+                    self.is_new_level = true;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use super::{TimerEvent, TimerWheel, SPANS};
+    use crate::common::{
+        concurrent::{arc::MiniArc, entry_info::EntryInfo, KeyHash},
+        time::{Clock, Instant, Mock},
+    };
+
+    #[test]
+    fn test_bucket_indices() {
+        fn bi(timer: &TimerWheel<()>, now: Instant, dur: Duration) -> (usize, usize) {
+            let t = now.saturating_add(dur);
+// License and Copyright Notice:
+//
+// Some of the code and doc comments in this module were copied from
+// `std::collections::LinkedList` in the Rust standard library.
+// https://github.com/rust-lang/rust/blob/master/src/liballoc/collections/linked_list.rs
+//
+// The original code/comments from LinkedList are dual-licensed under
+// the Apache License, Version 2.0 <https://github.com/rust-lang/rust/blob/master/LICENSE-APACHE>
+// or the MIT license <https://github.com/rust-lang/rust/blob/master/LICENSE-MIT>
+//
+// Copyrights of the original code/comments are retained by their contributors.
+// For full authorship information, see the version control history of
+// https://github.com/rust-lang/rust/ or https://thanks.rust-lang.org
+
+use std::{marker::PhantomData, ptr::NonNull};
+
+use super::CacheRegion;
+
+#[cfg(feature = "unstable-debug-counters")]
+use crate::common::concurrent::debug_counters;
+
+// `crate::{sync,unsync}::DeqNodes` uses a `tagptr::TagNonNull<DeqNode<T>, 2>`
+// pointer. To reserve the space for the 2-bit tag, use 4 bytes as the *minimum*
+// alignment.
+// https://doc.rust-lang.org/reference/type-layout.html#the-alignment-modifiers
+#[repr(align(4))]
+#[derive(PartialEq, Eq)]
+pub(crate) struct DeqNode<T> {
+    next: Option<NonNull<DeqNode<T>>>,
+    prev: Option<NonNull<DeqNode<T>>>,
+    pub(crate) element: T,
+}
+
+impl<T> std::fmt::Debug for DeqNode<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeqNode")
+            .field("next", &self.next)
+            .field("prev", &self.prev)
+            .finish()
+    }
+}
+
+impl<T> DeqNode<T> {
+    pub(crate) fn new(element: T) -> Self {
+        #[cfg(feature = "unstable-debug-counters")]
+        debug_counters::InternalGlobalDebugCounters::deq_node_created();
+
+        Self {
+            next: None,
+            prev: None,
+            element,
+        }
+    }
+
+    pub(crate) fn next_node_ptr(this: NonNull<Self>) -> Option<NonNull<DeqNode<T>>> {
+        unsafe { this.as_ref() }.next
+    }
+}
+
+#[cfg(feature = "unstable-debug-counters")]
+impl<T> Drop for DeqNode<T> {
+    fn drop(&mut self) {
+        debug_counters::InternalGlobalDebugCounters::deq_node_dropped();
+    }
+}
+
+/// Cursor is used to remember the current iterating position.
+enum DeqCursor<T> {
+    Node(NonNull<DeqNode<T>>),
+    Done,
+}
+
+pub(crate) struct Deque<T> {
+    region: CacheRegion,
+    len: usize,
+    head: Option<NonNull<DeqNode<T>>>,
+    tail: Option<NonNull<DeqNode<T>>>,
+    cursor: Option<DeqCursor<T>>,
+    marker: PhantomData<Box<DeqNode<T>>>,
+}
+
+impl<T> Drop for Deque<T> {
+    fn drop(&mut self) {
+        struct DropGuard<'a, T>(&'a mut Deque<T>);
+
+        impl<T> Drop for DropGuard<'_, T> {
+            fn drop(&mut self) {
+                // Continue the same loop we do below. This only runs when a destructor has
+                // panicked. If another one panics this will abort.
+                while self.0.pop_front().is_some() {}
+            }
+        }
+
+        while let Some(node) = self.pop_front() {
+            let guard = DropGuard(self);
+            drop(node);
+            std::mem::forget(guard);
+        }
+    }
+}
+
+// Inner crate public function/methods
+impl<T> Deque<T> {
+    pub(crate) fn new(region: CacheRegion) -> Self {
+        Self {
+            region,
+            len: 0,
+            head: None,
+            tail: None,
+            cursor: None,
+            marker: PhantomData,
+        }
+    }
+
+    pub(crate) fn region(&self) -> CacheRegion {
+        self.region
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn contains(&self, node: &DeqNode<T>) -> bool {
+        node.prev.is_some() || self.is_head(node)
+    }
+
+    pub(crate) fn peek_front(&self) -> Option<&DeqNode<T>> {
+        self.head.as_ref().map(|node| unsafe { node.as_ref() })
+    }
+
+    pub(crate) fn peek_front_ptr(&self) -> Option<NonNull<DeqNode<T>>> {
+        self.head.as_ref().copied()
+    }
+
+    /// Removes and returns the node at the front of the list.
+    pub(crate) fn pop_front(&mut self) -> Option<Box<DeqNode<T>>> {
+        // This method takes care not to create mutable references to whole nodes,
+        // to maintain validity of aliasing pointers into `element`.
+        self.head.map(|node| unsafe {
+            if self.is_at_cursor(node.as_ref()) {
+                self.advance_cursor();
+            }
+
+            let mut node = Box::from_raw(node.as_ptr());
+            self.head = node.next;
+
+            match self.head {
+                None => self.tail = None,
+                // Not creating new mutable (unique!) references overlapping `element`.
+                Some(head) => (*head.as_ptr()).prev = None,
+            }
+
+            self.len -= 1;
+
+            node.prev = None;
+            node.next = None;
+            node
+        })
+    }
+
+    pub(crate) fn peek_back(&self) -> Option<&DeqNode<T>> {
+        self.tail.as_ref().map(|node| unsafe { node.as_ref() })
+    }
+
+    /// Adds the given node to the back of the list.
+    pub(crate) fn push_back(&mut self, mut node: Box<DeqNode<T>>) -> NonNull<DeqNode<T>> {
+        // This method takes care not to create mutable references to whole nodes,
+        // to maintain validity of aliasing pointers into `element`.
+        unsafe {
+            node.next = None;
+            node.prev = self.tail;
+            let node = NonNull::new(Box::into_raw(node)).expect("Got a null ptr");
+
+            match self.tail {
+                None => self.head = Some(node),
+                // Not creating new mutable (unique!) references overlapping `element`.
+                Some(tail) => (*tail.as_ptr()).next = Some(node),
+            }
+
+            self.tail = Some(node);
+            self.len += 1;
+            node
+        }
+    }
+
+    pub(crate) unsafe fn move_to_back(&mut self, mut node: NonNull<DeqNode<T>>) {
+        if self.is_tail(node.as_ref()) {
+            // Already at the tail. Nothing to do.
+            return;
+        }
+
+        if self.is_at_cursor(node.as_ref()) {
+            self.advance_cursor();
+        }
+
+        let node = node.as_mut(); // this one is ours now, we can create an &mut.
+
+        // Not creating new mutable (unique!) references overlapping `element`.
+        match node.prev {
+            Some(prev) if node.next.is_some() => (*prev.as_ptr()).next = node.next,
+            Some(..) => (),
+            // This node is the head node.
+            None => self.head = node.next,
+        };
+
+        // This node is not the tail node.
+        if let Some(next) = node.next.take() {
+            (*next.as_ptr()).prev = node.prev;
+
+            let mut node = NonNull::from(node);
+            match self.tail {
+                // Not creating new mutable (unique!) references overlapping `element`.
+                Some(tail) => {
+                    node.as_mut().prev = Some(tail);
+                    (*tail.as_ptr()).next = Some(node);
+                }
+                None => unreachable!(),
+            }
+            self.tail = Some(node);
+        }
+    }
+
+    pub(crate) fn move_front_to_back(&mut self) {
+        if let Some(node) = self.head {
+            unsafe { self.move_to_back(node) };
+        }
+    }
+
+    /// Unlinks the specified node from the current list.
+    ///
+    /// This method takes care not to create mutable references to `element`, to
+    /// maintain validity of aliasing pointers.
+    ///
+    /// IMPORTANT: This method does not drop the node. If the node is no longer
+    /// needed, use `unlink_and_drop` instead, or drop it at the caller side.
+    /// Otherwise, the node will leak.
+    pub(crate) unsafe fn unlink(&mut self, mut node: NonNull<DeqNode<T>>) {
+        if self.is_at_cursor(node.as_ref()) {
+            self.advance_cursor();
+        }
+
+        let node = node.as_mut(); // this one is ours now, we can create an &mut.
+
+        // Not creating new mutable (unique!) references overlapping `element`.
+        match node.prev {
+            Some(prev) => (*prev.as_ptr()).next = node.next,
+            // this node is the head node
+            None => self.head = node.next,
+        };
+
+        match node.next {
+            Some(next) => (*next.as_ptr()).prev = node.prev,
+            // this node is the tail node
+            None => self.tail = node.prev,
+        };
+
+        node.prev = None;
+        node.next = None;
+
+        self.len -= 1;
+    }
+
+    /// Unlinks the specified node from the current list, and then drop the node.
+    ///
+    /// This method takes care not to create mutable references to `element`, to
+    /// maintain validity of aliasing pointers.
+    ///
+    /// Panics:
+    pub(crate) unsafe fn unlink_and_drop(&mut self, node: NonNull<DeqNode<T>>) {
+        self.unlink(node);
+        std::mem::drop(Box::from_raw(node.as_ptr()));
+    }
+
+    pub(crate) fn reset_cursor(&mut self) {
+        self.cursor = None;
+    }
+}
+
+impl<'a, T> Iterator for &'a mut Deque<T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cursor.is_none() {
+            if let Some(head) = self.head {
+                self.cursor = Some(DeqCursor::Node(head));
+            }
+        }
+        let elem = if let Some(DeqCursor::Node(node)) = self.cursor {
+            unsafe { Some(&(*node.as_ptr()).element) }
+        } else {
+            None
+        };
+        self.advance_cursor();
+        elem
+    }
+}
+
+// Private function/methods
+impl<T> Deque<T> {
+    fn is_head(&self, node: &DeqNode<T>) -> bool {
+use super::bucket::{self, Bucket, BucketArray, InsertOrModifyState, RehashOp};
+
+use std::{
+    hash::{BuildHasher, Hash},
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+use crossbeam_epoch::{Atomic, CompareExchangeError, Guard, Owned, Shared};
+
+pub(crate) struct BucketArrayRef<'a, K, V, S> {
+    pub(crate) bucket_array: &'a Atomic<BucketArray<K, V>>,
+    pub(crate) build_hasher: &'a S,
+    pub(crate) len: &'a AtomicUsize,
+}
+
+impl<K, V, S> BucketArrayRef<'_, K, V, S>
+where
+    K: Hash + Eq,
+    S: BuildHasher,
+{
+    pub(crate) fn get_key_value_and_then<T>(
+        &self,
+        hash: u64,
+        mut eq: impl FnMut(&K) -> bool,
+        with_entry: impl FnOnce(&K, &V) -> Option<T>,
+    ) -> Option<T> {
+        let guard = &crossbeam_epoch::pin();
+        let current_ref = self.get(guard);
+        let mut bucket_array_ref = current_ref;
+
+        let result;
+
+        loop {
+            match bucket_array_ref
+                .get(guard, hash, &mut eq)
+                .map(|p| unsafe { p.as_ref() })
+            {
+                Ok(Some(Bucket {
+                    key,
+                    maybe_value: value,
+                })) => {
+                    result = with_entry(key, unsafe { &*value.as_ptr() });
+                    break;
+                }
+                Ok(None) => {
+                    result = None;
+                    break;
+                }
+                Err(_) => {
+                    if let Some(r) =
+                        bucket_array_ref.rehash(guard, self.build_hasher, RehashOp::Expand)
+                    {
+                        bucket_array_ref = r;
+                    }
+                }
+            }
+        }
+
+        self.swing(guard, current_ref, bucket_array_ref);
+
+        result
+    }
+
+    pub(crate) fn remove_entry_if_and<T>(
+        &self,
+        hash: u64,
+        mut eq: impl FnMut(&K) -> bool,
+        mut condition: impl FnMut(&K, &V) -> bool,
+        with_previous_entry: impl FnOnce(&K, &V) -> T,
+    ) -> Option<T> {
+        let guard = &crossbeam_epoch::pin();
+        let current_ref = self.get(guard);
+        let mut bucket_array_ref = current_ref;
+
+        let result;
+
+        loop {
+            loop {
+                let rehash_op = RehashOp::new(
+                    bucket_array_ref.capacity(),
+                    &bucket_array_ref.tombstone_count,
+                    self.len,
+                );
+                if rehash_op.is_skip() {
+                    break;
+                }
+                if let Some(r) = bucket_array_ref.rehash(guard, self.build_hasher, rehash_op) {
+                    bucket_array_ref = r;
+                }
+            }
+
+            match bucket_array_ref.remove_if(guard, hash, &mut eq, condition) {
+                Ok(previous_bucket_ptr) => {
+                    if let Some(previous_bucket_ref) = unsafe { previous_bucket_ptr.as_ref() } {
+                        let Bucket {
+                            key,
+                            maybe_value: value,
+                        } = previous_bucket_ref;
+                        self.len.fetch_sub(1, Ordering::Relaxed);
+                        bucket_array_ref
+                            .tombstone_count
+                            .fetch_add(1, Ordering::Relaxed);
+                        result = Some(with_previous_entry(key, unsafe { &*value.as_ptr() }));
+
+                        unsafe { bucket::defer_destroy_tombstone(guard, previous_bucket_ptr) };
+                    } else {
+                        result = None;
+                    }
+
+                    break;
+                }
+                Err(c) => {
+                    condition = c;
+                    if let Some(r) =
+                        bucket_array_ref.rehash(guard, self.build_hasher, RehashOp::Expand)
+                    {
+                        bucket_array_ref = r;
+                    }
+                }
+            }
+        }
+
+        self.swing(guard, current_ref, bucket_array_ref);
+
+        result
+    }
+
+    pub(crate) fn insert_if_not_present_and<T>(
+        &self,
+        key: K,
+        hash: u64,
+        on_insert: impl FnOnce() -> V,
+        with_existing_entry: impl FnOnce(&K, &V) -> T,
+    ) -> Option<T> {
+        use bucket::InsertionResult;
+
+        let guard = &crossbeam_epoch::pin();
+        let current_ref = self.get(guard);
+        let mut bucket_array_ref = current_ref;
+        let mut state = InsertOrModifyState::New(key, on_insert);
+
+        let result;
+
+        loop {
+            loop {
+                let rehash_op = RehashOp::new(
+                    bucket_array_ref.capacity(),
+                    &bucket_array_ref.tombstone_count,
+                    self.len,
+                );
+                if rehash_op.is_skip() {
+                    break;
+                }
+                if let Some(r) = bucket_array_ref.rehash(guard, self.build_hasher, rehash_op) {
+                    bucket_array_ref = r;
+                }
+            }
+
+            match bucket_array_ref.insert_if_not_present(guard, hash, state) {
+                Ok(InsertionResult::AlreadyPresent(current_bucket_ptr)) => {
+                    let current_bucket_ref = unsafe { current_bucket_ptr.as_ref() }.unwrap();
+                    assert!(!bucket::is_tombstone(current_bucket_ptr));
+                    let Bucket {
+                        key,
+                        maybe_value: value,
+                    } = current_bucket_ref;
+                    result = Some(with_existing_entry(key, unsafe { &*value.as_ptr() }));
+                    break;
+                }
+                Ok(InsertionResult::Inserted) => {
+                    self.len.fetch_add(1, Ordering::Relaxed);
+                    result = None;
+                    break;
+                }
+                Ok(InsertionResult::ReplacedTombstone(previous_bucket_ptr)) => {
+                    assert!(bucket::is_tombstone(previous_bucket_ptr));
+                    self.len.fetch_add(1, Ordering::Relaxed);
+                    unsafe { bucket::defer_destroy_bucket(guard, previous_bucket_ptr) };
+                    result = None;
+                    break;
+                }
+                Err(s) => {
+                    state = s;
+                    if let Some(r) =
+                        bucket_array_ref.rehash(guard, self.build_hasher, RehashOp::Expand)
+                    {
+                        bucket_array_ref = r;
+                    }
+                }
+            }
+        }
+
+        self.swing(guard, current_ref, bucket_array_ref);
+
+        result
+    }
+
+    pub(crate) fn insert_with_or_modify_entry_and<T>(
+        &self,
+        key: K,
+        hash: u64,
+        on_insert: impl FnOnce() -> V,
+        mut on_modify: impl FnMut(&K, &V) -> V,
+        with_old_entry: impl FnOnce(&K, &V) -> T,
+    ) -> Option<T> {
+        let guard = &crossbeam_epoch::pin();
+        let current_ref = self.get(guard);
+        let mut bucket_array_ref = current_ref;
+        let mut state = InsertOrModifyState::New(key, on_insert);
+
+        let result;
+
+        loop {
+            loop {
+                let rehash_op = RehashOp::new(
+                    bucket_array_ref.capacity(),
+                    &bucket_array_ref.tombstone_count,
+                    self.len,
+                );
+                if rehash_op.is_skip() {
+                    break;
+                }
+                if let Some(r) = bucket_array_ref.rehash(guard, self.build_hasher, rehash_op) {
+                    bucket_array_ref = r;
+                }
+            }
+
+            match bucket_array_ref.insert_or_modify(guard, hash, state, on_modify) {
+                Ok(previous_bucket_ptr) => {
+                    if let Some(previous_bucket_ref) = unsafe { previous_bucket_ptr.as_ref() } {
+                        if bucket::is_tombstone(previous_bucket_ptr) {
+                            self.len.fetch_add(1, Ordering::Relaxed);
+                            result = None;
+                        } else {
+                            let Bucket {
+                                key,
+                                maybe_value: value,
+                            } = previous_bucket_ref;
+                            result = Some(with_old_entry(key, unsafe { &*value.as_ptr() }));
+                        }
+
+                        unsafe { bucket::defer_destroy_bucket(guard, previous_bucket_ptr) };
+                    } else {
+                        self.len.fetch_add(1, Ordering::Relaxed);
+                        result = None;
+                    }
+
+                    break;
+                }
+                Err((s, f)) => {
+                    state = s;
+                    on_modify = f;
+                    if let Some(r) =
+                        bucket_array_ref.rehash(guard, self.build_hasher, RehashOp::Expand)
+                    {
+                        bucket_array_ref = r;
+                    }
+                }
+            }
+        }
+
+        self.swing(guard, current_ref, bucket_array_ref);
+
+        result
+    }
+
+    pub(crate) fn keys<T>(&self, mut with_key: impl FnMut(&K) -> T) -> Vec<T> {
+        let guard = &crossbeam_epoch::pin();
+        let current_ref = self.get(guard);
+        let mut bucket_array_ref = current_ref;
+
+        let result;
+
+        loop {
+            match bucket_array_ref.keys(guard, &mut with_key) {
+                Ok(keys) => {
+                    result = keys;
+                    break;
+                }
+                Err(_) => {
+                    if let Some(r) =
+                        bucket_array_ref.rehash(guard, self.build_hasher, RehashOp::Expand)
+                    {
+                        bucket_array_ref = r;
+                    }
+                }
+            }
+        }
+
+        self.swing(guard, current_ref, bucket_array_ref);
+
+        result
+    }
+}
+
+impl<'g, K, V, S> BucketArrayRef<'_, K, V, S> {
+    fn get(&self, guard: &'g Guard) -> &'g BucketArray<K, V> {
+        let mut maybe_new_bucket_array = None;
+
+        loop {
+4.7858 minutes used of 45.0

@@ -1,0 +1,516 @@
+    Checking tokio v1.54.1
+    Checking tokio-util v0.7.20
+ Documenting h2 v0.4.12 (/work/crate)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.73s
+   Generated /target/doc/h2/index.html
+rustdoc_exit=0 rustfmt_exit=0
+use crate::frame::Reason;
+use crate::proto::{WindowSize, MAX_WINDOW_SIZE};
+
+use std::fmt;
+
+// We don't want to send WINDOW_UPDATE frames for tiny changes, but instead
+// aggregate them when the changes are significant. Many implementations do
+// this by keeping a "ratio" of the update version the allowed window size.
+//
+// While some may wish to represent this ratio as percentage, using a f32,
+// we skip having to deal with float math and stick to integers. To do so,
+// the "ratio" is represented by 2 i32s, split into the numerator and
+// denominator. For example, a 50% ratio is simply represented as 1/2.
+//
+// An example applying this ratio: If a stream has an allowed window size of
+// 100 bytes, WINDOW_UPDATE frames are scheduled when the unclaimed change
+// becomes greater than 1/2, or 50 bytes.
+const UNCLAIMED_NUMERATOR: i32 = 1;
+const UNCLAIMED_DENOMINATOR: i32 = 2;
+
+#[test]
+#[allow(clippy::assertions_on_constants)]
+fn sanity_unclaimed_ratio() {
+    assert!(UNCLAIMED_NUMERATOR < UNCLAIMED_DENOMINATOR);
+    assert!(UNCLAIMED_NUMERATOR >= 0);
+    assert!(UNCLAIMED_DENOMINATOR > 0);
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct FlowControl {
+    /// Window the peer knows about.
+    ///
+    /// This can go negative if a SETTINGS_INITIAL_WINDOW_SIZE is received.
+    ///
+    /// For example, say the peer sends a request and uses 32kb of the window.
+    /// We send a SETTINGS_INITIAL_WINDOW_SIZE of 16kb. The peer has to adjust
+    /// its understanding of the capacity of the window, and that would be:
+    ///
+    /// ```notrust
+    /// default (64kb) - used (32kb) - settings_diff (64kb - 16kb): -16kb
+    /// ```
+    window_size: Window,
+
+    /// Window that we know about.
+    ///
+    /// This can go negative if a user declares a smaller target window than
+    /// the peer knows about.
+    available: Window,
+}
+
+impl FlowControl {
+    pub fn new() -> FlowControl {
+        FlowControl {
+            window_size: Window(0),
+            available: Window(0),
+        }
+    }
+
+    /// Returns the window size as known by the peer
+    pub fn window_size(&self) -> WindowSize {
+        self.window_size.as_size()
+    }
+
+    /// Returns the window size available to the consumer
+    pub fn available(&self) -> Window {
+        self.available
+    }
+
+    /// Returns true if there is unavailable window capacity
+    pub fn has_unavailable(&self) -> bool {
+        if self.window_size < 0 {
+            return false;
+        }
+
+        self.window_size > self.available
+    }
+
+    pub fn claim_capacity(&mut self, capacity: WindowSize) -> Result<(), Reason> {
+        self.available.decrease_by(capacity)
+    }
+
+    pub fn assign_capacity(&mut self, capacity: WindowSize) -> Result<(), Reason> {
+        self.available.increase_by(capacity)
+    }
+
+    /// If a WINDOW_UPDATE frame should be sent, returns a positive number
+    /// representing the increment to be used.
+    ///
+    /// If there is no available bytes to be reclaimed, or the number of
+    /// available bytes does not reach the threshold, this returns `None`.
+    ///
+    /// This represents pending outbound WINDOW_UPDATE frames.
+    pub fn unclaimed_capacity(&self) -> Option<WindowSize> {
+        let available = self.available;
+
+        if self.window_size >= available {
+            return None;
+        }
+
+        let unclaimed = available.0 - self.window_size.0;
+        let threshold = self.window_size.0 / UNCLAIMED_DENOMINATOR * UNCLAIMED_NUMERATOR;
+
+        if unclaimed < threshold {
+            None
+        } else {
+            Some(unclaimed as WindowSize)
+        }
+    }
+
+    /// Increase the window size.
+    ///
+    /// This is called after receiving a WINDOW_UPDATE frame
+    pub fn inc_window(&mut self, sz: WindowSize) -> Result<(), Reason> {
+        let (val, overflow) = self.window_size.0.overflowing_add(sz as i32);
+
+        if overflow {
+            return Err(Reason::FLOW_CONTROL_ERROR);
+        }
+
+        if val > MAX_WINDOW_SIZE as i32 {
+            return Err(Reason::FLOW_CONTROL_ERROR);
+        }
+
+        tracing::trace!(
+            "inc_window; sz={}; old={}; new={}",
+            sz,
+            self.window_size,
+            val
+        );
+
+        self.window_size = Window(val);
+        Ok(())
+    }
+
+    /// Decrement the send-side window size.
+    ///
+    /// This is called after receiving a SETTINGS frame with a lower
+    /// INITIAL_WINDOW_SIZE value.
+    pub fn dec_send_window(&mut self, sz: WindowSize) -> Result<(), Reason> {
+        tracing::trace!(
+            "dec_window; sz={}; window={}, available={}",
+            sz,
+            self.window_size,
+            self.available
+        );
+        // ~~This should not be able to overflow `window_size` from the bottom.~~ wrong. it can.
+        self.window_size.decrease_by(sz)?;
+        Ok(())
+    }
+
+    /// Decrement the recv-side window size.
+    ///
+    /// This is called after receiving a SETTINGS ACK frame with a lower
+    /// INITIAL_WINDOW_SIZE value.
+    pub fn dec_recv_window(&mut self, sz: WindowSize) -> Result<(), Reason> {
+        tracing::trace!(
+            "dec_recv_window; sz={}; window={}, available={}",
+            sz,
+            self.window_size,
+            self.available
+        );
+        // This should not be able to overflow `window_size` from the bottom.
+        self.window_size.decrease_by(sz)?;
+        self.available.decrease_by(sz)?;
+        Ok(())
+    }
+
+    /// Decrements the window reflecting data has actually been sent. The caller
+    /// must ensure that the window has capacity.
+    pub fn send_data(&mut self, sz: WindowSize) -> Result<(), Reason> {
+        tracing::trace!(
+            "send_data; sz={}; window={}; available={}",
+            sz,
+            self.window_size,
+            self.available
+        );
+
+        // If send size is zero it's meaningless to update flow control window
+        if sz > 0 {
+            // Ensure that the argument is correct
+            assert!(self.window_size.0 >= sz as i32);
+
+            // Update values
+            self.window_size.decrease_by(sz)?;
+            self.available.decrease_by(sz)?;
+        }
+        Ok(())
+    }
+}
+
+/// The current capacity of a flow-controlled Window.
+///
+/// This number can go negative when either side has used a certain amount
+/// of capacity when the other side advertises a reduction in size.
+///
+/// This type tries to centralize the knowledge of addition and subtraction
+/// to this capacity, instead of having integer casts throughout the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd)]
+pub struct Window(i32);
+
+impl Window {
+    pub fn as_size(&self) -> WindowSize {
+        if self.0 < 0 {
+            0
+        } else {
+            self.0 as WindowSize
+        }
+    }
+
+    pub fn checked_size(&self) -> WindowSize {
+        assert!(self.0 >= 0, "negative Window");
+        self.0 as WindowSize
+    }
+
+    pub fn decrease_by(&mut self, other: WindowSize) -> Result<(), Reason> {
+        if let Some(v) = self.0.checked_sub(other as i32) {
+            self.0 = v;
+            Ok(())
+        } else {
+            Err(Reason::FLOW_CONTROL_ERROR)
+        }
+    }
+
+    pub fn increase_by(&mut self, other: WindowSize) -> Result<(), Reason> {
+        let other = self.add(other)?;
+        self.0 = other.0;
+        Ok(())
+    }
+
+    pub fn add(&self, other: WindowSize) -> Result<Self, Reason> {
+        if let Some(v) = self.0.checked_add(other as i32) {
+            Ok(Self(v))
+        } else {
+            Err(Reason::FLOW_CONTROL_ERROR)
+        }
+    }
+}
+
+impl PartialEq<usize> for Window {
+    fn eq(&self, other: &usize) -> bool {
+        if self.0 < 0 {
+            false
+        } else {
+            (self.0 as usize).eq(other)
+        }
+    }
+}
+
+impl PartialOrd<usize> for Window {
+    fn partial_cmp(&self, other: &usize) -> Option<::std::cmp::Ordering> {
+        if self.0 < 0 {
+            Some(::std::cmp::Ordering::Less)
+        } else {
+            (self.0 as usize).partial_cmp(other)
+        }
+    }
+}
+
+impl fmt::Display for Window {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl From<Window> for isize {
+    fn from(w: Window) -> isize {
+        w.0 as isize
+    }
+}
+        counts: &mut Counts,
+    ) -> Result<Option<StreamId>, Error> {
+        assert!(self.refused.is_none());
+
+        counts.peer().ensure_can_open(id, mode)?;
+
+        let next_id = self.next_stream_id()?;
+        if id < next_id {
+            proto_err!(conn: "id ({:?}) < next_id ({:?})", id, next_id);
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+        }
+
+        self.next_stream_id = id.next_id();
+
+        if !counts.can_inc_num_recv_streams() {
+            self.refused = Some(id);
+            return Ok(None);
+        }
+
+        Ok(Some(id))
+    }
+
+    /// Transition the stream state based on receiving headers
+    ///
+    /// The caller ensures that the frame represents headers and not trailers.
+    pub fn recv_headers(
+        &mut self,
+        frame: frame::Headers,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) -> Result<(), RecvHeaderBlockError<Option<frame::Headers>>> {
+        tracing::trace!("opening stream; init_window={}", self.init_window_sz);
+        let is_initial = stream.state.recv_open(&frame)?;
+
+        if is_initial {
+            // TODO: be smarter about this logic
+            if frame.stream_id() > self.last_processed_id {
+                self.last_processed_id = frame.stream_id();
+            }
+
+            // Increment the number of concurrent streams
+            counts.inc_num_recv_streams(stream);
+        }
+
+        if !stream.content_length.is_head() {
+            use super::stream::ContentLength;
+            use http::header;
+
+            if let Some(content_length) = frame.fields().get(header::CONTENT_LENGTH) {
+                let content_length = match frame::parse_u64(content_length.as_bytes()) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        proto_err!(stream: "could not parse content-length; stream={:?}", stream.id);
+                        return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+                    }
+                };
+
+                stream.content_length = ContentLength::Remaining(content_length);
+                // END_STREAM on headers frame with non-zero content-length is malformed.
+                // https://datatracker.ietf.org/doc/html/rfc9113#section-8.1.1
+                if frame.is_end_stream()
+                    && content_length > 0
+                    && frame
+                        .pseudo()
+                        .status
+                        .map_or(true, |status| status != 204 && status != 304)
+                {
+                    proto_err!(stream: "recv_headers with END_STREAM: content-length is not zero; stream={:?};", stream.id);
+                    return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+                }
+            }
+        }
+
+        if frame.is_over_size() {
+            // A frame is over size if the decoded header block was bigger than
+            // SETTINGS_MAX_HEADER_LIST_SIZE.
+            //
+            // > A server that receives a larger header block than it is willing
+            // > to handle can send an HTTP 431 (Request Header Fields Too
+            // > Large) status code [RFC6585]. A client can discard responses
+            // > that it cannot process.
+            //
+            // So, if peer is a server, we'll send a 431. In either case,
+            // an error is recorded, which will send a REFUSED_STREAM,
+            // since we don't want any of the data frames either.
+            tracing::debug!(
+                "stream error REQUEST_HEADER_FIELDS_TOO_LARGE -- \
+                 recv_headers: frame is over size; stream={:?}",
+                stream.id
+            );
+            return if counts.peer().is_server() && is_initial {
+                let mut res = frame::Headers::new(
+                    stream.id,
+                    frame::Pseudo::response(::http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE),
+                    HeaderMap::new(),
+                );
+                res.set_end_stream();
+                Err(RecvHeaderBlockError::Oversize(Some(res)))
+            } else {
+                Err(RecvHeaderBlockError::Oversize(None))
+            };
+        }
+
+        let stream_id = frame.stream_id();
+        let (pseudo, fields) = frame.into_parts();
+
+        if pseudo.protocol.is_some()
+            && counts.peer().is_server()
+            && !self.is_extended_connect_protocol_enabled
+        {
+            proto_err!(stream: "cannot use :protocol if extended connect protocol is disabled; stream={:?}", stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+        }
+
+        if pseudo.status.is_some() && counts.peer().is_server() {
+            proto_err!(stream: "cannot use :status header for requests; stream={:?}", stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+        }
+
+        if !pseudo.is_informational() {
+            let message = counts
+                .peer()
+                .convert_poll_message(pseudo, fields, stream_id)?;
+
+            // Push the frame onto the stream's recv buffer
+            stream
+                .pending_recv
+                .push_back(&mut self.buffer, Event::Headers(message));
+            stream.notify_recv();
+
+            // Only servers can receive a headers frame that initiates the stream.
+            // This is verified in `Streams` before calling this function.
+            if counts.peer().is_server() {
+                // Correctness: never push a stream to `pending_accept` without having the
+                // corresponding headers frame pushed to `stream.pending_recv`.
+                self.pending_accept.push(stream);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Called by the server to get the request
+    ///
+    /// # Panics
+    ///
+    /// Panics if `stream.pending_recv` has no `Event::Headers` queued.
+    ///
+    pub fn take_request(&mut self, stream: &mut store::Ptr) -> Request<()> {
+        use super::peer::PollMessage::*;
+
+        match stream.pending_recv.pop_front(&mut self.buffer) {
+            Some(Event::Headers(Server(request))) => request,
+            _ => unreachable!("server stream queue must start with Headers"),
+        }
+    }
+
+    /// Called by the client to get pushed response
+    pub fn poll_pushed(
+        &mut self,
+        cx: &Context,
+        stream: &mut store::Ptr,
+    ) -> Poll<Option<Result<(Request<()>, store::Key), proto::Error>>> {
+        use super::peer::PollMessage::*;
+
+        let mut ppp = stream.pending_push_promises.take();
+        let pushed = ppp.pop(stream.store_mut()).map(|mut pushed| {
+            match pushed.pending_recv.pop_front(&mut self.buffer) {
+                Some(Event::Headers(Server(headers))) => (headers, pushed.key()),
+                // When frames are pushed into the queue, it is verified that
+                // the first frame is a HEADERS frame.
+                _ => panic!("Headers not set on pushed stream"),
+            }
+        });
+        stream.pending_push_promises = ppp;
+        if let Some(p) = pushed {
+            Poll::Ready(Some(Ok(p)))
+        } else {
+            let is_open = stream.state.ensure_recv_open()?;
+
+            if is_open {
+                stream.push_task = Some(cx.waker().clone());
+                Poll::Pending
+            } else {
+                Poll::Ready(None)
+            }
+        }
+    }
+
+    /// Called by the client to get the response
+    pub fn poll_response(
+        &mut self,
+        cx: &Context,
+        stream: &mut store::Ptr,
+    ) -> Poll<Result<Response<()>, proto::Error>> {
+        use super::peer::PollMessage::*;
+
+        // If the buffer is not empty, then the first frame must be a HEADERS
+        // frame or the user violated the contract.
+        match stream.pending_recv.pop_front(&mut self.buffer) {
+            Some(Event::Headers(Client(response))) => Poll::Ready(Ok(response)),
+            Some(_) => panic!("poll_response called after response returned"),
+            None => {
+                if !stream.state.ensure_recv_open()? {
+                    proto_err!(stream: "poll_response: stream={:?} is not opened;",  stream.id);
+                    return Poll::Ready(Err(Error::library_reset(
+                        stream.id,
+                        Reason::PROTOCOL_ERROR,
+                    )));
+                }
+
+                stream.recv_task = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+
+    /// Transition the stream based on receiving trailers
+    pub fn recv_trailers(
+        &mut self,
+        frame: frame::Headers,
+        stream: &mut store::Ptr,
+    ) -> Result<(), Error> {
+        // Transition the state
+        stream.state.recv_close()?;
+
+        if stream.ensure_content_length_zero().is_err() {
+            proto_err!(stream: "recv_trailers: content-length is not zero; stream={:?};",  stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
+        }
+
+        let trailers = frame.into_fields();
+
+        // Push the frame onto the stream's recv buffer
+        stream
+            .pending_recv
+            .push_back(&mut self.buffer, Event::Trailers(trailers));
+        stream.notify_recv();
+
+        Ok(())
+    }

@@ -1,0 +1,615 @@
+
+impl<K, V, S> BaseCache<K, V, S>
+where
+    K: Hash + Eq,
+    S: BuildHasher,
+{
+    pub(crate) fn maybe_key_lock(&self, key: &Arc<K>) -> Option<KeyLock<'_, K, S>> {
+        self.inner.maybe_key_lock(key)
+    }
+}
+
+impl<K, V, S> BaseCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    // https://rust-lang.github.io/rust-clippy/master/index.html#too_many_arguments
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        name: Option<String>,
+        max_capacity: Option<u64>,
+        initial_capacity: Option<usize>,
+        build_hasher: S,
+        weigher: Option<Weigher<K, V>>,
+        eviction_policy: EvictionPolicy,
+        eviction_listener: Option<EvictionListener<K, V>>,
+        expiration_policy: ExpirationPolicy<K, V>,
+        housekeeper_config: HousekeeperConfig,
+        invalidator_enabled: bool,
+        clock: Clock,
+    ) -> Self {
+        let (r_size, w_size) = if max_capacity == Some(0) {
+            (0, 0)
+        } else {
+            (READ_LOG_CH_SIZE, WRITE_LOG_CH_SIZE)
+        };
+        let is_eviction_listener_enabled = eviction_listener.is_some();
+        let fast_now = clock.fast_now();
+
+        let (r_snd, r_rcv) = crossbeam_channel::bounded(r_size);
+        let (w_snd, w_rcv) = crossbeam_channel::bounded(w_size);
+
+        let inner = Arc::new(Inner::new(
+            name,
+            max_capacity,
+            initial_capacity,
+            build_hasher,
+            weigher,
+            eviction_policy,
+            eviction_listener,
+            r_rcv,
+            w_rcv,
+            expiration_policy,
+            invalidator_enabled,
+            clock,
+        ));
+
+        Self {
+            inner,
+            read_op_ch: r_snd,
+            write_op_ch: w_snd,
+            housekeeper: Some(Arc::new(Housekeeper::new(
+                is_eviction_listener_enabled,
+                housekeeper_config,
+                fast_now,
+            ))),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn hash<Q>(&self, key: &Q) -> u64
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        self.inner.hash(key)
+    }
+
+    pub(crate) fn contains_key_with_hash<Q>(&self, key: &Q, hash: u64) -> bool
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        // TODO: Maybe we can just call ScanningGet::scanning_get.
+        self.inner
+            .get_key_value_and(key, hash, |k, entry| {
+                let i = &self.inner;
+                let (ttl, tti, va) = (&i.time_to_live(), &i.time_to_idle(), &i.valid_after());
+                let now = self.current_time();
+
+                !is_expired_by_per_entry_ttl(entry.entry_info(), now)
+                    && !is_expired_entry_wo(ttl, va, entry, now)
+                    && !is_expired_entry_ao(tti, va, entry, now)
+                    && !i.is_invalidated_entry(k, entry)
+            })
+            .unwrap_or_default() // `false` is the default for `bool` type.
+    }
+
+    pub(crate) fn get_with_hash<Q>(&self, key: &Q, hash: u64, need_key: bool) -> Option<Entry<K, V>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        // Define a closure to record a read op.
+        let record = |op, now| {
+            self.record_read_op(op, now)
+                .expect("Failed to record a get op");
+        };
+        let ignore_if = None as Option<&mut fn(&V) -> bool>;
+        self.do_get_with_hash(key, hash, record, ignore_if, need_key)
+    }
+
+    pub(crate) fn get_with_hash_and_ignore_if<Q, I>(
+        &self,
+        key: &Q,
+        hash: u64,
+        ignore_if: Option<&mut I>,
+        need_key: bool,
+    ) -> Option<Entry<K, V>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+        I: FnMut(&V) -> bool,
+    {
+        // Define a closure to record a read op.
+        let record = |op, now| {
+            self.record_read_op(op, now)
+                .expect("Failed to record a get op");
+        };
+        self.do_get_with_hash(key, hash, record, ignore_if, need_key)
+    }
+
+    pub(crate) fn get_with_hash_without_recording<Q, I>(
+        &self,
+                .set_expiration_time(expiration_time);
+            // The `expiration_time` has changed from `None` to `Some` or vice versa.
+            true
+        } else {
+            false
+        }
+    }
+}
+
+//
+// for testing
+//
+#[cfg(test)]
+impl<K, V, S> BaseCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn invalidation_predicate_count(&self) -> usize {
+        self.inner.invalidation_predicate_count()
+    }
+
+    pub(crate) fn reconfigure_for_testing(&mut self) {
+        // Enable the frequency sketch.
+        self.inner.enable_frequency_sketch_for_testing();
+        // Disable auto clean up of pending tasks.
+        if let Some(hk) = &self.housekeeper {
+            hk.disable_auto_run();
+        }
+    }
+
+    pub(crate) fn key_locks_map_is_empty(&self) -> bool {
+        self.inner.key_locks_map_is_empty()
+    }
+}
+
+struct EvictionState<'a, K, V> {
+    counters: EvictionCounters,
+    notifier: Option<&'a RemovalNotifier<K, V>>,
+    more_entries_to_evict: bool,
+}
+
+impl<'a, K, V> EvictionState<'a, K, V> {
+    fn new(
+        entry_count: u64,
+
+impl<'a, K, V, S> IntoIterator for &'a Cache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    type Item = (Arc<K>, V);
+
+    type IntoIter = Iter<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+//
+// Iterator support
+//
+impl<K, V, S> ScanningGet<K, V> for Cache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn num_cht_segments(&self) -> usize {
+        self.base.num_cht_segments()
+    }
+
+    fn scanning_get(&self, key: &Arc<K>) -> Option<V> {
+        self.base.scanning_get(key)
+    }
+
+    fn keys(&self, cht_segment: usize) -> Option<Vec<Arc<K>>> {
+        self.base.keys(cht_segment)
+    }
+}
+
+//
+// private methods
+//
+impl<K, V, S> Cache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    // TODO: Like future::Cache, move this method to BaseCache.
+    #[inline]
+    fn schedule_write_op(
+        inner: &impl InnerSync,
+        ch: &Sender<WriteOp<K, V>>,
+        op: WriteOp<K, V>,
+        now: Instant,
+        housekeeper: Option<&HouseKeeperArc>,
+    ) -> Result<(), TrySendError<WriteOp<K, V>>> {
+        let mut op = op;
+
+        // NOTES:
+        // - This will block when the channel is full.
+        // - We are doing a busy-loop here. We were originally calling `ch.send(op)?`,
+        //   but we got a notable performance degradation.
+        loop {
+            BaseCache::<K, V, S>::apply_reads_writes_if_needed(inner, ch, now, housekeeper);
+            match ch.try_send(op) {
+                Ok(()) => break,
+                Err(TrySendError::Full(op1)) => {
+                    op = op1;
+                    std::thread::sleep(Duration::from_micros(WRITE_RETRY_INTERVAL_MICROS));
+                }
+                Err(e @ TrySendError::Disconnected(_)) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+}
+
+// For unit tests.
+#[cfg(test)]
+impl<K, V, S> Cache<K, V, S> {
+    pub(crate) fn is_table_empty(&self) -> bool {
+        self.entry_count() == 0
+    }
+
+    pub(crate) fn is_waiter_map_empty(&self) -> bool {
+        self.value_initializer.waiter_count() == 0
+    }
+}
+
+#[cfg(test)]
+impl<K, V, S> Cache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn invalidation_predicate_count(&self) -> usize {
+        self.base.invalidation_predicate_count()
+    }
+
+    pub(crate) fn reconfigure_for_testing(&mut self) {
+        self.base.reconfigure_for_testing();
+    }
+
+    pub(crate) fn key_locks_map_is_empty(&self) -> bool {
+        self.base.key_locks_map_is_empty()
+    }
+}
+
+// To see the debug prints, run test as `cargo test -- --nocapture`
+#[cfg(test)]
+mod tests {
+    use super::Cache;
+    use crate::{
+        common::{time::Clock, HousekeeperConfig},
+        notification::RemovalCause,
+                        entry,
+                        Some(gen),
+                        &mut eviction_state.counters,
+                    );
+                }
+                Err(_) => break,
+            };
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_upsert(
+        &self,
+        kh: KeyHash<K>,
+        entry: MiniArc<ValueEntry<K, V>>,
+        gen: u16,
+        old_weight: u32,
+        new_weight: u32,
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        freq: &FrequencySketch,
+        eviction_state: &mut EvictionState<'_, K, V>,
+    ) where
+        V: Clone,
+    {
+        {
+            let counters = &mut eviction_state.counters;
+
+            if entry.is_admitted() {
+                // The entry has been already admitted, so treat this as an update.
+                counters.saturating_sub(0, old_weight);
+                counters.saturating_add(0, new_weight);
+                self.update_timer_wheel(&entry, timer_wheel);
+                deqs.move_to_back_ao(&entry);
+                deqs.move_to_back_wo(&entry);
+                entry.entry_info().set_policy_gen(gen);
+                return;
+            }
+
+            if self.has_enough_capacity(new_weight, counters) {
+                // There are enough room in the cache (or the cache is unbounded).
+fn is_expired_by_per_entry_ttl<K>(entry_info: &MiniArc<EntryInfo<K>>, now: Instant) -> bool {
+    if let Some(ts) = entry_info.expiration_time() {
+        ts <= now
+    } else {
+        false
+    }
+}
+
+/// Returns `true` when one of the followings conditions is met:
+///
+/// - This entry is expired by the time-to-idle config of this cache instance.
+/// - Or, it is invalidated by the `invalidate_all` method.
+#[inline]
+fn is_expired_entry_ao(
+    time_to_idle: &Option<Duration>,
+    valid_after: &Option<Instant>,
+    entry: &impl AccessTime,
+    now: Instant,
+) -> bool {
+    if let Some(ts) = entry.last_accessed() {
+        is_invalid_entry(valid_after, ts) || is_expired_by_tti(time_to_idle, ts, now)
+    } else {
+        false
+    }
+}
+
+/// Returns `true` when one of the following conditions is met:
+///
+/// - This entry is expired by the time-to-live (TTL) config of this cache instance.
+/// - Or, it is invalidated by the `invalidate_all` method.
+#[inline]
+fn is_expired_entry_wo(
+    time_to_live: &Option<Duration>,
+    valid_after: &Option<Instant>,
+    entry: &impl AccessTime,
+    now: Instant,
+) -> bool {
+    if let Some(ts) = entry.last_modified() {
+        is_invalid_entry(valid_after, ts) || is_expired_by_ttl(time_to_live, ts, now)
+    } else {
+        false
+    }
+}
+
+#[inline]
+fn is_entry_expired_ao_or_invalid(
+    time_to_idle: &Option<Duration>,
+    valid_after: &Option<Instant>,
+    entry_last_accessed: Instant,
+    now: Instant,
+) -> (bool, bool) {
+    let ts = entry_last_accessed;
+    let expired = is_expired_by_tti(time_to_idle, ts, now);
+    let invalid = is_invalid_entry(valid_after, ts);
+    (expired, invalid)
+}
+
+#[inline]
+fn is_entry_expired_wo_or_invalid(
+    time_to_live: &Option<Duration>,
+    valid_after: &Option<Instant>,
+    entry_last_modified: Instant,
+    now: Instant,
+) -> (bool, bool) {
+    let ts = entry_last_modified;
+    let expired = is_expired_by_ttl(time_to_live, ts, now);
+    let invalid = is_invalid_entry(valid_after, ts);
+    (expired, invalid)
+}
+
+#[inline]
+fn is_invalid_entry(valid_after: &Option<Instant>, entry_ts: Instant) -> bool {
+    if let Some(va) = valid_after {
+        entry_ts < *va
+    } else {
+        false
+    }
+}
+
+#[inline]
+fn is_expired_by_tti(
+    time_to_idle: &Option<Duration>,
+    entry_last_accessed: Instant,
+    now: Instant,
+) -> bool {
+    if let Some(tti) = time_to_idle {
+        let expiration = entry_last_accessed.saturating_add(*tti);
+        expiration <= now
+    } else {
+        false
+    }
+}
+
+#[inline]
+fn is_expired_by_ttl(
+    time_to_live: &Option<Duration>,
+    entry_last_modified: Instant,
+    now: Instant,
+) -> bool {
+    if let Some(ttl) = time_to_live {
+        let expiration = entry_last_modified.saturating_add(*ttl);
+        {
+            let iter = &mut deqs.write_order.peekable();
+
+            while len < batch_size {
+                if let Some(kd) = iter.next() {
+                    if !kd.is_dirty() {
+                        if let Some(ts) = kd.last_modified() {
+                            let key = kd.key();
+                            let hash = self.hash(&**key);
+                            candidates.push(KeyDateLite::new(key, hash, ts));
+                            len += 1;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            has_next = iter.peek().is_some();
+        }
+
+        if len == 0 {
+            return;
+        }
+
+        let is_truncated = len == batch_size && has_next;
+        let (invalidated, is_done) = invalidator
+            .scan_and_invalidate(self, candidates, is_truncated)
+            .await;
+
+        for KvEntry { key: _key, entry } in invalidated {
+            Self::handle_remove(deqs, timer_wheel, entry, None, &mut eviction_state.counters);
+        }
+        if is_done {
+            deqs.write_order.reset_cursor();
+        }
+        if !invalidator.is_empty() {
+            eviction_state.more_entries_to_evict = true;
+        }
+    }
+
+    async fn evict_lru_entries(
+        &self,
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        batch_size: u32,
+        weights_to_evict: u64,
+        eviction_state: &mut EvictionState<'_, K, V>,
+    ) where
+        V: Clone,
+    {
+        const CACHE_REGION: CacheRegion = CacheRegion::MainProbation;
+        let deq_name = CACHE_REGION.name();
+        let mut evicted = 0u64;
+        let mut more_to_evict = true;
+
+        for _ in 0..batch_size {
+            if evicted >= weights_to_evict {
+                more_to_evict = false;
+                break;
+            }
+
+            let maybe_key_hash_ts = deqs.select_mut(CACHE_REGION).0.peek_front().map(|node| {
+                let entry_info = node.element.entry_info();
+                (
+                    Arc::clone(node.element.key()),
+                    node.element.hash(),
+                    entry_info.is_dirty(),
+                    entry_info.last_accessed(),
+                )
+            });
+1387:    pub fn invalidate_all(&self) {
+1388:        self.base.invalidate_all();
+2585:    async fn invalidate_all() {
+2624:        cache.invalidate_all();
+2647:    async fn invalidate_all_without_running_pending_tasks() {
+2654:        cache.invalidate_all();
+2676:        let (clock, mock) = Clock::mock();
+2780:        let (clock, mock) = Clock::mock();
+2868:        let (clock, mock) = Clock::mock();
+2940:        let (clock, mock) = Clock::mock();
+3015:        let (clock, mock) = Clock::mock();
+3136:        let (clock, mock) = Clock::mock();
+3293:        let (clock, mock) = Clock::mock();
+5008:        let (clock, mock) = Clock::mock();
+5170:        let (clock, mock) = Clock::mock();
+5331:        let (clock, mock) = Clock::mock();
+use async_lock::{RwLock, RwLockWriteGuard};
+use futures_util::FutureExt;
+use std::{
+    any::{Any, TypeId},
+    fmt,
+    future::Future,
+    hash::{BuildHasher, Hash},
+    pin::Pin,
+    sync::Arc,
+};
+
+use crate::{
+    common::concurrent::arc::MiniArc,
+    ops::compute::{CompResult, Op},
+    Entry,
+};
+
+use super::{Cache, ComputeNone, OptionallyNone};
+
+const WAITER_MAP_NUM_SEGMENTS: usize = 64;
+
+type ErrorObject = Arc<dyn Any + Send + Sync + 'static>;
+
+pub(crate) enum InitResult<V, E> {
+    Initialized(V),
+    ReadExisting(V),
+    InitErr(Arc<E>),
+}
+
+enum WaiterValue<V> {
+    Computing,
+    Ready(Result<V, ErrorObject>),
+    ReadyNone,
+    // https://github.com/moka-rs/moka/issues/43
+    InitFuturePanicked,
+    // https://github.com/moka-rs/moka/issues/59
+    EnclosingFutureAborted,
+}
+
+impl<V> fmt::Debug for WaiterValue<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WaiterValue::Computing => write!(f, "Computing"),
+            WaiterValue::Ready(_) => write!(f, "Ready"),
+            WaiterValue::ReadyNone => write!(f, "ReadyNone"),
+            WaiterValue::InitFuturePanicked => write!(f, "InitFuturePanicked"),
+            WaiterValue::EnclosingFutureAborted => write!(f, "EnclosingFutureAborted"),
+        }
+    }
+}
+
+type Waiter<V> = MiniArc<RwLock<WaiterValue<V>>>;
+type WaiterMap<K, V, S> = crate::cht::SegmentedHashMap<(Arc<K>, TypeId), Waiter<V>, S>;
+
+struct WaiterGuard<'a, K, V, S>
+// NOTE: We usually do not attach trait bounds to here at the struct definition, but
+// the Drop trait requires these bounds here.
+where
+    K: Eq + Hash,
+    V: Clone,
+    S: BuildHasher,
+{
+    w_key: Option<(Arc<K>, TypeId)>,
+    w_hash: u64,
+    waiters: &'a WaiterMap<K, V, S>,
+    write_lock: RwLockWriteGuard<'a, WaiterValue<V>>,
+}
+
+impl<'a, K, V, S> WaiterGuard<'a, K, V, S>
+where
+    K: Eq + Hash,
+    V: Clone,
+    S: BuildHasher,
+{
+    fn new(
+        w_key: (Arc<K>, TypeId),
+        w_hash: u64,
+        waiters: &'a WaiterMap<K, V, S>,
+        write_lock: RwLockWriteGuard<'a, WaiterValue<V>>,
+    ) -> Self {
+        Self {
+            w_key: Some(w_key),
+            w_hash,
+            waiters,
+            write_lock,
+{"active_seconds": 37.797, "budget_seconds": 2700, "slot_wait_seconds": 0.0}
+total 88
+drwxr-xr-x 6 audit audit   192 Nov  3 15:16 .
+drwxr-xr-x 8 audit audit   256 Nov  3 16:34 ..
+-rw-r--r-- 1 audit audit 90112 Nov  3 14:42 .global-cache
+-rw-r--r-- 1 audit audit     0 Nov  3 14:42 .package-cache
+-rw-r--r-- 1 audit audit     0 Nov  3 14:42 .package-cache-mutate
+drwxr-xr-x 6 audit audit   192 Nov  3 15:16 registry

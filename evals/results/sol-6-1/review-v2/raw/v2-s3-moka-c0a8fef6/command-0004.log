@@ -1,0 +1,450 @@
+     82 src/cht.rs
+    125 src/common.rs
+    150 src/future.rs
+    305 src/lib.rs
+     47 src/notification.rs
+     71 src/ops.rs
+    400 src/policy.rs
+     40 src/sync.rs
+   3294 src/sync/base_cache.rs
+    618 src/sync/builder.rs
+   5132 src/sync/cache.rs
+   1097 src/sync/entry_selector.rs
+    385 src/sync/invalidator.rs
+     94 src/sync/key_lock.rs
+   2005 src/sync/segment.rs
+    390 src/sync/value_initializer.rs
+   3535 src/future/base_cache.rs
+    489 src/future/builder.rs
+   5761 src/future/cache.rs
+   1318 src/future/entry_selector.rs
+    215 src/future/housekeeper.rs
+    391 src/future/invalidator.rs
+     94 src/future/key_lock.rs
+     78 src/future/notifier.rs
+    667 src/future/value_initializer.rs
+     16 src/common/builder_utils.rs
+    386 src/common/concurrent.rs
+    783 src/common/deque.rs
+     92 src/common/entry.rs
+     31 src/common/error.rs
+    401 src/common/frequency_sketch.rs
+    149 src/common/iter.rs
+     81 src/common/test_utils.rs
+     10 src/common/time.rs
+    802 src/common/timer_wheel.rs
+  29534 total
+use std::{
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+#[derive(Clone, Debug)]
+/// The policy of a cache.
+pub struct Policy {
+    max_capacity: Option<u64>,
+    num_segments: usize,
+    time_to_live: Option<Duration>,
+    time_to_idle: Option<Duration>,
+}
+
+impl Policy {
+    pub(crate) fn new(
+        max_capacity: Option<u64>,
+        num_segments: usize,
+        time_to_live: Option<Duration>,
+        time_to_idle: Option<Duration>,
+    ) -> Self {
+        Self {
+            max_capacity,
+            num_segments,
+            time_to_live,
+            time_to_idle,
+        }
+    }
+
+    /// Returns the `max_capacity` of the cache.
+    pub fn max_capacity(&self) -> Option<u64> {
+        self.max_capacity
+    }
+
+    #[cfg(feature = "sync")]
+    pub(crate) fn set_max_capacity(&mut self, capacity: Option<u64>) {
+        self.max_capacity = capacity;
+    }
+
+    /// Returns the number of internal segments of the cache.
+    pub fn num_segments(&self) -> usize {
+        self.num_segments
+    }
+
+    #[cfg(feature = "sync")]
+    pub(crate) fn set_num_segments(&mut self, num: usize) {
+        self.num_segments = num;
+    }
+
+    /// Returns the `time_to_live` of the cache.
+    pub fn time_to_live(&self) -> Option<Duration> {
+        self.time_to_live
+    }
+
+    /// Returns the `time_to_idle` of the cache.
+    pub fn time_to_idle(&self) -> Option<Duration> {
+        self.time_to_idle
+    }
+}
+
+/// The eviction (and admission) policy of a cache.
+///
+/// When the cache is full, the eviction/admission policy is used to determine which
+/// items should be admitted to the cache and which cached items should be evicted.
+/// The choice of a policy will directly affect the performance (hit rate) of the
+/// cache.
+///
+/// The following policies are available:
+///
+/// - **TinyLFU** (default):
+///   - Suitable for most workloads.
+///   - TinyLFU combines the LRU eviction policy and an admission policy based on the
+///     historical popularity of keys.
+///   - Note that it tracks not only the keys currently in the cache, but all hit and
+///     missed keys. The data structure used to _estimate_ the popularity of keys is
+///     a modified Count-Min Sketch, which has a very low memory footprint (thus the
+///     name "tiny").
+/// - **LRU**:
+///   - Suitable for some workloads with strong recency bias, such as streaming data
+///     processing.
+///
+/// LFU stands for Least Frequently Used. LRU stands for Least Recently Used.
+///
+/// Use associate function [`EvictionPolicy::tiny_lfu`](#method.tiny_lfu) or
+/// [`EvictionPolicy::lru`](#method.lru) to obtain an instance of `EvictionPolicy`.
+#[derive(Clone, Default)]
+pub struct EvictionPolicy {
+    pub(crate) config: EvictionPolicyConfig,
+}
+
+impl EvictionPolicy {
+    /// Returns the TinyLFU policy, which is suitable for most workloads.
+    ///
+    /// TinyLFU is a combination of the LRU eviction policy and the admission policy
+    /// based on the historical popularity of keys.
+    ///
+    /// Note that it tracks not only the keys currently in the cache, but all hit and
+    /// missed keys. The data structure used to _estimate_ the popularity of keys is
+    /// a modified Count-Min Sketch, which has a very low memory footprint (thus the
+    /// name "tiny").
+    pub fn tiny_lfu() -> Self {
+        Self {
+            config: EvictionPolicyConfig::TinyLfu,
+        }
+    }
+
+    /// Returns the LRU policy.
+    ///
+    /// Suitable for some workloads with strong recency bias, such as streaming data
+    /// processing.
+    pub fn lru() -> Self {
+        Self {
+            config: EvictionPolicyConfig::Lru,
+        }
+    }
+}
+
+impl fmt::Debug for EvictionPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.config {
+            EvictionPolicyConfig::TinyLfu => write!(f, "EvictionPolicy::TinyLfu"),
+            EvictionPolicyConfig::Lru => write!(f, "EvictionPolicy::Lru"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum EvictionPolicyConfig {
+    #[default]
+    TinyLfu,
+    Lru,
+}
+
+/// Calculates when cache entries expire. A single expiration time is retained on
+/// each entry so that the lifetime of an entry may be extended or reduced by
+/// subsequent evaluations.
+///
+/// `Expiry` trait provides three methods. They specify the expiration time of an
+/// entry by returning a `Some(duration)` until the entry expires:
+///
+/// - [`expire_after_create`](#method.expire_after_create) &mdash; Returns the
+///   duration (or none) after the entry's creation.
+/// - [`expire_after_read`](#method.expire_after_read) &mdash; Returns the duration
+///   (or none)  after its last read.
+/// - [`expire_after_update`](#method.expire_after_update) &mdash; Returns the
+///   duration (or none)  after its last update.
+///
+/// The default implementations are provided that return `None` (no expiration) or
+/// `current_duration: Option<Instant>` (not modify the current expiration time).
+/// Override some of them as you need.
+///
+pub trait Expiry<K, V> {
+    /// Specifies that the entry should be automatically removed from the cache once
+    /// the duration has elapsed after the entry's creation. This method is called
+    /// for cache write methods such as `insert` and `get_with` but only when the key
+    /// was not present in the cache.
+    ///
+    /// # Parameters
+    ///
+    /// - `key` &mdash; A reference to the key of the entry.
+    /// - `value` &mdash; A reference to the value of the entry.
+    /// - `created_at` &mdash; The time when this entry was inserted.
+    ///
+    /// # Return value
+    ///
+    /// The returned `Option<Duration>` is used to set the expiration time of the
+    /// entry.
+    ///
+    /// - Returning `Some(duration)` &mdash; The expiration time is set to
+    ///   `created_at + duration`.
+    /// - Returning `None` &mdash; The expiration time is cleared (no expiration).
+    ///   - This is the value that the default implementation returns.
+    ///
+    /// # Notes on `time_to_live` and `time_to_idle` policies
+    ///
+    /// When the cache is configured with `time_to_live` and/or `time_to_idle`
+    /// policies, the entry will be evicted after the earliest of the expiration time
+    /// returned by this expiry, the `time_to_live` and `time_to_idle` policies.
+    #[allow(unused_variables)]
+    fn expire_after_create(&self, key: &K, value: &V, created_at: Instant) -> Option<Duration> {
+        None
+    }
+
+    /// Specifies that the entry should be automatically removed from the cache once
+    /// the duration has elapsed after its last read. This method is called for cache
+    /// read methods such as `get` and `get_with` but only when the key is present in
+    /// the cache.
+    ///
+    /// # Parameters
+    ///
+    /// - `key` &mdash; A reference to the key of the entry.
+    /// - `value` &mdash; A reference to the value of the entry.
+    /// - `read_at` &mdash; The time when this entry was read.
+    /// - `duration_until_expiry` &mdash; The remaining duration until the entry
+    ///   expires. (Calculated by `expiration_time - read_at`)
+    /// - `last_modified_at` &mdash; The time when this entry was created or updated.
+    ///
+    /// # Return value
+    ///
+    /// The returned `Option<Duration>` is used to set the expiration time of the
+    /// entry.
+    ///
+    /// - Returning `Some(duration)` &mdash; The expiration time is set to
+    ///   `read_at + duration`.
+    /// - Returning `None` &mdash; The expiration time is cleared (no expiration).
+    /// - Returning `duration_until_expiry` will not modify the expiration time.
+    ///   - This is the value that the default implementation returns.
+    ///
+    /// # Notes on `time_to_live` and `time_to_idle` policies
+    ///
+    /// When the cache is configured with `time_to_live` and/or `time_to_idle`
+    /// policies, then:
+    ///
+    /// - The entry will be evicted after the earliest of the expiration time
+    ///   returned by this expiry, the `time_to_live` and `time_to_idle` policies.
+    /// - The `duration_until_expiry` takes in account the `time_to_live` and
+    ///   `time_to_idle` policies.
+    #[allow(unused_variables)]
+    fn expire_after_read(
+        &self,
+        key: &K,
+        value: &V,
+        read_at: Instant,
+        duration_until_expiry: Option<Duration>,
+        last_modified_at: Instant,
+    ) -> Option<Duration> {
+        duration_until_expiry
+    }
+
+    /// Specifies that the entry should be automatically removed from the cache once
+    /// the duration has elapsed after the replacement of its value. This method is
+    /// called for cache write methods such as `insert` but only when the key is
+    /// already present in the cache.
+    ///
+    /// # Parameters
+    ///
+    /// - `key` &mdash; A reference to the key of the entry.
+    /// - `value` &mdash; A reference to the value of the entry.
+    /// - `updated_at` &mdash; The time when this entry was updated.
+    /// - `duration_until_expiry` &mdash; The remaining duration until the entry
+    ///   expires. (Calculated by `expiration_time - updated_at`)
+    ///
+    /// # Return value
+    ///
+    /// The returned `Option<Duration>` is used to set the expiration time of the
+    /// entry.
+    ///
+    /// - Returning `Some(duration)` &mdash; The expiration time is set to
+    ///   `updated_at + duration`.
+    /// - Returning `None` &mdash; The expiration time is cleared (no expiration).
+    /// - Returning `duration_until_expiry` will not modify the expiration time.
+    ///   - This is the value that the default implementation returns.
+    ///
+    /// # Notes on `time_to_live` and `time_to_idle` policies
+    ///
+    /// When the cache is configured with `time_to_live` and/or `time_to_idle`
+    /// policies, then:
+    ///
+    /// - The entry will be evicted after the earliest of the expiration time
+    ///   returned by this expiry, the `time_to_live` and `time_to_idle` policies.
+    /// - The `duration_until_expiry` takes in account the `time_to_live` and
+    ///   `time_to_idle` policies.
+    #[allow(unused_variables)]
+    fn expire_after_update(
+        &self,
+        key: &K,
+        value: &V,
+        updated_at: Instant,
+        duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
+        duration_until_expiry
+    }
+}
+
+pub(crate) struct ExpirationPolicy<K, V> {
+    time_to_live: Option<Duration>,
+    time_to_idle: Option<Duration>,
+    expiry: Option<Arc<dyn Expiry<K, V> + Send + Sync + 'static>>,
+}
+
+impl<K, V> Default for ExpirationPolicy<K, V> {
+    fn default() -> Self {
+        Self {
+            time_to_live: None,
+            time_to_idle: None,
+            expiry: None,
+        }
+    }
+}
+
+impl<K, V> Clone for ExpirationPolicy<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            time_to_live: self.time_to_live,
+            time_to_idle: self.time_to_idle,
+            expiry: self.expiry.clone(),
+        }
+    }
+}
+use std::time::Duration;
+
+pub(crate) const MAX_NANOS: u64 = u64::MAX - 1;
+
+/// `Instant` represents a point in time since the `Clock` was created. It has
+/// nanosecond precision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Instant {
+    elapsed_ns: u64,
+}
+
+impl Instant {
+    pub(crate) fn from_nanos(nanos: u64) -> Instant {
+        debug_assert!(nanos <= MAX_NANOS);
+        Instant { elapsed_ns: nanos }
+    }
+
+    pub(crate) fn from_duration_since_clock_start(duration: Duration) -> Instant {
+        Instant::from_nanos(Self::duration_to_saturating_nanoseconds(duration))
+    }
+
+    pub(crate) fn as_nanos(&self) -> u64 {
+        self.elapsed_ns
+    }
+
+    /// Converts a `std::time::Duration` to nanoseconds, saturating to
+    /// `MAX_NANOSECONDS` (`u64::MAX - 1`) if the duration is too large.
+    /// (`Duration::as_nanos` returns `u128`)
+    ///
+    /// Note that `u64::MAX - 1` is used here instead of `u64::MAX` because
+    /// `u64::MAX` is used by `moka`'s `AtomicTime` to indicate the time is unset.
+    pub(crate) fn duration_to_saturating_nanoseconds(duration: Duration) -> u64 {
+        u64::try_from(duration.as_nanos())
+            .map(|n| n.min(MAX_NANOS))
+            .unwrap_or(MAX_NANOS)
+    }
+
+    pub(crate) fn saturating_add(&self, duration: Duration) -> Instant {
+        let dur_ms = Self::duration_to_saturating_nanoseconds(duration);
+        Instant::from_nanos(self.elapsed_ns.saturating_add(dur_ms).min(MAX_NANOS))
+    }
+
+    pub(crate) fn saturating_duration_since(&self, earlier: Self) -> Duration
+    where
+        Self: Sized,
+    {
+        Duration::from_nanos(self.elapsed_ns.saturating_sub(earlier.elapsed_ns))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_saturating_add() {
+        let instant = Instant::from_nanos(100_000);
+        let duration = Duration::from_nanos(50_000);
+        let result = instant.saturating_add(duration);
+        assert_eq!(result, Instant::from_nanos(150_000));
+
+        let instant = Instant::from_nanos(u64::MAX - 10_000);
+        let duration = Duration::from_nanos(12_000);
+        let result = instant.saturating_add(duration);
+        assert_eq!(result, Instant::from_nanos(u64::MAX - 1));
+    }
+
+    #[test]
+    fn test_saturating_duration_since() {
+        let instant = Instant::from_nanos(100_000);
+        let earlier = Instant::from_nanos(60_000);
+        let result = instant.saturating_duration_since(earlier);
+        assert_eq!(result, Duration::from_nanos(40_000));
+
+        let instant = Instant::from_nanos(60_000);
+        let earlier = Instant::from_nanos(100_000);
+        let result = instant.saturating_duration_since(earlier);
+        assert_eq!(result, Duration::ZERO);
+    }
+}
+use std::time::Duration;
+
+const YEAR_SECONDS: u64 = 365 * 24 * 3600;
+
+pub(crate) fn ensure_expirations_or_panic(
+    time_to_live: Option<Duration>,
+    time_to_idle: Option<Duration>,
+) {
+    let max_duration = Duration::from_secs(1_000 * YEAR_SECONDS);
+    if let Some(d) = time_to_live {
+        assert!(d <= max_duration, "time_to_live is longer than 1000 years");
+    }
+    if let Some(d) = time_to_idle {
+        assert!(d <= max_duration, "time_to_idle is longer than 1000 years");
+    }
+}
+.ci_extras/remove-examples-msrv.sh
+.ci_extras/pin-crate-vers-nightly.sh
+.ci_extras/pin-crate-vers-kani.sh
+.ci_extras/build_linux_cross.rs
+.ci_extras/pin-crate-vers-msrv.sh
+.github/FUNDING.yml
+.github/workflows/CIArm64.yml
+.github/workflows/Codecov.yml
+.github/workflows/CIQuantaEnabled.yml
+.github/workflows/Lints.yml
+.github/workflows/Trybuild.yml
+.github/workflows/LinuxCrossCompileTest.yml
+.github/workflows/Audit.yml
+.github/workflows/Loom.yml
+.github/workflows/Miri.yml
+.github/workflows/CI.yml
+.github/workflows/Kani.yml
+.cargo/config.toml

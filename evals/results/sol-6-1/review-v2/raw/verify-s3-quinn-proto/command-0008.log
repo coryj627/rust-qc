@@ -1,0 +1,845 @@
+    /// Read from the given recv stream
+    ///
+    /// `max_length` limits the maximum size of the returned `Bytes` value; passing `usize::MAX`
+    /// will yield the best performance. `ordered` will make sure the returned chunk's offset will
+    /// have an offset exactly equal to the previously returned offset plus the previously returned
+    /// bytes' length.
+    ///
+    /// Yields `Ok(None)` if the stream was finished. Otherwise, yields a segment of data and its
+    /// offset in the stream. If `ordered` is `false`, segments may be received in any order, and
+    /// the `Chunk`'s `offset` field can be used to determine ordering in the caller.
+    ///
+    /// While most applications will prefer to consume stream data in order, unordered reads can
+    /// improve performance when packet loss occurs and data cannot be retransmitted before the flow
+    /// control window is filled. On any given stream, you can switch from ordered to unordered
+    /// reads, but ordered reads on streams that have seen previous unordered reads will return
+    /// `ReadError::IllegalOrderedRead`.
+    pub fn read(&mut self, ordered: bool) -> Result<Chunks<'_>, ReadableError> {
+        Chunks::new(self.id, ordered, self.state, self.pending)
+    }
+
+    /// Stop accepting data on the given receive stream
+    ///
+    /// Discards unread data and notifies the peer to stop transmitting. Once stopped, further
+    /// attempts to operate on a stream will yield `ClosedStream` errors.
+    pub fn stop(&mut self, error_code: VarInt) -> Result<(), ClosedStream> {
+        let mut entry = match self.state.recv.entry(self.id) {
+            hash_map::Entry::Occupied(s) => s,
+            hash_map::Entry::Vacant(_) => return Err(ClosedStream { _private: () }),
+        };
+        let stream = get_or_insert_recv(self.state.stream_receive_window)(entry.get_mut());
+
+        let (read_credits, stop_sending) = stream.stop()?;
+        if stop_sending.should_transmit() {
+            self.pending.stop_sending.push(frame::StopSending {
+                id: self.id,
+                error_code,
+            });
+        }
+
+        // We need to keep stopped streams around until they're finished or reset so we can update
+        // connection-level flow control to account for discarded data. Otherwise, we can discard
+        // state immediately.
+        if !stream.final_offset_unknown() {
+            let recv = entry.remove().expect("must have recv when stopping");
+            self.state.stream_recv_freed(self.id, recv);
+        }
+
+        if self.state.add_read_credits(read_credits).should_transmit() {
+            self.pending.max_data = true;
+        }
+
+        Ok(())
+    }
+
+    /// Check whether this stream has been reset by the peer, returning the reset error code if so
+    ///
+    /// After returning `Ok(Some(_))` once, stream state will be discarded and all future calls will
+    /// return `Err(ClosedStream)`.
+    pub fn received_reset(&mut self) -> Result<Option<VarInt>, ClosedStream> {
+        let hash_map::Entry::Occupied(entry) = self.state.recv.entry(self.id) else {
+            return Err(ClosedStream { _private: () });
+        };
+        let Some(s) = entry.get().as_ref().and_then(|s| s.as_open_recv()) else {
+            return Ok(None);
+        };
+        if s.stopped {
+            return Err(ClosedStream { _private: () });
+        }
+        let Some(code) = s.reset_code() else {
+            return Ok(None);
+        };
+
+        // Clean up state after application observes the reset, since there's no reason for the
+        // application to attempt to read or stop the stream once it knows it's reset
+        let (_, recv) = entry.remove_entry();
+        self.state
+            .stream_recv_freed(self.id, recv.expect("must have recv on reset"));
+        self.state.queue_max_stream_id(self.pending);
+
+        Ok(Some(code))
+    }
+}
+
+/// Access to streams
+pub struct SendStream<'a> {
+    pub(super) id: StreamId,
+    pub(super) state: &'a mut StreamsState,
+    pub(super) pending: &'a mut Retransmits,
+    pub(super) conn_state: &'a super::State,
+}
+
+#[allow(clippy::needless_lifetimes)] // Needed for cfg(fuzzing)
+impl<'a> SendStream<'a> {
+    #[cfg(fuzzing)]
+    pub fn new(
+        id: StreamId,
+        state: &'a mut StreamsState,
+        pending: &'a mut Retransmits,
+        conn_state: &'a super::State,
+    ) -> Self {
+        Self {
+            id,
+            state,
+            pending,
+            conn_state,
+        }
+    }
+
+    /// Send data on the given stream
+    ///
+    /// Returns the number of bytes successfully written.
+    pub fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
+        Ok(self.write_source(&mut ByteSlice::from_slice(data))?.bytes)
+    }
+
+    /// Send data on the given stream
+    ///
+    /// Returns the number of bytes and chunks successfully written.
+    /// Note that this method might also write a partial chunk. In this case
+    /// [`Written::chunks`] will not count this chunk as fully written. However
+    /// the chunk will be advanced and contain only non-written data after the call.
+    pub fn write_chunks(&mut self, data: &mut [Bytes]) -> Result<Written, WriteError> {
+        self.write_source(&mut BytesArray::from_chunks(data))
+    }
+
+    fn write_source<B: BytesSource>(&mut self, source: &mut B) -> Result<Written, WriteError> {
+        if self.conn_state.is_closed() {
+            trace!(%self.id, "write blocked; connection draining");
+            return Err(WriteError::Blocked);
+        }
+
+        let limit = self.state.write_limit();
+
+        let max_send_data = self.state.max_send_data(self.id);
+
+        let stream = self
+            .state
+            .send
+            .get_mut(&self.id)
+            .map(get_or_insert_send(max_send_data))
+            .ok_or(WriteError::ClosedStream)?;
+
+        if limit == 0 {
+            trace!(
+                stream = %self.id, max_data = self.state.max_data, data_sent = self.state.data_sent,
+                "write blocked by connection-level flow control or send window"
+            );
+            if !stream.connection_blocked {
+                stream.connection_blocked = true;
+                self.state.connection_blocked.push(self.id);
+            }
+            return Err(WriteError::Blocked);
+        }
+
+        let was_pending = stream.is_pending();
+        let written = stream.write(source, limit)?;
+        self.state.data_sent += written.bytes as u64;
+        self.state.unacked_data += written.bytes as u64;
+        trace!(stream = %self.id, "wrote {} bytes", written.bytes);
+        if !was_pending {
+            self.state.pending.push_pending(self.id, stream.priority);
+        }
+        Ok(written)
+    }
+
+    /// Check if this stream was stopped, get the reason if it was
+    pub fn stopped(&self) -> Result<Option<VarInt>, ClosedStream> {
+        match self.state.send.get(&self.id).as_ref() {
+            Some(Some(s)) => Ok(s.stop_reason),
+            Some(None) => Ok(None),
+            None => Err(ClosedStream { _private: () }),
+        }
+    }
+
+    /// Finish a send stream, signalling that no more data will be sent.
+    ///
+    /// If this fails, no [`StreamEvent::Finished`] will be generated.
+    ///
+    /// [`StreamEvent::Finished`]: crate::StreamEvent::Finished
+    pub fn finish(&mut self) -> Result<(), FinishError> {
+        let max_send_data = self.state.max_send_data(self.id);
+        let stream = self
+            .state
+            .send
+            .get_mut(&self.id)
+            .map(get_or_insert_send(max_send_data))
+            .ok_or(FinishError::ClosedStream)?;
+
+        let was_pending = stream.is_pending();
+use std::collections::VecDeque;
+
+use bytes::Bytes;
+use thiserror::Error;
+use tracing::{debug, trace};
+
+use super::Connection;
+use crate::{
+    TransportError,
+    frame::{Datagram, FrameStruct},
+};
+
+/// API to control datagram traffic
+pub struct Datagrams<'a> {
+    pub(super) conn: &'a mut Connection,
+}
+
+impl Datagrams<'_> {
+    /// Queue an unreliable, unordered datagram for immediate transmission
+    ///
+    /// If `drop` is true, previously queued datagrams which are still unsent may be discarded to
+    /// make space for this datagram, in order of oldest to newest. If `drop` is false, and there
+    /// isn't enough space due to previously queued datagrams, this function will return
+    /// `SendDatagramError::Blocked`. `Event::DatagramsUnblocked` will be emitted once datagrams
+    /// have been sent.
+    ///
+    /// Returns `Err` iff a `len`-byte datagram cannot currently be sent.
+    pub fn send(&mut self, data: Bytes, drop: bool) -> Result<(), SendDatagramError> {
+        if self.conn.config.datagram_receive_buffer_size.is_none() {
+            return Err(SendDatagramError::Disabled);
+        }
+        let max = self
+            .max_size()
+            .ok_or(SendDatagramError::UnsupportedByPeer)?;
+        if data.len() > max {
+            return Err(SendDatagramError::TooLarge);
+        }
+        if drop {
+            while self.conn.datagrams.outgoing_total > self.conn.config.datagram_send_buffer_size {
+                let prev = self
+                    .conn
+                    .datagrams
+                    .outgoing
+                    .pop_front()
+                    .expect("datagrams.outgoing_total desynchronized");
+                trace!(len = prev.data.len(), "dropping outgoing datagram");
+                self.conn.datagrams.outgoing_total -= prev.data.len();
+            }
+        } else if self.conn.datagrams.outgoing_total + data.len()
+            > self.conn.config.datagram_send_buffer_size
+        {
+            self.conn.datagrams.send_blocked = true;
+            return Err(SendDatagramError::Blocked(data));
+        }
+        self.conn.datagrams.outgoing_total += data.len();
+        self.conn.datagrams.outgoing.push_back(Datagram { data });
+        Ok(())
+    }
+
+    /// Compute the maximum size of datagrams that may passed to `send_datagram`
+    ///
+    /// Returns `None` if datagrams are unsupported by the peer or disabled locally.
+    ///
+    /// This may change over the lifetime of a connection according to variation in the path MTU
+    /// estimate. The peer can also enforce an arbitrarily small fixed limit, but if the peer's
+    /// limit is large this is guaranteed to be a little over a kilobyte at minimum.
+    ///
+    /// Not necessarily the maximum size of received datagrams.
+    pub fn max_size(&self) -> Option<usize> {
+        // We use the conservative overhead bound for any packet number, reducing the budget by at
+        // most 3 bytes, so that PN size fluctuations don't cause users sending maximum-size
+        // datagrams to suffer avoidable packet loss.
+        let max_size = self.conn.path.current_mtu() as usize
+            - self.conn.predict_1rtt_overhead(None)
+            - Datagram::SIZE_BOUND;
+        let limit = self
+            .conn
+            .peer_params
+            .max_datagram_frame_size?
+            .into_inner()
+            .saturating_sub(Datagram::SIZE_BOUND as u64);
+        Some(limit.min(max_size as u64) as usize)
+    }
+
+    /// Receive an unreliable, unordered datagram
+    pub fn recv(&mut self) -> Option<Bytes> {
+        self.conn.datagrams.recv()
+    }
+
+    /// Bytes available in the outgoing datagram buffer
+    ///
+    /// When greater than zero, [`send`](Self::send)ing a datagram of at most this size is
+    /// guaranteed not to cause older datagrams to be dropped.
+    pub fn send_buffer_space(&self) -> usize {
+        self.conn
+            .config
+            .datagram_send_buffer_size
+            .saturating_sub(self.conn.datagrams.outgoing_total)
+    }
+}
+
+#[derive(Default)]
+pub(super) struct DatagramState {
+    /// Number of bytes of datagrams that have been received by the local transport but not
+    /// delivered to the application
+    pub(super) recv_buffered: usize,
+    pub(super) incoming: VecDeque<Datagram>,
+    pub(super) outgoing: VecDeque<Datagram>,
+    pub(super) outgoing_total: usize,
+    pub(super) send_blocked: bool,
+}
+
+impl DatagramState {
+    pub(super) fn received(
+        &mut self,
+        datagram: Datagram,
+        window: &Option<usize>,
+    ) -> Result<bool, TransportError> {
+        let window = match window {
+            None => {
+                return Err(TransportError::PROTOCOL_VIOLATION(
+                    "unexpected DATAGRAM frame",
+                ));
+            }
+            Some(x) => *x,
+        };
+
+        if datagram.data.len() > window {
+            return Err(TransportError::PROTOCOL_VIOLATION("oversized datagram"));
+        }
+
+        let was_empty = self.recv_buffered == 0;
+        while datagram.data.len() + self.recv_buffered > window {
+            debug!("dropping stale datagram");
+            self.recv();
+        }
+
+        self.recv_buffered += datagram.data.len();
+        self.incoming.push_back(datagram);
+        Ok(was_empty)
+    }
+
+    /// Discard outgoing datagrams with a payload larger than `max_payload` bytes
+    ///
+    /// Used to ensure that reductions in MTU don't get us stuck in a state where we have a datagram
+    /// queued but can't send it.
+    pub(super) fn drop_oversized(&mut self, max_payload: usize) {
+        self.outgoing.retain(|datagram| {
+            let result = datagram.data.len() < max_payload;
+            if !result {
+                trace!(
+                    "dropping {} byte datagram violating {} byte limit",
+                    datagram.data.len(),
+                    max_payload
+                );
+                self.outgoing_total -= datagram.data.len();
+            }
+            result
+        });
+    }
+
+    /// Attempt to write a datagram frame into `buf`, consuming it from `self.outgoing`
+    ///
+    /// Returns whether a frame was written. At most `max_size` bytes will be written, including
+    /// framing.
+    pub(super) fn write(&mut self, buf: &mut Vec<u8>, max_size: usize) -> bool {
+        let datagram = match self.outgoing.pop_front() {
+            Some(x) => x,
+            None => return false,
+        };
+
+        if buf.len() + datagram.size(true) > max_size {
+            // Future work: we could be more clever about cramming small datagrams into
+            // mostly-full packets when a larger one is queued first
+            self.outgoing.push_front(datagram);
+            return false;
+        }
+
+        trace!(len = datagram.data.len(), "DATAGRAM");
+
+        self.outgoing_total -= datagram.data.len();
+        datagram.encode(true, buf);
+        true
+    }
+
+    pub(super) fn recv(&mut self) -> Option<Bytes> {
+        let x = self.incoming.pop_front()?.data;
+        self.recv_buffered -= x.len();
+        Some(x)
+    }
+}
+
+/// Errors that can arise when sending a datagram
+#[derive(Debug, Error, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum SendDatagramError {
+    /// The peer does not support receiving datagram frames
+    #[error("datagrams not supported by peer")]
+    UnsupportedByPeer,
+    /// Datagram support is disabled locally
+    #[error("datagram support disabled")]
+    Disabled,
+    /// The datagram is larger than the connection can currently accommodate
+    ///
+    /// Indicates that the path MTU minus overhead or the limit advertised by the peer has been
+    /// exceeded.
+    #[error("datagram too large")]
+    TooLarge,
+    /// Send would block
+    #[error("datagram send blocked")]
+    Blocked(Bytes),
+}
+use crate::Duration;
+use crate::connection::spaces::PendingAcks;
+use crate::frame::AckFrequency;
+use crate::transport_parameters::TransportParameters;
+use crate::{AckFrequencyConfig, TIMER_GRANULARITY, TransportError, VarInt};
+
+/// State associated to ACK frequency
+pub(super) struct AckFrequencyState {
+    //
+    // Sending ACK_FREQUENCY frames
+    //
+    in_flight_ack_frequency_frame: Option<(u64, Duration)>,
+    next_outgoing_sequence_number: VarInt,
+    pub(super) peer_max_ack_delay: Duration,
+
+    //
+    // Receiving ACK_FREQUENCY frames
+    //
+    last_ack_frequency_frame: Option<u64>,
+    pub(super) max_ack_delay: Duration,
+}
+
+impl AckFrequencyState {
+    pub(super) fn new(default_max_ack_delay: Duration) -> Self {
+        Self {
+            in_flight_ack_frequency_frame: None,
+            next_outgoing_sequence_number: VarInt(0),
+            peer_max_ack_delay: default_max_ack_delay,
+
+            last_ack_frequency_frame: None,
+            max_ack_delay: default_max_ack_delay,
+        }
+    }
+
+    /// Returns the `max_ack_delay` that should be requested of the peer when sending an
+    /// ACK_FREQUENCY frame
+    pub(super) fn candidate_max_ack_delay(
+        &self,
+        rtt: Duration,
+        config: &AckFrequencyConfig,
+        peer_params: &TransportParameters,
+    ) -> Duration {
+        // Use the peer's max_ack_delay if no custom max_ack_delay was provided in the config
+        let min_ack_delay =
+            Duration::from_micros(peer_params.min_ack_delay.map_or(0, |x| x.into()));
+        config
+            .max_ack_delay
+            .unwrap_or(self.peer_max_ack_delay)
+            .clamp(min_ack_delay, rtt.max(MIN_AUTOMATIC_ACK_DELAY))
+    }
+
+    /// Returns the `max_ack_delay` for the purposes of calculating the PTO
+    ///
+    /// This `max_ack_delay` is defined as the maximum of the peer's current `max_ack_delay` and all
+    /// in-flight `max_ack_delay`s (i.e. proposed values that haven't been acknowledged yet, but
+    /// might be already in use by the peer).
+    pub(super) fn max_ack_delay_for_pto(&self) -> Duration {
+        // Note: we have at most one in-flight ACK_FREQUENCY frame
+        if let Some((_, max_ack_delay)) = self.in_flight_ack_frequency_frame {
+            self.peer_max_ack_delay.max(max_ack_delay)
+        } else {
+            self.peer_max_ack_delay
+        }
+    }
+
+    /// Returns the next sequence number for an ACK_FREQUENCY frame
+    pub(super) fn next_sequence_number(&mut self) -> VarInt {
+        assert!(self.next_outgoing_sequence_number <= VarInt::MAX);
+
+        let seq = self.next_outgoing_sequence_number;
+        self.next_outgoing_sequence_number.0 += 1;
+        seq
+    }
+
+    /// Returns true if we should send an ACK_FREQUENCY frame
+    pub(super) fn should_send_ack_frequency(
+        &self,
+        rtt: Duration,
+        config: &AckFrequencyConfig,
+        peer_params: &TransportParameters,
+    ) -> bool {
+        if self.next_outgoing_sequence_number.0 == 0 {
+            // Always send at startup
+            return true;
+        }
+        let current = self
+            .in_flight_ack_frequency_frame
+            .map_or(self.peer_max_ack_delay, |(_, pending)| pending);
+        let desired = self.candidate_max_ack_delay(rtt, config, peer_params);
+        let error = (desired.as_secs_f32() / current.as_secs_f32()) - 1.0;
+        error.abs() > MAX_RTT_ERROR
+    }
+
+    /// Notifies the [`AckFrequencyState`] that a packet containing an ACK_FREQUENCY frame was sent
+    pub(super) fn ack_frequency_sent(&mut self, pn: u64, requested_max_ack_delay: Duration) {
+        self.in_flight_ack_frequency_frame = Some((pn, requested_max_ack_delay));
+    }
+
+    /// Notifies the [`AckFrequencyState`] that a packet has been ACKed
+    pub(super) fn on_acked(&mut self, pn: u64) {
+        match self.in_flight_ack_frequency_frame {
+            Some((number, requested_max_ack_delay)) if number == pn => {
+                self.in_flight_ack_frequency_frame = None;
+                self.peer_max_ack_delay = requested_max_ack_delay;
+            }
+            _ => {}
+        }
+    }
+
+    /// Notifies the [`AckFrequencyState`] that an ACK_FREQUENCY frame was received
+    ///
+    /// Updates the endpoint's params according to the payload of the ACK_FREQUENCY frame, or
+    /// returns an error in case the requested `max_ack_delay` is invalid.
+    ///
+    /// Returns `true` if the frame was processed and `false` if it was ignored because of being
+    /// stale.
+    pub(super) fn ack_frequency_received(
+        &mut self,
+        frame: &AckFrequency,
+        pending_acks: &mut PendingAcks,
+    ) -> Result<bool, TransportError> {
+        if self
+            .last_ack_frequency_frame
+            .is_some_and(|highest_sequence_nr| frame.sequence.into_inner() <= highest_sequence_nr)
+        {
+            return Ok(false);
+        }
+
+        self.last_ack_frequency_frame = Some(frame.sequence.into_inner());
+
+        // Update max_ack_delay
+        let max_ack_delay = Duration::from_micros(frame.request_max_ack_delay.into_inner());
+        if max_ack_delay < TIMER_GRANULARITY {
+            return Err(TransportError::PROTOCOL_VIOLATION(
+                "Requested Max Ack Delay in ACK_FREQUENCY frame is less than min_ack_delay",
+            ));
+        }
+        self.max_ack_delay = max_ack_delay;
+
+        // Update the rest of the params
+        pending_acks.set_ack_frequency_params(frame);
+
+        Ok(true)
+    }
+}
+
+/// Maximum proportion difference between the most recently requested max ACK delay and the
+/// currently desired one before a new request is sent, when the peer supports the ACK frequency
+/// extension and an explicit max ACK delay is not configured.
+const MAX_RTT_ERROR: f32 = 0.2;
+                }
+            };
+        }
+
+        Self {
+            min_rtt: keep_if_changed!(min_rtt),
+            smoothed_rtt: keep_if_changed!(smoothed_rtt),
+            latest_rtt: keep_if_changed!(latest_rtt),
+            rtt_variance: keep_if_changed!(rtt_variance),
+            pto_count: keep_if_changed!(pto_count),
+            bytes_in_flight: keep_if_changed!(bytes_in_flight),
+            packets_in_flight: keep_if_changed!(packets_in_flight),
+            congestion_window: keep_if_changed!(congestion_window),
+            ssthresh: keep_if_changed!(ssthresh),
+            pacing_rate: keep_if_changed!(pacing_rate),
+        }
+    }
+
+    /// Emit a `MetricsUpdated` event containing only updated values
+    fn to_qlog_event(&self, previous: &Self) -> Option<MetricsUpdated> {
+        let updated = self.retain_updated(previous);
+
+        if updated == Self::default() {
+            return None;
+        }
+
+        Some(MetricsUpdated {
+            min_rtt: updated.min_rtt.map(|rtt| rtt.as_secs_f32()),
+            smoothed_rtt: updated.smoothed_rtt.map(|rtt| rtt.as_secs_f32()),
+            latest_rtt: updated.latest_rtt.map(|rtt| rtt.as_secs_f32()),
+            rtt_variance: updated.rtt_variance.map(|rtt| rtt.as_secs_f32()),
+            pto_count: updated
+                .pto_count
+                .map(|count| count.try_into().unwrap_or(u16::MAX)),
+            bytes_in_flight: updated.bytes_in_flight,
+            packets_in_flight: updated.packets_in_flight,
+            congestion_window: updated.congestion_window,
+            ssthresh: updated.ssthresh,
+            pacing_rate: updated.pacing_rate,
+        })
+    }
+}
+
+/// RTT estimation for a particular network path
+#[derive(Copy, Clone)]
+pub struct RttEstimator {
+    /// The most recent RTT measurement made when receiving an ack for a previously unacked packet
+    latest: Duration,
+    /// The smoothed RTT of the connection, computed as described in RFC6298
+    smoothed: Option<Duration>,
+    /// The RTT variance, computed as described in RFC6298
+/// Largest amount of space that could be occupied by a Handshake or 0-RTT packet's header
+///
+/// Excludes packet-type-specific fields such as packet number or Initial token
+// https://www.rfc-editor.org/rfc/rfc9000.html#name-0-rtt: flags + version + dcid len + dcid +
+// scid len + scid + length + pn
+const MAX_HANDSHAKE_OR_0RTT_HEADER_SIZE: usize =
+    1 + 4 + 1 + MAX_CID_SIZE + 1 + MAX_CID_SIZE + VarInt::from_u32(u16::MAX as u32).size() + 4;
+
+/// Perform key updates this many packets before the AEAD confidentiality limit.
+///
+/// Chosen arbitrarily, intended to be large enough to prevent spurious connection loss.
+const KEY_UPDATE_MARGIN: u64 = 10_000;
+
+#[derive(Default)]
+struct SentFrames {
+    retransmits: ThinRetransmits,
+    largest_acked: Option<u64>,
+    stream_frames: StreamMetaVec,
+    /// Whether the packet contains non-retransmittable frames (like datagrams)
+    non_retransmits: bool,
+    requires_padding: bool,
+}
+
+impl SentFrames {
+    /// Returns whether the packet contains only ACKs
+    fn is_ack_only(&self, streams: &StreamsState) -> bool {
+        self.largest_acked.is_some()
+            && !self.non_retransmits
+            && self.stream_frames.is_empty()
+            && self.retransmits.is_empty(streams)
+    }
+}
+
+/// Compute the negotiated idle timeout based on local and remote max_idle_timeout transport parameters.
+///
+/// According to the definition of max_idle_timeout, a value of `0` means the timeout is disabled; see <https://www.rfc-editor.org/rfc/rfc9000#section-18.2-4.4.1.>
+///
+/// According to the negotiation procedure, either the minimum of the timeouts or one specified is used as the negotiated value; see <https://www.rfc-editor.org/rfc/rfc9000#section-10.1-2.>
+///
+/// Returns the negotiated idle timeout as a `Duration`, or `None` when both endpoints have opted out of idle timeout.
+fn negotiate_max_idle_timeout(x: Option<VarInt>, y: Option<VarInt>) -> Option<Duration> {
+    match (x, y) {
+        (Some(VarInt(0)) | None, Some(VarInt(0)) | None) => None,
+        (Some(VarInt(0)) | None, Some(y)) => Some(Duration::from_millis(y.0)),
+        (Some(x), Some(VarInt(0)) | None) => Some(Duration::from_millis(x.0)),
+        (Some(x), Some(y)) => Some(Duration::from_millis(cmp::min(x, y).0)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negotiate_max_idle_timeout_commutative() {
+        let test_params = [
+            (None, None, None),
+            (None, Some(VarInt(0)), None),
+            (None, Some(VarInt(2)), Some(Duration::from_millis(2))),
+            (Some(VarInt(0)), Some(VarInt(0)), None),
+            (
+                Some(VarInt(2)),
+                Some(VarInt(0)),
+                Some(Duration::from_millis(2)),
+            ),
+            (
+                Some(VarInt(1)),
+                Some(VarInt(4)),
+                Some(Duration::from_millis(1)),
+            ),
+        ];
+
+        for (left, right, result) in test_params {
+            assert_eq!(negotiate_max_idle_timeout(left, right), result);
+            assert_eq!(negotiate_max_idle_timeout(right, left), result);
+        }
+    }
+}
+                        w.put_slice(cid);
+                    }
+                }
+                TransportParameterId::RetrySourceConnectionId => {
+                    if let Some(ref cid) = self.retry_src_cid {
+                        w.write_var(id as u64);
+                        w.write_var(cid.len() as u64);
+                        w.put_slice(cid);
+                    }
+                }
+                TransportParameterId::GreaseQuicBit => {
+                    if self.grease_quic_bit {
+                        w.write_var(id as u64);
+                        w.write_var(0);
+                    }
+                }
+                TransportParameterId::MinAckDelayDraft07 => {
+                    if let Some(x) = self.min_ack_delay {
+                        w.write_var(id as u64);
+                        w.write_var(x.size() as u64);
+                        w.write(x);
+                    }
+                }
+                id => {
+                    macro_rules! write_params {
+                        {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
+                            match id {
+                                $(TransportParameterId::$id => {
+                                    if self.$name.0 != $default {
+                                        w.write_var(id as u64);
+                                        w.write(VarInt::try_from(self.$name.size()).unwrap());
+                                        w.write(self.$name);
+                                    }
+                                })*,
+                                _ => {
+                                    unimplemented!("Missing implementation of write for transport parameter with code {id:?}");
+                                }
+                            }
+                        }
+                    }
+                    apply_params!(write_params);
+                }
+            }
+        }
+    }
+
+    /// Decode `TransportParameters` from buffer
+    pub fn read<R: Buf>(side: Side, r: &mut R) -> Result<Self, Error> {
+        // Initialize to protocol-specified defaults
+        let mut params = Self::default();
+
+        // State to check for duplicate transport parameters.
+        macro_rules! param_state {
+            {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {{
+                struct ParamState {
+                    $($name: bool,)*
+                }
+
+                ParamState {
+                    $($name: false,)*
+                }
+            }}
+        }
+        let mut got = apply_params!(param_state);
+
+        while r.has_remaining() {
+            let id = r.get_var()?;
+            let len = r.get_var()?;
+            if (r.remaining() as u64) < len {
+                return Err(Error::Malformed);
+            }
+            let len = len as usize;
+            let Ok(id) = TransportParameterId::try_from(id) else {
+                // unknown transport parameters are ignored
+                r.advance(len);
+                continue;
+            };
+
+            match id {
+                TransportParameterId::OriginalDestinationConnectionId => {
+                    decode_cid(len, &mut params.original_dst_cid, r)?
+                }
+                TransportParameterId::StatelessResetToken => {
+                    if len != 16 || params.stateless_reset_token.is_some() {
+                        return Err(Error::Malformed);
+                    }
+                    let mut tok = [0; RESET_TOKEN_SIZE];
+                    r.copy_to_slice(&mut tok);
+                    params.stateless_reset_token = Some(tok.into());
+                }
+                TransportParameterId::DisableActiveMigration => {
+                    if len != 0 || params.disable_active_migration {
+                        return Err(Error::Malformed);
+                    }
+                    params.disable_active_migration = true;
+                }
+                TransportParameterId::PreferredAddress => {
+                    if params.preferred_address.is_some() {
+                        return Err(Error::Malformed);
+                    }
+                    params.preferred_address = Some(PreferredAddress::read(&mut r.take(len))?);
+                }
+                TransportParameterId::InitialSourceConnectionId => {
+                    decode_cid(len, &mut params.initial_src_cid, r)?
+                }
+                TransportParameterId::RetrySourceConnectionId => {
+                    decode_cid(len, &mut params.retry_src_cid, r)?
+                }
+                TransportParameterId::MaxDatagramFrameSize => {
+                    if len > 8 || params.max_datagram_frame_size.is_some() {
+                        return Err(Error::Malformed);
+                    }
+                    params.max_datagram_frame_size = Some(r.get().unwrap());
+                }
+                TransportParameterId::GreaseQuicBit => match len {
+                    0 => params.grease_quic_bit = true,
+                    _ => return Err(Error::Malformed),
+                },
+                TransportParameterId::MinAckDelayDraft07 => {
+                    params.min_ack_delay = Some(r.get().unwrap())
+                }
+                _ => {
+                    macro_rules! parse {
+                        {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
+                            match id {
+                                $(TransportParameterId::$id => {
+                                    let value = r.get::<VarInt>()?;
+                                    if len != value.size() || got.$name { return Err(Error::Malformed); }
+                                    params.$name = value.into();
+                                    got.$name = true;
+                                })*
+                                _ => r.advance(len),
+                            }
+                        }
+                    }
+                    apply_params!(parse);
+                }
+            }
+        }
+
+        // Semantic validation
+
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-4.26.1
+        if params.ack_delay_exponent.0 > 20
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-4.28.1
+            || params.max_ack_delay.0 >= 1 << 14
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-6.2.1
+            || params.active_connection_id_limit.0 < 2
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-4.10.1
+            || params.max_udp_payload_size.0 < 1200
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-4.6-2
+            || params.initial_max_streams_bidi.0 > MAX_STREAM_COUNT
+            || params.initial_max_streams_uni.0 > MAX_STREAM_COUNT
+            // https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-08.html#section-3-4
+            || params.min_ack_delay.is_some_and(|min_ack_delay| {
+                // min_ack_delay uses microseconds, whereas max_ack_delay uses milliseconds
+                min_ack_delay.0 > params.max_ack_delay.0 * 1_000
+            })
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-8
+            || (side.is_server()
+                && (params.original_dst_cid.is_some()
+                    || params.preferred_address.is_some()
+                    || params.retry_src_cid.is_some()
+                    || params.stateless_reset_token.is_some()))
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-4.38.1
+            || params

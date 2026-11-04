@@ -1,0 +1,340 @@
+fn test_userdata_wrappers() -> Result<()> {
+    #[derive(Debug)]
+    struct MyUserData(i64);
+
+    impl UserData for MyUserData {
+        fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+            fields.add_field("static", "constant");
+            fields.add_field_method_get("data", |_, this| Ok(this.0));
+            fields.add_field_method_set("data", |_, this, val| {
+                this.0 = val;
+                Ok(())
+            })
+        }
+
+        fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+            methods.add_method("dbg", |_, this, ()| Ok(format!("{this:?}")));
+        }
+    }
+
+    let lua = Lua::new();
+    let globals = lua.globals();
+
+    // Rc<T>
+    #[cfg(not(feature = "send"))]
+    {
+        use std::rc::Rc;
+
+        let ud = Rc::new(MyUserData(1));
+        globals.set("ud", ud.clone())?;
+        lua.load(
+            r#"
+            assert(ud.static == "constant")
+            local ok, err = pcall(function() ud.data = 2 end)
+            assert(
+                tostring(err):find("error mutably borrowing userdata") ~= nil,
+                "expected 'error mutably borrowing userdata', got '" .. tostring(err) .. "'"
+            )
+            assert(ud.data == 1)
+            assert(ud:dbg(), "MyUserData(1)")
+        "#,
+        )
+        .exec()
+        .unwrap();
+
+        // Test borrowing original userdata
+        {
+            let ud = globals.get::<AnyUserData>("ud")?;
+            assert!(ud.is::<Rc<MyUserData>>());
+            assert!(!ud.is::<MyUserData>());
+
+            assert_eq!(ud.borrow::<MyUserData>()?.0, 1);
+            assert!(matches!(
+                ud.borrow_mut::<MyUserData>(),
+                Err(Error::UserDataBorrowMutError)
+            ));
+            assert!(ud.borrow_mut::<Rc<MyUserData>>().is_ok());
+
+            assert_eq!(ud.borrow_scoped::<MyUserData, _>(|x| x.0)?, 1);
+            assert!(matches!(
+                ud.borrow_mut_scoped::<MyUserData, _>(|_| ()),
+                Err(Error::UserDataBorrowMutError)
+            ));
+        }
+
+        // Collect userdata
+        globals.set("ud", Nil)?;
+        lua.gc_collect()?;
+        assert_eq!(Rc::strong_count(&ud), 1);
+
+        // We must be able to mutate userdata when having one reference only
+        globals.set("ud", ud)?;
+        lua.load(
+            r#"
+            ud.data = 2
+            assert(ud.data == 2)
+        "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    // Rc<RefCell<T>>
+    #[cfg(not(feature = "send"))]
+    {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ud = Rc::new(RefCell::new(MyUserData(2)));
+        globals.set("ud", ud.clone())?;
+        lua.load(
+            r#"
+            assert(ud.static == "constant")
+            assert(ud.data == 2)
+            ud.data = 10
+            assert(ud.data == 10)
+            assert(ud:dbg() == "MyUserData(10)")
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        // Test borrowing original userdata
+        {
+            let ud = globals.get::<AnyUserData>("ud")?;
+            assert!(ud.is::<Rc<RefCell<MyUserData>>>());
+            assert!(!ud.is::<MyUserData>());
+
+            assert_eq!(ud.borrow::<MyUserData>()?.0, 10);
+            assert_eq!(ud.borrow_mut::<MyUserData>()?.0, 10);
+            ud.borrow_mut::<MyUserData>()?.0 = 20;
+            assert_eq!(ud.borrow::<MyUserData>()?.0, 20);
+
+            assert_eq!(ud.borrow_scoped::<MyUserData, _>(|x| x.0)?, 20);
+            ud.borrow_mut_scoped::<MyUserData, _>(|x| x.0 = 30)?;
+            assert_eq!(ud.borrow::<MyUserData>()?.0, 30);
+
+            // Double (read) borrow is okay
+            let _borrow = ud.borrow::<MyUserData>()?;
+            assert_eq!(ud.borrow::<MyUserData>()?.0, 30);
+            assert!(matches!(
+                ud.borrow_mut::<MyUserData>(),
+                Err(Error::UserDataBorrowMutError)
+            ));
+        }
+
+        // Collect userdata
+        globals.set("ud", Nil)?;
+        lua.gc_collect()?;
+        let state = self.state();
+        let mut stack_guard = StackGuard::new(state);
+        check_stack(state, 13)?;
+
+        // Prepare metatable, add meta methods first and then meta fields
+        let metatable_nrec = registry.meta_methods.len() + registry.meta_fields.len();
+        #[cfg(feature = "async")]
+        let metatable_nrec = metatable_nrec + registry.async_meta_methods.len();
+        push_table(state, 0, metatable_nrec, true)?;
+        for (k, m) in registry.meta_methods {
+            self.push(self.create_callback(m)?)?;
+            rawset_field(state, -2, MetaMethod::validate(&k)?)?;
+        }
+        #[cfg(feature = "async")]
+        for (k, m) in registry.async_meta_methods {
+            self.push(self.create_async_callback(m)?)?;
+            rawset_field(state, -2, MetaMethod::validate(&k)?)?;
+        }
+        let mut has_name = false;
+        for (k, v) in registry.meta_fields {
+            has_name = has_name || k == MetaMethod::Type;
+            v?.push_into_stack(self)?;
+            rawset_field(state, -2, MetaMethod::validate(&k)?)?;
+        }
+        // Set `__name/__type` if not provided
+        if !has_name {
+            let type_name = registry.type_name;
+            push_string(state, type_name.as_bytes(), !self.unlikely_memory_error())?;
+            rawset_field(state, -2, MetaMethod::Type.name())?;
+        }
+        let metatable_index = ffi::lua_absindex(state, -1);
+
+        let fields_nrec = registry.fields.len();
+        if fields_nrec > 0 {
+            // If `__index` is a table then update it in-place
+            let index_type = ffi::lua_getfield(state, metatable_index, cstr!("__index"));
+            match index_type {
+                ffi::LUA_TNIL | ffi::LUA_TTABLE => {
+                    if index_type == ffi::LUA_TNIL {
+                        // Create a new table
+                        ffi::lua_pop(state, 1);
+                        push_table(state, 0, fields_nrec, true)?;
+                    }
+                    for (k, v) in mem::take(&mut registry.fields) {
+                        v?.push_into_stack(self)?;
+                        rawset_field(state, -2, &k)?;
+                    }
+                    rawset_field(state, metatable_index, "__index")?;
+                }
+                _ => {
+                    ffi::lua_pop(state, 1);
+                    // Fields will be converted to functions and added to field getters
+                }
+            }
+        }
+
+        let mut field_getters_index = None;
+        let field_getters_nrec = registry.field_getters.len() + registry.fields.len();
+        if field_getters_nrec > 0 {
+            push_table(state, 0, field_getters_nrec, true)?;
+            for (k, m) in registry.field_getters {
+                self.push(self.create_callback(m)?)?;
+                rawset_field(state, -2, &k)?;
+            }
+            for (k, v) in registry.fields {
+                unsafe extern "C-unwind" fn return_field(state: *mut ffi::lua_State) -> c_int {
+                    ffi::lua_pushvalue(state, ffi::lua_upvalueindex(1));
+                    1
+                }
+                v?.push_into_stack(self)?;
+                protect_lua!(state, 1, 1, fn(state) {
+                    ffi::lua_pushcclosure(state, return_field, 1);
+                })?;
+                rawset_field(state, -2, &k)?;
+            }
+            field_getters_index = Some(ffi::lua_absindex(state, -1));
+        }
+
+        let mut field_setters_index = None;
+        let field_setters_nrec = registry.field_setters.len();
+        if field_setters_nrec > 0 {
+            push_table(state, 0, field_setters_nrec, true)?;
+            for (k, m) in registry.field_setters {
+                self.push(self.create_callback(m)?)?;
+                rawset_field(state, -2, &k)?;
+            }
+            field_setters_index = Some(ffi::lua_absindex(state, -1));
+        }
+
+        // Create methods namecall table
+        #[cfg_attr(not(feature = "luau"), allow(unused_mut))]
+        let mut methods_map = None;
+        #[cfg(feature = "luau")]
+        if registry.enable_namecall {
+            let map: &mut rustc_hash::FxHashMap<_, crate::types::CallbackPtr> =
+                methods_map.get_or_insert_with(Default::default);
+            for (k, m) in &registry.methods {
+                map.insert(k.as_bytes().to_vec(), &**m);
+            }
+        }
+
+        let mut methods_index = None;
+        let methods_nrec = registry.methods.len();
+        #[cfg(feature = "async")]
+        let methods_nrec = methods_nrec + registry.async_methods.len();
+        if methods_nrec > 0 {
+            // If `__index` is a table then update it in-place
+            let index_type = ffi::lua_getfield(state, metatable_index, cstr!("__index"));
+            match index_type {
+                ffi::LUA_TTABLE => {} // Update the existing table
+                _ => {
+                    // Create a new table
+                    ffi::lua_pop(state, 1);
+                    push_table(state, 0, methods_nrec, true)?;
+                }
+            }
+            for (k, m) in registry.methods {
+                self.push(self.create_callback(m)?)?;
+                rawset_field(state, -2, &k)?;
+            }
+            #[cfg(feature = "async")]
+            for (k, m) in registry.async_methods {
+                self.push(self.create_async_callback(m)?)?;
+                rawset_field(state, -2, &k)?;
+            }
+            match index_type {
+                ffi::LUA_TTABLE => {
+                    ffi::lua_pop(state, 1); // All done
+                }
+                ffi::LUA_TNIL => {
+                    // Set the new table as `__index`
+                    rawset_field(state, metatable_index, "__index")?;
+                }
+                _ => {
+                    methods_index = Some(ffi::lua_absindex(state, -1));
+                }
+            }
+        }
+
+        ffi::lua_pushcfunction(state, registry.destructor);
+        rawset_field(state, metatable_index, "__gc")?;
+
+        init_userdata_metatable(
+            state,
+            metatable_index,
+            field_getters_index,
+            field_setters_index,
+            methods_index,
+            methods_map,
+        )?;
+
+        // Update stack guard to keep metatable after return
+        stack_guard.keep(1);
+
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub(crate) unsafe fn register_userdata_metatable(&self, mt_ptr: *const c_void, type_id: Option<TypeId>) {
+        (*self.extra.get()).registered_userdata_mt.insert(mt_ptr, type_id);
+    }
+    ///
+    /// Bracket notation rules:
+    /// - `[123]` - integer keys
+    /// - `["string key"]` or `['string key']` - string keys (must be quoted)
+    /// - String keys support escape sequences: `\"`, `\'`, `\\`
+    fn get_path<V: FromLua>(&self, path: &str) -> Result<V> {
+        let mut current = self.to_value();
+        for (key, safe_nil) in parse_lookup_path(path)? {
+            current = match current {
+                Value::Table(table) => table.get::<Value>(key),
+                Value::UserData(ud) => ud.get::<Value>(key),
+                _ => {
+                    let type_name = current.type_name();
+                    let err = format!("attempt to index a {type_name} value with key '{key}'");
+                    Err(Error::runtime(err))
+                }
+            }?;
+            if safe_nil && (current == Value::Nil || current == Value::NULL) {
+                break;
+            }
+        }
+
+        let lua = self.weak_lua().lock();
+        V::from_lua(current, lua.lua())
+    }
+
+    /// Converts the object to a string in a human-readable format.
+    ///
+    /// This might invoke the `__tostring` metamethod.
+    fn to_string(&self) -> Result<StdString>;
+
+    /// Converts the object to a Lua value.
+    fn to_value(&self) -> Value;
+
+    /// Gets a reference to the associated Lua state.
+    #[doc(hidden)]
+    fn weak_lua(&self) -> &WeakLua;
+}
+
+/// A trait for types that can be used as Lua functions.
+pub trait LuaNativeFn<A: FromLuaMulti> {
+/work/tmp/luau.log:286:test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+/work/tmp/luau.log:292:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+/work/tmp/luau.log:323:test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+/work/tmp/luau.log:338:test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+/work/tmp/luau.log:361:test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+/work/tmp/luau.log:408:test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+/work/tmp/luau.log:421:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+/work/tmp/luau.log:434:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+/work/tmp/luau.log:461:test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+/work/tmp/luau.log:474:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

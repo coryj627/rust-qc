@@ -1,0 +1,777 @@
+use std::any::Any;
+use std::cmp;
+use std::sync::Arc;
+
+use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
+use crate::connection::RttEstimator;
+use crate::{Duration, Instant};
+
+/// CUBIC Constants.
+///
+/// These are recommended value in RFC8312.
+const BETA_CUBIC: f64 = 0.7;
+
+const C: f64 = 0.4;
+
+/// CUBIC State Variables.
+///
+/// We need to keep those variables across the connection.
+/// k, w_max are described in the RFC.
+#[derive(Debug, Default, Clone)]
+pub(super) struct State {
+    k: f64,
+
+    w_max: f64,
+
+    // Store cwnd increment during congestion avoidance.
+    cwnd_inc: u64,
+}
+
+/// CUBIC Functions.
+///
+/// Note that these calculations are based on a count of cwnd as bytes,
+/// not packets.
+/// Unit of t (duration) and RTT are based on seconds (f64).
+impl State {
+    // K = cbrt(w_max * (1 - beta_cubic) / C) (Eq. 2)
+    fn cubic_k(&self, max_datagram_size: u64) -> f64 {
+        let w_max = self.w_max / max_datagram_size as f64;
+        (w_max * (1.0 - BETA_CUBIC) / C).cbrt()
+    }
+
+    // W_cubic(t) = C * (t - K)^3 - w_max (Eq. 1)
+    fn w_cubic(&self, t: Duration, max_datagram_size: u64) -> f64 {
+        let w_max = self.w_max / max_datagram_size as f64;
+
+        (C * (t.as_secs_f64() - self.k).powi(3) + w_max) * max_datagram_size as f64
+    }
+
+    // W_est(t) = w_max * beta_cubic + 3 * (1 - beta_cubic) / (1 + beta_cubic) *
+    // (t / RTT) (Eq. 4)
+    fn w_est(&self, t: Duration, rtt: Duration, max_datagram_size: u64) -> f64 {
+        let w_max = self.w_max / max_datagram_size as f64;
+        (w_max * BETA_CUBIC
+            + 3.0 * (1.0 - BETA_CUBIC) / (1.0 + BETA_CUBIC) * t.as_secs_f64() / rtt.as_secs_f64())
+            * max_datagram_size as f64
+    }
+}
+
+/// The RFC8312 congestion controller, as widely used for TCP
+#[derive(Debug, Clone)]
+pub struct Cubic {
+    config: Arc<CubicConfig>,
+    /// Maximum number of bytes in flight that may be sent.
+    window: u64,
+    /// Slow start threshold in bytes. When the congestion window is below ssthresh, the mode is
+    /// slow start and the window grows by the number of bytes acknowledged.
+    ssthresh: u64,
+    /// The time when QUIC first detects a loss, causing it to enter recovery. When a packet sent
+    /// after this time is acknowledged, QUIC exits recovery.
+    recovery_start_time: Option<Instant>,
+    cubic_state: State,
+    current_mtu: u64,
+}
+
+impl Cubic {
+    /// Construct a state using the given `config` and current time `now`
+    pub fn new(config: Arc<CubicConfig>, _now: Instant, current_mtu: u16) -> Self {
+        Self {
+            window: config.initial_window,
+            ssthresh: u64::MAX,
+            recovery_start_time: None,
+            config,
+            cubic_state: Default::default(),
+            current_mtu: current_mtu as u64,
+        }
+    }
+
+    fn minimum_window(&self) -> u64 {
+        2 * self.current_mtu
+    }
+}
+
+impl Controller for Cubic {
+    fn on_ack(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        bytes: u64,
+        app_limited: bool,
+        rtt: &RttEstimator,
+    ) {
+        if app_limited
+            || self
+                .recovery_start_time
+                .map(|recovery_start_time| sent <= recovery_start_time)
+                .unwrap_or(false)
+        {
+            return;
+        }
+
+        if self.window < self.ssthresh {
+            // Slow start
+            self.window += bytes;
+        } else {
+            // Congestion avoidance.
+            let ca_start_time;
+
+            match self.recovery_start_time {
+                Some(t) => ca_start_time = t,
+                None => {
+                    // When we come here without congestion_event() triggered,
+                    // initialize congestion_recovery_start_time, w_max and k.
+                    ca_start_time = now;
+                    self.recovery_start_time = Some(now);
+
+                    self.cubic_state.w_max = self.window as f64;
+                    self.cubic_state.k = 0.0;
+                }
+            }
+
+            let t = now - ca_start_time;
+
+            // w_cubic(t + rtt)
+            let w_cubic = self.cubic_state.w_cubic(t + rtt.get(), self.current_mtu);
+
+            // w_est(t)
+            let w_est = self.cubic_state.w_est(t, rtt.get(), self.current_mtu);
+
+            let mut cubic_cwnd = self.window;
+
+            if w_cubic < w_est {
+                // TCP friendly region.
+                cubic_cwnd = cmp::max(cubic_cwnd, w_est as u64);
+            } else if cubic_cwnd < w_cubic as u64 {
+                // Concave region or convex region use same increment.
+                let cubic_inc =
+                    (w_cubic - cubic_cwnd as f64) / cubic_cwnd as f64 * self.current_mtu as f64;
+
+                cubic_cwnd += cubic_inc as u64;
+            }
+
+            // Update the increment and increase cwnd by MSS.
+            self.cubic_state.cwnd_inc += cubic_cwnd - self.window;
+
+            // cwnd_inc can be more than 1 MSS in the late stage of max probing.
+            // however RFC9002 §7.3.3 (Congestion Avoidance) limits
+            // the increase of cwnd to 1 max_datagram_size per cwnd acknowledged.
+            if self.cubic_state.cwnd_inc >= self.current_mtu {
+                self.window += self.current_mtu;
+                self.cubic_state.cwnd_inc = 0;
+            }
+        }
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        is_persistent_congestion: bool,
+        _lost_bytes: u64,
+    ) {
+        if self
+            .recovery_start_time
+            .map(|recovery_start_time| sent <= recovery_start_time)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        self.recovery_start_time = Some(now);
+
+        // Fast convergence
+        if (self.window as f64) < self.cubic_state.w_max {
+            self.cubic_state.w_max = self.window as f64 * (1.0 + BETA_CUBIC) / 2.0;
+        } else {
+            self.cubic_state.w_max = self.window as f64;
+        }
+
+        self.ssthresh = cmp::max(
+            (self.cubic_state.w_max * BETA_CUBIC) as u64,
+            self.minimum_window(),
+        );
+        self.window = self.ssthresh;
+        self.cubic_state.k = self.cubic_state.cubic_k(self.current_mtu);
+
+        self.cubic_state.cwnd_inc = (self.cubic_state.cwnd_inc as f64 * BETA_CUBIC) as u64;
+
+        if is_persistent_congestion {
+            self.recovery_start_time = None;
+            self.cubic_state.w_max = self.window as f64;
+
+            // 4.7 Timeout - reduce ssthresh based on BETA_CUBIC
+            self.ssthresh = cmp::max(
+                (self.window as f64 * BETA_CUBIC) as u64,
+                self.minimum_window(),
+            );
+
+            self.cubic_state.cwnd_inc = 0;
+
+            self.window = self.minimum_window();
+        }
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.current_mtu = new_mtu as u64;
+        self.window = self.window.max(self.minimum_window());
+    }
+
+    fn window(&self) -> u64 {
+        self.window
+    }
+
+    fn metrics(&self) -> super::ControllerMetrics {
+        super::ControllerMetrics {
+            congestion_window: self.window(),
+            ssthresh: Some(self.ssthresh),
+            pacing_rate: None,
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.config.initial_window
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+use std::any::Any;
+use std::sync::Arc;
+
+use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
+use crate::Instant;
+use crate::connection::RttEstimator;
+
+/// A simple, standard congestion controller
+#[derive(Debug, Clone)]
+pub struct NewReno {
+    config: Arc<NewRenoConfig>,
+    current_mtu: u64,
+    /// Maximum number of bytes in flight that may be sent.
+    window: u64,
+    /// Slow start threshold in bytes. When the congestion window is below ssthresh, the mode is
+    /// slow start and the window grows by the number of bytes acknowledged.
+    ssthresh: u64,
+    /// The time when QUIC first detects a loss, causing it to enter recovery. When a packet sent
+    /// after this time is acknowledged, QUIC exits recovery.
+    recovery_start_time: Instant,
+    /// Bytes which had been acked by the peer since leaving slow start
+    bytes_acked: u64,
+}
+
+impl NewReno {
+    /// Construct a state using the given `config` and current time `now`
+    pub fn new(config: Arc<NewRenoConfig>, now: Instant, current_mtu: u16) -> Self {
+        Self {
+            window: config.initial_window,
+            ssthresh: u64::MAX,
+            recovery_start_time: now,
+            current_mtu: current_mtu as u64,
+            config,
+            bytes_acked: 0,
+        }
+    }
+
+    fn minimum_window(&self) -> u64 {
+        2 * self.current_mtu
+    }
+}
+
+impl Controller for NewReno {
+    fn on_ack(
+        &mut self,
+        _now: Instant,
+        sent: Instant,
+        bytes: u64,
+        app_limited: bool,
+        _rtt: &RttEstimator,
+    ) {
+        if app_limited || sent <= self.recovery_start_time {
+            return;
+        }
+
+        if self.window < self.ssthresh {
+            // Slow start
+            self.window += bytes;
+
+            if self.window >= self.ssthresh {
+                // Exiting slow start
+                // Initialize `bytes_acked` for congestion avoidance. The idea
+                // here is that any bytes over `sshthresh` will already be counted
+                // towards the congestion avoidance phase - independent of when
+                // how close to `sshthresh` the `window` was when switching states,
+                // and independent of datagram sizes.
+                self.bytes_acked = self.window - self.ssthresh;
+            }
+        } else {
+            // Congestion avoidance
+            // This implementation uses the method which does not require
+            // floating point math, which also increases the window by 1 datagram
+            // for every round trip.
+            // This mechanism is called Appropriate Byte Counting in
+            // https://tools.ietf.org/html/rfc3465
+            self.bytes_acked += bytes;
+
+            if self.bytes_acked >= self.window {
+                self.bytes_acked -= self.window;
+                self.window += self.current_mtu;
+            }
+        }
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        is_persistent_congestion: bool,
+        _lost_bytes: u64,
+    ) {
+        if sent <= self.recovery_start_time {
+            return;
+        }
+
+        self.recovery_start_time = now;
+        self.window = (self.window as f32 * self.config.loss_reduction_factor) as u64;
+        self.window = self.window.max(self.minimum_window());
+        self.ssthresh = self.window;
+
+        if is_persistent_congestion {
+            self.window = self.minimum_window();
+        }
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.current_mtu = new_mtu as u64;
+        self.window = self.window.max(self.minimum_window());
+    }
+
+    fn window(&self) -> u64 {
+        self.window
+    }
+
+    fn metrics(&self) -> super::ControllerMetrics {
+        super::ControllerMetrics {
+            congestion_window: self.window(),
+            ssthresh: Some(self.ssthresh),
+            pacing_rate: None,
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.config.initial_window
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+/// Configuration for the `NewReno` congestion controller
+#[derive(Debug, Clone)]
+pub struct NewRenoConfig {
+    initial_window: u64,
+    loss_reduction_factor: f32,
+}
+
+impl NewRenoConfig {
+    /// Default limit on the amount of outstanding data in bytes.
+    ///
+    /// Recommended value: `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`
+    pub fn initial_window(&mut self, value: u64) -> &mut Self {
+        self.initial_window = value;
+        self
+    }
+
+    /// Reduction in congestion window when a new loss event is detected.
+    pub fn loss_reduction_factor(&mut self, value: f32) -> &mut Self {
+        self.loss_reduction_factor = value;
+        self
+    }
+}
+
+impl Default for NewRenoConfig {
+    fn default() -> Self {
+        Self {
+            initial_window: 14720.clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE),
+            loss_reduction_factor: 0.5,
+        }
+    }
+}
+
+impl ControllerFactory for NewRenoConfig {
+    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        Box::new(NewReno::new(self, now, current_mtu))
+    }
+}
+//! Logic for controlling the rate at which data is sent
+
+use crate::Instant;
+use crate::connection::RttEstimator;
+use std::any::Any;
+use std::sync::Arc;
+
+mod bbr;
+mod cubic;
+mod new_reno;
+
+pub use bbr::{Bbr, BbrConfig};
+pub use cubic::{Cubic, CubicConfig};
+pub use new_reno::{NewReno, NewRenoConfig};
+
+/// Common interface for different congestion controllers
+pub trait Controller: Send + Sync {
+    /// One or more packets were just sent
+    #[allow(unused_variables)]
+    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {}
+
+    /// Packet deliveries were confirmed
+    ///
+    /// `app_limited` indicates whether the connection was blocked on outgoing
+    /// application data prior to receiving these acknowledgements.
+    #[allow(unused_variables)]
+    fn on_ack(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        bytes: u64,
+        app_limited: bool,
+        rtt: &RttEstimator,
+    ) {
+    }
+
+    /// Packets are acked in batches, all with the same `now` argument. This indicates one of those batches has completed.
+    #[allow(unused_variables)]
+    fn on_end_acks(
+        &mut self,
+        now: Instant,
+        in_flight: u64,
+        app_limited: bool,
+        largest_packet_num_acked: Option<u64>,
+    ) {
+    }
+
+    /// Packets were deemed lost or marked congested
+    ///
+    /// `in_persistent_congestion` indicates whether all packets sent within the persistent
+    /// congestion threshold period ending when the most recent packet in this batch was sent were
+    /// lost.
+    /// `lost_bytes` indicates how many bytes were lost. This value will be 0 for ECN triggers.
+    fn on_congestion_event(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        is_persistent_congestion: bool,
+        lost_bytes: u64,
+    );
+
+    /// The known MTU for the current network path has been updated
+    fn on_mtu_update(&mut self, new_mtu: u16);
+
+    /// Number of ack-eliciting bytes that may be in flight
+    fn window(&self) -> u64;
+
+    /// Retrieve implementation-specific metrics used to populate `qlog` traces when they are enabled
+    fn metrics(&self) -> ControllerMetrics {
+        ControllerMetrics {
+            congestion_window: self.window(),
+            ssthresh: None,
+            pacing_rate: None,
+        }
+    }
+
+    /// Duplicate the controller's state
+    fn clone_box(&self) -> Box<dyn Controller>;
+
+    /// Initial congestion window
+    fn initial_window(&self) -> u64;
+
+    /// Returns Self for use in down-casting to extract implementation details
+    fn into_any(self: Box<Self>) -> Box<dyn Any>;
+}
+
+/// Common congestion controller metrics
+#[derive(Default)]
+#[non_exhaustive]
+pub struct ControllerMetrics {
+    /// Congestion window (bytes)
+    pub congestion_window: u64,
+    /// Slow start threshold (bytes)
+    pub ssthresh: Option<u64>,
+    /// Pacing rate (bits/s)
+    pub pacing_rate: Option<u64>,
+}
+
+/// Constructs controllers on demand
+pub trait ControllerFactory {
+    /// Construct a fresh `Controller`
+    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller>;
+}
+
+const BASE_DATAGRAM_SIZE: u64 = 1200;
+use std::{collections::VecDeque, ops::Range};
+
+use bytes::{Buf, Bytes};
+
+use crate::{VarInt, range_set::RangeSet};
+
+/// Buffer of outgoing retransmittable stream data
+#[derive(Default, Debug)]
+pub(super) struct SendBuffer {
+    /// Data queued by the application but not yet acknowledged. May or may not have been sent.
+    unacked_segments: VecDeque<Bytes>,
+    /// Total size of `unacked_segments`
+    unacked_len: usize,
+    /// The first offset that hasn't been written by the application, i.e. the offset past the end of `unacked`
+    offset: u64,
+    /// The first offset that hasn't been sent
+    ///
+    /// Always lies in (offset - unacked.len())..offset
+    unsent: u64,
+    /// Acknowledged ranges which couldn't be discarded yet as they don't include the earliest
+    /// offset in `unacked`
+    // TODO: Recover storage from these by compacting (#700)
+    acks: RangeSet,
+    /// Previously transmitted ranges deemed lost
+    retransmits: RangeSet,
+}
+
+impl SendBuffer {
+    /// Construct an empty buffer at the initial offset
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append application data to the end of the stream
+    pub(super) fn write(&mut self, data: Bytes) {
+        self.unacked_len += data.len();
+        self.offset += data.len() as u64;
+        self.unacked_segments.push_back(data);
+    }
+
+    /// Discard a range of acknowledged stream data
+    pub(super) fn ack(&mut self, mut range: Range<u64>) {
+        // Clamp the range to data which is still tracked
+        let base_offset = self.offset - self.unacked_len as u64;
+        range.start = base_offset.max(range.start);
+        range.end = base_offset.max(range.end);
+
+        self.acks.insert(range);
+
+        while self.acks.min() == Some(self.offset - self.unacked_len as u64) {
+            let prefix = self.acks.pop_min().unwrap();
+            let mut to_advance = (prefix.end - prefix.start) as usize;
+
+            self.unacked_len -= to_advance;
+            while to_advance > 0 {
+                let front = self
+                    .unacked_segments
+                    .front_mut()
+                    .expect("Expected buffered data");
+
+                if front.len() <= to_advance {
+                    to_advance -= front.len();
+                    self.unacked_segments.pop_front();
+
+                    if self.unacked_segments.len() * 4 < self.unacked_segments.capacity() {
+                        self.unacked_segments.shrink_to_fit();
+                    }
+                } else {
+                    front.advance(to_advance);
+                    to_advance = 0;
+                }
+            }
+        }
+    }
+
+    /// Compute the next range to transmit on this stream and update state to account for that
+    /// transmission.
+    ///
+    /// `max_len` here includes the space which is available to transmit the
+    /// offset and length of the data to send. The caller has to guarantee that
+    /// there is at least enough space available to write maximum-sized metadata
+    /// (8 byte offset + 8 byte length).
+    ///
+    /// The method returns a tuple:
+    /// - The first return value indicates the range of data to send
+    /// - The second return value indicates whether the length needs to be encoded
+    ///   in the STREAM frames metadata (`true`), or whether it can be omitted
+    ///   since the selected range will fill the whole packet.
+    pub(super) fn poll_transmit(&mut self, mut max_len: usize) -> (Range<u64>, bool) {
+        debug_assert!(max_len >= 8 + 8);
+        let mut encode_length = false;
+
+        if let Some(range) = self.retransmits.pop_min() {
+            // Retransmit sent data
+
+            // When the offset is known, we know how many bytes are required to encode it.
+            // Offset 0 requires no space
+            if range.start != 0 {
+                max_len -= VarInt::size(unsafe { VarInt::from_u64_unchecked(range.start) });
+            }
+            if range.end - range.start < max_len as u64 {
+                encode_length = true;
+                max_len -= 8;
+            }
+
+            let end = range.end.min((max_len as u64).saturating_add(range.start));
+            if end != range.end {
+                self.retransmits.insert(end..range.end);
+            }
+            return (range.start..end, encode_length);
+        }
+
+        // Transmit new data
+
+        // When the offset is known, we know how many bytes are required to encode it.
+        // Offset 0 requires no space
+        if self.unsent != 0 {
+            max_len -= VarInt::size(unsafe { VarInt::from_u64_unchecked(self.unsent) });
+        }
+        if self.offset - self.unsent < max_len as u64 {
+            encode_length = true;
+            max_len -= 8;
+        }
+
+        let end = self
+            .offset
+            .min((max_len as u64).saturating_add(self.unsent));
+        let result = self.unsent..end;
+        self.unsent = end;
+        (result, encode_length)
+    }
+
+    /// Returns data which is associated with a range
+    ///
+    /// This function can return a subset of the range, if the data is stored
+    /// in noncontiguous fashion in the send buffer. In this case callers
+    /// should call the function again with an incremented start offset to
+    /// retrieve more data.
+    pub(super) fn get(&self, offsets: Range<u64>) -> &[u8] {
+        let base_offset = self.offset - self.unacked_len as u64;
+
+        let mut segment_offset = base_offset;
+        for segment in self.unacked_segments.iter() {
+            if offsets.start >= segment_offset
+                && offsets.start < segment_offset + segment.len() as u64
+            {
+                let start = (offsets.start - segment_offset) as usize;
+                let end = (offsets.end - segment_offset) as usize;
+
+                return &segment[start..end.min(segment.len())];
+            }
+            segment_offset += segment.len() as u64;
+        }
+
+        &[]
+    }
+
+    /// Queue a range of sent but unacknowledged data to be retransmitted
+    pub(super) fn retransmit(&mut self, range: Range<u64>) {
+        debug_assert!(range.end <= self.unsent, "unsent data can't be lost");
+        self.retransmits.insert(range);
+    }
+
+    pub(super) fn retransmit_all_for_0rtt(&mut self) {
+        debug_assert_eq!(self.offset, self.unacked_len as u64);
+        self.unsent = 0;
+    }
+
+    /// First stream offset unwritten by the application, i.e. the offset that the next write will
+    /// begin at
+    pub(super) fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Whether all sent data has been acknowledged
+    pub(super) fn is_fully_acked(&self) -> bool {
+        self.unacked_len == 0
+    }
+
+    /// Whether there's data to send
+    ///
+    /// There may be sent unacknowledged data even when this is false.
+    pub(super) fn has_unsent_data(&self) -> bool {
+        self.unsent != self.offset || !self.retransmits.is_empty()
+    }
+
+    /// Compute the amount of data that hasn't been acknowledged
+    pub(super) fn unacked(&self) -> u64 {
+        self.unacked_len as u64 - self.acks.iter().map(|x| x.end - x.start).sum::<u64>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fragment_with_length() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world!";
+        buf.write(MSG.into());
+        // 0 byte offset => 19 bytes left => 13 byte data isn't enough
+        // with 8 bytes reserved for length 11 payload bytes will fit
+        assert_eq!(buf.poll_transmit(19), (0..11, true));
+        assert_eq!(
+            buf.poll_transmit(MSG.len() + 16 - 11),
+            (11..MSG.len() as u64, true)
+        );
+        assert_eq!(
+            buf.poll_transmit(58),
+            (MSG.len() as u64..MSG.len() as u64, true)
+        );
+    }
+
+    #[test]
+    fn fragment_without_length() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world with some extra data!";
+        buf.write(MSG.into());
+        // 0 byte offset => 19 bytes left => can be filled by 34 bytes payload
+        assert_eq!(buf.poll_transmit(19), (0..19, false));
+        assert_eq!(
+            buf.poll_transmit(MSG.len() - 19 + 1),
+            (19..MSG.len() as u64, false)
+        );
+        assert_eq!(
+            buf.poll_transmit(58),
+            (MSG.len() as u64..MSG.len() as u64, true)
+        );
+    }
+
+    #[test]
+    fn reserves_encoded_offset() {
+        let mut buf = SendBuffer::new();
+
+        // Pretend we have more than 1 GB of data in the buffer
+        let chunk: Bytes = Bytes::from_static(&[0; 1024 * 1024]);
+        for _ in 0..1025 {
+            buf.write(chunk.clone());
+        }
+
+        const SIZE1: u64 = 64;
+        const SIZE2: u64 = 16 * 1024;
+        const SIZE3: u64 = 1024 * 1024 * 1024;
+
+        // Offset 0 requires no space
+        assert_eq!(buf.poll_transmit(16), (0..16, false));
+        buf.retransmit(0..16);
+        assert_eq!(buf.poll_transmit(16), (0..16, false));
+        let mut transmitted = 16u64;
+
+        // Offset 16 requires 1 byte
+        assert_eq!(
+            buf.poll_transmit((SIZE1 - transmitted + 1) as usize),
+            (transmitted..SIZE1, false)
+        );
+        buf.retransmit(transmitted..SIZE1);
+        assert_eq!(
+            buf.poll_transmit((SIZE1 - transmitted + 1) as usize),
+            (transmitted..SIZE1, false)

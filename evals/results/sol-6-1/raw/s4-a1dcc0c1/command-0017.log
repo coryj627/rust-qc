@@ -1,0 +1,727 @@
+    help = "Use binary at <CYGPATH> to convert between unix and Windows paths.",
+    long,
+    value_name = "CYGPATH"
+  )]
+  pub(crate) cygpath: PathBuf,
+  #[arg(
+    conflicts_with = "dotenv_path",
+    help = "Search for environment file named <DOTENV-FILENAME> instead of `.env`",
+    long,
+    value_name = "DOTENV-FILENAME"
+  )]
+  pub(crate) dotenv_filename: Option<String>,
+  #[arg(
+    add = ArgValueCompleter::new(PathCompleter::file()),
+    help = "Load <DOTENV-PATH> as environment file instead of searching for one",
+    long,
+    short = 'E',
+    value_name = "DOTENV-PATH"
+  )]
+  pub(crate) dotenv_path: Option<PathBuf>,
+  #[arg(
+    conflicts_with = "quiet",
+    env = "JUST_DRY_RUN",
+    help = "Print what just would do without doing it",
+    long,
+    short = 'n'
+  )]
+  pub(crate) dry_run: bool,
+  #[arg(
+    default_value = "just",
+    env = "JUST_DUMP_FORMAT",
+    help = "Dump justfile as <FORMAT>",
+    long,
+    value_enum,
+    value_name = "FORMAT"
+  )]
+use {super::*, CompileErrorKind::*, TokenKind::*};
+
+static DEDENT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[ \t\n]*\n[^ \t\n]").unwrap());
+
+/// Just language lexer
+///
+/// The lexer proceeds character-by-character, as opposed to using regular
+/// expressions to lex tokens or semi-tokens at a time. As a result, it is
+/// verbose and straightforward. Just used to have a regex-based lexer, which
+/// was slower and generally godawful.  However, this should not be taken as a
+/// slight against regular expressions, the lexer was just idiosyncratically
+/// bad.
+pub(crate) struct Lexer<'src> {
+  /// Char iterator
+  chars: Chars<'src>,
+  /// Indentation stack
+  indentation: Vec<&'src str>,
+  /// Interpolation token start stack
+  interpolation_stack: Vec<Token<'src>>,
+  /// Source text line count
+  lines: usize,
+  /// Next character to be lexed
+  next: Option<char>,
+  /// Current open delimiters
+  open_delimiters: Vec<(Delimiter, usize)>,
+  /// Path to source file
+  path: &'src Path,
+  /// Inside recipe body
+  recipe_body: bool,
+  /// Next indent will start a recipe body
+  recipe_body_pending: bool,
+  /// Source text
+  src: &'src str,
+  /// Current token end
+  token_end: Position,
+  /// Current token start
+  token_start: Position,
+  /// Tokens
+  tokens: Vec<Token<'src>>,
+}
+
+impl<'src> Lexer<'src> {
+  pub(crate) const INTERPOLATION_END: &'static str = "}}";
+  pub(crate) const INTERPOLATION_ESCAPE: &'static str = "{{{{";
+  pub(crate) const INTERPOLATION_START: &'static str = "{{";
+
+  /// Lex `src`
+  pub(crate) fn lex(path: &'src Path, src: &'src str) -> CompileResult<'src, Vec<Token<'src>>> {
+    Self::new(path, src).tokenize()
+  }
+
+  #[cfg(test)]
+  pub(crate) fn test_lex(src: &'src str) -> CompileResult<'src, Vec<Token<'src>>> {
+    Self::new("justfile".as_ref(), src).tokenize()
+  }
+
+  /// Create a new Lexer to lex `src`
+  fn new(path: &'src Path, src: &'src str) -> Self {
+    let mut chars = src.chars();
+    let next = chars.next();
+
+    let start = Position {
+      offset: 0,
+      column: 0,
+      line: 0,
+    };
+
+    Self {
+      chars,
+      indentation: vec![""],
+      interpolation_stack: Vec::new(),
+      lines: src.lines().count(),
+      next,
+      open_delimiters: Vec::new(),
+      path,
+      recipe_body: false,
+      recipe_body_pending: false,
+      src,
+      token_end: start,
+      token_start: start,
+      tokens: Vec::new(),
+    }
+  }
+
+  /// Advance over the character in `self.next`, updating `self.token_end`
+  /// accordingly.
+  fn advance(&mut self) -> CompileResult<'src> {
+    match self.next {
+      Some(c) => {
+        let len_utf8 = c.len_utf8();
+
+        self.token_end.offset += len_utf8;
+        self.token_end.column += len_utf8;
+
+        if c == '\n' && self.token_end.line + 1 < self.lines {
+          self.token_end.column = 0;
+          self.token_end.line += 1;
+        }
+
+        self.next = self.chars.next();
+
+        Ok(())
+      }
+      None => Err(self.internal_error("Lexer advanced past end of text")),
+    }
+  }
+
+  /// Lexeme of in-progress token
+  fn lexeme(&self) -> &'src str {
+    &self.src[self.token_start.offset..self.token_end.offset]
+  }
+
+  /// Length of current token
+  fn current_token_length(&self) -> usize {
+    self.token_end.offset - self.token_start.offset
+  }
+
+  fn accepted(&mut self, c: char) -> CompileResult<'src, bool> {
+    if self.next_is(c) {
+      self.advance()?;
+      Ok(true)
+    } else {
+      Ok(false)
+    }
+  }
+
+  fn presume(&mut self, c: char) -> CompileResult<'src> {
+    if !self.next_is(c) {
+      return Err(self.internal_error(format!("Lexer presumed character `{c}`")));
+    }
+
+    self.advance()?;
+
+    Ok(())
+  }
+
+  fn presume_str(&mut self, s: &str) -> CompileResult<'src> {
+    for c in s.chars() {
+      self.presume(c)?;
+    }
+
+    Ok(())
+  }
+
+  /// Is next character c?
+  fn next_is(&self, c: char) -> bool {
+    self.next == Some(c)
+  }
+
+  /// Is next character ' ' or '\t'?
+  fn next_is_whitespace(&self) -> bool {
+    self.next_is(' ') || self.next_is('\t')
+  }
+
+  /// Un-lexed text
+  fn rest(&self) -> &'src str {
+    &self.src[self.token_end.offset..]
+  }
+
+  /// Check if unlexed text begins with prefix
+  fn rest_starts_with(&self, prefix: &str) -> bool {
+    self.rest().starts_with(prefix)
+  }
+
+  /// Does rest start with "\n" or "\r\n"?
+  fn at_eol(&self) -> bool {
+    self.next_is('\n') || self.rest_starts_with("\r\n")
+  }
+
+  /// Are we at end-of-file?
+  fn at_eof(&self) -> bool {
+    self.rest().is_empty()
+  }
+
+  /// Are we at end-of-line or end-of-file?
+  fn at_eol_or_eof(&self) -> bool {
+    self.at_eol() || self.at_eof()
+  }
+
+  /// Get current indentation
+  fn indentation(&self) -> &'src str {
+    self.indentation.last().unwrap()
+  }
+
+  /// Are we currently indented
+  fn indented(&self) -> bool {
+    !self.indentation().is_empty()
+  }
+
+  /// Create a new token with `kind` whose lexeme is between `self.token_start`
+  /// and `self.token_end`
+  fn token(&mut self, kind: TokenKind) {
+    self.tokens.push(Token {
+      column: self.token_start.column,
+      kind,
+      length: self.token_end.offset - self.token_start.offset,
+      line: self.token_start.line,
+      offset: self.token_start.offset,
+      path: self.path,
+      src: self.src,
+    });
+
+    // Set `token_start` to point after the lexed token
+    self.token_start = self.token_end;
+  }
+
+  /// Create an internal error with `message`
+  fn internal_error(&self, message: impl Into<String>) -> CompileError<'src> {
+    // Use `self.token_end` as the location of the error
+    let token = Token {
+      src: self.src,
+      offset: self.token_end.offset,
+      line: self.token_end.line,
+      column: self.token_end.column,
+      length: 0,
+      kind: Unspecified,
+      path: self.path,
+    };
+    CompileError::new(
+      token,
+      Internal {
+        message: message.into(),
+      },
+    )
+  }
+
+  /// Create a compilation error with `kind`
+  fn error(&self, kind: CompileErrorKind<'src>) -> CompileError<'src> {
+    // Use the in-progress token span as the location of the error.
+
+    // The width of the error site to highlight depends on the kind of error:
+    let length = match kind {
+      UnterminatedString | UnterminatedBacktick => {
+        let Some(kind) = StringKind::from_token_start(self.lexeme()) else {
+          return self.internal_error("Lexer::error: expected string or backtick token start");
+        };
+        kind.delimiter().len()
+      }
+      // highlight the full token
+      _ => self.lexeme().len(),
+    };
+
+    let token = Token {
+      kind: Unspecified,
+      src: self.src,
+      offset: self.token_start.offset,
+      line: self.token_start.line,
+      column: self.token_start.column,
+      length,
+      path: self.path,
+use {
+  super::*,
+  nix::{
+    errno::Errno,
+    fcntl::{FcntlArg, FdFlag},
+    sys::signal::{SaFlags, SigAction, SigHandler, SigSet},
+  },
+  std::{
+    fs::File,
+    io::Read,
+    os::fd::{BorrowedFd, IntoRawFd, OwnedFd},
+    sync::atomic::{self, AtomicI32},
+  },
+};
+
+const INVALID_FILENO: i32 = -1;
+
+static WRITE: AtomicI32 = AtomicI32::new(INVALID_FILENO);
+
+fn die(message: &str) -> ! {
+  // SAFETY:
+  //
+  // Standard error is open for the duration of the program.
+  const STDERR: BorrowedFd = unsafe { BorrowedFd::borrow_raw(libc::STDERR_FILENO) };
+
+  let mut i = 0;
+  let mut buffer = [0; 512];
+
+  let mut append = |s: &str| {
+    let remaining = buffer.len() - i;
+    let n = s.len().min(remaining);
+    let end = i + n;
+    buffer[i..end].copy_from_slice(&s.as_bytes()[0..n]);
+    i = end;
+  };
+
+  append("error: ");
+  append(message);
+  append("\n");
+
+  nix::unistd::write(STDERR, &buffer[0..i]).ok();
+
+  process::abort();
+}
+
+extern "C" fn handler(signal: libc::c_int) {
+  let errno = Errno::last();
+
+  let Ok(signal) = u8::try_from(signal) else {
+    die("unexpected signal");
+  };
+
+  // SAFETY:
+  //
+  // `WRITE` is initialized before the signal handler can run and remains open
+  // for the duration of the program.
+  let fd = unsafe { BorrowedFd::borrow_raw(WRITE.load(atomic::Ordering::Relaxed)) };
+
+  if let Err(err) = nix::unistd::write(fd, &[signal]) {
+    die(err.desc());
+  }
+
+  errno.set();
+}
+
+fn fcntl(fd: &OwnedFd, arg: FcntlArg) -> RunResult<'static, libc::c_int> {
+  nix::fcntl::fcntl(fd, arg).map_err(|errno| Error::SignalHandlerPipeCloexec {
+    io_error: errno.into(),
+  })
+}
+
+fn set_cloexec(fd: &OwnedFd) -> RunResult<'static> {
+  // It would be better to use pipe2(O_CLOEXEC) rather than pipe-then-fcntl,
+  // but it isn't supported on all platforms (most notably, not macos) and in
+  // the atomicity guarantees that pipe2 provides aren't needed.
+  let existing_flags = fcntl(fd, FcntlArg::F_GETFD)?;
+  let combined_flags = FdFlag::from_bits_retain(existing_flags) | FdFlag::FD_CLOEXEC;
+  fcntl(fd, FcntlArg::F_SETFD(combined_flags))?;
+  Ok(())
+}
+
+pub(crate) struct Signals(File);
+
+impl Signals {
+  pub(crate) fn new() -> RunResult<'static, Self> {
+    let (read, write) = nix::unistd::pipe().map_err(|errno| Error::SignalHandlerPipeOpen {
+      io_error: errno.into(),
+    })?;
+
+    set_cloexec(&read)?;
+    set_cloexec(&write)?;
+
+    if WRITE
+      .compare_exchange(
+        INVALID_FILENO,
+        write.into_raw_fd(),
+        atomic::Ordering::Relaxed,
+        atomic::Ordering::Relaxed,
+      )
+      .is_err()
+    {
+      panic!("signal iterator cannot be initialized twice");
+    }
+
+    let sa = SigAction::new(
+      SigHandler::Handler(handler),
+      SaFlags::SA_RESTART,
+      SigSet::empty(),
+    );
+
+    for &signal in Signal::ALL {
+      // SAFETY:
+      //
+      // This is the only place we modify signal handlers, and
+      // `nix::sys::signal::sigaction` is unsafe only if an invalid signal
+      // handler has already been installed.
+      unsafe {
+        nix::sys::signal::sigaction(signal.into(), &sa).map_err(|errno| {
+          Error::SignalHandlerSigaction {
+            signal,
+            io_error: errno.into(),
+          }
+        })?;
+      }
+    }
+
+    Ok(Self(File::from(read)))
+  }
+}
+
+impl Iterator for Signals {
+  type Item = io::Result<Signal>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    let mut signal = [0];
+    Some(
+      self
+        .0
+        .read_exact(&mut signal)
+        .and_then(|()| Signal::try_from(signal[0])),
+    )
+  }
+}
+  fn parse_ast(mut self) -> CompileResult<'src, Ast<'src>> {
+    self.accept(ByteOrderMark)?;
+
+    while !self.accepted(Eof)? {
+      let mut attributes = self.parse_attributes()?;
+
+      let item = self.parse_item(&mut attributes)?;
+      self.items.push(item);
+
+      let unterminated = match self.items.iter().last().unwrap() {
+        Item::Newline => false,
+        Item::Recipe(recipe) => {
+          if recipe.body.is_empty() {
+            true
+          } else {
+            self.items.push(Item::Newline);
+            false
+          }
+        }
+        _ => true,
+      };
+
+      if let Some((token, attributes)) = attributes {
+        return Err(token.error(CompileErrorKind::ExtraneousAttributes {
+          count: attributes.len(),
+        }));
+      }
+
+      if unterminated {
+        if let Some(comment) = self.accept(Comment)? {
+          self.items.push(Item::Comment(comment.lexeme().trim_end()));
+        }
+
+        if !self.next_is(Eof) {
+          self.expect(Eol)?;
+          self.items.push(Item::Newline);
+        }
+      }
+    }
+
+    if self.next_token != self.tokens.len() {
+      return Err(self.internal_error(format!(
+        "Parse completed with {} unparsed tokens",
+        self.tokens.len() - self.next_token,
+      ))?);
+    }
+
+    Ok(Ast {
+      items: self.items,
+      module_path: self.module_namepath.map(Into::into).unwrap_or_default(),
+      unstable_features: self.unstable_features,
+      warnings: Vec::new(),
+      working_directory: self.working_directory.into(),
+use super::*;
+
+#[test]
+fn bugfix() {
+  let mut justfile = String::from("foo: (x ");
+  for _ in 0..500 {
+    justfile.push('(');
+  }
+  Test::new()
+    .justfile(&justfile)
+    .stderr(RECURSION_LIMIT_REACHED)
+    .failure();
+}
+
+const RECURSION_LIMIT_REACHED: &str = if cfg!(windows) {
+  "
+error: Parsing recursion depth exceeded
+ ——▶ justfile:1:57
+  │
+1 │ foo: (x ((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((
+  │                                                         ^
+"
+} else {
+  "
+error: Parsing recursion depth exceeded
+ ——▶ justfile:1:265
+  │
+1 │ foo: (x ((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((
+  │                                                                                                                                                                                                                                                                         ^
+"
+};
+use super::*;
+
+pub(crate) struct Loader {
+  paths: Arena<PathBuf>,
+  srcs: Arena<String>,
+}
+
+impl Loader {
+  pub(crate) fn new() -> Self {
+    Self {
+      srcs: Arena::new(),
+      paths: Arena::new(),
+    }
+  }
+
+  pub(crate) fn load<'src>(
+    &'src self,
+    config: &Config,
+    root: &Path,
+    path: &Path,
+  ) -> RunResult<'src, (&'src Path, &'src str)> {
+    Config::warn_non_unicode_path(config.color, "justfile", path);
+
+    let src = fs::read_to_string(path).map_err(|io_error| Error::Load {
+      path: path.into(),
+      io_error,
+    })?;
+
+    let relative = path.strip_prefix(root.parent().unwrap()).unwrap_or(path);
+
+    Ok((self.paths.alloc(relative.into()), self.srcs.alloc(src)))
+  }
+}
+//! `just` is primarily used as a command-line binary, but does provide a
+//! limited public library interface.
+//!
+//! Please keep in mind that there are no semantic version guarantees for the
+//! library interface. It may break or change at any time.
+
+pub(crate) use {
+  crate::{
+    alias::Alias,
+    alias_style::AliasStyle,
+    analyzer::Analyzer,
+    arg_attribute::ArgAttribute,
+    assignment::Assignment,
+    assignment_resolver::AssignmentResolver,
+    ast::Ast,
+    attribute::{Attribute, AttributeDiscriminant},
+    attribute_set::AttributeSet,
+    binding::Binding,
+    color::Color,
+    color_display::ColorDisplay,
+    command_color::CommandColor,
+    command_ext::CommandExt,
+    compilation::Compilation,
+    compile_error::CompileError,
+    compile_error_kind::CompileErrorKind,
+    compiler::Compiler,
+    completer::Completer,
+    condition::Condition,
+    conditional_operator::ConditionalOperator,
+    config::Config,
+    config_error::ConfigError,
+    const_error::ConstError,
+    constants::constants,
+    count::Count,
+    delimiter::Delimiter,
+    dependency::Dependency,
+    dump_format::DumpFormat,
+    enclosure::Enclosure,
+    error::Error,
+    evaluate_format::EvaluateFormat,
+    evaluator::Evaluator,
+    execution_context::ExecutionContext,
+    executor::Executor,
+    expression::Expression,
+    format_string_part::FormatStringPart,
+    fragment::Fragment,
+    function::Function,
+    function_definition::FunctionDefinition,
+    indentation::Indentation,
+    interpreter::Interpreter,
+    invocation::Invocation,
+    invocation_parser::InvocationParser,
+    item::Item,
+    justfile::Justfile,
+    keyed::Keyed,
+    keyword::Keyword,
+    lexer::Lexer,
+    line::Line,
+    list::List,
+    load_dotenv::load_dotenv,
+    loader::Loader,
+    modulepath::Modulepath,
+    name::Name,
+    namepath::Namepath,
+    number::Number,
+    numerator::Numerator,
+    ordinal::Ordinal,
+    output_error::OutputError,
+    parameter::Parameter,
+    parameter_kind::ParameterKind,
+    parser::Parser,
+    pattern::Pattern,
+    platform::Platform,
+    platform_interface::PlatformInterface,
+    position::Position,
+    positional::Positional,
+    ran::Ran,
+    range_ext::RangeExt,
+    recipe::Recipe,
+    recipe_resolver::RecipeResolver,
+    recipe_signature::RecipeSignature,
+    reference::Reference,
+    references::References,
+    request::Request,
+    scope::Scope,
+    search::Search,
+    search_config::SearchConfig,
+    search_error::SearchError,
+    set::Set,
+    setting::Setting,
+    settings::Settings,
+    shebang::Shebang,
+    shell::Shell,
+    shell_kind::ShellKind,
+    show_whitespace::ShowWhitespace,
+    sigil::Sigil,
+    signal::Signal,
+    signal_handler::SignalHandler,
+    source::Source,
+    string_delimiter::StringDelimiter,
+    string_kind::StringKind,
+    string_literal::StringLiteral,
+    string_state::StringState,
+    subcommand::Subcommand,
+    suggestion::Suggestion,
+    switch::Switch,
+    table::Table,
+    token::Token,
+    token_kind::TokenKind,
+    unresolved_dependency::UnresolvedDependency,
+    unresolved_recipe::UnresolvedRecipe,
+    unstable_feature::UnstableFeature,
+    usage::Usage,
+    use_color::UseColor,
+    verbosity::Verbosity,
+    warning::Warning,
+    which::which,
+  },
+  camino::Utf8Path,
+  clap::{CommandFactory, FromArgMatches, Parser as _, ValueEnum},
+  clap_complete::{ArgValueCompleter, CompletionCandidate, PathCompleter, engine::ValueCompleter},
+  edit_distance::edit_distance,
+  lexiclean::Lexiclean,
+  libc::EXIT_FAILURE,
+  rand::seq::IndexedRandom,
+  regex::Regex,
+  serde::{
+    Deserialize, Serialize, Serializer,
+    ser::{SerializeMap, SerializeSeq},
+  },
+  snafu::{ResultExt, Snafu},
+  std::{
+    borrow::Cow,
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    env,
+    ffi::{OsStr, OsString},
+    fmt::{self, Debug, Display, Formatter},
+    fs::{self, File},
+    io::{self, Write},
+    iter::{self, FromIterator},
+    mem,
+    ops::Deref,
+    ops::{Index, RangeInclusive},
+    path::{self, Component, Path, PathBuf},
+    process::{self, Command, ExitStatus, Stdio},
+    slice,
+    str::{self, Chars, FromStr},
+    sync::{Arc, LazyLock, Mutex, MutexGuard},
+    thread,
+    time::Instant,
+    vec,
+  },
+  strum::{Display, EnumDiscriminants, EnumIter, EnumString, IntoStaticStr},
+  tempfile::TempDir,
+  typed_arena::Arena,
+  unicode_width::{UnicodeWidthChar, UnicodeWidthStr},
+};
+
+#[cfg(test)]
+pub(crate) use crate::{node::Node, tree::Tree};
+
+pub use crate::run::run;
+
+#[doc(hidden)]
+pub use {arguments::Arguments, request::Response, subcommand::INIT_JUSTFILE, unindent::unindent};
+
+type CompileResult<'a, T = ()> = Result<T, CompileError<'a>>;
+type ConfigResult<T> = Result<T, ConfigError>;
+type FunctionResult = Result<String, String>;
+type RunResult<'a, T = ()> = Result<T, Error<'a>>;
+type SearchResult<T> = Result<T, SearchError>;
+
+#[cfg(test)]
+#[macro_use]
+pub mod testing;
+
+#[cfg(test)]
+#[macro_use]
+pub mod tree;
+2.04305 minutes used of 15.0

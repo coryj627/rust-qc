@@ -1,0 +1,11 @@
+{"bug":"K001","A":{"v":"missed"},"B":{"v":"missed"},"C":{"v":"missed"},"D":{"v":"missed"}}
+{"bug":"K002","A":{"v":"found","ref":"#2"},"B":{"v":"found","ref":"#6"},"C":{"v":"found","ref":"#10"},"D":{"v":"found","ref":"#9"}}
+{"bug":"K003","A":{"v":"missed"},"B":{"v":"missed"},"C":{"v":"missed"},"D":{"v":"missed"}}
+{"bug":"K004","A":{"v":"found","ref":"#5"},"B":{"v":"missed"},"C":{"v":"found","ref":"#4"},"D":{"v":"missed"}}
+{"bug":"K005","A":{"v":"found","ref":"#7"},"B":{"v":"found","ref":"#3"},"C":{"v":"found","ref":"#9"},"D":{"v":"found","ref":"#5"}}
+{"bug":"K006","A":{"v":"found","ref":"#2"},"B":{"v":"found","ref":"#6"},"C":{"v":"found","ref":"#10"},"D":{"v":"found","ref":"#9"}}
+{"bug":"K007","A":{"v":"missed"},"B":{"v":"missed"},"C":{"v":"missed"},"D":{"v":"missed"}}
+{"bug":"K008","A":{"v":"found","ref":"#3"},"B":{"v":"missed"},"C":{"v":"missed"},"D":{"v":"missed"}}
+{"bug":"K009","A":{"v":"missed"},"B":{"v":"missed"},"C":{"v":"missed"},"D":{"v":"missed"}}
+{"bug":"K010","A":{"v":"missed"},"B":{"v":"missed"},"C":{"v":"missed"},"D":{"v":"missed"}}
+{"bug":"K011","A":{"v":"missed"},"B":{"v":"missed"},"C":{"v":"missed"},"D":{"v":"missed"}}

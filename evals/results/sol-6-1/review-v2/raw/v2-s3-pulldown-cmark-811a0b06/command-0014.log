@@ -1,0 +1,901 @@
+pub(crate) fn scan_containers(
+    tree: &Tree<Item>,
+    line_start: &mut LineStart<'_>,
+    options: Options,
+) -> usize {
+    let mut i = 0;
+    for &node_ix in tree.walk_spine() {
+        match tree[node_ix].item.body {
+            ItemBody::BlockQuote(..) => {
+                let save = line_start.clone();
+                let _ = line_start.scan_space(3);
+                if !line_start.scan_blockquote_marker() {
+                    *line_start = save;
+                    break;
+                }
+            }
+            ItemBody::ListItem(indent) => {
+                let save = line_start.clone();
+                if !line_start.scan_space(indent) && !line_start.is_at_eol() {
+                    *line_start = save;
+                    break;
+                }
+            }
+            ItemBody::DefinitionListDefinition(indent) => {
+                let save = line_start.clone();
+                if !line_start.scan_space(indent) && !line_start.is_at_eol() {
+                    *line_start = save;
+                    break;
+                }
+            }
+            ItemBody::FootnoteDefinition(..) if options.has_gfm_footnotes() => {
+                let save = line_start.clone();
+                if !line_start.scan_space(4) && !line_start.is_at_eol() {
+                    *line_start = save;
+                    break;
+                }
+            }
+            _ => (),
+        }
+        i += 1;
+    }
+    i
+}
+pub(crate) fn skip_container_prefixes(tree: &Tree<Item>, bytes: &[u8], options: Options) -> usize {
+    let mut line_start = LineStart::new(bytes);
+    let _ = scan_containers(tree, &mut line_start, options);
+    line_start.bytes_scanned()
+}
+
+impl Tree<Item> {
+    pub(crate) fn append_text(&mut self, start: usize, end: usize, backslash_escaped: bool) {
+        if end > start {
+            if let Some(ix) = self.cur() {
+                if matches!(self[ix].item.body, ItemBody::Text { .. }) && self[ix].item.end == start
+                {
+                    self[ix].item.end = end;
+                    return;
+                }
+            }
+            self.append(Item {
+                start,
+                end,
+                body: ItemBody::Text { backslash_escaped },
+            });
+        }
+    }
+    /// Returns true if the current node is inside a table.
+    ///
+    /// If `cur` is an ItemBody::Table, it would return false,
+    /// but since the `TableRow` and `TableHead` and `TableCell`
+    /// are children of the table, anything doing inline parsing
+    /// doesn't need to care about that.
+    pub(crate) fn is_in_table(&self) -> bool {
+        fn might_be_in_table(item: &Item) -> bool {
+            item.body.is_inline()
+                || matches!(item.body, |ItemBody::TableHead| ItemBody::TableRow
+                    | ItemBody::TableCell)
+        }
+        for &ix in self.walk_spine().rev() {
+            if matches!(self[ix].item.body, ItemBody::Table(_)) {
+                return true;
+            }
+            if !might_be_in_table(&self[ix].item) {
+                return false;
+            }
+        }
+        false
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+struct InlineEl {
+    /// offset of tree node
+    start: TreeIndex,
+    /// number of delimiters available for matching
+    count: usize,
+    /// length of the run that these delimiters came from
+    run_length: usize,
+    /// b'*', b'_', or b'~'
+    c: u8,
+    /// can both open and close
+    both: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct InlineStack {
+    stack: Vec<InlineEl>,
+    // Lower bounds for matching indices in the stack. For example
+    // a strikethrough delimiter will never match with any element
+    // in the stack with index smaller than
+    // `lower_bounds[InlineStack::TILDES]`.
+    lower_bounds: [usize; 9],
+}
+
+impl InlineStack {
+    /// These are indices into the lower bounds array.
+    /// Not both refers to the property that the delimiter can not both
+    /// be opener as a closer.
+    const UNDERSCORE_NOT_BOTH: usize = 0;
+    const ASTERISK_NOT_BOTH: usize = 1;
+    const ASTERISK_BASE: usize = 2;
+    const TILDES: usize = 5;
+    const UNDERSCORE_BASE: usize = 6;
+
+    fn pop_all(&mut self, tree: &mut Tree<Item>) {
+        for el in self.stack.drain(..) {
+            for i in 0..el.count {
+                tree[el.start + i].item.body = ItemBody::Text {
+                    backslash_escaped: false,
+                };
+            }
+        }
+        self.lower_bounds = [0; 9];
+    }
+
+    fn get_lowerbound(&self, c: u8, count: usize, both: bool) -> usize {
+        if c == b'_' {
+            let mod3_lower = self.lower_bounds[InlineStack::UNDERSCORE_BASE + count % 3];
+            if both {
+                mod3_lower
+            } else {
+                min(
+                    mod3_lower,
+                    self.lower_bounds[InlineStack::UNDERSCORE_NOT_BOTH],
+                )
+            }
+        } else if c == b'*' {
+            let mod3_lower = self.lower_bounds[InlineStack::ASTERISK_BASE + count % 3];
+            if both {
+                mod3_lower
+            } else {
+                min(
+                    mod3_lower,
+                    self.lower_bounds[InlineStack::ASTERISK_NOT_BOTH],
+                )
+            }
+        } else {
+            self.lower_bounds[InlineStack::TILDES]
+        }
+    }
+
+    fn set_lowerbound(&mut self, c: u8, count: usize, both: bool, new_bound: usize) {
+        if c == b'_' {
+            if both {
+                self.lower_bounds[InlineStack::UNDERSCORE_BASE + count % 3] = new_bound;
+            } else {
+                self.lower_bounds[InlineStack::UNDERSCORE_NOT_BOTH] = new_bound;
+            }
+        } else if c == b'*' {
+            self.lower_bounds[InlineStack::ASTERISK_BASE + count % 3] = new_bound;
+            if !both {
+//! The first pass resolves all block structure, generating an AST. Within a block, items
+//! are in a linear chain with potential inline markup identified.
+
+use std::cmp::max;
+use std::ops::Range;
+
+use crate::parse::{
+    scan_containers, Allocations, FootnoteDef, HeadingAttributes, Item, ItemBody, LinkDef,
+    LINK_MAX_NESTED_PARENS,
+};
+use crate::strings::CowStr;
+use crate::tree::{Tree, TreeIndex};
+use crate::Options;
+use crate::{
+    linklabel::{scan_link_label_rest, LinkLabel},
+    HeadingLevel,
+};
+use crate::{scanners::*, MetadataBlockKind};
+
+use unicase::UniCase;
+
+/// Runs the first pass, which resolves the block structure of the document,
+/// and returns the resulting tree.
+pub(crate) fn run_first_pass(text: &str, options: Options) -> (Tree<Item>, Allocations<'_>) {
+    // This is a very naive heuristic for the number of nodes
+    // we'll need.
+    let start_capacity = max(128, text.len() / 32);
+    let lookup_table = &create_lut(&options);
+    let first_pass = FirstPass {
+        text,
+        tree: Tree::with_capacity(start_capacity),
+        begin_list_item: None,
+        last_line_blank: false,
+        allocs: Allocations::new(),
+        options,
+        lookup_table,
+        brace_context_next: 0,
+        brace_context_stack: Vec::new(),
+    };
+    first_pass.run()
+}
+
+// Each level of brace nesting adds another entry to a hash table.
+// To limit the amount of memory consumed, do not create a new brace
+// context beyond some amount deep.
+//
+// There are actually two limits at play here: this one,
+// and the one where the maximum amount of distinct contexts passes
+// the 255 item limit imposed by using `u8`. When over 255 distinct
+// contexts are created, it wraps around, while this one instead makes it
+// saturate, which is a better behavior.
+const MATH_BRACE_CONTEXT_MAX_NESTING: usize = 25;
+
+/// State for the first parsing pass.
+struct FirstPass<'a, 'b> {
+    text: &'a str,
+    tree: Tree<Item>,
+    begin_list_item: Option<usize>,
+    last_line_blank: bool,
+    allocs: Allocations<'a>,
+    options: Options,
+    lookup_table: &'b LookupTable,
+    /// Math environment brace nesting.
+    brace_context_stack: Vec<u8>,
+    brace_context_next: usize,
+}
+
+impl<'a, 'b> FirstPass<'a, 'b> {
+    fn run(mut self) -> (Tree<Item>, Allocations<'a>) {
+        let mut ix = 0;
+        while ix < self.text.len() {
+            ix = self.parse_block(ix);
+        }
+        while self.tree.spine_len() > 0 {
+            self.pop(ix);
+        }
+        (self.tree, self.allocs)
+    }
+
+    /// Returns offset after block.
+    fn parse_block(&mut self, mut start_ix: usize) -> usize {
+        let bytes = self.text.as_bytes();
+        let mut line_start = LineStart::new(&bytes[start_ix..]);
+
+        // math spans and their braces are tracked only within a single block
+        self.brace_context_stack.clear();
+        self.brace_context_next = 0;
+
+        let i = scan_containers(&self.tree, &mut line_start, self.options);
+        for _ in i..self.tree.spine_len() {
+            self.pop(start_ix);
+        }
+
+        if self.options.contains(Options::ENABLE_OLD_FOOTNOTES) {
+            // finish footnote if it's still open and was preceded by blank line
+            if let Some(node_ix) = self.tree.peek_up() {
+                if let ItemBody::FootnoteDefinition(..) = self.tree[node_ix].item.body {
+                    if self.last_line_blank {
+                        self.pop(start_ix);
+                    }
+                }
+            }
+        }
+
+        // Process new containers
+        loop {
+            let save = line_start.clone();
+            let outer_indent = line_start.scan_space_upto(4);
+            if outer_indent >= 4 {
+                line_start = save;
+                break;
+            }
+            if self.options.contains(Options::ENABLE_FOOTNOTES) {
+                // Footnote definitions
+                let container_start = start_ix + line_start.bytes_scanned();
+                if let Some(bytecount) = self.parse_footnote(container_start) {
+                    start_ix = container_start + bytecount;
+                    if self.options.contains(Options::ENABLE_OLD_FOOTNOTES) {
+                        // gfm footnotes need indented, but old footnotes don't
+                        // handle this, old footnotes treat the next line as part of the current line
+                        start_ix += scan_blank_line(&bytes[start_ix..]).unwrap_or(0);
+                    }
+                    line_start = LineStart::new(&bytes[start_ix..]);
+                    continue;
+                }
+            }
+            let container_start = start_ix + line_start.bytes_scanned();
+            if let Some((ch, index, indent)) = line_start.scan_list_marker_with_indent(outer_indent)
+            {
+                let after_marker_index = start_ix + line_start.bytes_scanned();
+                self.continue_list(container_start - outer_indent, ch, index);
+                self.tree.append(Item {
+                    start: container_start - outer_indent,
+                    end: after_marker_index, // will get updated later if item not empty
+                    body: ItemBody::ListItem(indent),
+                });
+                self.tree.push();
+                if let Some(n) = scan_blank_line(&bytes[after_marker_index..]) {
+                    self.begin_list_item = Some(after_marker_index + n);
+                    return after_marker_index + n;
+                }
+                if self.options.contains(Options::ENABLE_TASKLISTS) {
+                    let task_list_marker =
+                        line_start.scan_task_list_marker().map(|is_checked| Item {
+                            start: after_marker_index,
+                            end: start_ix + line_start.bytes_scanned(),
+                            body: ItemBody::TaskListMarker(is_checked),
+                        });
+                    if let Some(task_list_marker) = task_list_marker {
+                        if let Some(n) = scan_blank_line(&bytes[task_list_marker.end..]) {
+                            self.tree.append(task_list_marker);
+                            self.begin_list_item = Some(task_list_marker.end + n);
+                            return task_list_marker.end + n;
+                        } else {
+                            line_start.scan_all_space();
+                            let ix = start_ix + line_start.bytes_scanned();
+                            return self.parse_paragraph(ix, Some(task_list_marker));
+                        }
+                    }
+                }
+            } else if let Some((indent, child, item)) = self
+                .options
+                .contains(Options::ENABLE_DEFINITION_LIST)
+                .then(|| {
+                    self.tree
+                        .cur()
+                        .map(|cur| (self.tree[cur].child, &mut self.tree[cur].item))
+                })
+                .flatten()
+                .filter(|(_, item)| {
+                    matches!(
+                        item,
+                        Item {
+                            body: ItemBody::Paragraph
+                                | ItemBody::TightParagraph
+                                | ItemBody::MaybeDefinitionListTitle
+                                | ItemBody::DefinitionListDefinition(_),
+                            ..
+                        }
+                    )
+                })
+                .and_then(|item| {
+                    Some((
+                        line_start
+                            .scan_definition_list_definition_marker_with_indent(outer_indent)?,
+                        item.0,
+                        item.1,
+                    ))
+                })
+            {
+                match item.body {
+                    ItemBody::Paragraph | ItemBody::TightParagraph => {
+                        item.body = ItemBody::DefinitionList(true);
+                        let Item { start, end, .. } = *item;
+                        let list_idx = self.tree.cur().unwrap();
+                        let title_idx = self.tree.create_node(Item {
+                            start,
+                            end, // will get updated later if item not empty
+                            body: ItemBody::DefinitionListTitle,
+                        });
+                        self.tree[title_idx].child = child;
+                        self.tree[list_idx].child = Some(title_idx);
+                        self.tree.push();
+                    }
+                    ItemBody::MaybeDefinitionListTitle => {
+                        item.body = ItemBody::DefinitionListTitle;
+                    }
+                    ItemBody::DefinitionListDefinition(_) => {}
+                    _ => unreachable!(),
+                }
+                let after_marker_index = start_ix + line_start.bytes_scanned();
+                self.tree.append(Item {
+                    start: container_start - outer_indent,
+                    end: after_marker_index, // will get updated later if item not empty
+                    body: ItemBody::DefinitionListDefinition(indent),
+                });
+                if let Some(ItemBody::DefinitionList(ref mut is_tight)) =
+                    self.tree.peek_up().map(|cur| &mut self.tree[cur].item.body)
+                {
+                    if self.last_line_blank {
+                        *is_tight = false;
+                        self.last_line_blank = false;
+                    }
+                }
+                self.tree.push();
+                if let Some(n) = scan_blank_line(&bytes[after_marker_index..]) {
+                    self.begin_list_item = Some(after_marker_index + n);
+                    return after_marker_index + n;
+                }
+            } else if line_start.scan_blockquote_marker() {
+                let kind = if self.options.contains(Options::ENABLE_GFM) {
+                    line_start.scan_blockquote_tag()
+                } else {
+                    None
+                };
+                self.finish_list(start_ix);
+                self.tree.append(Item {
+                    start: container_start,
+                    end: 0, // will get set later
+                    body: ItemBody::BlockQuote(kind),
+                });
+                self.tree.push();
+                if kind.is_some() {
+                    // blockquote tag leaves us at the end of the line
+                    // we need to scan through all the container syntax for the next line
+                    // and break out if we can't re-scan all of them
+                    let ix = start_ix + line_start.bytes_scanned();
+                    let mut lazy_line_start = LineStart::new(&bytes[ix..]);
+                    let tree_position =
+                        scan_containers(&self.tree, &mut lazy_line_start, self.options);
+                    let current_container = tree_position == self.tree.spine_len();
+                    if !lazy_line_start.scan_space(4)
+                        && self.scan_paragraph_interrupt(
+                            &bytes[ix + lazy_line_start.bytes_scanned()..],
+                            current_container,
+                            tree_position,
+                        )
+                    {
+                        return ix;
+                    } else {
+                        // blockquote tags act as if they were nested in a paragraph
+                        // so you can lazily continue the imaginary paragraph off of them
+                        line_start = lazy_line_start;
+                        line_start.scan_all_space();
+                        start_ix = ix;
+                        break;
+                    }
+                }
+            } else {
+                line_start = save;
+                break;
+            }
+        }
+
+        let ix = start_ix + line_start.bytes_scanned();
+
+        if let Some(n) = scan_blank_line(&bytes[ix..]) {
+            if let Some(node_ix) = self.tree.peek_up() {
+                match &mut self.tree[node_ix].item.body {
+                    ItemBody::BlockQuote(..) => (),
+                    ItemBody::ListItem(indent) | ItemBody::DefinitionListDefinition(indent)
+                        if self.begin_list_item.is_some() =>
+                    {
+                        self.last_line_blank = true;
+                        // This is a blank list item.
+                        // While the list itself can be continued no matter how many blank lines
+                        // there are between this one and the next one, it cannot nest anything
+                        // else, so its indentation should not be subtracted from the line start.
+                        *indent = 0;
+                    }
+                    _ => {
+                        self.last_line_blank = true;
+                    }
+                }
+            } else {
+                self.last_line_blank = true;
+            }
+            return ix + n;
+        }
+
+        // Save `remaining_space` here to avoid needing to backtrack `line_start` for HTML blocks
+        let remaining_space = line_start.remaining_space();
+
+        let indent = line_start.scan_space_upto(4);
+        if indent == 4 {
+            self.finish_list(start_ix);
+            let ix = start_ix + line_start.bytes_scanned();
+            let remaining_space = line_start.remaining_space();
+            return self.parse_indented_code_block(ix, remaining_space);
+        }
+
+        let ix = start_ix + line_start.bytes_scanned();
+
+        // metadata blocks cannot be indented
+        if indent == 0 {
+            if let Some((_n, metadata_block_ch)) = scan_metadata_block(
+                &bytes[ix..],
+                self.options
+                    .contains(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS),
+                self.options
+                    .contains(Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS),
+            ) {
+                self.finish_list(start_ix);
+                return self.parse_metadata_block(ix, metadata_block_ch);
+            }
+        }
+
+        // HTML Blocks
+        if bytes[ix] == b'<' {
+            // Types 1-5 are all detected by one function and all end with the same
+            // pattern
+            if let Some(html_end_tag) = get_html_end_tag(&bytes[(ix + 1)..]) {
+                self.finish_list(start_ix);
+                return self.parse_html_block_type_1_to_5(
+                    ix,
+                    html_end_tag,
+                    remaining_space,
+                    indent,
+                );
+            }
+// Copyright 2015 Google Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+
+//! Command line tool to exercise pulldown-cmark.
+
+#![forbid(unsafe_code)]
+
+use pulldown_cmark::{html, BrokenLink, Options, Parser};
+
+use std::env;
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::PathBuf;
+
+fn dry_run(text: &str, opts: Options, broken_links: &mut Vec<BrokenLink<'static>>) {
+    let p = Parser::new_with_broken_link_callback(
+        text,
+        opts,
+        Some(|link: BrokenLink<'_>| {
+            broken_links.push(link.into_static());
+            None
+        }),
+    );
+    let count = p.count();
+    println!("{} events", count);
+}
+
+fn print_events(text: &str, opts: Options, broken_links: &mut Vec<BrokenLink<'static>>) {
+    let parser = Parser::new_with_broken_link_callback(
+        text,
+        opts,
+        Some(|link: BrokenLink<'_>| {
+            broken_links.push(link.into_static());
+            None
+        }),
+    )
+    .into_offset_iter();
+    for (event, range) in parser {
+        println!("{:?}: {:?}", range, event);
+    }
+    println!("EOF");
+}
+
+fn brief(program: &str) -> String {
+    format!(
+        "Usage: {} [options]\n\n{}",
+        program, "Reads markdown from file or standard input and emits HTML.",
+    )
+}
+
+pub fn main() -> std::io::Result<()> {
+    let args: Vec<_> = env::args().collect();
+    let mut opts = getopts::Options::new();
+    opts.optflag("h", "help", "this help message");
+    opts.optflag("d", "dry-run", "dry run, produce no output");
+    opts.optflag("e", "events", "print event sequence instead of rendering");
+    // Check for conflicting short flags when adding a new one!
+    opts.optflag("T", "enable-tables", "enable GitHub-style tables");
+    opts.optflag("m", "enable-math", "enable LaTeX-style math");
+    opts.optflag("F", "enable-footnotes", "enable GitHub-style footnotes");
+    opts.optflag(
+        "f",
+        "enable-old-footnotes",
+        "enable Hoedown-style footnotes",
+    );
+    opts.optflag(
+        "S",
+        "enable-strikethrough",
+        "enable GitHub-style strikethrough",
+    );
+    opts.optflag("U", "enable-superscript", "enable superscript");
+    opts.optflag("B", "enable-subscript", "enable subscript");
+    opts.optflag("L", "enable-tasklists", "enable GitHub-style task lists");
+    opts.optflag("P", "enable-smart-punctuation", "enable smart punctuation");
+    opts.optflag(
+        "H",
+        "enable-heading-attributes",
+        "enable heading attributes",
+    );
+    opts.optflag("M", "enable-metadata-blocks", "enable metadata blocks");
+    opts.optflag(
+        "R",
+        "reject-broken-links",
+        "fail if input file has broken links",
+    );
+    opts.optflag("G", "enable-gfm", "enable misc GFM features");
+    opts.optflag(
+        "D",
+        "enable-definition-list",
+        "enable Commonmark-HS-Extensions compatible definition lists",
+    );
+    opts.optflag("W", "enable-wikilinks", "enable wikilinks");
+
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => m,
+        Err(f) => {
+            eprintln!("{}\n{}", f, opts.usage(&brief(&args[0])));
+            std::process::exit(1);
+        }
+    };
+    if matches.opt_present("help") {
+        println!("{}", opts.usage(&brief(&args[0])));
+        return Ok(());
+    }
+    let mut opts = Options::empty();
+    if matches.opt_present("enable-tables") {
+        opts.insert(Options::ENABLE_TABLES);
+    }
+    if matches.opt_present("enable-math") {
+        opts.insert(Options::ENABLE_MATH);
+    }
+    if matches.opt_present("enable-footnotes") {
+        opts.insert(Options::ENABLE_FOOTNOTES);
+    }
+    if matches.opt_present("enable-old-footnotes") {
+        opts.insert(Options::ENABLE_OLD_FOOTNOTES);
+    }
+    if matches.opt_present("enable-strikethrough") {
+        opts.insert(Options::ENABLE_STRIKETHROUGH);
+    }
+    if matches.opt_present("enable-superscript") {
+        opts.insert(Options::ENABLE_SUPERSCRIPT);
+    }
+    if matches.opt_present("enable-subscript") {
+        opts.insert(Options::ENABLE_SUBSCRIPT);
+    }
+    if matches.opt_present("enable-tasklists") {
+        opts.insert(Options::ENABLE_TASKLISTS);
+    }
+    if matches.opt_present("enable-smart-punctuation") {
+        opts.insert(Options::ENABLE_SMART_PUNCTUATION);
+    }
+    if matches.opt_present("enable-heading-attributes") {
+        opts.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+    }
+    if matches.opt_present("enable-metadata-blocks") {
+        opts.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+        opts.insert(Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS);
+    }
+    if matches.opt_present("enable-gfm") {
+        opts.insert(Options::ENABLE_GFM);
+    }
+    if matches.opt_present("enable-definition-list") {
+        opts.insert(Options::ENABLE_DEFINITION_LIST);
+    }
+    if matches.opt_present("enable-wikilinks") {
+        opts.insert(Options::ENABLE_WIKILINKS);
+    }
+
+    let mut input = String::new();
+    let mut broken_links = vec![];
+    if !&matches.free.is_empty() {
+        for filename in &matches.free {
+            let real_path = PathBuf::from(filename);
+            let mut f = File::open(&real_path).expect("file not found");
+            f.read_to_string(&mut input)
+                .expect("something went wrong reading the file");
+            if matches.opt_present("events") {
+                print_events(&input, opts, &mut broken_links);
+            } else if matches.opt_present("dry-run") {
+                dry_run(&input, opts, &mut broken_links);
+            } else {
+                pulldown_cmark(&input, opts, &mut broken_links);
+            }
+        }
+    } else {
+        let _ = io::stdin().lock().read_to_string(&mut input);
+        if matches.opt_present("events") {
+            print_events(&input, opts, &mut broken_links);
+        } else if matches.opt_present("dry-run") {
+            dry_run(&input, opts, &mut broken_links);
+        } else {
+            pulldown_cmark(&input, opts, &mut broken_links);
+        }
+    }
+
+    if matches.opt_present("reject-broken-links") && !broken_links.is_empty() {
+        eprintln!("Error: {} broken links:", broken_links.len());
+        for link in broken_links {
+            let start = link.span.start;
+            let end = link.span.end;
+            let reference = link.reference;
+            eprintln!("[{start}-{end}]: {reference}");
+        }
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+pub fn pulldown_cmark(input: &str, opts: Options, broken_links: &mut Vec<BrokenLink<'static>>) {
+    let mut p = Parser::new_with_broken_link_callback(
+        input,
+        opts,
+        Some(|link: BrokenLink<'_>| {
+            broken_links.push(link.into_static());
+            None
+        }),
+    );
+    let stdio = io::stdout();
+    let buffer = std::io::BufWriter::with_capacity(1024 * 1024, stdio.lock());
+    let _ = html::write_html_io(buffer, &mut p);
+}
+Run this with `cargo test --features gen-tests suite::wikilinks`
+
+# Wikilinks
+Shorthand link definitions for use in Markdown-based wikis. Syntax and design
+choices inspired heavily by 
+[Obsidian](https://obsidian.md/) and
+[commonmark-hs](https://github.com/jgm/commonmark-hs).
+
+A wikilink is defined within double brackets. The destination url of the
+resulting anchor is the text in the link.
+
+```````````````````````````````` example_wikilinks
+This is a [[WikiLink]].
+.
+<p>This is a <a href="WikiLink">WikiLink</a>.</p>
+````````````````````````````````
+
+```````````````````````````````` example_wikilinks
+This is a [[Main/WikiLink]].
+.
+<p>This is a <a href="Main/WikiLink">Main/WikiLink</a>.</p>
+````````````````````````````````
+
+Wikilinks take precedence over reference links:
+
+```````````````````````````````` example_wikilinks
+This is [[Ambiguous]].
+
+[Ambiguous]: https://example.com/
+.
+<p>This is <a href="Ambiguous">Ambiguous</a>.</p>
+````````````````````````````````
+
+However, they should not otherwise interfere with normal Markdown links:
+
+```````````````````````````````` example_wikilinks
+[[squid] calamari is considered a delicacy](https://en.wikipedia.org/wiki/Squid)
+
+[calamari [squid]](https://en.wikipedia.org/wiki/Squid)
+.
+<p>
+<a href="https://en.wikipedia.org/wiki/Squid">[squid] calamari is considered a delicacy</a>
+</p>
+<p>
+<a href="https://en.wikipedia.org/wiki/Squid">calamari [squid]</a>
+</p>
+````````````````````````````````
+
+They also take precedence over inline links:
+
+```````````````````````````````` example_wikilinks
+This is [also [[Ambiguous]]](https://example.com/).
+.
+<p>This is [also <a href="Ambiguous">Ambiguous</a>](https://example.com/).</p>
+````````````````````````````````
+
+Wikilinks, when enabled, may be used as an alternative to the autolink syntax;
+\<https://example.org/\>:
+
+```````````````````````````````` example_wikilinks
+<https://example.org/>
+
+[[https://example.org/]]
+.
+<p><a href="https://example.org/">https://example.org/</a></p>
+<p><a href="https://example.org/">https://example.org/</a></p>
+````````````````````````````````
+
+Wikilinks can have different display text through a utility called piping:
+
+```````````````````````````````` example_wikilinks
+This is [[WikiLink|a pothole]].
+.
+<p>This is <a href="WikiLink">a pothole</a>.</p>
+````````````````````````````````
+
+```````````````````````````````` example_wikilinks
+This is a [[WikiLink/In/A/Directory|WikiLink]].
+.
+<p>This is a <a href="WikiLink/In/A/Directory">WikiLink</a>.</p>
+````````````````````````````````
+
+Using this syntax, it is possible to show more Markdown in the text:
+
+```````````````````````````````` example_wikilinks
+This is [[WikiLink|a **strong** pothole]].
+.
+<p>This is <a href="WikiLink">a <strong>strong</strong> pothole</a>.</p>
+````````````````````````````````
+
+Or images:
+
+```````````````````````````````` example_wikilinks
+This is a cute dog, linked to the page "WikiLink"
+
+[[WikiLink|![dog](dog.png)]]
+.
+<p>This is a cute dog, linked to the page "WikiLink"</p>
+<p>
+<a href="WikiLink"><img src="dog.png" alt="dog" /></a>
+</p>
+````````````````````````````````
+
+With nested wikilinks, the deepest one takes precedence:
+
+```````````````````````````````` example_wikilinks
+[[WikiLink|[[Fish]]]]
+.
+<p>[[WikiLink|<a href="Fish">Fish</a>]]</p>
+````````````````````````````````
+
+Links inside wikilinks will take precedence:
+
+```````````````````````````````` example_wikilinks
+[[WikiLink|[cat](cat.html)]]
+.
+<p>[[WikiLink|<a href="cat.html">cat</a>]]</p>
+````````````````````````````````
+
+A similar looking syntax can be used to embed images:
+
+```````````````````````````````` example_wikilinks
+This is a cute dog.
+
+![[dog.png]]
+.
+<p>This is a cute dog.</p>
+<p>
+<img src="dog.png" alt="dog.png" />
+</p>
+````````````````````````````````
+
+In this syntax, the pipe operator serves as a way to define alt text.
+
+```````````````````````````````` example_wikilinks
+![[dog.png|a cute dog]]
+.
+<p><img src="dog.png" alt="a cute dog" /></p>
+````````````````````````````````
+
+Wikilinks cannot be empty. They will render as-is.
+
+```````````````````````````````` example_wikilinks
+]] [[]] [[|]] [[|Symbol]] [[
+.
+<p>]] [[]] [[|]] [[|Symbol]] [[</p>
+````````````````````````````````
+
+Other interactions wikilinks have with other Markdown syntax:
+
+```````````````````````````````` example_wikilinks
+[inline link]([[url]])
+.
+<p><a href="%5B%5Burl%5D%5D">inline link</a></p>
+````````````````````````````````
+
+```````````````````````````````` example_wikilinks
+[inline link]([[url)]]
+.
+<p><a href="%5B%5Burl">inline link</a>]]</p>
+````````````````````````````````
+
+```````````````````````````````` example_wikilinks
+`[[code]]`
+.
+<p><code>[[code]]</code></p>
+````````````````````````````````
+
+```````````````````````````````` example_wikilinks
+emphasis **cross [[over** here]]

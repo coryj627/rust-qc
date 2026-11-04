@@ -1,0 +1,1056 @@
+
+//! Tree-based two pass parser.
+
+use std::cmp::{max, min};
+use std::collections::{HashMap, VecDeque};
+use std::iter::FusedIterator;
+use std::num::NonZeroUsize;
+use std::ops::{Index, Range};
+
+use unicase::UniCase;
+
+use crate::firstpass::run_first_pass;
+use crate::linklabel::{scan_link_label_rest, FootnoteLabel, LinkLabel, ReferenceLabel};
+use crate::scanners::*;
+use crate::strings::CowStr;
+use crate::tree::{Tree, TreeIndex};
+use crate::{
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, LinkType, MetadataBlockKind,
+    Options, Tag, TagEnd,
+};
+
+// Allowing arbitrary depth nested parentheses inside link destinations
+// can create denial of service vulnerabilities if we're not careful.
+// The simplest countermeasure is to limit their depth, which is
+// explicitly allowed by the spec as long as the limit is at least 3:
+// https://spec.commonmark.org/0.29/#link-destination
+pub(crate) const LINK_MAX_NESTED_PARENS: usize = 32;
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Item {
+    pub start: usize,
+    pub end: usize,
+    pub body: ItemBody,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy, Default)]
+pub(crate) enum ItemBody {
+    // These are possible inline items, need to be resolved in second pass.
+
+    // repeats, can_open, can_close
+    MaybeEmphasis(usize, bool, bool),
+    // can_open, can_close, brace context
+    MaybeMath(bool, bool, u8),
+    // quote byte, can_open, can_close
+    MaybeSmartQuote(u8, bool, bool),
+    MaybeCode(usize, bool), // number of backticks, preceded by backslash
+    MaybeHtml,
+    MaybeLinkOpen,
+    // bool indicates whether or not the preceding section could be a reference
+    MaybeLinkClose(bool),
+    MaybeImage,
+
+    // These are inline items after resolution.
+    Emphasis,
+    Strong,
+    Strikethrough,
+    Superscript,
+    Subscript,
+    Math(CowIndex, bool), // true for display math
+    Code(CowIndex),
+    Link(LinkIndex),
+    Image(LinkIndex),
+    FootnoteReference(CowIndex),
+    TaskListMarker(bool), // true for checked
+
+    // These are also inline items.
+    InlineHtml,
+    OwnedInlineHtml(CowIndex),
+    SynthesizeText(CowIndex),
+    SynthesizeChar(char),
+    Html,
+    Text {
+        backslash_escaped: bool,
+    },
+    SoftBreak,
+    // true = is backlash
+    HardBreak(bool),
+
+    // Dummy node at the top of the tree - should not be used otherwise!
+    #[default]
+    Root,
+
+    // These are block items.
+    Paragraph,
+    TightParagraph,
+    Rule,
+    Heading(HeadingLevel, Option<HeadingIndex>), // heading level
+    FencedCodeBlock(CowIndex),
+    IndentCodeBlock,
+    HtmlBlock,
+    BlockQuote(Option<BlockQuoteKind>),
+    List(bool, u8, u64), // is_tight, list character, list start index
+    ListItem(usize),     // indent level
+    FootnoteDefinition(CowIndex),
+    MetadataBlock(MetadataBlockKind),
+
+    // Definition lists
+    DefinitionList(bool), // is_tight
+    // gets turned into either a paragraph or a definition list title,
+    // depending on whether there's a definition after it
+    MaybeDefinitionListTitle,
+    DefinitionListTitle,
+    DefinitionListDefinition(usize),
+
+    // Tables
+    Table(AlignmentIndex),
+    TableHead,
+    TableRow,
+    TableCell,
+}
+
+impl ItemBody {
+    fn is_maybe_inline(&self) -> bool {
+        use ItemBody::*;
+        matches!(
+            *self,
+            MaybeEmphasis(..)
+                | MaybeMath(..)
+                | MaybeSmartQuote(..)
+                | MaybeCode(..)
+                | MaybeHtml
+                | MaybeLinkOpen
+                | MaybeLinkClose(..)
+                | MaybeImage
+        )
+    }
+    fn is_inline(&self) -> bool {
+        use ItemBody::*;
+        matches!(
+            *self,
+            MaybeEmphasis(..)
+                | MaybeMath(..)
+                | MaybeSmartQuote(..)
+                | MaybeCode(..)
+                | MaybeHtml
+                | MaybeLinkOpen
+                | MaybeLinkClose(..)
+                | MaybeImage
+                | Emphasis
+                | Strong
+                | Strikethrough
+                | Math(..)
+                | Code(..)
+                | Link(..)
+                | Image(..)
+                | FootnoteReference(..)
+                | TaskListMarker(..)
+                | InlineHtml
+                | OwnedInlineHtml(..)
+                | SynthesizeText(..)
+                | SynthesizeChar(..)
+                | Html
+                | Text { .. }
+                | SoftBreak
+                | HardBreak(..)
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct BrokenLink<'a> {
+    pub span: std::ops::Range<usize>,
+    pub link_type: LinkType,
+    pub reference: CowStr<'a>,
+}
+
+/// Markdown event iterator.
+pub struct Parser<'input, F = DefaultBrokenLinkCallback> {
+    text: &'input str,
+    options: Options,
+    tree: Tree<Item>,
+    allocs: Allocations<'input>,
+    broken_link_callback: Option<F>,
+    html_scan_guard: HtmlScanGuard,
+
+    // https://github.com/pulldown-cmark/pulldown-cmark/issues/844
+    // Consider this example:
+    //
+    //     [x]: xxx...
+    //     [x]
+    //     [x]
+    //     [x]
+    //
+    // Which expands to this HTML:
+    //
+    //     <a href="xxx...">x</a>
+    //     <a href="xxx...">x</a>
+    //     <a href="xxx...">x</a>
+    //
+    // This is quadratic growth, because it's filling in the area of a square.
+    // To prevent this, track how much it's expanded and limit it.
+    link_ref_expansion_limit: usize,
+
+    // used by inline passes. store them here for reuse
+    inline_stack: InlineStack,
+    link_stack: LinkStack,
+    wikilink_stack: LinkStack,
+    code_delims: CodeDelims,
+    math_delims: MathDelims,
+}
+
+impl<'input, F> std::fmt::Debug for Parser<'input, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Only print the fields that have public types.
+        f.debug_struct("Parser")
+            .field("text", &self.text)
+            .field("options", &self.options)
+            .field(
+                "broken_link_callback",
+                &self.broken_link_callback.as_ref().map(|_| ..),
+            )
+            .finish()
+    }
+}
+
+impl<'a> BrokenLink<'a> {
+    /// Moves the link into version with a static lifetime.
+    ///
+    /// The `reference` member is cloned to a Boxed or Inline version.
+    pub fn into_static(self) -> BrokenLink<'static> {
+        BrokenLink {
+            span: self.span.clone(),
+            link_type: self.link_type,
+            reference: self.reference.into_string().into(),
+        }
+    }
+}
+
+impl<'input> Parser<'input, DefaultBrokenLinkCallback> {
+    /// Creates a new event iterator for a markdown string without any options enabled.
+    pub fn new(text: &'input str) -> Self {
+        Self::new_ext(text, Options::empty())
+    }
+
+    /// Creates a new event iterator for a markdown string with given options.
+    pub fn new_ext(text: &'input str, options: Options) -> Self {
+        Self::new_with_broken_link_callback(text, options, None)
+    }
+}
+
+impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
+    /// In case the parser encounters any potential links that have a broken
+    /// reference (e.g `[foo]` when there is no `[foo]: ` entry at the bottom)
+    /// the provided callback will be called with the reference name,
+    /// and the returned pair will be used as the link URL and title if it is not
+    /// `None`.
+    pub fn new_with_broken_link_callback(
+        text: &'input str,
+        options: Options,
+        broken_link_callback: Option<F>,
+    ) -> Self {
+        let (mut tree, allocs) = run_first_pass(text, options);
+        tree.reset();
+        let inline_stack = Default::default();
+        let link_stack = Default::default();
+        let wikilink_stack = Default::default();
+        let html_scan_guard = Default::default();
+        Parser {
+            text,
+            options,
+            tree,
+            allocs,
+            broken_link_callback,
+            inline_stack,
+            link_stack,
+            wikilink_stack,
+            html_scan_guard,
+            // always allow 100KiB
+            link_ref_expansion_limit: text.len().max(100_000),
+            code_delims: CodeDelims::new(),
+            math_delims: MathDelims::new(),
+        }
+    }
+
+    /// Returns a reference to the internal `RefDefs` object, which provides access
+    /// to the internal map of reference definitions.
+    pub fn reference_definitions(&self) -> &RefDefs<'_> {
+        &self.allocs.refdefs
+    }
+
+    /// Use a link label to fetch a type, url, and title.
+    ///
+    /// This function enforces the [`link_ref_expansion_limit`].
+    /// If it returns Some, it also consumes some of the fuel.
+    /// If we're out of fuel, it immediately returns None.
+    ///
+    /// The URL and title are found in the [`RefDefs`] map.
+    /// If they're not there, and a callback was provided by the user,
+    /// the [`broken_link_callback`] will be invoked and given the opportunity
+    /// to provide a fallback.
+    ///
+    /// The link type (that's "link" or "image") depends on the usage site, and
+    /// is provided by the caller of this function.
+    /// This function returns a new one because, if it has to invoke a callback
+    /// to find the information, the link type is [mapped to an unknown type].
+    ///
+    /// [mapped to an unknown type]: crate::LinkType::to_unknown
+    /// [`link_ref_expansion_limit`]: Self::link_ref_expansion_limit
+    /// [`broken_link_callback`]: Self::broken_link_callback
+    fn fetch_link_type_url_title(
+        &mut self,
+        link_label: CowStr<'input>,
+        span: Range<usize>,
+        link_type: LinkType,
+    ) -> Option<(LinkType, CowStr<'input>, CowStr<'input>)> {
+        if self.link_ref_expansion_limit == 0 {
+            return None;
+        }
+
+        let (link_type, url, title) = self
+            .allocs
+            .refdefs
+            .get(link_label.as_ref())
+            .map(|matching_def| {
+                // found a matching definition!
+                let title = matching_def
+                    .title
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| "".into());
+                let url = matching_def.dest.clone();
+                (link_type, url, title)
+            })
+            .or_else(|| {
+                match self.broken_link_callback.as_mut() {
+                    Some(callback) => {
+                        // Construct a BrokenLink struct, which will be passed to the callback
+                        let broken_link = BrokenLink {
+                            span,
+                            link_type,
+                            reference: link_label,
+// Copyright 2018 Google LLC
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+
+//! Link label parsing and matching.
+
+use unicase::UniCase;
+
+use crate::scanners::{is_ascii_punctuation, is_ascii_whitespace, scan_eol};
+use crate::strings::CowStr;
+
+#[derive(Debug)]
+pub(crate) enum ReferenceLabel<'a> {
+    Link(CowStr<'a>),
+    Footnote(CowStr<'a>),
+}
+
+pub(crate) type LinkLabel<'a> = UniCase<CowStr<'a>>;
+
+pub(crate) type FootnoteLabel<'a> = UniCase<CowStr<'a>>;
+
+/// Assumes the opening bracket has already been scanned.
+/// The line break handler determines what happens when a linebreak
+/// is found. It is passed the bytes following the line break and
+/// either returns `Some(k)`, where `k` is the number of bytes to skip,
+/// or `None` to abort parsing the label.
+/// Returns the number of bytes read (including closing bracket) and label on success.
+pub(crate) fn scan_link_label_rest<'t>(
+    text: &'t str,
+    linebreak_handler: &dyn Fn(&[u8]) -> Option<usize>,
+    is_in_table: bool,
+) -> Option<(usize, CowStr<'t>)> {
+    let bytes = text.as_bytes();
+    let mut ix = 0;
+    let mut only_white_space = true;
+    let mut codepoints = 0;
+    // no worries, doesn't allocate until we push things onto it
+    let mut label = String::new();
+    let mut mark = 0;
+
+    loop {
+        if codepoints >= 1000 {
+            return None;
+        }
+        match *bytes.get(ix)? {
+            b'[' => return None,
+            b']' => break,
+            // Backslash escapes in link references are normally untouched, but
+            // tables are an exception, because they're parsed as-if the tables
+            // were parsed in a discrete pass, changing `\|` to `|`, and then
+            // passing the changed string to the inline parser.
+            b'|' if is_in_table && ix != 0 && bytes.get(ix - 1) == Some(&b'\\') => {
+                // only way to reach this spot is to have `\\|` (even number of `\` before `|`)
+                label.push_str(&text[mark..ix - 1]);
+                label.push('|');
+                ix += 1;
+                only_white_space = false;
+                mark = ix;
+            }
+            b'\\' if is_in_table && bytes.get(ix + 1) == Some(&b'|') => {
+                // only way to reach this spot is to have `\|` (odd number of `\` before `|`)
+                label.push_str(&text[mark..ix]);
+                label.push('|');
+                ix += 2;
+                codepoints += 1;
+                only_white_space = false;
+                mark = ix;
+            }
+            b'\\' if is_ascii_punctuation(*bytes.get(ix + 1)?) => {
+                ix += 2;
+                codepoints += 2;
+                only_white_space = false;
+            }
+            b if is_ascii_whitespace(b) => {
+                // normalize labels by collapsing whitespaces, including linebreaks
+                let mut whitespaces = 0;
+                let mut linebreaks = 0;
+                let whitespace_start = ix;
+
+                while ix < bytes.len() && is_ascii_whitespace(bytes[ix]) {
+                    if let Some(eol_bytes) = scan_eol(&bytes[ix..]) {
+                        linebreaks += 1;
+                        if linebreaks > 1 {
+                            return None;
+                        }
+                        ix += eol_bytes;
+                        ix += linebreak_handler(&bytes[ix..])?;
+                        whitespaces += 2; // indicate that we need to replace
+                    } else {
+                        whitespaces += if bytes[ix] == b' ' { 1 } else { 2 };
+                        ix += 1;
+                    }
+                }
+                if whitespaces > 1 {
+                    label.push_str(&text[mark..whitespace_start]);
+                    label.push(' ');
+                    mark = ix;
+                    codepoints += ix - whitespace_start;
+                } else {
+                    codepoints += 1;
+                }
+            }
+            b => {
+                only_white_space = false;
+                ix += 1;
+                if b & 0b1000_0000 != 0 {
+                    codepoints += 1;
+                }
+            }
+        }
+    }
+
+    if only_white_space {
+        None
+    } else {
+        let cow = if mark == 0 {
+            let asciiws = &[' ', '\r', '\n', '\t'][..];
+            text[..ix].trim_matches(asciiws).into()
+        } else {
+            label.push_str(&text[mark..ix]);
+            while matches!(
+                label.as_bytes().last(),
+                Some(&b' ' | &b'\r' | &b'\n' | &b'\t')
+            ) {
+                label.pop();
+            }
+            while matches!(
+                label.as_bytes().first(),
+                Some(&b' ' | &b'\r' | &b'\n' | &b'\t')
+            ) {
+                label.remove(0);
+            }
+            label.into()
+        };
+        Some((ix + 1, cow))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::scan_link_label_rest;
+
+    #[test]
+    fn whitespace_normalization() {
+        let input = "«\t\tBlurry Eyes\t\t»][blurry_eyes]";
+        let expected_output = "« Blurry Eyes »"; // regular spaces!
+
+        let (_bytes, normalized_label) = scan_link_label_rest(input, &|_| None, false).unwrap();
+        assert_eq!(expected_output, normalized_label.as_ref());
+    }
+
+    #[test]
+    fn return_carriage_linefeed_ok() {
+        let input = "hello\r\nworld\r\n]";
+        assert!(scan_link_label_rest(input, &|_| Some(0), false).is_some());
+    }
+}
+// Copyright 2015 Google Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+
+//! Command line tool to exercise pulldown-cmark.
+
+#![forbid(unsafe_code)]
+
+use pulldown_cmark::{html, BrokenLink, Options, Parser};
+
+use std::env;
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::PathBuf;
+
+fn dry_run(text: &str, opts: Options, broken_links: &mut Vec<BrokenLink<'static>>) {
+    let p = Parser::new_with_broken_link_callback(
+        text,
+        opts,
+        Some(|link: BrokenLink<'_>| {
+            broken_links.push(link.into_static());
+            None
+        }),
+    );
+    let count = p.count();
+    println!("{} events", count);
+}
+
+fn print_events(text: &str, opts: Options, broken_links: &mut Vec<BrokenLink<'static>>) {
+    let parser = Parser::new_with_broken_link_callback(
+        text,
+        opts,
+        Some(|link: BrokenLink<'_>| {
+            broken_links.push(link.into_static());
+            None
+        }),
+    )
+    .into_offset_iter();
+    for (event, range) in parser {
+        println!("{:?}: {:?}", range, event);
+    }
+    println!("EOF");
+}
+
+fn brief(program: &str) -> String {
+    format!(
+        "Usage: {} [options]\n\n{}",
+        program, "Reads markdown from file or standard input and emits HTML.",
+    )
+}
+
+pub fn main() -> std::io::Result<()> {
+    let args: Vec<_> = env::args().collect();
+    let mut opts = getopts::Options::new();
+    opts.optflag("h", "help", "this help message");
+    opts.optflag("d", "dry-run", "dry run, produce no output");
+    opts.optflag("e", "events", "print event sequence instead of rendering");
+    // Check for conflicting short flags when adding a new one!
+    opts.optflag("T", "enable-tables", "enable GitHub-style tables");
+    opts.optflag("m", "enable-math", "enable LaTeX-style math");
+    opts.optflag("F", "enable-footnotes", "enable GitHub-style footnotes");
+    opts.optflag(
+        "f",
+        "enable-old-footnotes",
+        "enable Hoedown-style footnotes",
+    );
+    opts.optflag(
+        "S",
+        "enable-strikethrough",
+        "enable GitHub-style strikethrough",
+    );
+    opts.optflag("U", "enable-superscript", "enable superscript");
+    opts.optflag("B", "enable-subscript", "enable subscript");
+    opts.optflag("L", "enable-tasklists", "enable GitHub-style task lists");
+    opts.optflag("P", "enable-smart-punctuation", "enable smart punctuation");
+    opts.optflag(
+        "H",
+        "enable-heading-attributes",
+        "enable heading attributes",
+    );
+    opts.optflag("M", "enable-metadata-blocks", "enable metadata blocks");
+    opts.optflag(
+        "R",
+        "reject-broken-links",
+        "fail if input file has broken links",
+    );
+    opts.optflag("G", "enable-gfm", "enable misc GFM features");
+    opts.optflag(
+        "D",
+        "enable-definition-list",
+        "enable Commonmark-HS-Extensions compatible definition lists",
+    );
+    opts.optflag("W", "enable-wikilinks", "enable wikilinks");
+
+    let matches = match opts.parse(&args[1..]) {
+        Ok(m) => m,
+        Err(f) => {
+            eprintln!("{}\n{}", f, opts.usage(&brief(&args[0])));
+            std::process::exit(1);
+        }
+    };
+    if matches.opt_present("help") {
+        println!("{}", opts.usage(&brief(&args[0])));
+        return Ok(());
+    }
+    let mut opts = Options::empty();
+    if matches.opt_present("enable-tables") {
+        opts.insert(Options::ENABLE_TABLES);
+    }
+    if matches.opt_present("enable-math") {
+        opts.insert(Options::ENABLE_MATH);
+    }
+    if matches.opt_present("enable-footnotes") {
+        opts.insert(Options::ENABLE_FOOTNOTES);
+    }
+    if matches.opt_present("enable-old-footnotes") {
+        opts.insert(Options::ENABLE_OLD_FOOTNOTES);
+    }
+    if matches.opt_present("enable-strikethrough") {
+        opts.insert(Options::ENABLE_STRIKETHROUGH);
+    }
+    if matches.opt_present("enable-superscript") {
+        opts.insert(Options::ENABLE_SUPERSCRIPT);
+    }
+    if matches.opt_present("enable-subscript") {
+        opts.insert(Options::ENABLE_SUBSCRIPT);
+    }
+    if matches.opt_present("enable-tasklists") {
+        opts.insert(Options::ENABLE_TASKLISTS);
+    }
+    if matches.opt_present("enable-smart-punctuation") {
+        opts.insert(Options::ENABLE_SMART_PUNCTUATION);
+    }
+    if matches.opt_present("enable-heading-attributes") {
+        opts.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+    }
+    if matches.opt_present("enable-metadata-blocks") {
+        opts.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+        opts.insert(Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS);
+    }
+    if matches.opt_present("enable-gfm") {
+        opts.insert(Options::ENABLE_GFM);
+    }
+    if matches.opt_present("enable-definition-list") {
+        opts.insert(Options::ENABLE_DEFINITION_LIST);
+    }
+    if matches.opt_present("enable-wikilinks") {
+        opts.insert(Options::ENABLE_WIKILINKS);
+    }
+
+    let mut input = String::new();
+    let mut broken_links = vec![];
+    if !&matches.free.is_empty() {
+        for filename in &matches.free {
+            let real_path = PathBuf::from(filename);
+            let mut f = File::open(&real_path).expect("file not found");
+            f.read_to_string(&mut input)
+                .expect("something went wrong reading the file");
+            if matches.opt_present("events") {
+                print_events(&input, opts, &mut broken_links);
+            } else if matches.opt_present("dry-run") {
+                dry_run(&input, opts, &mut broken_links);
+            } else {
+                pulldown_cmark(&input, opts, &mut broken_links);
+            }
+        }
+    } else {
+        let _ = io::stdin().lock().read_to_string(&mut input);
+        if matches.opt_present("events") {
+            print_events(&input, opts, &mut broken_links);
+        } else if matches.opt_present("dry-run") {
+            dry_run(&input, opts, &mut broken_links);
+        } else {
+            pulldown_cmark(&input, opts, &mut broken_links);
+        }
+    }
+
+    if matches.opt_present("reject-broken-links") && !broken_links.is_empty() {
+        eprintln!("Error: {} broken links:", broken_links.len());
+        for link in broken_links {
+            let start = link.span.start;
+            let end = link.span.end;
+            let reference = link.reference;
+            eprintln!("[{start}-{end}]: {reference}");
+        }
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+pub fn pulldown_cmark(input: &str, opts: Options, broken_links: &mut Vec<BrokenLink<'static>>) {
+    let mut p = Parser::new_with_broken_link_callback(
+        input,
+        opts,
+        Some(|link: BrokenLink<'_>| {
+            broken_links.push(link.into_static());
+            None
+        }),
+    );
+    let stdio = io::stdout();
+    let buffer = std::io::BufWriter::with_capacity(1024 * 1024, stdio.lock());
+    let _ = html::write_html_io(buffer, &mut p);
+}
+#![cfg(feature = "html")]
+
+use pulldown_cmark::{Options, Parser};
+
+#[rustfmt::skip]
+mod suite;
+
+#[inline(never)]
+pub fn test_markdown_html(
+    input: &str,
+    output: &str,
+    smart_punct: bool,
+    metadata_blocks: bool,
+    old_footnotes: bool,
+    subscript: bool,
+    wikilinks: bool,
+) {
+    let mut s = String::new();
+
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_MATH);
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_SUPERSCRIPT);
+    if wikilinks {
+        opts.insert(Options::ENABLE_WIKILINKS);
+    }
+    if subscript {
+        opts.insert(Options::ENABLE_SUBSCRIPT);
+    }
+    opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_GFM);
+    if old_footnotes {
+        opts.insert(Options::ENABLE_OLD_FOOTNOTES);
+    } else {
+        opts.insert(Options::ENABLE_FOOTNOTES);
+    }
+    if metadata_blocks {
+        opts.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+        opts.insert(Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS);
+    }
+    if smart_punct {
+        opts.insert(Options::ENABLE_SMART_PUNCTUATION);
+    }
+    opts.insert(Options::ENABLE_HEADING_ATTRIBUTES);
+    opts.insert(Options::ENABLE_DEFINITION_LIST);
+
+    let p = Parser::new_ext(input, opts);
+    pulldown_cmark::html::push_html(&mut s, p);
+
+    // normalizing the HTML using html5ever may hide actual errors
+    // assert_eq!(html_standardize(output), html_standardize(&s));
+    assert_eq!(html_standardize(output), html_standardize(&s));
+}
+
+fn html_standardize(s: &str) -> String {
+    s.replace("<br>", "<br />")
+        .replace("<br/>", "<br />")
+        .replace("<hr>", "<hr />")
+        .replace("<hr/>", "<hr />")
+        // permit extra or missing line breaks only between tags
+        .replace(">\n<", "><")
+}
+# Adding Extensions
+
+This guide explains how to add new extensions to pulldown-cmark. Extensions allow you to parse additional Markdown syntax beyond the CommonMark specification.
+
+If you are looking to get your extension merged upstream, it's a good idea to discuss it with the maintainers before getting to work.
+
+## Overview
+
+Adding an extension typically requires:
+
+1. Adding a feature flag in the `Options` bitflags
+2. Adding any new data structures needed to represent the extension's AST nodes
+3. Implementing block parsing in `firstpass.rs` if the extension adds block-level elements
+4. Implementing inline parsing in `parse.rs` if the extension adds inline elements
+5. Adding HTML rendering support in `html.rs`
+6. Adding tests to verify the extension works correctly
+
+Let's walk through each of these steps in detail.
+
+## Adding the Feature Flag
+
+Extensions are controlled via the `Options` bitflags defined in `lib.rs`. Add a new constant using the next available bit:
+
+```rust
+bitflags::bitflags! {
+    pub struct Options: u32 {
+        // Existing options...
+        const ENABLE_MY_EXTENSION = 1 << N; // N is next available bit
+    }
+}
+```
+
+This allows users to enable your extension with:
+
+```rust
+let mut options = Options::empty();
+options.insert(Options::ENABLE_MY_EXTENSION);
+```
+
+## Adding AST Data Structures
+
+Extensions often need new AST node types to represent their syntax. These are defined in several places:
+
+- `Tag` enum in `lib.rs` for container elements 
+- `TagEnd` enum in `lib.rs` for end tags
+- `Event` enum in `lib.rs` for new event types
+- `ItemBody` enum in `parse.rs` for internal AST nodes
+
+For example, the tables extension defines:
+
+```rust
+// In lib.rs
+pub enum Tag<'a> {
+    // ...
+    Table(Vec<Alignment>),
+    TableHead,
+    TableRow,
+    TableCell,
+}
+
+// In parse.rs
+pub(crate) enum ItemBody {
+    // ...
+    Table(AlignmentIndex),
+    TableHead,
+    TableRow, 
+    TableCell,
+}
+```
+
+Follow existing patterns for naming and make sure to implement all the necessary traits (`Debug`, `Clone`, etc.).
+
+## Implementing Block Parsing
+
+If your extension adds block-level elements (like tables, footnotes, etc.), you'll need to:
+
+1. Add scanning functions in `scanners.rs` to detect your syntax
+2. Add parsing logic in `firstpass.rs` to build the block structure
+3. Update the `scan_containers()` function if your blocks can be nested
+
+For example, the tables extension adds:
+
+```rust
+// In scanners.rs
+pub(crate) fn scan_table_head(data: &[u8]) -> (usize, Vec<Alignment>) {
+    // Scan table header row syntax...
+}
+
+// In firstpass.rs 
+impl<'a> FirstPass<'a, 'b> {
+    fn parse_table(&mut self, ...) -> Option<usize> {
+        // Parse table structure...
+    }
+}
+```
+
+Follow these guidelines when implementing block parsing:
+
+- Use the `scan_` prefix for low-level scanning functions
+- Make scanning functions return the number of bytes consumed
+- Handle edge cases like empty lines and indentation
+- Properly integrate with the container block structure
+- Follow the parsing strategies used by existing extensions
+
+## Implementing Inline Parsing
+
+If your extension adds inline elements (like strikethrough, math, etc.), you'll need to:
+
+1. Add marker detection in `parse_line()` in `firstpass.rs`
+2. Add opener/closer matching logic in `handle_inline()` 
+3. Add conversion from internal AST to events
+
+For example, the strikethrough extension adds:
+
+```rust
+// In firstpass.rs
+impl<'a, 'b> FirstPass<'a, 'b> {
+    fn parse_line(&mut self, ..) -> (usize, Option<Item>) {
+        match byte {
+            b'~' => {
+                // Handle tilde markers...
+            }
+        }
+    }
+}
+```
+
+Inline parsing tips:
+
+- Use the `MaybeX` pattern for markers that need matching
+- Handle backslash escaping correctly
+- Support nested inline elements 
+- Follow CommonMark rules for [flanking](https://spec.commonmark.org/0.31.2/#delimiter-run) conditions
+- Reuse existing inline parsing infrastructure
+
+## Adding HTML Rendering
+
+HTML rendering is handled in `html.rs`. You'll need to:
+
+1. Add HTML tag generation for your new elements
+2. Update the `body_to_tag_end()` and `item_to_event()` functions
+3. Handle any special rendering requirements
+
+For example:
+
+```rust 
+// In html.rs
+impl<'a, I, W> HtmlWriter<'a, I, W> {
+    fn start_tag(&mut self, tag: Tag<'a>) -> Result<(), W::Error> {
+        match tag {
+            Tag::MyExtension => {
+                self.write("<my-extension>")
+            }
+            // ...
+        }
+    }
+}
+```
+
+HTML rendering tips:
+
+- Follow HTML5 standards
+- Handle escaping properly
+- Consider accessibility 
+- Test in different contexts
+
+## Testing
+
+Add tests to verify your extension works correctly. pulldown-cmark is principally tested with spec documents, which are Markdown files containing test cases. Each extension should have a file under `specs/` explaining how the feature works along with test cases. Have a look at the existing specs for inspiration.
+Other kinds of testing you should consider:
+
+1. Unit tests alongside implementation
+2. Integration tests in `tests/`
+3. round-trip tests
+4. Edge case tests
+5. Interaction tests with other extensions
+
+For example:
+
+```rust
+#[test]
+fn test_my_extension() {
+    let input = "Test my extension syntax";
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_MY_EXTENSION);
+    let parser = Parser::new_ext(input, options);
+    // Test parsing result...
+}
+```
+
+Testing tips:
+
+- Test both positive and negative cases
+- Test interactions with other syntax
+- Test error conditions
+- Test HTML output
+- Test with different options enabled
+- Run the different fuzzers to find crashes (`fuzz/` parse target) and performance issues (`dos-fuzzer/`)
+
+## Example: Adding Subscript Extension
+
+Here's a complete example of adding a hypothetical subscript extension that uses `~text~` for subscript:
+
+```rust
+// In lib.rs
+bitflags::bitflags! {
+    pub struct Options: u32 {
+        const ENABLE_SUBSCRIPT = 1 << 15;
+    }
+}
+
+pub enum Tag<'a> {
+    Subscript,
+}
+
+// In parse.rs
+pub(crate) enum ItemBody {
+    MaybeSubscript(usize),  // For opener/closer matching
+    Subscript,
+}
+
+impl<'a, F> Parser<'a, F> {
+    fn parse_line(&mut self, ..) -> (usize, Option<Item>) {
+        match byte {
+            b'~' => {
+                // Handle subscript markers...
+            }
+        }
+    }
+}
+
+// In html.rs
+impl<'a, I, W> HtmlWriter<'a, I, W> {
+    fn start_tag(&mut self, tag: Tag<'a>) -> Result<(), W::Error> {
+        match tag {
+            Tag::Subscript => self.write("<sub>"),
+        }
+    }
+}
+```
+
+## Tips and Best Practices
+
+- Study existing extensions for patterns to follow
+- Keep parsing efficient 
+- Handle edge cases gracefully
+- Document your extension thoroughly
+- Consider adding feature flags for subfeatures
+- Follow CommonMark principles where possible
+- Test extensively
+- Consider compatibility with other extensions
+
+## Common Pitfalls
+
+- Not handling nested elements correctly
+- Improper escaping in HTML output
+- Not following CommonMark precedence rules
+- Inefficient parsing of large documents
+- Poor error recovery
+- Not handling edge cases
+- Breaking existing syntax
+- Not documenting limitations
+
+## Further Reading
+
+- [CommonMark Spec](https://spec.commonmark.org/)
+- [GitHub Flavored Markdown Spec](https://github.github.com/gfm/)
+- [Existing pulldown-cmark extension specs](https://pulldown-cmark.github.io/pulldown-cmark/specs.html)
+- [HTML5 Spec](https://html.spec.whatwg.org/)

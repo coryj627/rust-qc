@@ -1,0 +1,839 @@
+use bytes::Bytes;
+use rand::Rng;
+use tracing::{debug, trace, trace_span};
+
+use super::{Connection, SentFrames, spaces::SentPacket};
+use crate::{
+    ConnectionId, Instant, TransportError, TransportErrorCode,
+    connection::ConnectionSide,
+    frame::{self, Close},
+    packet::{FIXED_BIT, Header, InitialHeader, LongType, PacketNumber, PartialEncode, SpaceId},
+};
+
+pub(super) struct PacketBuilder {
+    pub(super) datagram_start: usize,
+    pub(super) space: SpaceId,
+    pub(super) partial_encode: PartialEncode,
+    pub(super) ack_eliciting: bool,
+    pub(super) exact_number: u64,
+    pub(super) short_header: bool,
+    /// Smallest absolute position in the associated buffer that must be occupied by this packet's
+    /// frames
+    pub(super) min_size: usize,
+    /// Largest absolute position in the associated buffer that may be occupied by this packet's
+    /// frames
+    pub(super) max_size: usize,
+    pub(super) tag_len: usize,
+    pub(super) _span: tracing::span::EnteredSpan,
+}
+
+impl PacketBuilder {
+    /// Write a new packet header to `buffer` and determine the packet's properties
+    ///
+    /// Marks the connection drained and returns `None` if the confidentiality limit would be
+    /// violated.
+    pub(super) fn new(
+        now: Instant,
+        space_id: SpaceId,
+        dst_cid: ConnectionId,
+        buffer: &mut Vec<u8>,
+        buffer_capacity: usize,
+        datagram_start: usize,
+        ack_eliciting: bool,
+        conn: &mut Connection,
+    ) -> Option<Self> {
+        let version = conn.version;
+        // Initiate key update if we're approaching the confidentiality limit
+        let sent_with_keys = conn.spaces[space_id].sent_with_keys;
+        if space_id == SpaceId::Data {
+            if sent_with_keys >= conn.key_phase_size {
+                debug!("routine key update due to phase exhaustion");
+                conn.force_key_update();
+            }
+        } else {
+            let confidentiality_limit = conn.spaces[space_id]
+                .crypto
+                .as_ref()
+                .map_or_else(
+                    || &conn.zero_rtt_crypto.as_ref().unwrap().packet,
+                    |keys| &keys.packet.local,
+                )
+                .confidentiality_limit();
+            if sent_with_keys.saturating_add(1) == confidentiality_limit {
+                // We still have time to attempt a graceful close
+                conn.close_inner(
+                    now,
+                    Close::Connection(frame::ConnectionClose {
+                        error_code: TransportErrorCode::AEAD_LIMIT_REACHED,
+                        frame_type: None,
+                        reason: Bytes::from_static(b"confidentiality limit reached"),
+                    }),
+                )
+            } else if sent_with_keys > confidentiality_limit {
+                // Confidentiality limited violated and there's nothing we can do
+                conn.kill(
+                    TransportError::AEAD_LIMIT_REACHED("confidentiality limit reached").into(),
+                );
+                return None;
+            }
+        }
+
+        let space = &mut conn.spaces[space_id];
+        let exact_number = match space_id {
+            SpaceId::Data => conn.packet_number_filter.allocate(&mut conn.rng, space),
+            _ => space.get_tx_number(),
+        };
+
+        let span = trace_span!("send", space = ?space_id, pn = exact_number).entered();
+
+        let number = PacketNumber::new(exact_number, space.largest_acked_packet.unwrap_or(0));
+        let header = match space_id {
+            SpaceId::Data if space.crypto.is_some() => Header::Short {
+                dst_cid,
+                number,
+                spin: if conn.spin_enabled {
+                    conn.spin
+                } else {
+                    conn.rng.random()
+                },
+                key_phase: conn.key_phase,
+            },
+            SpaceId::Data => Header::Long {
+                ty: LongType::ZeroRtt,
+                src_cid: conn.handshake_cid,
+                dst_cid,
+                number,
+                version,
+            },
+            SpaceId::Handshake => Header::Long {
+                ty: LongType::Handshake,
+                src_cid: conn.handshake_cid,
+                dst_cid,
+                number,
+                version,
+            },
+            SpaceId::Initial => Header::Initial(InitialHeader {
+                src_cid: conn.handshake_cid,
+                dst_cid,
+                token: match &conn.side {
+                    ConnectionSide::Client { token, .. } => token.clone(),
+                    ConnectionSide::Server { .. } => Bytes::new(),
+                },
+                number,
+                version,
+            }),
+        };
+        let partial_encode = header.encode(buffer);
+        if conn.peer_params.grease_quic_bit && conn.rng.random() {
+            buffer[partial_encode.start] ^= FIXED_BIT;
+        }
+
+        let (sample_size, tag_len) = if let Some(ref crypto) = space.crypto {
+            (
+                crypto.header.local.sample_size(),
+                crypto.packet.local.tag_len(),
+            )
+        } else if space_id == SpaceId::Data {
+            let zero_rtt = conn.zero_rtt_crypto.as_ref().unwrap();
+            (zero_rtt.header.sample_size(), zero_rtt.packet.tag_len())
+        } else {
+            unreachable!();
+        };
+
+        // Each packet must be large enough for header protection sampling, i.e. the combined
+        // lengths of the encoded packet number and protected payload must be at least 4 bytes
+        // longer than the sample required for header protection. Further, each packet should be at
+        // least tag_len + 6 bytes larger than the destination CID on incoming packets so that the
+        // peer may send stateless resets that are indistinguishable from regular traffic.
+
+        // pn_len + payload_len + tag_len >= sample_size + 4
+        // payload_len >= sample_size + 4 - pn_len - tag_len
+        let min_size = Ord::max(
+            buffer.len() + (sample_size + 4).saturating_sub(number.len() + tag_len),
+            partial_encode.start + dst_cid.len() + 6,
+        );
+        let max_size = buffer_capacity - tag_len;
+        debug_assert!(max_size >= min_size);
+
+        Some(Self {
+            datagram_start,
+            space: space_id,
+            partial_encode,
+            exact_number,
+            short_header: header.is_short(),
+            min_size,
+            max_size,
+            tag_len,
+            ack_eliciting,
+            _span: span,
+        })
+    }
+
+    /// Append the minimum amount of padding to the packet such that, after encryption, the
+    /// enclosing datagram will occupy at least `min_size` bytes
+    pub(super) fn pad_to(&mut self, min_size: u16) {
+        // The datagram might already have a larger minimum size than the caller is requesting, if
+        // e.g. we're coalescing packets and have populated more than `min_size` bytes with packets
+        // already.
+        self.min_size = Ord::max(
+            self.min_size,
+            self.datagram_start + (min_size as usize) - self.tag_len,
+        );
+    }
+
+    pub(super) fn finish_and_track(
+        self,
+        now: Instant,
+        conn: &mut Connection,
+        sent: Option<SentFrames>,
+        buffer: &mut Vec<u8>,
+    ) {
+        let ack_eliciting = self.ack_eliciting;
+        let exact_number = self.exact_number;
+        let space_id = self.space;
+        let (size, padded) = self.finish(conn, now, buffer);
+        let sent = match sent {
+            Some(sent) => sent,
+            None => return,
+        };
+
+        let size = match padded || ack_eliciting {
+            true => size as u16,
+            false => 0,
+        };
+
+        let packet = SentPacket {
+            path_generation: conn.path.generation(),
+            largest_acked: sent.largest_acked,
+            time_sent: now,
+            size,
+            ack_eliciting,
+            retransmits: sent.retransmits,
+            stream_frames: sent.stream_frames,
+        };
+
+        conn.path
+            .sent(exact_number, packet, &mut conn.spaces[space_id]);
+        conn.stats.path.sent_packets += 1;
+        conn.reset_keep_alive(now);
+        if size != 0 {
+            if ack_eliciting {
+                conn.spaces[space_id].time_of_last_ack_eliciting_packet = Some(now);
+                if conn.permit_idle_reset {
+                    conn.reset_idle_timeout(now, space_id);
+                }
+                conn.permit_idle_reset = false;
+            }
+            conn.set_loss_detection_timer(now);
+            conn.path.pacing.on_transmit(size);
+        }
+    }
+
+    /// Encrypt packet, returning the length of the packet and whether padding was added
+    pub(super) fn finish(
+        self,
+        conn: &mut Connection,
+        now: Instant,
+        buffer: &mut Vec<u8>,
+    ) -> (usize, bool) {
+        let pad = buffer.len() < self.min_size;
+        if pad {
+            trace!("PADDING * {}", self.min_size - buffer.len());
+            buffer.resize(self.min_size, 0);
+        }
+
+        let space = &conn.spaces[self.space];
+        let (header_crypto, packet_crypto) = if let Some(ref crypto) = space.crypto {
+            (&*crypto.header.local, &*crypto.packet.local)
+        } else if self.space == SpaceId::Data {
+            let zero_rtt = conn.zero_rtt_crypto.as_ref().unwrap();
+            (&*zero_rtt.header, &*zero_rtt.packet)
+        } else {
+            unreachable!("tried to send {:?} packet without keys", self.space);
+        };
+
+        debug_assert_eq!(
+            packet_crypto.tag_len(),
+            self.tag_len,
+            "Mismatching crypto tag len"
+        );
+
+        buffer.resize(buffer.len() + packet_crypto.tag_len(), 0);
+        let encode_start = self.partial_encode.start;
+        let packet_buf = &mut buffer[encode_start..];
+        self.partial_encode.finish(
+            packet_buf,
+            header_crypto,
+            Some((self.exact_number, packet_crypto)),
+        );
+
+        let len = buffer.len() - encode_start;
+use std::{
+    collections::{VecDeque, hash_map},
+    convert::TryFrom,
+    mem,
+};
+
+use bytes::BufMut;
+use rustc_hash::FxHashMap;
+use tracing::{debug, trace};
+
+use super::{
+    PendingStreamsQueue, Recv, Retransmits, Send, SendState, ShouldTransmit, StreamEvent,
+    StreamHalf, ThinRetransmits,
+};
+use crate::{
+    Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
+    coding::BufMutExt,
+    connection::stats::FrameStats,
+    frame::{self, FrameStruct, StreamMetaVec},
+    transport_parameters::TransportParameters,
+};
+
+/// Wrapper around `Recv` that facilitates reusing `Recv` instances
+#[derive(Debug)]
+pub(super) enum StreamRecv {
+    /// A `Recv` that is ready to be opened
+    Free(Box<Recv>),
+    /// A `Recv` that has been opened
+    Open(Box<Recv>),
+}
+
+impl StreamRecv {
+    /// Returns a reference to the inner `Recv` if the stream is open
+    pub(super) fn as_open_recv(&self) -> Option<&Recv> {
+        match self {
+            Self::Open(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    // Returns a mutable reference to the inner `Recv` if the stream is open
+    pub(super) fn as_open_recv_mut(&mut self) -> Option<&mut Recv> {
+        match self {
+            Self::Open(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    // Returns the inner `Recv`
+    pub(super) fn into_inner(self) -> Box<Recv> {
+        match self {
+            Self::Free(r) | Self::Open(r) => r,
+        }
+    }
+
+    // Reinitialize the stream so the inner `Recv` can be reused
+    pub(super) fn free(self, initial_max_data: u64) -> Self {
+        match self {
+            Self::Free(_) => unreachable!("Self::Free on reinit()"),
+            Self::Open(mut recv) => {
+                recv.reinit(initial_max_data);
+                Self::Free(recv)
+            }
+        }
+    }
+}
+
+#[allow(unreachable_pub)] // fuzzing only
+pub struct StreamsState {
+    pub(super) side: Side,
+    // Set of streams that are currently open, or could be immediately opened by the peer
+    pub(super) send: FxHashMap<StreamId, Option<Box<Send>>>,
+    pub(super) recv: FxHashMap<StreamId, Option<StreamRecv>>,
+    pub(super) free_recv: Vec<StreamRecv>,
+    pub(super) next: [u64; 2],
+    /// Maximum number of locally-initiated streams that may be opened over the lifetime of the
+    /// connection so far, per direction
+    pub(super) max: [u64; 2],
+    /// Maximum number of remotely-initiated streams that may be opened over the lifetime of the
+    /// connection so far, per direction
+    pub(super) max_remote: [u64; 2],
+    /// Value of `max_remote` most recently transmitted to the peer in a `MAX_STREAMS` frame
+    sent_max_remote: [u64; 2],
+    /// Number of streams that we've given the peer permission to open and which aren't fully closed
+    pub(super) allocated_remote_count: [u64; 2],
+    /// Size of the desired stream flow control window. May be smaller than `allocated_remote_count`
+    /// due to `set_max_concurrent` calls.
+    max_concurrent_remote_count: [u64; 2],
+    /// Whether `max_concurrent_remote_count` has ever changed
+    flow_control_adjusted: bool,
+    /// Lowest remotely-initiated stream index that haven't actually been opened by the peer
+    pub(super) next_remote: [u64; 2],
+    /// Whether the remote endpoint has opened any streams the application doesn't know about yet,
+    /// per directionality
+    opened: [bool; 2],
+    // Next to report to the application, once opened
+    pub(super) next_reported_remote: [u64; 2],
+    /// Number of outbound streams
+    ///
+    /// This differs from `self.send.len()` in that it does not include streams that the peer is
+    /// permitted to open but which have not yet been opened.
+    pub(super) send_streams: usize,
+    /// Streams with outgoing data queued, sorted by priority
+    pub(super) pending: PendingStreamsQueue,
+
+    events: VecDeque<StreamEvent>,
+    /// Streams blocked on connection-level flow control or stream window space
+    ///
+    /// Streams are only added to this list when a write fails.
+    pub(super) connection_blocked: Vec<StreamId>,
+    /// Connection-level flow control budget dictated by the peer
+    pub(super) max_data: u64,
+    /// The initial receive window
+    receive_window: u64,
+    /// Limit on incoming data, which is transmitted through `MAX_DATA` frames
+    local_max_data: u64,
+    /// The last value of `MAX_DATA` which had been queued for transmission in
+    /// an outgoing `MAX_DATA` frame
+    sent_max_data: VarInt,
+    /// Sum of current offsets of all send streams.
+    pub(super) data_sent: u64,
+    /// Sum of end offsets of all receive streams. Includes gaps, so it's an upper bound.
+    data_recvd: u64,
+    /// Total quantity of unacknowledged outgoing data
+    pub(super) unacked_data: u64,
+    /// Configured upper bound for `unacked_data`.
+    ///
+    /// Note this may be less than `unacked_data` if the user has set a new value.
+    pub(super) send_window: u64,
+    /// Configured upper bound for how much unacked data the peer can send us per stream
+    pub(super) stream_receive_window: u64,
+
+    // Pertinent state from the TransportParameters supplied by the peer
+    initial_max_stream_data_uni: VarInt,
+    initial_max_stream_data_bidi_local: VarInt,
+    initial_max_stream_data_bidi_remote: VarInt,
+
+    /// The shrink to be applied to local_max_data when receive_window is shrunk
+    receive_window_shrink_debt: u64,
+}
+
+impl StreamsState {
+    #[allow(unreachable_pub)] // fuzzing only
+    pub fn new(
+        side: Side,
+        max_remote_uni: VarInt,
+        max_remote_bi: VarInt,
+        send_window: u64,
+        receive_window: VarInt,
+        stream_receive_window: VarInt,
+    ) -> Self {
+        let mut this = Self {
+            side,
+            send: FxHashMap::default(),
+            recv: FxHashMap::default(),
+            free_recv: Vec::new(),
+            next: [0, 0],
+            max: [0, 0],
+            max_remote: [max_remote_bi.into(), max_remote_uni.into()],
+            sent_max_remote: [max_remote_bi.into(), max_remote_uni.into()],
+            allocated_remote_count: [max_remote_bi.into(), max_remote_uni.into()],
+            max_concurrent_remote_count: [max_remote_bi.into(), max_remote_uni.into()],
+            flow_control_adjusted: false,
+            next_remote: [0, 0],
+            opened: [false, false],
+            next_reported_remote: [0, 0],
+            send_streams: 0,
+            pending: PendingStreamsQueue::new(),
+            events: VecDeque::new(),
+            connection_blocked: Vec::new(),
+            max_data: 0,
+            receive_window: receive_window.into(),
+            local_max_data: receive_window.into(),
+            sent_max_data: receive_window,
+            data_sent: 0,
+            data_recvd: 0,
+            unacked_data: 0,
+            send_window,
+            stream_receive_window: stream_receive_window.into(),
+            initial_max_stream_data_uni: 0u32.into(),
+            initial_max_stream_data_bidi_local: 0u32.into(),
+            initial_max_stream_data_bidi_remote: 0u32.into(),
+            receive_window_shrink_debt: 0,
+        };
+
+        for dir in Dir::iter() {
+            for i in 0..this.max_remote[dir as usize] {
+                this.insert(true, StreamId::new(!side, dir, i));
+            }
+        }
+
+        this
+    }
+
+    pub(crate) fn set_params(&mut self, params: &TransportParameters) {
+        self.initial_max_stream_data_uni = params.initial_max_stream_data_uni;
+        self.initial_max_stream_data_bidi_local = params.initial_max_stream_data_bidi_local;
+        self.initial_max_stream_data_bidi_remote = params.initial_max_stream_data_bidi_remote;
+        self.max[Dir::Bi as usize] = params.initial_max_streams_bidi.into();
+        self.max[Dir::Uni as usize] = params.initial_max_streams_uni.into();
+        self.received_max_data(params.initial_max_data);
+        for i in 0..self.max_remote[Dir::Bi as usize] {
+            let id = StreamId::new(!self.side, Dir::Bi, i);
+            if let Some(s) = self.send.get_mut(&id).and_then(|s| s.as_mut()) {
+                s.max_data = params.initial_max_stream_data_bidi_local.into();
+            }
+        }
+    }
+
+    /// Ensure we have space for at least a full flow control window of remotely-initiated streams
+    /// to be open, and notify the peer if the window has moved
+    fn ensure_remote_streams(&mut self, dir: Dir) {
+        let new_count = self.max_concurrent_remote_count[dir as usize]
+            .saturating_sub(self.allocated_remote_count[dir as usize]);
+        for i in 0..new_count {
+            let id = StreamId::new(!self.side, dir, self.max_remote[dir as usize] + i);
+            self.insert(true, id);
+        }
+        self.allocated_remote_count[dir as usize] += new_count;
+        self.max_remote[dir as usize] += new_count;
+    }
+
+    pub(crate) fn zero_rtt_rejected(&mut self) {
+        // Revert to initial state for outgoing streams
+        for dir in Dir::iter() {
+            for i in 0..self.next[dir as usize] {
+                // We don't bother calling `stream_freed` here because we explicitly reset affected
+                // counters below.
+                let id = StreamId::new(self.side, dir, i);
+                self.send.remove(&id).unwrap();
+                if let Dir::Bi = dir {
+                    self.recv.remove(&id).unwrap();
+                }
+            }
+            self.next[dir as usize] = 0;
+
+            // If 0-RTT was rejected, any flow control frames we sent were lost.
+            if self.flow_control_adjusted {
+                // Conservative approximation of whatever we sent in transport parameters
+                self.sent_max_remote[dir as usize] = 0;
+            }
+        }
+
+        self.pending.clear();
+        self.send_streams = 0;
+        self.data_sent = 0;
+        self.connection_blocked.clear();
+    }
+
+    /// Process incoming stream frame
+    ///
+    /// If successful, returns whether a `MAX_DATA` frame needs to be transmitted
+    pub(crate) fn received(
+        &mut self,
+        frame: frame::Stream,
+        payload_len: usize,
+    ) -> Result<ShouldTransmit, TransportError> {
+        let id = frame.id;
+        self.validate_receive_id(id).map_err(|e| {
+            debug!("received illegal STREAM frame");
+use std::{
+    collections::{BinaryHeap, hash_map},
+    io,
+};
+
+use bytes::Bytes;
+use thiserror::Error;
+use tracing::trace;
+
+use super::spaces::{Retransmits, ThinRetransmits};
+use crate::{
+    Dir, StreamId, VarInt,
+    connection::streams::state::{get_or_insert_recv, get_or_insert_send},
+    frame,
+};
+
+mod recv;
+use recv::Recv;
+pub use recv::{Chunks, ReadError, ReadableError};
+
+mod send;
+pub(crate) use send::{ByteSlice, BytesArray};
+use send::{BytesSource, Send, SendState};
+pub use send::{FinishError, WriteError, Written};
+
+mod state;
+#[allow(unreachable_pub)] // fuzzing only
+pub use state::StreamsState;
+
+/// Access to streams
+pub struct Streams<'a> {
+    pub(super) state: &'a mut StreamsState,
+    pub(super) conn_state: &'a super::State,
+}
+
+#[allow(clippy::needless_lifetimes)] // Needed for cfg(fuzzing)
+impl<'a> Streams<'a> {
+    #[cfg(fuzzing)]
+    pub fn new(state: &'a mut StreamsState, conn_state: &'a super::State) -> Self {
+        Self { state, conn_state }
+    }
+
+    /// Open a single stream if possible
+    ///
+    /// Returns `None` if the streams in the given direction are currently exhausted.
+    pub fn open(&mut self, dir: Dir) -> Option<StreamId> {
+        if self.conn_state.is_closed() {
+            return None;
+        }
+
+        // TODO: Queue STREAM_ID_BLOCKED if this fails
+        if self.state.next[dir as usize] >= self.state.max[dir as usize] {
+            return None;
+        }
+
+        self.state.next[dir as usize] += 1;
+        let id = StreamId::new(self.state.side, dir, self.state.next[dir as usize] - 1);
+        self.state.insert(false, id);
+        self.state.send_streams += 1;
+        Some(id)
+    }
+
+    /// Accept a remotely initiated stream of a certain directionality, if possible
+    ///
+    /// Returns `None` if there are no new incoming streams for this connection.
+    /// Has no impact on the data flow-control or stream concurrency limits.
+    pub fn accept(&mut self, dir: Dir) -> Option<StreamId> {
+        if self.state.next_remote[dir as usize] == self.state.next_reported_remote[dir as usize] {
+            return None;
+        }
+
+        let x = self.state.next_reported_remote[dir as usize];
+        self.state.next_reported_remote[dir as usize] = x + 1;
+        if dir == Dir::Bi {
+            self.state.send_streams += 1;
+        }
+
+        Some(StreamId::new(!self.state.side, dir, x))
+    }
+
+    #[cfg(fuzzing)]
+    pub fn state(&mut self) -> &mut StreamsState {
+        self.state
+    }
+
+    /// The number of streams that may have unacknowledged data.
+    pub fn send_streams(&self) -> usize {
+        self.state.send_streams
+    }
+
+    /// The number of remotely initiated open streams of a certain directionality.
+    ///
+    /// Includes remotely initiated streams, which have not been accepted via [`accept`](Self::accept).
+    /// These streams count against the respective concurrency limit reported by
+    /// [`Connection::max_concurrent_streams`](super::Connection::max_concurrent_streams).
+    pub fn remote_open_streams(&self, dir: Dir) -> u64 {
+        // total opened - total closed = total opened - ( total permitted - total permitted unclosed )
+        self.state.next_remote[dir as usize]
+            - (self.state.max_remote[dir as usize]
+                - self.state.allocated_remote_count[dir as usize])
+    }
+}
+
+/// Access to streams
+pub struct RecvStream<'a> {
+    pub(super) id: StreamId,
+    pub(super) state: &'a mut StreamsState,
+    pub(super) pending: &'a mut Retransmits,
+}
+
+impl RecvStream<'_> {
+    /// Read from the given recv stream
+    ///
+    /// `max_length` limits the maximum size of the returned `Bytes` value; passing `usize::MAX`
+    /// will yield the best performance. `ordered` will make sure the returned chunk's offset will
+    /// have an offset exactly equal to the previously returned offset plus the previously returned
+    /// bytes' length.
+    ///
+    /// Yields `Ok(None)` if the stream was finished. Otherwise, yields a segment of data and its
+    /// offset in the stream. If `ordered` is `false`, segments may be received in any order, and
+    /// the `Chunk`'s `offset` field can be used to determine ordering in the caller.
+    ///
+    /// While most applications will prefer to consume stream data in order, unordered reads can
+    /// improve performance when packet loss occurs and data cannot be retransmitted before the flow
+    /// control window is filled. On any given stream, you can switch from ordered to unordered
+    /// reads, but ordered reads on streams that have seen previous unordered reads will return
+    /// `ReadError::IllegalOrderedRead`.
+    pub fn read(&mut self, ordered: bool) -> Result<Chunks<'_>, ReadableError> {
+        Chunks::new(self.id, ordered, self.state, self.pending)
+    }
+
+    /// Stop accepting data on the given receive stream
+    ///
+    /// Discards unread data and notifies the peer to stop transmitting. Once stopped, further
+    /// attempts to operate on a stream will yield `ClosedStream` errors.
+    pub fn stop(&mut self, error_code: VarInt) -> Result<(), ClosedStream> {
+        let mut entry = match self.state.recv.entry(self.id) {
+            hash_map::Entry::Occupied(s) => s,
+            hash_map::Entry::Vacant(_) => return Err(ClosedStream { _private: () }),
+        };
+        let stream = get_or_insert_recv(self.state.stream_receive_window)(entry.get_mut());
+
+        let (read_credits, stop_sending) = stream.stop()?;
+        if stop_sending.should_transmit() {
+            self.pending.stop_sending.push(frame::StopSending {
+                id: self.id,
+                error_code,
+            });
+        }
+
+        // We need to keep stopped streams around until they're finished or reset so we can update
+        // connection-level flow control to account for discarded data. Otherwise, we can discard
+        // state immediately.
+        if !stream.final_offset_unknown() {
+            let recv = entry.remove().expect("must have recv when stopping");
+            self.state.stream_recv_freed(self.id, recv);
+        }
+
+        if self.state.add_read_credits(read_credits).should_transmit() {
+            self.pending.max_data = true;
+        }
+
+        Ok(())
+    }
+
+    /// Check whether this stream has been reset by the peer, returning the reset error code if so
+    ///
+    /// After returning `Ok(Some(_))` once, stream state will be discarded and all future calls will
+    /// return `Err(ClosedStream)`.
+    pub fn received_reset(&mut self) -> Result<Option<VarInt>, ClosedStream> {
+        let hash_map::Entry::Occupied(entry) = self.state.recv.entry(self.id) else {
+            return Err(ClosedStream { _private: () });
+        };
+        let Some(s) = entry.get().as_ref().and_then(|s| s.as_open_recv()) else {
+            return Ok(None);
+        };
+        if s.stopped {
+            return Err(ClosedStream { _private: () });
+        }
+        let Some(code) = s.reset_code() else {
+            return Ok(None);
+        };
+
+        // Clean up state after application observes the reset, since there's no reason for the
+        // application to attempt to read or stop the stream once it knows it's reset
+        let (_, recv) = entry.remove_entry();
+        self.state
+            .stream_recv_freed(self.id, recv.expect("must have recv on reset"));
+        self.state.queue_max_stream_id(self.pending);
+
+        Ok(Some(code))
+    }
+}
+
+/// Access to streams
+pub struct SendStream<'a> {
+    pub(super) id: StreamId,
+    pub(super) state: &'a mut StreamsState,
+    pub(super) pending: &'a mut Retransmits,
+    pub(super) conn_state: &'a super::State,
+}
+
+#[allow(clippy::needless_lifetimes)] // Needed for cfg(fuzzing)
+impl<'a> SendStream<'a> {
+    #[cfg(fuzzing)]
+    pub fn new(
+        id: StreamId,
+        state: &'a mut StreamsState,
+        pending: &'a mut Retransmits,
+        conn_state: &'a super::State,
+    ) -> Self {
+        Self {
+            id,
+            state,
+            pending,
+            conn_state,
+        }
+    }
+
+    /// Send data on the given stream
+    ///
+    /// Returns the number of bytes successfully written.
+    pub fn write(&mut self, data: &[u8]) -> Result<usize, WriteError> {
+        Ok(self.write_source(&mut ByteSlice::from_slice(data))?.bytes)
+    }
+
+    /// Send data on the given stream
+    ///
+    /// Returns the number of bytes and chunks successfully written.
+    /// Note that this method might also write a partial chunk. In this case
+    /// [`Written::chunks`] will not count this chunk as fully written. However
+    /// the chunk will be advanced and contain only non-written data after the call.
+    pub fn write_chunks(&mut self, data: &mut [Bytes]) -> Result<Written, WriteError> {
+        self.write_source(&mut BytesArray::from_chunks(data))
+    }
+
+    fn write_source<B: BytesSource>(&mut self, source: &mut B) -> Result<Written, WriteError> {
+        if self.conn_state.is_closed() {
+            trace!(%self.id, "write blocked; connection draining");
+            return Err(WriteError::Blocked);
+        }
+
+        let limit = self.state.write_limit();
+
+        let max_send_data = self.state.max_send_data(self.id);
+
+        let stream = self
+            .state
+            .send
+            .get_mut(&self.id)
+            .map(get_or_insert_send(max_send_data))
+            .ok_or(WriteError::ClosedStream)?;
+
+        if limit == 0 {
+            trace!(
+                stream = %self.id, max_data = self.state.max_data, data_sent = self.state.data_sent,
+                "write blocked by connection-level flow control or send window"
+            );
+            if !stream.connection_blocked {
+                stream.connection_blocked = true;
+422:        assert!(id.dir() == Dir::Bi || id.initiator() != self.side.side());
+433:        assert!(id.dir() == Dir::Bi || id.initiator() == self.side.side());
+458:        assert!(max_datagrams != 0);
+565:                self.zero_rtt_crypto.as_ref().expect(
+603:                    debug_assert!(untracked_bytes <= segment_size as u64);
+731:                debug_assert_eq!(
+745:            debug_assert!(buf_capacity - buf.len() >= MIN_PACKET_SPACE);
+763:            debug_assert!(
+804:                debug_assert!(
+854:                    let mut builder = builder_storage.take().unwrap();
+889:            debug_assert!(
+1021:            .expect("previous path challenge pending without token");
+1023:        debug_assert_eq!(
+1619:                .expect("no previous keys")
+1622:                .expect("update not acknowledged yet")
+1655:                debug_assert!(!self.peer_completed_address_validation());
+1674:        let lost_send_time = now.checked_sub(loss_delay).unwrap();
+1675:        let largest_acked_packet = self.spaces[pn_space].largest_acked_packet.unwrap();
+1750:                let info = self.spaces[pn_space].take(packet).unwrap(); // safe: lost_packets is populated just above
+1793:            let info = self.spaces[SpaceId::Data].take(packet).unwrap(); // safe: lost_mtu_probe is omitted from lost_packets, and therefore must not have been removed yet
+1811:            debug_assert!(!self.peer_completed_address_validation());
+1999:        debug_assert!(self.side.is_server());
+2043:                        .expect("crypto layer didn't supply transport parameters with ticket");
+2087:        debug_assert!(space <= expected, "received out-of-order CRYPTO data");
+2160:        debug_assert!(
+2170:                    .expect("handshake should be complete"),
+2175:        debug_assert!(space as usize > self.highest_space as usize);
+2184:        debug_assert!(space_id != SpaceId::Data);
+2296:                    .unwrap()
+2411:                    SpaceId::Data => self.process_payload(now, remote, number.unwrap(), packet)?,
+2475:                let client_hello = state.client_hello.take().unwrap();
+2556:                        if !self.crypto.early_data_accepted().unwrap() {
+2557:                            debug_assert!(self.side.is_client());
+2637:                self.process_payload(now, remote, number.unwrap(), packet)?;
+3036:                panic!("packets from unknown remote should be dropped by clients");
+3038:            debug_assert!(
+3195:            let config = self.config.ack_frequency_config.as_ref().unwrap();
+3261:                - VarInt::size(unsafe { VarInt::from_u64_unchecked(frame.offset) })
+3353:            debug_assert_eq!(space_id, SpaceId::Data);
+3355:                panic!("NEW_TOKEN frames should not be enqueued by clients");
+3413:        debug_assert!(!space.pending_acks.ranges().is_empty());
+3416:        debug_assert!(space.crypto.is_some(), "tried to send ACK in 0-RTT");
+3480:            }).expect("preferred address CID is the first received, and hence is guaranteed to be legal");
+3532:            .expect("only called for `Data` packets");
+3541:                .unwrap() // safe because update_keys() can only be triggered by short packets
+3543:            mem::replace(self.next_crypto.as_mut().unwrap(), new),
+3579:            panic!("Packets should never be coalesced in tests");
+4098:            assert_eq!(negotiate_max_idle_timeout(left, right), result);
+4099:            assert_eq!(negotiate_max_idle_timeout(right, left), result);

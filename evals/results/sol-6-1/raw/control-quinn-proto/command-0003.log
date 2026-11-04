@@ -1,0 +1,780 @@
+use std::ops::Range;
+
+use crate::{ConnectionId, ResetToken, frame::NewConnectionId};
+
+/// DataType stored in CidQueue buffer
+type CidData = (ConnectionId, Option<ResetToken>);
+
+/// Sliding window of active Connection IDs
+///
+/// May contain gaps due to packet loss or reordering
+#[derive(Debug)]
+pub(crate) struct CidQueue {
+    /// Ring buffer indexed by `self.cursor`
+    buffer: [Option<CidData>; Self::LEN],
+    /// Index at which circular buffer addressing is based
+    cursor: usize,
+    /// Sequence number of `self.buffer[cursor]`
+    ///
+    /// The sequence number of the active CID; must be the smallest among CIDs in `buffer`.
+    offset: u64,
+}
+
+impl CidQueue {
+    pub(crate) fn new(cid: ConnectionId) -> Self {
+        let mut buffer = [None; Self::LEN];
+        buffer[0] = Some((cid, None));
+        Self {
+            buffer,
+            cursor: 0,
+            offset: 0,
+        }
+    }
+
+    /// Handle a `NEW_CONNECTION_ID` frame
+    ///
+    /// Returns a non-empty range of retired sequence numbers and the reset token of the new active
+    /// CID iff any CIDs were retired.
+    pub(crate) fn insert(
+        &mut self,
+        cid: NewConnectionId,
+    ) -> Result<Option<(Range<u64>, ResetToken)>, InsertError> {
+        // Position of new CID wrt. the current active CID
+        let index = match cid.sequence.checked_sub(self.offset) {
+            None => return Err(InsertError::Retired),
+            Some(x) => x,
+        };
+
+        let retired_count = cid.retire_prior_to.saturating_sub(self.offset);
+        if index >= Self::LEN as u64 + retired_count {
+            return Err(InsertError::ExceedsLimit);
+        }
+
+        // Discard retired CIDs, if any
+        for i in 0..(retired_count.min(Self::LEN as u64) as usize) {
+            self.buffer[(self.cursor + i) % Self::LEN] = None;
+        }
+
+        // Record the new CID
+        let index = ((self.cursor as u64 + index) % Self::LEN as u64) as usize;
+        self.buffer[index] = Some((cid.id, Some(cid.reset_token)));
+
+        if retired_count == 0 {
+            return Ok(None);
+        }
+
+        // The active CID was retired. Find the first known CID with sequence number of at least
+        // retire_prior_to, and inform the caller that all prior CIDs have been retired, and of
+        // the new CID's reset token.
+        self.cursor = ((self.cursor as u64 + retired_count) % Self::LEN as u64) as usize;
+        let (i, (_, token)) = self
+            .iter()
+            .next()
+            .expect("it is impossible to retire a CID without supplying a new one");
+        self.cursor = (self.cursor + i) % Self::LEN;
+        let orig_offset = self.offset;
+        self.offset = cid.retire_prior_to + i as u64;
+        // We don't immediately retire CIDs in the range (orig_offset +
+        // Self::LEN)..self.offset. These are CIDs that we haven't yet received from a
+        // NEW_CONNECTION_ID frame, since having previously received them would violate the
+        // connection ID limit we specified based on Self::LEN. If we do receive a such a frame
+        // in the future, e.g. due to reordering, we'll retire it then. This ensures we can't be
+        // made to buffer an arbitrarily large number of RETIRE_CONNECTION_ID frames.
+        Ok(Some((
+            orig_offset..self.offset.min(orig_offset + Self::LEN as u64),
+            token.expect("non-initial CID missing reset token"),
+        )))
+    }
+
+    /// Switch to next active CID if possible, return
+    /// 1) the corresponding ResetToken and 2) a non-empty range preceding it to retire
+    pub(crate) fn next(&mut self) -> Option<(ResetToken, Range<u64>)> {
+        let (i, cid_data) = self.iter().nth(1)?;
+        self.buffer[self.cursor] = None;
+
+        let orig_offset = self.offset;
+        self.offset += i as u64;
+        self.cursor = (self.cursor + i) % Self::LEN;
+        Some((cid_data.1.unwrap(), orig_offset..self.offset))
+    }
+
+    /// Iterate CIDs in CidQueue that are not `None`, including the active CID
+    fn iter(&self) -> impl Iterator<Item = (usize, CidData)> + '_ {
+        (0..Self::LEN).filter_map(move |step| {
+            let index = (self.cursor + step) % Self::LEN;
+            self.buffer[index].map(|cid_data| (step, cid_data))
+        })
+    }
+
+    /// Replace the initial CID
+    pub(crate) fn update_initial_cid(&mut self, cid: ConnectionId) {
+        debug_assert_eq!(self.offset, 0);
+        self.buffer[self.cursor] = Some((cid, None));
+    }
+
+    /// Return active remote CID itself
+    pub(crate) fn active(&self) -> ConnectionId {
+        self.buffer[self.cursor].unwrap().0
+    }
+
+    /// Return the sequence number of active remote CID
+    pub(crate) fn active_seq(&self) -> u64 {
+        self.offset
+    }
+
+    pub(crate) const LEN: usize = 5;
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum InsertError {
+    /// CID was already retired
+    Retired,
+    /// Sequence number violates the leading edge of the window
+    ExceedsLimit,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cid(sequence: u64, retire_prior_to: u64) -> NewConnectionId {
+        NewConnectionId {
+            sequence,
+            id: ConnectionId::new(&[0xAB; 8]),
+            reset_token: ResetToken::from([0xCD; crate::RESET_TOKEN_SIZE]),
+            retire_prior_to,
+        }
+    }
+
+    fn initial_cid() -> ConnectionId {
+        ConnectionId::new(&[0xFF; 8])
+    }
+
+    #[test]
+    fn next_dense() {
+        let mut q = CidQueue::new(initial_cid());
+        assert!(q.next().is_none());
+        assert!(q.next().is_none());
+
+        for i in 1..CidQueue::LEN as u64 {
+            q.insert(cid(i, 0)).unwrap();
+        }
+        for i in 1..CidQueue::LEN as u64 {
+            let (_, retire) = q.next().unwrap();
+            assert_eq!(q.active_seq(), i);
+            assert_eq!(retire.end - retire.start, 1);
+        }
+        assert!(q.next().is_none());
+    }
+    #[test]
+    fn next_sparse() {
+        let mut q = CidQueue::new(initial_cid());
+        let seqs = (1..CidQueue::LEN as u64).filter(|x| x % 2 == 0);
+        for i in seqs.clone() {
+            q.insert(cid(i, 0)).unwrap();
+        }
+        for i in seqs {
+            let (_, retire) = q.next().unwrap();
+            dbg!(&retire);
+            assert_eq!(q.active_seq(), i);
+            assert_eq!(retire, (q.active_seq().saturating_sub(2))..q.active_seq());
+        }
+        assert!(q.next().is_none());
+    }
+
+    #[test]
+    fn wrap() {
+        let mut q = CidQueue::new(initial_cid());
+
+        for i in 1..CidQueue::LEN as u64 {
+            q.insert(cid(i, 0)).unwrap();
+        }
+        for _ in 1..(CidQueue::LEN as u64 - 1) {
+            q.next().unwrap();
+        }
+        for i in CidQueue::LEN as u64..(CidQueue::LEN as u64 + 3) {
+            q.insert(cid(i, 0)).unwrap();
+        }
+        for i in (CidQueue::LEN as u64 - 1)..(CidQueue::LEN as u64 + 3) {
+            q.next().unwrap();
+            assert_eq!(q.active_seq(), i);
+        }
+        assert!(q.next().is_none());
+    }
+
+    #[test]
+    fn retire_dense() {
+        let mut q = CidQueue::new(initial_cid());
+
+        for i in 1..CidQueue::LEN as u64 {
+            q.insert(cid(i, 0)).unwrap();
+        }
+        assert_eq!(q.active_seq(), 0);
+
+        assert_eq!(q.insert(cid(4, 2)).unwrap().unwrap().0, 0..2);
+        assert_eq!(q.active_seq(), 2);
+        assert_eq!(q.insert(cid(4, 2)), Ok(None));
+
+        for i in 2..(CidQueue::LEN as u64 - 1) {
+            let _ = q.next().unwrap();
+            assert_eq!(q.active_seq(), i + 1);
+            assert_eq!(q.insert(cid(i + 1, i + 1)), Ok(None));
+        }
+
+        assert!(q.next().is_none());
+    }
+
+    #[test]
+    fn retire_sparse() {
+        // Retiring CID 0 when CID 1 is not known should retire CID 1 as we move to CID 2
+        let mut q = CidQueue::new(initial_cid());
+        q.insert(cid(2, 0)).unwrap();
+        assert_eq!(q.insert(cid(3, 1)).unwrap().unwrap().0, 0..2,);
+        assert_eq!(q.active_seq(), 2);
+    }
+
+    #[test]
+    fn retire_many() {
+        let mut q = CidQueue::new(initial_cid());
+        q.insert(cid(2, 0)).unwrap();
+        assert_eq!(
+            q.insert(cid(1_000_000, 1_000_000)).unwrap().unwrap().0,
+            0..CidQueue::LEN as u64,
+        );
+        assert_eq!(q.active_seq(), 1_000_000);
+    }
+
+    #[test]
+    fn insert_limit() {
+        let mut q = CidQueue::new(initial_cid());
+        assert_eq!(q.insert(cid(CidQueue::LEN as u64 - 1, 0)), Ok(None));
+        assert_eq!(
+            q.insert(cid(CidQueue::LEN as u64, 0)),
+            Err(InsertError::ExceedsLimit)
+        );
+    }
+
+    #[test]
+    fn insert_duplicate() {
+        let mut q = CidQueue::new(initial_cid());
+        q.insert(cid(0, 0)).unwrap();
+use std::{collections::VecDeque, ops::Range};
+
+use bytes::{Buf, Bytes};
+
+use crate::{VarInt, range_set::RangeSet};
+
+/// Buffer of outgoing retransmittable stream data
+#[derive(Default, Debug)]
+pub(super) struct SendBuffer {
+    /// Data queued by the application but not yet acknowledged. May or may not have been sent.
+    unacked_segments: VecDeque<Bytes>,
+    /// Total size of `unacked_segments`
+    unacked_len: usize,
+    /// The first offset that hasn't been written by the application, i.e. the offset past the end of `unacked`
+    offset: u64,
+    /// The first offset that hasn't been sent
+    ///
+    /// Always lies in (offset - unacked.len())..offset
+    unsent: u64,
+    /// Acknowledged ranges which couldn't be discarded yet as they don't include the earliest
+    /// offset in `unacked`
+    // TODO: Recover storage from these by compacting (#700)
+    acks: RangeSet,
+    /// Previously transmitted ranges deemed lost
+    retransmits: RangeSet,
+}
+
+impl SendBuffer {
+    /// Construct an empty buffer at the initial offset
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append application data to the end of the stream
+    pub(super) fn write(&mut self, data: Bytes) {
+        self.unacked_len += data.len();
+        self.offset += data.len() as u64;
+        self.unacked_segments.push_back(data);
+    }
+
+    /// Discard a range of acknowledged stream data
+    pub(super) fn ack(&mut self, mut range: Range<u64>) {
+        // Clamp the range to data which is still tracked
+        let base_offset = self.offset - self.unacked_len as u64;
+        range.start = base_offset.max(range.start);
+        range.end = base_offset.max(range.end);
+
+        self.acks.insert(range);
+
+        while self.acks.min() == Some(self.offset - self.unacked_len as u64) {
+            let prefix = self.acks.pop_min().unwrap();
+            let mut to_advance = (prefix.end - prefix.start) as usize;
+
+            self.unacked_len -= to_advance;
+            while to_advance > 0 {
+                let front = self
+                    .unacked_segments
+                    .front_mut()
+                    .expect("Expected buffered data");
+
+                if front.len() <= to_advance {
+                    to_advance -= front.len();
+                    self.unacked_segments.pop_front();
+
+                    if self.unacked_segments.len() * 4 < self.unacked_segments.capacity() {
+                        self.unacked_segments.shrink_to_fit();
+                    }
+                } else {
+                    front.advance(to_advance);
+                    to_advance = 0;
+                }
+            }
+        }
+    }
+
+    /// Compute the next range to transmit on this stream and update state to account for that
+    /// transmission.
+    ///
+    /// `max_len` here includes the space which is available to transmit the
+    /// offset and length of the data to send. The caller has to guarantee that
+    /// there is at least enough space available to write maximum-sized metadata
+    /// (8 byte offset + 8 byte length).
+    ///
+    /// The method returns a tuple:
+    /// - The first return value indicates the range of data to send
+    /// - The second return value indicates whether the length needs to be encoded
+    ///   in the STREAM frames metadata (`true`), or whether it can be omitted
+    ///   since the selected range will fill the whole packet.
+    pub(super) fn poll_transmit(&mut self, mut max_len: usize) -> (Range<u64>, bool) {
+        debug_assert!(max_len >= 8 + 8);
+        let mut encode_length = false;
+
+        if let Some(range) = self.retransmits.pop_min() {
+            // Retransmit sent data
+
+            // When the offset is known, we know how many bytes are required to encode it.
+            // Offset 0 requires no space
+            if range.start != 0 {
+                max_len -= VarInt::size(unsafe { VarInt::from_u64_unchecked(range.start) });
+            }
+            if range.end - range.start < max_len as u64 {
+                encode_length = true;
+                max_len -= 8;
+            }
+
+            let end = range.end.min((max_len as u64).saturating_add(range.start));
+            if end != range.end {
+                self.retransmits.insert(end..range.end);
+            }
+            return (range.start..end, encode_length);
+        }
+
+        // Transmit new data
+
+        // When the offset is known, we know how many bytes are required to encode it.
+        // Offset 0 requires no space
+        if self.unsent != 0 {
+            max_len -= VarInt::size(unsafe { VarInt::from_u64_unchecked(self.unsent) });
+        }
+        if self.offset - self.unsent < max_len as u64 {
+            encode_length = true;
+            max_len -= 8;
+        }
+
+        let end = self
+            .offset
+            .min((max_len as u64).saturating_add(self.unsent));
+        let result = self.unsent..end;
+        self.unsent = end;
+        (result, encode_length)
+    }
+
+    /// Returns data which is associated with a range
+    ///
+    /// This function can return a subset of the range, if the data is stored
+    /// in noncontiguous fashion in the send buffer. In this case callers
+    /// should call the function again with an incremented start offset to
+    /// retrieve more data.
+    pub(super) fn get(&self, offsets: Range<u64>) -> &[u8] {
+        let base_offset = self.offset - self.unacked_len as u64;
+
+        let mut segment_offset = base_offset;
+        for segment in self.unacked_segments.iter() {
+            if offsets.start >= segment_offset
+                && offsets.start < segment_offset + segment.len() as u64
+            {
+                let start = (offsets.start - segment_offset) as usize;
+                let end = (offsets.end - segment_offset) as usize;
+
+                return &segment[start..end.min(segment.len())];
+            }
+            segment_offset += segment.len() as u64;
+        }
+
+        &[]
+    }
+
+    /// Queue a range of sent but unacknowledged data to be retransmitted
+    pub(super) fn retransmit(&mut self, range: Range<u64>) {
+        debug_assert!(range.end <= self.unsent, "unsent data can't be lost");
+        self.retransmits.insert(range);
+    }
+
+    pub(super) fn retransmit_all_for_0rtt(&mut self) {
+        debug_assert_eq!(self.offset, self.unacked_len as u64);
+        self.unsent = 0;
+    }
+
+    /// First stream offset unwritten by the application, i.e. the offset that the next write will
+    /// begin at
+    pub(super) fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Whether all sent data has been acknowledged
+    pub(super) fn is_fully_acked(&self) -> bool {
+        self.unacked_len == 0
+    }
+
+    /// Whether there's data to send
+    ///
+    /// There may be sent unacknowledged data even when this is false.
+    pub(super) fn has_unsent_data(&self) -> bool {
+        self.unsent != self.offset || !self.retransmits.is_empty()
+    }
+
+    /// Compute the amount of data that hasn't been acknowledged
+    pub(super) fn unacked(&self) -> u64 {
+        self.unacked_len as u64 - self.acks.iter().map(|x| x.end - x.start).sum::<u64>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fragment_with_length() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world!";
+        buf.write(MSG.into());
+        // 0 byte offset => 19 bytes left => 13 byte data isn't enough
+        // with 8 bytes reserved for length 11 payload bytes will fit
+        assert_eq!(buf.poll_transmit(19), (0..11, true));
+        assert_eq!(
+            buf.poll_transmit(MSG.len() + 16 - 11),
+            (11..MSG.len() as u64, true)
+        );
+        assert_eq!(
+            buf.poll_transmit(58),
+            (MSG.len() as u64..MSG.len() as u64, true)
+        );
+    }
+
+    #[test]
+    fn fragment_without_length() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world with some extra data!";
+        buf.write(MSG.into());
+        // 0 byte offset => 19 bytes left => can be filled by 34 bytes payload
+        assert_eq!(buf.poll_transmit(19), (0..19, false));
+        assert_eq!(
+            buf.poll_transmit(MSG.len() - 19 + 1),
+            (19..MSG.len() as u64, false)
+        );
+        assert_eq!(
+            buf.poll_transmit(58),
+            (MSG.len() as u64..MSG.len() as u64, true)
+        );
+    }
+
+    #[test]
+    fn reserves_encoded_offset() {
+        let mut buf = SendBuffer::new();
+
+        // Pretend we have more than 1 GB of data in the buffer
+        let chunk: Bytes = Bytes::from_static(&[0; 1024 * 1024]);
+        for _ in 0..1025 {
+            buf.write(chunk.clone());
+        }
+
+        const SIZE1: u64 = 64;
+        const SIZE2: u64 = 16 * 1024;
+        const SIZE3: u64 = 1024 * 1024 * 1024;
+
+        // Offset 0 requires no space
+        assert_eq!(buf.poll_transmit(16), (0..16, false));
+        buf.retransmit(0..16);
+        assert_eq!(buf.poll_transmit(16), (0..16, false));
+        let mut transmitted = 16u64;
+
+        // Offset 16 requires 1 byte
+        assert_eq!(
+            buf.poll_transmit((SIZE1 - transmitted + 1) as usize),
+            (transmitted..SIZE1, false)
+        );
+        buf.retransmit(transmitted..SIZE1);
+        assert_eq!(
+            buf.poll_transmit((SIZE1 - transmitted + 1) as usize),
+            (transmitted..SIZE1, false)
+use std::collections::hash_map::Entry;
+use std::mem;
+
+use thiserror::Error;
+use tracing::debug;
+
+use super::state::get_or_insert_recv;
+use super::{ClosedStream, Retransmits, ShouldTransmit, StreamId, StreamsState};
+use crate::connection::assembler::{Assembler, Chunk, IllegalOrderedRead};
+use crate::connection::streams::state::StreamRecv;
+use crate::{TransportError, VarInt, frame};
+
+#[derive(Debug, Default)]
+pub(super) struct Recv {
+    // NB: when adding or removing fields, remember to update `reinit`.
+    state: RecvState,
+    pub(super) assembler: Assembler,
+    sent_max_stream_data: u64,
+    pub(super) end: u64,
+    pub(super) stopped: bool,
+}
+
+impl Recv {
+    pub(super) fn new(initial_max_data: u64) -> Box<Self> {
+        Box::new(Self {
+            state: RecvState::default(),
+            assembler: Assembler::new(),
+            sent_max_stream_data: initial_max_data,
+            end: 0,
+            stopped: false,
+        })
+    }
+
+    /// Reset to the initial state
+    pub(super) fn reinit(&mut self, initial_max_data: u64) {
+        self.state = RecvState::default();
+        self.assembler.reinit();
+        self.sent_max_stream_data = initial_max_data;
+        self.end = 0;
+        self.stopped = false;
+    }
+
+    /// Process a STREAM frame
+    ///
+    /// Return value is `(number_of_new_bytes_ingested, stream_is_closed)`
+    pub(super) fn ingest(
+        &mut self,
+        frame: frame::Stream,
+        payload_len: usize,
+        received: u64,
+        max_data: u64,
+    ) -> Result<(u64, bool), TransportError> {
+        let end = frame.offset + frame.data.len() as u64;
+        if end >= 2u64.pow(62) {
+            return Err(TransportError::FLOW_CONTROL_ERROR(
+                "maximum stream offset too large",
+            ));
+        }
+
+        if let Some(final_offset) = self.final_offset() {
+            if end > final_offset || (frame.fin && end != final_offset) {
+                debug!(end, final_offset, "final size error");
+                return Err(TransportError::FINAL_SIZE_ERROR(""));
+            }
+        }
+
+        let new_bytes = self.credit_consumed_by(end, received, max_data)?;
+
+        // Stopped streams don't need to wait for the actual data, they just need to know
+        // how much there was.
+        if frame.fin && !self.stopped {
+            if let RecvState::Recv { ref mut size } = self.state {
+                *size = Some(end);
+            }
+        }
+
+        self.end = self.end.max(end);
+        // Don't bother storing data or releasing stream-level flow control credit if the stream's
+        // already stopped
+        if !self.stopped {
+            self.assembler.insert(frame.offset, frame.data, payload_len);
+        }
+
+        Ok((new_bytes, frame.fin && self.stopped))
+    }
+
+    pub(super) fn stop(&mut self) -> Result<(u64, ShouldTransmit), ClosedStream> {
+        if self.stopped {
+            return Err(ClosedStream { _private: () });
+        }
+
+        self.stopped = true;
+        self.assembler.clear();
+        // Issue flow control credit for unread data
+        let read_credits = self.end - self.assembler.bytes_read();
+        // This may send a spurious STOP_SENDING if we've already received all data, but it's a bit
+        // fiddly to distinguish that from the case where we've received a FIN but are missing some
+        // data that the peer might still be trying to retransmit, in which case a STOP_SENDING is
+        // still useful.
+        Ok((read_credits, ShouldTransmit(self.is_receiving())))
+    }
+
+    /// Returns the window that should be advertised in a `MAX_STREAM_DATA` frame
+    ///
+    /// The method returns a tuple which consists of the window that should be
+    /// announced, as well as a boolean parameter which indicates if a new
+    /// transmission of the value is recommended. If the boolean value is
+    /// `false` the new window should only be transmitted if a previous transmission
+    /// had failed.
+    pub(super) fn max_stream_data(&mut self, stream_receive_window: u64) -> (u64, ShouldTransmit) {
+        let max_stream_data = self.assembler.bytes_read() + stream_receive_window;
+
+        // Only announce a window update if it's significant enough
+        // to make it worthwhile sending a MAX_STREAM_DATA frame.
+        // We use here a fraction of the configured stream receive window to make
+        // the decision, and accommodate for streams using bigger windows requiring
+        // less updates. A fixed size would also work - but it would need to be
+        // smaller than `stream_receive_window` in order to make sure the stream
+        // does not get stuck.
+        let diff = max_stream_data - self.sent_max_stream_data;
+        let transmit = self.can_send_flow_control() && diff >= (stream_receive_window / 8);
+        (max_stream_data, ShouldTransmit(transmit))
+    }
+
+    /// Records that a `MAX_STREAM_DATA` announcing a certain window was sent
+    ///
+    /// This will suppress enqueuing further `MAX_STREAM_DATA` frames unless
+    /// either the previous transmission was not acknowledged or the window
+    /// further increased.
+    pub(super) fn record_sent_max_stream_data(&mut self, sent_value: u64) {
+        if sent_value > self.sent_max_stream_data {
+            self.sent_max_stream_data = sent_value;
+        }
+    }
+
+    /// Whether the total amount of data that the peer will send on this stream is unknown
+    ///
+    /// True until we've received either a reset or the final frame.
+    ///
+    /// Implies that the sender might benefit from stream-level flow control updates, and we might
+    /// need to issue connection-level flow control updates due to flow control budget use by this
+    /// stream in the future, even if it's been stopped.
+    pub(super) fn final_offset_unknown(&self) -> bool {
+        matches!(self.state, RecvState::Recv { size: None })
+    }
+
+    /// Whether stream-level flow control updates should be sent for this stream
+    pub(super) fn can_send_flow_control(&self) -> bool {
+        // Stream-level flow control is redundant if the sender has already sent the whole stream,
+        // and moot if we no longer want data on this stream.
+        self.final_offset_unknown() && !self.stopped
+    }
+
+    /// Whether data is still being accepted from the peer
+    pub(super) fn is_receiving(&self) -> bool {
+        matches!(self.state, RecvState::Recv { .. })
+    }
+
+    fn final_offset(&self) -> Option<u64> {
+        match self.state {
+            RecvState::Recv { size } => size,
+            RecvState::ResetRecvd { size, .. } => Some(size),
+        }
+    }
+
+    /// Returns `false` iff the reset was redundant
+    pub(super) fn reset(
+        &mut self,
+        error_code: VarInt,
+        final_offset: VarInt,
+        received: u64,
+        max_data: u64,
+    ) -> Result<bool, TransportError> {
+        // Validate final_offset
+        if let Some(offset) = self.final_offset() {
+            if offset != final_offset.into_inner() {
+                return Err(TransportError::FINAL_SIZE_ERROR("inconsistent value"));
+            }
+        } else if self.end > u64::from(final_offset) {
+            return Err(TransportError::FINAL_SIZE_ERROR(
+                "lower than high water mark",
+            ));
+        }
+        self.credit_consumed_by(final_offset.into(), received, max_data)?;
+
+        if matches!(self.state, RecvState::ResetRecvd { .. }) {
+            return Ok(false);
+        }
+        self.state = RecvState::ResetRecvd {
+            size: final_offset.into(),
+            error_code,
+        };
+        // Nuke buffers so that future reads fail immediately, which ensures future reads don't
+        // issue flow control credit redundant to that already issued. We could instead special-case
+        // reset streams during read, but it's unclear if there's any benefit to retaining data for
+        // reset streams.
+        self.assembler.clear();
+        Ok(true)
+    }
+
+    pub(super) fn reset_code(&self) -> Option<VarInt> {
+        match self.state {
+            RecvState::ResetRecvd { error_code, .. } => Some(error_code),
+            _ => None,
+        }
+    }
+
+    /// Compute the amount of flow control credit consumed, or return an error if more was consumed
+    /// than issued
+    fn credit_consumed_by(
+        &self,
+        offset: u64,
+        received: u64,
+        max_data: u64,
+    ) -> Result<u64, TransportError> {
+        let prev_end = self.end;
+        let new_bytes = offset.saturating_sub(prev_end);
+        if offset > self.sent_max_stream_data || received + new_bytes > max_data {
+            debug!(
+                received,
+                new_bytes,
+                max_data,
+                offset,
+                stream_max_data = self.sent_max_stream_data,
+                "flow control error"
+            );
+            return Err(TransportError::FLOW_CONTROL_ERROR(""));
+        }
+
+        Ok(new_bytes)
+    }
+}
+
+/// Chunks returned from [`RecvStream::read()`][crate::RecvStream::read].
+///
+/// ### Note: Finalization Needed
+/// Bytes read from the stream are not released from the congestion window until
+/// either [`Self::finalize()`] is called, or this type is dropped.
+///
+/// It is recommended that you call [`Self::finalize()`] because it returns a flag
+/// telling you whether reading from the stream has resulted in the need to transmit a packet.
+///
+/// If this type is leaked, the stream will remain blocked on the remote peer until
+/// another read from the stream is done.
+pub struct Chunks<'a> {
+    id: StreamId,
+    ordered: bool,
+    streams: &'a mut StreamsState,
+    pending: &'a mut Retransmits,
+    state: ChunksState,
+    read: u64,
+}
+
+impl<'a> Chunks<'a> {
+    pub(super) fn new(
+        id: StreamId,
+        ordered: bool,
+        streams: &'a mut StreamsState,
+        pending: &'a mut Retransmits,
+    ) -> Result<Self, ReadableError> {

@@ -1,0 +1,1180 @@
+use super::{base_cache::Inner, PredicateId, PredicateIdStr};
+use crate::{
+    common::{
+        concurrent::{arc::MiniArc, AccessTime, KvEntry, ValueEntry},
+        time::Instant,
+    },
+    notification::RemovalCause,
+    PredicateError,
+};
+
+use parking_lot::{Mutex, MutexGuard};
+use std::{
+    hash::{BuildHasher, Hash},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
+use uuid::Uuid;
+
+pub(crate) type PredicateFun<K, V> = Arc<dyn Fn(&K, &V) -> bool + Send + Sync + 'static>;
+
+const PREDICATE_MAP_NUM_SEGMENTS: usize = 16;
+
+pub(crate) struct KeyDateLite<K> {
+    key: Arc<K>,
+    hash: u64,
+    timestamp: Instant,
+}
+
+impl<K> Clone for KeyDateLite<K> {
+    fn clone(&self) -> Self {
+        Self {
+            key: Arc::clone(&self.key),
+            hash: self.hash,
+            timestamp: self.timestamp,
+        }
+    }
+}
+
+impl<K> KeyDateLite<K> {
+    pub(crate) fn new(key: &Arc<K>, hash: u64, timestamp: Instant) -> Self {
+        Self {
+            key: Arc::clone(key),
+            hash,
+            timestamp,
+        }
+    }
+}
+
+pub(crate) struct Invalidator<K, V, S> {
+    predicates: crate::cht::SegmentedHashMap<PredicateId, Predicate<K, V>, S>,
+    is_empty: AtomicBool,
+    scan_context: Arc<ScanContext<K, V>>,
+}
+
+//
+// Crate public methods.
+//
+impl<K, V, S> Invalidator<K, V, S> {
+    pub(crate) fn new(hasher: S) -> Self
+    where
+        S: BuildHasher,
+    {
+        const CAPACITY: usize = 0;
+        let predicates = crate::cht::SegmentedHashMap::with_num_segments_capacity_and_hasher(
+            PREDICATE_MAP_NUM_SEGMENTS,
+            CAPACITY,
+            hasher,
+        );
+        Self {
+            predicates,
+            is_empty: AtomicBool::new(true),
+            scan_context: Arc::new(ScanContext::default()),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.is_empty.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn remove_predicates_registered_before(&self, ts: Instant)
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher,
+    {
+        let pred_map = &self.predicates;
+
+        let removing_ids = pred_map
+            .iter()
+            .filter(|(_, pred)| pred.registered_at <= ts)
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+
+        for id in removing_ids {
+            let hash = pred_map.hash(&id);
+            pred_map.remove(hash, |k| k == &id);
+        }
+
+        if pred_map.is_empty() {
+            self.is_empty.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn register_predicate(
+        &self,
+        predicate: PredicateFun<K, V>,
+        registered_at: Instant,
+    ) -> Result<PredicateId, PredicateError>
+    where
+        K: Hash + Eq,
+        S: BuildHasher,
+    {
+        const MAX_RETRY: usize = 1_000;
+        let mut tries = 0;
+        let preds = &self.predicates;
+
+        while tries < MAX_RETRY {
+            let id = Uuid::new_v4().as_hyphenated().to_string();
+
+            let hash = preds.hash(&id);
+            if preds.contains_key(hash, |k| k == &id) {
+                tries += 1;
+
+                continue; // Retry
+            }
+            let pred = Predicate::new(&id, predicate, registered_at);
+            preds.insert_entry_and(id.clone(), hash, pred, |_, _| ());
+            self.is_empty.store(false, Ordering::Release);
+
+            return Ok(id);
+        }
+
+        // Since we are using 128-bit UUID for the ID and we do retries for MAX_RETRY
+        // times, this panic should extremely unlikely occur (unless there is a bug in
+        // UUID generation).
+        panic!("Cannot assign a new PredicateId to a predicate");
+    }
+
+    // This method will be called by the get method of Cache.
+    #[inline]
+    pub(crate) fn apply_predicates(&self, key: &Arc<K>, entry: &MiniArc<ValueEntry<K, V>>) -> bool
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher,
+    {
+        if self.is_empty() {
+            false
+        } else if let Some(ts) = entry.last_modified() {
+            Self::do_apply_predicates(
+                self.predicates.iter().map(|(_, v)| v),
+                key,
+                &entry.value,
+                ts,
+            )
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn scan_and_invalidate(
+        &self,
+        cache: &Inner<K, V, S>,
+        candidates: Vec<KeyDateLite<K>>,
+        is_truncated: bool,
+    ) -> (Vec<KvEntry<K, V>>, bool)
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher,
+    {
+        let mut predicates = self.scan_context.predicates.lock();
+        if predicates.is_empty() {
+            *predicates = self.predicates.iter().map(|(_k, v)| v).collect();
+        }
+
+        let mut invalidated = Vec::default();
+        let mut newest_timestamp = None;
+
+        for candidate in &candidates {
+            let key = &candidate.key;
+            let hash = candidate.hash;
+            let ts = candidate.timestamp;
+            if self.apply(&predicates, cache, key, hash, ts) {
+                if let Some(entry) = Self::invalidate(cache, key, hash, ts) {
+                    invalidated.push(KvEntry {
+                        key: Arc::clone(key),
+                        entry,
+                    });
+                }
+            }
+            newest_timestamp = Some(ts);
+        }
+
+        self.remove_finished_predicates(predicates, is_truncated, newest_timestamp);
+
+        (invalidated, self.predicates.is_empty())
+    }
+}
+
+//
+// Private methods.
+//
+impl<K, V, S> Invalidator<K, V, S>
+where
+    K: Hash + Eq,
+    S: BuildHasher,
+{
+    #[inline]
+    fn do_apply_predicates<I>(predicates: I, key: &K, value: &V, ts: Instant) -> bool
+    where
+        I: Iterator<Item = Predicate<K, V>>,
+    {
+        for predicate in predicates {
+            if predicate.is_applicable(ts) && predicate.apply(key, value) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn remove_finished_predicates(
+        &self,
+        mut predicates: MutexGuard<'_, Vec<Predicate<K, V>>>,
+        is_truncated: bool,
+        newest_timestamp: Option<Instant>,
+    ) where
+        K: Hash + Eq,
+        S: BuildHasher,
+    {
+        let predicates = &mut *predicates;
+        if is_truncated {
+            if let Some(ts) = newest_timestamp {
+                let (active, finished): (Vec<_>, Vec<_>) =
+                    predicates.drain(..).partition(|p| p.is_applicable(ts));
+
+                // Remove finished predicates from the predicate registry.
+                self.remove_predicates(&finished);
+                // Set the active predicates to the scan context.
+                *predicates = active;
+            } else {
+                unreachable!();
+            }
+        } else {
+            // Remove all the predicates from the predicate registry and scan context.
+            self.remove_predicates(predicates);
+            predicates.clear();
+        }
+    }
+
+    fn remove_predicates(&self, predicates: &[Predicate<K, V>])
+    where
+        K: Hash + Eq,
+        S: BuildHasher,
+    {
+        let pred_map = &self.predicates;
+        for p in predicates.iter() {
+            let hash = pred_map.hash(p.id());
+            pred_map.remove(hash, |k| k == p.id());
+        }
+
+        if pred_map.is_empty() {
+            self.is_empty.store(true, Ordering::Release);
+        }
+    }
+
+    fn apply(
+        &self,
+        predicates: &[Predicate<K, V>],
+        cache: &Inner<K, V, S>,
+        key: &Arc<K>,
+        hash: u64,
+        ts: Instant,
+    ) -> bool {
+        if let Some(entry) = cache.cache.get(hash, |k| k == key) {
+            if let Some(lm) = entry.last_modified() {
+                if lm == ts {
+                    return Invalidator::<_, _, S>::do_apply_predicates(
+                        predicates.iter().cloned(),
+                        key,
+                        &entry.value,
+                        lm,
+                    );
+                }
+            }
+        }
+
+        false
+    }
+
+    fn invalidate(
+        cache: &Inner<K, V, S>,
+        key: &Arc<K>,
+        hash: u64,
+        ts: Instant,
+    ) -> Option<MiniArc<ValueEntry<K, V>>>
+    where
+        K: Send + Sync + 'static,
+        if self.is_done {
+            return None;
+        }
+
+        loop {
+            if self.is_new_level {
+                let previous_time_nanos = self.timer_wheel.time_nanos(self.previous_time);
+                let current_time_nanos = self.timer_wheel.time_nanos(self.current_time);
+                let previous_ticks = previous_time_nanos >> SHIFT[self.level];
+                let current_ticks = current_time_nanos >> SHIFT[self.level];
+
+                if current_ticks <= previous_ticks {
+                    self.is_done = true;
+                    return None;
+                }
+
+                self.index_mask = BUCKET_COUNTS[self.level] - 1;
+                self.index = (previous_ticks & self.index_mask) as u8;
+                let steps =
+                    (current_ticks - previous_ticks + 1).min(BUCKET_COUNTS[self.level]) as u8;
+                self.end_index = self.index + steps;
+
+                self.is_new_level = false;
+                self.is_new_index = true;
+
+                // dbg!(self.level, self.index, self.end_index);
+            }
+
+            let i = self.index & self.index_mask as u8;
+
+            if self.is_new_index {
+                // Move the sentinel to the back of the queue.
+                self.timer_wheel
+                    .reset_timer_node_positions(self.level, i as usize);
+
+                self.is_new_index = false;
+            }
+
+            // Pop the next timer event (cache entry) from the queue at the current
+            // level and index.
+            //
+            // We will repeat processing this level until we see the sentinel.
+            // (`pop_timer_node` will return `None` when it sees the sentinel)
+            if let Some(node) = self.timer_wheel.pop_timer_node(self.level, i as usize) {
+                let expiration_time = node.as_ref().element.entry_info().expiration_time();
+                if let Some(t) = expiration_time {
+                    if t <= self.current_time {
+                        // The cache entry has expired. Unset the timer node from
+                        // the ValueEntry and return the node.
+                        node.as_ref().element.unset_timer_node_in_deq_nodes();
+                        return Some(TimerEvent::Expired(node));
+                    }
+
+                    // The cache entry has not expired. Reschedule it.
+                    let node_p = NonNull::new(Box::into_raw(node)).expect("Got a null ptr");
+
+                    #[cfg(test)]
+                    // Get the entry info before rescheduling (mutating) the node to
+                    // avoid Stacked Borrows/Tree Borrows violations on `node_p`.
+                    let entry_info =
+                        MiniArc::clone(unsafe { node_p.as_ref() }.element.entry_info());
+
+                    match self.timer_wheel.schedule_existing_node(node_p) {
+                        ReschedulingResult::Rescheduled => {
+                            #[cfg(test)]
+                            return Some(TimerEvent::Rescheduled(entry_info));
+                            #[cfg(not(test))]
+                            return Some(TimerEvent::Rescheduled(()));
+                        }
+                        ReschedulingResult::Removed(node) => {
+                            // The timer event has been removed from the timer
+                            // wheel. Unset the timer node from the ValueEntry.
+                            node.as_ref().element.unset_timer_node_in_deq_nodes();
+                            return Some(TimerEvent::Descheduled);
+                        }
+                    }
+                }
+            } else {
+                // Done with the current queue. Move to the next index
+                // and/or next level.
+                self.index += 1;
+                self.is_new_index = true;
+
+                if self.index >= self.end_index {
+                    self.level += 1;
+                    // No more levels to process. We are done.
+                    if self.level >= BUCKET_COUNTS.len() {
+                        self.is_done = true;
+                        return None;
+                    }
+                    self.is_new_level = true;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use super::{TimerEvent, TimerWheel, SPANS};
+    use crate::common::{
+        concurrent::{arc::MiniArc, entry_info::EntryInfo, KeyHash},
+        time::{Clock, Instant, Mock},
+    };
+
+    #[test]
+    fn test_bucket_indices() {
+        fn bi(timer: &TimerWheel<()>, now: Instant, dur: Duration) -> (usize, usize) {
+            let t = now.saturating_add(dur);
+            timer.bucket_indices(t)
+        }
+
+        let (clock, mock) = Clock::mock();
+        let now = clock.now();
+
+        let mut timer = TimerWheel::<()>::new(now);
+        timer.enable();
+
+        assert_eq!(timer.bucket_indices(now), (0, 0));
+
+        // Level 0: 1.07s
+        assert_eq!(bi(&timer, now, n2d(SPANS[0] - 1)), (0, 0));
+        assert_eq!(bi(&timer, now, n2d(SPANS[0])), (0, 1));
+        assert_eq!(bi(&timer, now, n2d(SPANS[0] * 63)), (0, 63));
+
+        // Level 1: 1.14m
+        assert_eq!(bi(&timer, now, n2d(SPANS[0] * 64)), (1, 1));
+        assert_eq!(bi(&timer, now, n2d(SPANS[1])), (1, 1));
+        assert_eq!(bi(&timer, now, n2d(SPANS[1] * 63 + SPANS[0] * 63)), (1, 63));
+
+        // Level 2: 1.22h
+        assert_eq!(bi(&timer, now, n2d(SPANS[1] * 64)), (2, 1));
+        assert_eq!(bi(&timer, now, n2d(SPANS[2])), (2, 1));
+        assert_eq!(
+            bi(
+                &timer,
+                now,
+                n2d(SPANS[2] * 31 + SPANS[1] * 63 + SPANS[0] * 63)
+            ),
+            (2, 31)
+        );
+
+        // Level 3: 1.63dh
+        assert_eq!(bi(&timer, now, n2d(SPANS[2] * 32)), (3, 1));
+        assert_eq!(bi(&timer, now, n2d(SPANS[3])), (3, 1));
+        assert_eq!(bi(&timer, now, n2d(SPANS[3] * 3)), (3, 3));
+
+        // Overflow
+        assert_eq!(bi(&timer, now, n2d(SPANS[3] * 4)), (4, 0));
+        assert_eq!(bi(&timer, now, n2d(SPANS[4])), (4, 0));
+        assert_eq!(bi(&timer, now, n2d(SPANS[4] * 100)), (4, 0));
+
+        // Increment the clock by 5 ticks. (1 tick ~= 1.07s)
+        let now = advance_clock(&clock, &mock, n2d(SPANS[0] * 5));
+        timer.current = now;
+
+        // Level 0: 1.07s
+        assert_eq!(bi(&timer, now, n2d(SPANS[0] - 1)), (0, 5));
+        assert_eq!(bi(&timer, now, n2d(SPANS[0])), (0, 6));
+        assert_eq!(bi(&timer, now, n2d(SPANS[0] * 63)), (0, 4));
+
+        // Level 1: 1.14m
+        assert_eq!(bi(&timer, now, n2d(SPANS[0] * 64)), (1, 1));
+        assert_eq!(bi(&timer, now, n2d(SPANS[1])), (1, 1));
+        assert_eq!(
+            bi(&timer, now, n2d(SPANS[1] * 63 + SPANS[0] * (63 - 5))),
+            (1, 63)
+        );
+
+        // Increment the clock by 61 ticks. (total 66 ticks)
+        let now = advance_clock(&clock, &mock, n2d(SPANS[0] * 61));
+        timer.current = now;
+
+        // Level 0: 1.07s
+        assert_eq!(bi(&timer, now, n2d(SPANS[0] - 1)), (0, 2));
+        assert_eq!(bi(&timer, now, n2d(SPANS[0])), (0, 3));
+        assert_eq!(bi(&timer, now, n2d(SPANS[0] * 63)), (0, 1));
+
+        // Level 1: 1.14m
+        assert_eq!(bi(&timer, now, n2d(SPANS[0] * 64)), (1, 2));
+        assert_eq!(bi(&timer, now, n2d(SPANS[1])), (1, 2));
+        assert_eq!(
+            bi(&timer, now, n2d(SPANS[1] * 63 + SPANS[0] * (63 - 2))),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn test_advance() {
+//! Segmented lock-free hash tables.
+//!
+//! Segmented hash tables divide their entries between a number of smaller
+//! logical hash tables, or segments. Each segment is entirely independent from
+//! the others, and entries are never relocated across segment boundaries.
+//!
+//! In the context of this crate, a segment refers specifically to an array of
+//! bucket pointers. The number of segments in a hash table is rounded up to the
+//! nearest power of two; this is so that selecting the segment for a key is no
+//! more than a right shift to select the most significant bits of a hashed key.
+//!
+//! Each segment is entirely independent from the others, all operations can be
+//! performed concurrently by multiple threads. Should a set of threads be
+//! operating on disjoint sets of segments, the only synchronization between
+//! them will be destructive interference as they access and update the bucket
+//! array pointer and length for each segment.
+//!
+//! Compared to the unsegmented hash tables in this crate, the segmented hash
+//! tables have higher concurrent write throughput for disjoint sets of keys.
+//! However, the segmented hash tables have slightly lower read and
+//! single-threaded write throughput. This is because the segmenting structure
+//! adds another layer of indirection between the hash table and its buckets.
+//!
+//! The idea for segmenting hash tables was inspired by the
+//! [`ConcurrentHashMap`] from OpenJDK 7, which consists of a number of
+//! separately-locked segments. OpenJDK 8 introduced a striped concurrent hash
+//! map that stripes a set of bucket locks across the set of buckets using the
+//! least significant bits of hashed keys.
+//!
+//! [`ConcurrentHashMap`]: https://github.com/openjdk-mirror/jdk7u-jdk/blob/master/src/share/classes/java/util/concurrent/ConcurrentHashMap.java
+
+use crate::cht::map::{
+    bucket::{self, BucketArray},
+    bucket_array_ref::BucketArrayRef,
+    DefaultHashBuilder,
+};
+
+use super::iter::{Iter, ScanningGet};
+
+use std::{
+    hash::{BuildHasher, Hash},
+    ptr,
+    sync::atomic::{self, AtomicUsize, Ordering},
+};
+
+use crossbeam_epoch::Atomic;
+use equivalent::Equivalent;
+
+/// A lock-free hash map implemented with segmented bucket pointer arrays, open
+/// addressing, and linear probing.
+///
+/// By default, `Cache` uses a hashing algorithm selected to provide resistance
+/// against HashDoS attacks.
+///
+/// The default hashing algorithm is the one used by `std::collections::HashMap`,
+/// which is currently SipHash 1-3.
+///
+/// While its performance is very competitive for medium sized keys, other hashing
+/// algorithms will outperform it for small keys such as integers as well as large
+/// keys such as long strings. However those algorithms will typically not protect
+/// against attacks such as HashDoS.
+///
+/// The hashing algorithm can be replaced on a per-`HashMap` basis using the
+/// [`default`], [`with_hasher`], [`with_capacity_and_hasher`],
+/// [`with_num_segments_and_hasher`], and
+/// [`with_num_segments_capacity_and_hasher`] methods. Many alternative
+/// algorithms are available on crates.io, such as the [`AHash`] crate.
+///
+/// The number of segments can be specified on a per-`HashMap` basis using the
+/// [`with_num_segments`], [`with_num_segments_and_capacity`],
+/// [`with_num_segments_and_hasher`], and
+/// [`with_num_segments_capacity_and_hasher`] methods. By default, the
+/// `num-cpus` feature is enabled and [`new`], [`with_capacity`],
+/// [`with_hasher`], and [`with_capacity_and_hasher`] will create maps with
+/// twice as many segments as the system has CPUs.
+///
+/// It is required that the keys implement the [`Eq`] and [`Hash`] traits,
+/// although this can frequently be achieved by using
+/// `#[derive(PartialEq, Eq, Hash)]`. If you implement these yourself, it is
+/// important that the following property holds:
+///
+/// ```text
+/// k1 == k2 -> hash(k1) == hash(k2)
+/// ```
+///
+/// In other words, if two keys are equal, their hashes must be equal.
+///
+/// It is a logic error for a key to be modified in such a way that the key's
+/// hash, as determined by the [`Hash`] trait, or its equality, as determined by
+/// the [`Eq`] trait, changes while it is in the map. This is normally only
+/// possible through [`Cell`], [`RefCell`], global state, I/O, or unsafe code.
+///
+/// [`AHash`]: https://crates.io/crates/ahash
+/// [`default`]: #method.default
+/// [`with_hasher`]: #method.with_hasher
+/// [`with_capacity`]: #method.with_capacity
+/// [`with_capacity_and_hasher`]: #method.with_capacity_and_hasher
+/// [`with_num_segments_and_hasher`]: #method.with_num_segments_and_hasher
+/// [`with_num_segments_capacity_and_hasher`]: #method.with_num_segments_capacity_and_hasher
+/// [`with_num_segments`]: #method.with_num_segments
+/// [`with_num_segments_and_capacity`]: #method.with_num_segments_and_capacity
+/// [`new`]: #method.new
+/// [`Eq`]: https://doc.rust-lang.org/std/cmp/trait.Eq.html
+/// [`Hash`]: https://doc.rust-lang.org/std/hash/trait.Hash.html
+/// [`Cell`]: https://doc.rust-lang.org/std/cell/struct.Ref.html
+/// [`RefCell`]: https://doc.rust-lang.org/std/cell/struct.RefCell.html
+pub(crate) struct HashMap<K, V, S = DefaultHashBuilder> {
+    segments: Box<[Segment<K, V>]>,
+    build_hasher: S,
+    len: AtomicUsize,
+    segment_shift: u32,
+}
+
+#[cfg(test)]
+impl<K, V> HashMap<K, V, DefaultHashBuilder> {
+    /// Creates an empty `HashMap` with the specified capacity.
+    ///
+    /// The hash map will be able to hold at least `capacity` elements without
+    /// reallocating any bucket pointer arrays. If `capacity` is 0, the hash map
+    /// will not allocate any bucket pointer arrays. However, it will always
+    /// allocate memory for segment pointers and lengths.
+    ///
+    /// The `HashMap` will be created with at least twice as many segments as
+    /// the system has CPUs.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_num_segments_capacity_and_hasher(
+            default_num_segments(),
+            capacity,
+            DefaultHashBuilder::default(),
+        )
+    }
+}
+
+impl<K, V, S> HashMap<K, V, S> {
+    /// Creates an empty `HashMap` with the specified number of segments, using
+    /// `build_hasher` to hash the keys.
+    ///
+    /// The hash map is initially created with a capacity of 0, so it will not
+    /// allocate bucket pointer arrays until it is first inserted into. However,
+    /// it will always allocate memory for segment pointers and lengths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is 0.
+    pub(crate) fn with_num_segments_and_hasher(num_segments: usize, build_hasher: S) -> Self {
+        Self::with_num_segments_capacity_and_hasher(num_segments, 0, build_hasher)
+    }
+
+    /// Creates an empty `HashMap` with the specified number of segments and
+    /// capacity, using `build_hasher` to hash the keys.
+    ///
+    /// The hash map will be able to hold at least `capacity` elements without
+    /// reallocating any bucket pointer arrays. If `capacity` is 0, the hash map
+    /// will not allocate any bucket pointer arrays. However, it will always
+    /// allocate memory for segment pointers and lengths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is 0.
+    pub(crate) fn with_num_segments_capacity_and_hasher(
+        num_segments: usize,
+        capacity: usize,
+        build_hasher: S,
+    ) -> Self {
+        assert!(num_segments > 0);
+
+        let actual_num_segments = num_segments.next_power_of_two();
+        let segment_shift = 64 - actual_num_segments.trailing_zeros();
+
+        let mut segments = Vec::with_capacity(actual_num_segments);
+
+        if capacity == 0 {
+            unsafe {
+                ptr::write_bytes(segments.as_mut_ptr(), 0, actual_num_segments);
+                segments.set_len(actual_num_segments);
+            }
+        } else {
+            let actual_capacity = (capacity * 2 / actual_num_segments).next_power_of_two();
+
+            for _ in 0..actual_num_segments {
+                segments.push(Segment {
+                    bucket_array: Atomic::new(BucketArray::with_length(0, actual_capacity)),
+                    len: AtomicUsize::new(0),
+                });
+            }
+        }
+
+        let segments = segments.into_boxed_slice();
+
+        Self {
+            segments,
+            build_hasher,
+            len: AtomicUsize::new(0),
+            segment_shift,
+        }
+    }
+
+    pub(crate) fn actual_num_segments(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Returns the number of elements in the map.
+    ///
+    /// # Safety
+    ///
+    /// This method on its own is safe, but other threads can add or remove
+    /// elements at any time.
+    pub(crate) fn len(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
+    }
+
+    /// Returns `true` if the map contains no elements.
+    ///
+    /// # Safety
+    ///
+    /// This method on its own is safe, but other threads can add or remove
+    /// elements at any time.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the number of elements the map can hold without reallocating any
+    /// bucket pointer arrays.
+    ///
+    /// Note that all mutating operations except removal will result in a bucket
+    /// being allocated or reallocated.
+    ///
+    /// # Safety
+    ///
+    /// This method on its own is safe, but other threads can increase the
+    /// capacity of each segment at any time by adding elements.
+    #[cfg(any(test, feature = "unstable-debug-counters"))]
+    pub(crate) fn capacity(&self) -> usize {
+        let guard = &crossbeam_epoch::pin();
+
+        self.segments
+            .iter()
+            .map(|s| s.bucket_array.load_consume(guard))
+            .map(|p| unsafe { p.as_ref() })
+            .map(|a| a.map_or(0, BucketArray::capacity))
+            .sum::<usize>()
+    }
+
+    #[cfg(test)]
+    /// Returns the number of segments in the map.
+    pub(crate) fn num_segments(&self) -> usize {
+        self.segments.len()
+    }
+}
+
+impl<K: Hash + Eq, V, S: BuildHasher> HashMap<K, V, S> {
+    #[inline]
+    pub(crate) fn contains_key(&self, hash: u64, eq: impl FnMut(&K) -> bool) -> bool {
+        self.get_key_value_and_then(hash, eq, |_, _| Some(()))
+            .is_some()
+    }
+
+    /// Returns a clone of the value corresponding to the key.
+    #[inline]
+    pub(crate) fn get(&self, hash: u64, eq: impl FnMut(&K) -> bool) -> Option<V>
+    where
+        V: Clone,
+    {
+        self.get_key_value_and(hash, eq, |_, v| v.clone())
+    }
+
+    /// Returns the result of invoking a function with a reference to the
+    /// key-value pair corresponding to the supplied key.
+    #[inline]
+    pub(crate) fn get_key_value_and<T>(
+        &self,
+        hash: u64,
+        eq: impl FnMut(&K) -> bool,
+        with_entry: impl FnOnce(&K, &V) -> T,
+    ) -> Option<T> {
+        self.get_key_value_and_then(hash, eq, |k, v| Some(with_entry(k, v)))
+    }
+
+    /// Returns the result of invoking a function with a reference to the
+    /// key-value pair corresponding to the supplied key.
+use std::{hash::Hash, sync::Arc};
+
+// This trait is implemented by `sync::BaseCache` and `sync::Cache`.
+pub(crate) trait ScanningGet<K, V> {
+    /// Returns the number of segments in the concurrent hash table.
+    fn num_cht_segments(&self) -> usize;
+
+    /// Returns a _clone_ of the value corresponding to the key.
+    ///
+    /// Unlike the `get` method of cache, this method is not considered a cache read
+    /// operation, so it does not update the historic popularity estimator or reset
+    /// the idle timer for the key.
+    fn scanning_get(&self, key: &Arc<K>) -> Option<V>;
+
+    /// Returns a vec of keys in a specified segment of the concurrent hash table.
+    fn keys(&self, cht_segment: usize) -> Option<Vec<Arc<K>>>;
+}
+
+/// Iterator visiting all key-value pairs in a cache in arbitrary order.
+///
+/// Call [`Cache::iter`](./struct.Cache.html#method.iter) method to obtain an `Iter`.
+pub struct Iter<'i, K, V> {
+    keys: Option<Vec<Arc<K>>>,
+    cache_segments: Box<[&'i dyn ScanningGet<K, V>]>,
+    num_cht_segments: usize,
+    cache_seg_index: usize,
+    cht_seg_index: usize,
+    is_done: bool,
+}
+
+impl<'i, K, V> Iter<'i, K, V> {
+    pub(crate) fn with_single_cache_segment(
+        cache: &'i dyn ScanningGet<K, V>,
+        num_cht_segments: usize,
+    ) -> Self {
+        Self {
+            keys: None,
+            cache_segments: Box::new([cache]),
+            num_cht_segments,
+            cache_seg_index: 0,
+            cht_seg_index: 0,
+            is_done: false,
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    pub(crate) fn with_multiple_cache_segments(
+        cache_segments: Box<[&'i dyn ScanningGet<K, V>]>,
+        num_cht_segments: usize,
+    ) -> Self {
+        Self {
+            keys: None,
+            cache_segments,
+            num_cht_segments,
+            cache_seg_index: 0,
+            cht_seg_index: 0,
+            is_done: false,
+        }
+    }
+}
+
+impl<K, V> Iterator for Iter<'_, K, V>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    type Item = (Arc<K>, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.is_done {
+            return None;
+        }
+
+        while let Some(key) = self.next_key() {
+            if let Some(v) = self.cache().scanning_get(&key) {
+                return Some((key, v));
+            }
+        }
+
+        self.is_done = true;
+        None
+    }
+}
+
+impl<'i, K, V> Iter<'i, K, V>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    fn cache(&self) -> &'i dyn ScanningGet<K, V> {
+        self.cache_segments[self.cache_seg_index]
+    }
+
+    fn next_key(&mut self) -> Option<Arc<K>> {
+        while let Some(keys) = self.current_keys() {
+            if let key @ Some(_) = keys.pop() {
+                return key;
+            }
+        }
+        None
+    }
+
+    fn current_keys(&mut self) -> Option<&mut Vec<Arc<K>>> {
+        // If keys is none or some but empty, try to get next keys.
+        while self.keys.as_ref().map_or(true, Vec::is_empty) {
+            // Adjust indices.
+            if self.cht_seg_index >= self.num_cht_segments {
+                self.cache_seg_index += 1;
+                self.cht_seg_index = 0;
+                if self.cache_seg_index >= self.cache_segments.len() {
+                    // No more cache segments left.
+                    return None;
+                }
+            }
+
+            let cache_segment = self.cache_segments[self.cache_seg_index];
+            self.keys = cache_segment.keys(self.cht_seg_index);
+            self.num_cht_segments = cache_segment.num_cht_segments();
+
+            self.cht_seg_index += 1;
+        }
+
+        self.keys.as_mut()
+    }
+}
+
+// Clippy beta 0.1.83 (f41c7ed9889 2024-10-31) warns about unused lifetimes on 'a.
+// This seems a false positive. The lifetimes are used in the Send and Sync impls.
+// Let's suppress the warning.
+// https://rust-lang.github.io/rust-clippy/master/index.html#extra_unused_lifetimes
+#[allow(clippy::extra_unused_lifetimes)]
+unsafe impl<'a, K, V> Send for Iter<'_, K, V>
+where
+    K: 'a + Eq + Hash + Send,
+    V: 'a + Send,
+{
+}
+
+// Clippy beta 0.1.83 (f41c7ed9889 2024-10-31) warns about unused lifetimes on 'a.
+// This seems a false positive. The lifetimes are used in the Send and Sync impls.
+// Let's suppress the warning.
+// https://rust-lang.github.io/rust-clippy/master/index.html#extra_unused_lifetimes
+#[allow(clippy::extra_unused_lifetimes)]
+unsafe impl<'a, K, V> Sync for Iter<'_, K, V>
+where
+    K: 'a + Eq + Hash + Sync,
+    V: 'a + Sync,
+{
+}
+// License and Copyright Notice:
+//
+// Some of the code and doc comments in this module were ported or copied from
+// a Java class `com.github.benmanes.caffeine.cache.FrequencySketch` of Caffeine.
+// https://github.com/ben-manes/caffeine/blob/master/caffeine/src/main/java/com/github/benmanes/caffeine/cache/FrequencySketch.java
+//
+// The original code/comments from Caffeine are licensed under the Apache License,
+// Version 2.0 <https://github.com/ben-manes/caffeine/blob/master/LICENSE>
+//
+// Copyrights of the original code/comments are retained by their contributors.
+// For full authorship information, see the version control history of
+// https://github.com/ben-manes/caffeine/
+
+/// A probabilistic multi-set for estimating the popularity of an element within
+/// a time window. The maximum frequency of an element is limited to 15 (4-bits)
+/// and an aging process periodically halves the popularity of all elements.
+#[derive(Default)]
+pub(crate) struct FrequencySketch {
+    sample_size: u32,
+    table_mask: u64,
+    table: Box<[u64]>,
+    size: u32,
+}
+
+// A mixture of seeds from FNV-1a, CityHash, and Murmur3. (Taken from Caffeine)
+static SEED: [u64; 4] = [
+    0xc3a5_c85c_97cb_3127,
+    0xb492_b66f_be98_f273,
+    0x9ae1_6a3b_2f90_404f,
+    0xcbf2_9ce4_8422_2325,
+];
+
+static RESET_MASK: u64 = 0x7777_7777_7777_7777;
+
+static ONE_MASK: u64 = 0x1111_1111_1111_1111;
+
+// -------------------------------------------------------------------------------
+// Some of the code and doc comments in this module were ported or copied from
+// a Java class `com.github.benmanes.caffeine.cache.FrequencySketch` of Caffeine.
+// https://github.com/ben-manes/caffeine/blob/master/caffeine/src/main/java/com/github/benmanes/caffeine/cache/FrequencySketch.java
+// -------------------------------------------------------------------------------
+//
+// FrequencySketch maintains a 4-bit CountMinSketch [1] with periodic aging to
+// provide the popularity history for the TinyLfu admission policy [2].
+// The time and space efficiency of the sketch allows it to cheaply estimate the
+// frequency of an entry in a stream of cache access events.
+//
+// The counter matrix is represented as a single dimensional array holding 16
+// counters per slot. A fixed depth of four balances the accuracy and cost,
+// resulting in a width of four times the length of the array. To retain an
+// accurate estimation the array's length equals the maximum number of entries
+// in the cache, increased to the closest power-of-two to exploit more efficient
+// bit masking. This configuration results in a confidence of 93.75% and error
+// bound of e / width.
+//
+// The frequency of all entries is aged periodically using a sampling window
+// based on the maximum number of entries in the cache. This is referred to as
+// the reset operation by TinyLfu and keeps the sketch fresh by dividing all
+// counters by two and subtracting based on the number of odd counters
+// found. The O(n) cost of aging is amortized, ideal for hardware pre-fetching,
+// and uses inexpensive bit manipulations per array location.
+//
+// [1] An Improved Data Stream Summary: The Count-Min Sketch and its Applications
+//     http://dimacs.rutgers.edu/~graham/pubs/papers/cm-full.pdf
+// [2] TinyLFU: A Highly Efficient Cache Admission Policy
+//     https://dl.acm.org/citation.cfm?id=3149371
+//
+// -------------------------------------------------------------------------------
+
+impl FrequencySketch {
+    /// Initializes and increases the capacity of this `FrequencySketch` instance,
+    /// if necessary, to ensure that it can accurately estimate the popularity of
+    /// elements given the maximum size of the cache. This operation forgets all
+    /// previous counts when resizing.
+    pub(crate) fn ensure_capacity(&mut self, cap: u32) {
+        // The max byte size of the table, Box<[u64; table_size]>
+        //
+        // | Pointer width    | Max size |
+        // |:-----------------|---------:|
+        // | 16 bit           |    8 KiB |
+        // | 32 bit           |  128 MiB |
+        // | 64 bit or bigger |    8 GiB |
+
+        let maximum = if cfg!(target_pointer_width = "16") {
+            cap.min(1024)
+        } else if cfg!(target_pointer_width = "32") {
+            cap.min(2u32.pow(24)) // about 16 millions
+        } else {
+            // Same to Caffeine's limit:
+            //   `Integer.MAX_VALUE >>> 1` with `ceilingPowerOfTwo()` applied.
+            cap.min(2u32.pow(30)) // about 1 billion
+        };
+        let table_size = if maximum == 0 {
+            1
+        } else {
+            maximum.next_power_of_two()
+        };
+
+        if self.table.len() as u32 >= table_size {
+            return;
+        }
+
+        self.table = vec![0; table_size as usize].into_boxed_slice();
+        self.table_mask = table_size.saturating_sub(1) as u64;
+        self.sample_size = if cap == 0 {
+            10
+        } else {
+            maximum.saturating_mul(10).min(i32::MAX as u32)
+        };
+    }
+
+    /// Takes the hash value of an element, and returns the estimated number of
+    /// occurrences of the element, up to the maximum (15).
+    pub(crate) fn frequency(&self, hash: u64) -> u8 {
+        if self.table.is_empty() {
+            return 0;
+        }
+
+        let start = ((hash & 3) << 2) as u8;
+        let mut frequency = u8::MAX;
+        for i in 0..4 {
+            let index = self.index_of(hash, i);
+            let shift = (start + i) << 2;
+            let count = ((self.table[index] >> shift) & 0xF) as u8;
+            frequency = frequency.min(count);
+        }
+        frequency
+    }
+
+    /// Take a hash value of an element and increments the popularity of the
+    /// element if it does not exceed the maximum (15). The popularity of all
+    /// elements will be periodically down sampled when the observed events
+    /// exceeds a threshold. This process provides a frequency aging to allow
+    /// expired long term entries to fade away.
+    pub(crate) fn increment(&mut self, hash: u64) {
+        if self.table.is_empty() {
+            return;
+        }
+
+        let start = ((hash & 3) << 2) as u8;
+        let mut added = false;
+        for i in 0..4 {
+            let index = self.index_of(hash, i);
+            added |= self.increment_at(index, start + i);
+        }
+
+        if added {
+            self.size += 1;
+            if self.size >= self.sample_size {
+                self.reset();
+            }
+        }
+    }
+
+    /// Takes a table index (each entry has 16 counters) and counter index, and
+    /// increments the counter by 1 if it is not already at the maximum value
+    /// (15). Returns `true` if incremented.
+    fn increment_at(&mut self, table_index: usize, counter_index: u8) -> bool {
+        let offset = (counter_index as usize) << 2;
+        let mask = 0xF_u64 << offset;
+        if self.table[table_index] & mask != mask {
+            self.table[table_index] += 1u64 << offset;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reduces every counter by half of its original value.
+    fn reset(&mut self) {
+        let mut count = 0u32;
+        for entry in self.table.iter_mut() {
+            // Count number of odd numbers.
+            count += (*entry & ONE_MASK).count_ones();
+            *entry = (*entry >> 1) & RESET_MASK;
+        }
+        self.size = (self.size >> 1) - (count >> 2);
+    }
+
+    /// Returns the table index for the counter at the specified depth.
+    fn index_of(&self, hash: u64, depth: u8) -> usize {
+        let i = depth as usize;
+        let mut hash = hash.wrapping_add(SEED[i]).wrapping_mul(SEED[i]);
+        hash = hash.wrapping_add(hash >> 32);
+        (hash & self.table_mask) as usize
+    }
+
+    #[cfg(feature = "unstable-debug-counters")]
+    pub(crate) fn table_size(&self) -> u64 {
+        (self.table.len() * std::mem::size_of::<u64>()) as u64
+    }
+}
+
+// Methods only available for testing.
+#[cfg(test)]
+impl FrequencySketch {
+    pub(crate) fn table_len(&self) -> usize {
+        self.table.len()
+    }
+}
+
+// Some test cases were ported from Caffeine at:
+// https://github.com/ben-manes/caffeine/blob/master/caffeine/src/test/java/com/github/benmanes/caffeine/cache/FrequencySketchTest.java
+//
+// To see the debug prints, run test as `cargo test -- --nocapture`
+#[cfg(test)]
+mod tests {
+    use super::FrequencySketch;
+    use once_cell::sync::Lazy;
+    use std::hash::{BuildHasher, Hash, Hasher};
+
+    static ITEM: Lazy<u32> = Lazy::new(|| {
+        let mut buf = [0; 4];
+        getrandom::getrandom(&mut buf).unwrap();
+        u32::from_ne_bytes(buf)
+    });
+
+    // This test was ported from Caffeine.
+    #[test]
+    fn increment_once() {
+        let mut sketch = FrequencySketch::default();
+        sketch.ensure_capacity(512);
+        let hasher = hasher();
+        let item_hash = hasher(*ITEM);
+        sketch.increment(item_hash);
+        assert_eq!(sketch.frequency(item_hash), 1);
+    }
+
+    // This test was ported from Caffeine.
+    #[test]
+    fn increment_max() {
+        let mut sketch = FrequencySketch::default();
+        sketch.ensure_capacity(512);
+        let hasher = hasher();
+        let item_hash = hasher(*ITEM);
+        for _ in 0..20 {
+            sketch.increment(item_hash);
+        }
+        assert_eq!(sketch.frequency(item_hash), 15);
+    }
+
+    // This test was ported from Caffeine.
+    #[test]
+    fn increment_distinct() {
+        let mut sketch = FrequencySketch::default();
+        sketch.ensure_capacity(512);
+        let hasher = hasher();
+        sketch.increment(hasher(*ITEM));
+        sketch.increment(hasher(ITEM.wrapping_add(1)));
+        assert_eq!(sketch.frequency(hasher(*ITEM)), 1);
+        assert_eq!(sketch.frequency(hasher(ITEM.wrapping_add(1))), 1);
+        assert_eq!(sketch.frequency(hasher(ITEM.wrapping_add(2))), 0);
+    }
+
+    // This test was ported from Caffeine.
+    #[test]
+    fn index_of_around_zero() {
+        let mut sketch = FrequencySketch::default();
+        sketch.ensure_capacity(512);
+        let mut indexes = std::collections::HashSet::new();

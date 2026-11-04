@@ -1,0 +1,729 @@
+use std::os::raw::c_int;
+use std::string::String as StdString;
+use std::sync::Arc;
+
+use crate::error::{Error, Result};
+use crate::multi::MultiValue;
+use crate::private::Sealed;
+use crate::state::{Lua, RawLua, WeakLua};
+use crate::types::MaybeSend;
+use crate::util::{check_stack, parse_lookup_path, short_type_name};
+use crate::value::Value;
+
+#[cfg(feature = "async")]
+use {crate::function::AsyncCallFuture, std::future::Future};
+
+/// Trait for types convertible to [`Value`].
+pub trait IntoLua: Sized {
+    /// Performs the conversion.
+    fn into_lua(self, lua: &Lua) -> Result<Value>;
+
+    /// Pushes the value into the Lua stack.
+    ///
+    /// # Safety
+    /// This method does not check Lua stack space.
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn push_into_stack(self, lua: &RawLua) -> Result<()> {
+        lua.push_value(&self.into_lua(lua.lua())?)
+    }
+}
+
+/// Trait for types convertible from [`Value`].
+pub trait FromLua: Sized {
+    /// Performs the conversion.
+    fn from_lua(value: Value, lua: &Lua) -> Result<Self>;
+
+    /// Performs the conversion for an argument (eg. function argument).
+    ///
+    /// `i` is the argument index (position),
+    /// `to` is a function name that received the argument.
+    #[doc(hidden)]
+    #[inline]
+    fn from_lua_arg(arg: Value, i: usize, to: Option<&str>, lua: &Lua) -> Result<Self> {
+        Self::from_lua(arg, lua).map_err(|err| Error::BadArgument {
+            to: to.map(|s| s.to_string()),
+            pos: i,
+            name: None,
+            cause: Arc::new(err),
+        })
+    }
+
+    /// Performs the conversion for a value in the Lua stack at index `idx`.
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn from_stack(idx: c_int, lua: &RawLua) -> Result<Self> {
+        Self::from_lua(lua.stack_value(idx, None), lua.lua())
+    }
+
+    /// Same as `from_lua_arg` but for a value in the Lua stack at index `idx`.
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn from_stack_arg(idx: c_int, i: usize, to: Option<&str>, lua: &RawLua) -> Result<Self> {
+        Self::from_stack(idx, lua).map_err(|err| Error::BadArgument {
+            to: to.map(|s| s.to_string()),
+            pos: i,
+            name: None,
+            cause: Arc::new(err),
+        })
+    }
+}
+
+/// Trait for types convertible to any number of Lua values.
+///
+/// This is a generalization of [`IntoLua`], allowing any number of resulting Lua values instead of
+/// just one. Any type that implements [`IntoLua`] will automatically implement this trait.
+pub trait IntoLuaMulti: Sized {
+    /// Performs the conversion.
+    fn into_lua_multi(self, lua: &Lua) -> Result<MultiValue>;
+
+    /// Pushes the values into the Lua stack.
+    ///
+    /// Returns number of pushed values.
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn push_into_stack_multi(self, lua: &RawLua) -> Result<c_int> {
+        let values = self.into_lua_multi(lua.lua())?;
+        let len: c_int = values.len().try_into().unwrap();
+        unsafe {
+            check_stack(lua.state(), len + 1)?;
+            for val in &values {
+                lua.push_value(val)?;
+            }
+        }
+        Ok(len)
+    }
+}
+
+/// Trait for types that can be created from an arbitrary number of Lua values.
+///
+/// This is a generalization of [`FromLua`], allowing an arbitrary number of Lua values to
+/// participate in the conversion. Any type that implements [`FromLua`] will automatically
+/// implement this trait.
+pub trait FromLuaMulti: Sized {
+    /// Performs the conversion.
+    ///
+    /// In case `values` contains more values than needed to perform the conversion, the excess
+    /// values should be ignored. This reflects the semantics of Lua when calling a function or
+    /// assigning values. Similarly, if not enough values are given, conversions should assume that
+    /// any missing values are nil.
+    fn from_lua_multi(values: MultiValue, lua: &Lua) -> Result<Self>;
+
+    /// Performs the conversion for a list of arguments.
+    ///
+    /// `i` is an index (position) of the first argument,
+    /// `to` is a function name that received the arguments.
+    #[doc(hidden)]
+    #[inline]
+    fn from_lua_args(args: MultiValue, i: usize, to: Option<&str>, lua: &Lua) -> Result<Self> {
+        let _ = (i, to);
+        Self::from_lua_multi(args, lua)
+    }
+
+    /// Performs the conversion for a number of values in the Lua stack.
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn from_stack_multi(nvals: c_int, lua: &RawLua) -> Result<Self> {
+        let mut values = MultiValue::with_capacity(nvals as usize);
+        for idx in 0..nvals {
+            values.push_back(lua.stack_value(-nvals + idx, None));
+        }
+        Self::from_lua_multi(values, lua.lua())
+    }
+
+    /// Same as `from_lua_args` but for a number of values in the Lua stack.
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn from_stack_args(nargs: c_int, i: usize, to: Option<&str>, lua: &RawLua) -> Result<Self> {
+        let _ = (i, to);
+        Self::from_stack_multi(nargs, lua)
+    }
+}
+
+/// A trait for types that can be used as Lua objects (usually table and userdata).
+pub trait ObjectLike: Sealed {
+    /// Gets the value associated to `key` from the object, assuming it has `__index` metamethod.
+    fn get<V: FromLua>(&self, key: impl IntoLua) -> Result<V>;
+
+    /// Sets the value associated to `key` in the object, assuming it has `__newindex` metamethod.
+    fn set(&self, key: impl IntoLua, value: impl IntoLua) -> Result<()>;
+
+    /// Calls the object as a function assuming it has `__call` metamethod.
+    ///
+    /// The metamethod is called with the object as its first argument, followed by the passed
+    /// arguments.
+    fn call<R>(&self, args: impl IntoLuaMulti) -> Result<R>
+    where
+        R: FromLuaMulti;
+
+    /// Asynchronously calls the object as a function assuming it has `__call` metamethod.
+    ///
+    /// The metamethod is called with the object as its first argument, followed by the passed
+    /// arguments.
+    #[cfg(feature = "async")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+    fn call_async<R>(&self, args: impl IntoLuaMulti) -> AsyncCallFuture<R>
+            stack
+        }
+    }
+}
+
+/// Represents a specific event that triggered the hook.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DebugEvent {
+    Call,
+    Ret,
+    TailCall,
+    Line,
+    Count,
+    Unknown(c_int),
+}
+
+#[derive(Clone, Debug)]
+pub struct DebugNames<'a> {
+    /// A (reasonable) name of the function (`None` if the name cannot be found).
+    pub name: Option<Cow<'a, str>>,
+    /// Explains the `name` field (can be `global`/`local`/`method`/`field`/`upvalue`/etc).
+    ///
+    /// Always `None` for Luau.
+    pub name_what: Option<&'static str>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DebugSource<'a> {
+    /// Source of the chunk that created the function.
+    pub source: Option<Cow<'a, str>>,
+    /// A "printable" version of `source`, to be used in error messages.
+    pub short_src: Option<Cow<'a, str>>,
+    /// The line number where the definition of the function starts.
+    pub line_defined: Option<usize>,
+    /// The line number where the definition of the function ends (not set by Luau).
+    pub last_line_defined: Option<usize>,
+    /// A string `Lua` if the function is a Lua function, `C` if it is a C function, `main` if it is
+    /// the main part of a chunk.
+    pub what: &'static str,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct DebugStack {
+    /// Number of upvalues.
+    pub num_ups: u8,
+    /// Number of parameters.
+    #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luau"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luau")))
+    )]
+    pub num_params: u8,
+    /// Whether the function is a vararg function.
+    #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luau"))]
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luau")))
+    )]
+    pub is_vararg: bool,
+}
+
+/// Determines when a hook function will be called by Lua.
+#[cfg(not(feature = "luau"))]
+#[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HookTriggers {
+    /// Before a function call.
+    pub on_calls: bool,
+    /// When Lua returns from a function.
+    pub on_returns: bool,
+    /// Before executing a new line, or returning from a function call.
+    #[cfg(feature = "lua54")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "lua54")))]
+    pub fn remove_warning_function(&self) {
+        let lua = self.lock();
+        unsafe {
+            (*lua.extra.get()).warn_callback = None;
+            ffi::lua_setwarnf(lua.state(), None, ptr::null_mut());
+        }
+    }
+
+    /// Emits a warning with the given message.
+    ///
+    /// A message in a call with `incomplete` set to `true` should be continued in
+    /// another call to this function.
+    #[cfg(feature = "lua54")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "lua54")))]
+    pub fn warning(&self, msg: impl AsRef<str>, incomplete: bool) {
+        let msg = msg.as_ref();
+        let mut bytes = vec![0; msg.len() + 1];
+        bytes[..msg.len()].copy_from_slice(msg.as_bytes());
+        let real_len = bytes.iter().position(|&c| c == 0).unwrap();
+        bytes.truncate(real_len);
+        let lua = self.lock();
+        unsafe {
+            ffi::lua_warning(lua.state(), bytes.as_ptr() as *const _, incomplete as c_int);
+        }
+    }
+
+    /// Gets information about the interpreter runtime stack at a given level.
+    ///
+    /// This function calls callback `f`, passing the [`Debug`] structure that can be used to get
+    /// information about the function executing at a given level.
+    /// Level `0` is the current running function, whereas level `n+1` is the function that has
+    /// called level `n` (except for tail calls, which do not count in the stack).
+    pub fn inspect_stack<R>(&self, level: usize, f: impl FnOnce(&Debug) -> R) -> Option<R> {
+        let lua = self.lock();
+        unsafe {
+            let mut ar = mem::zeroed::<ffi::lua_Debug>();
+            let level = level as c_int;
+            #[cfg(not(feature = "luau"))]
+            if ffi::lua_getstack(lua.state(), level, &mut ar) == 0 {
+                return None;
+            }
+            #[cfg(feature = "luau")]
+            if ffi::lua_getinfo(lua.state(), level, cstr!(""), &mut ar) == 0 {
+                return None;
+            }
+
+            Some(f(&Debug::new(&lua, level, &mut ar)))
+        }
+    }
+        std::fs::read(self).map(Cow::Owned)
+    }
+}
+
+impl AsChunk for PathBuf {
+    fn name(&self) -> Option<StdString> {
+        Some(format!("@{}", self.display()))
+    }
+
+    fn source<'a>(&self) -> IoResult<Cow<'a, [u8]>> {
+        std::fs::read(self).map(Cow::Owned)
+    }
+}
+
+impl<C: AsChunk + ?Sized> AsChunk for Box<C> {
+    fn name(&self) -> Option<StdString> {
+        (**self).name()
+    }
+
+    fn environment(&self, lua: &Lua) -> Result<Option<Table>> {
+        (**self).environment(lua)
+    }
+
+    fn mode(&self) -> Option<ChunkMode> {
+        (**self).mode()
+    }
+
+    fn source<'a>(&self) -> IoResult<Cow<'a, [u8]>>
+    where
+        Self: 'a,
+    {
+        (**self).source()
+    }
+}
+
+/// Returned from [`Lua::load`] and is used to finalize loading and executing Lua main chunks.
+#[must_use = "`Chunk`s do nothing unless one of `exec`, `eval`, `call`, or `into_function` are called on them"]
+pub struct Chunk<'a> {
+    pub(crate) lua: WeakLua,
+    pub(crate) name: StdString,
+    pub(crate) env: Result<Option<Table>>,
+    pub(crate) mode: Option<ChunkMode>,
+    pub(crate) source: IoResult<Cow<'a, [u8]>>,
+    #[cfg(feature = "luau")]
+    pub(crate) compiler: Option<Compiler>,
+}
+
+/// Represents chunk mode (text or binary).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkMode {
+    Text,
+    Binary,
+}
+
+/// Represents a constant value that can be used by Luau compiler.
+#[cfg(any(feature = "luau", doc))]
+    std::task::Poll,
+};
+
+#[cfg(feature = "serde")]
+use serde::Serialize;
+
+pub(crate) use extra::ExtraData;
+pub use raw::RawLua;
+pub(crate) use util::callback_error_ext;
+
+/// Top level Lua struct which represents an instance of Lua VM.
+pub struct Lua {
+    pub(self) raw: XRc<ReentrantMutex<RawLua>>,
+    // Controls whether garbage collection should be run on drop
+    pub(self) collect_garbage: bool,
+}
+
+/// Weak reference to Lua instance.
+///
+/// This can used to prevent circular references between Lua and Rust objects.
+#[derive(Clone)]
+pub struct WeakLua(XWeak<ReentrantMutex<RawLua>>);
+
+pub(crate) struct LuaGuard(ArcReentrantMutexGuard<RawLua>);
+
+/// Mode of the Lua garbage collector (GC).
+///
+/// In Lua 5.4 GC can work in two modes: incremental and generational.
+/// Previous Lua versions support only incremental GC.
+///
+/// More information can be found in the Lua [documentation].
+///
+/// [documentation]: https://www.lua.org/manual/5.4/manual.html#2.5
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GCMode {
+    Incremental,
+    #[cfg(feature = "lua54")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "lua54")))]
+    Generational,
+}
+
+/// Controls Lua interpreter behavior such as Rust panics handling.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct LuaOptions {
+    /// Catch Rust panics when using [`pcall`]/[`xpcall`].
+    Box<dyn for<'a> Fn(&'a RawLua, c_int) -> BoxFuture<'a, Result<c_int>> + Send + 'static>;
+
+#[cfg(all(feature = "async", not(feature = "send")))]
+pub(crate) type AsyncCallback =
+    Box<dyn for<'a> Fn(&'a RawLua, c_int) -> BoxFuture<'a, Result<c_int>> + 'static>;
+
+#[cfg(feature = "async")]
+pub(crate) type AsyncCallbackUpvalue = Upvalue<AsyncCallback>;
+
+#[cfg(feature = "async")]
+pub(crate) type AsyncPollUpvalue = Upvalue<Option<BoxFuture<'static, Result<c_int>>>>;
+
+/// Type to set next Lua VM action after executing interrupt or hook function.
+pub enum VmState {
+    Continue,
+    /// Yield the current thread.
+    ///
+    /// Supported by Lua 5.3+ and Luau.
+    Yield,
+}
+
+#[cfg(not(feature = "luau"))]
+pub(crate) enum HookKind {
+    Global,
+    Thread(HookTriggers, HookCallback),
+}
+
+#[cfg(all(feature = "send", not(feature = "luau")))]
+pub(crate) type HookCallback = XRc<dyn Fn(&Lua, &Debug) -> Result<VmState> + Send>;
+
+#[cfg(all(not(feature = "send"), not(feature = "luau")))]
+pub(crate) type HookCallback = XRc<dyn Fn(&Lua, &Debug) -> Result<VmState>>;
+
+#[cfg(all(feature = "send", feature = "luau"))]
+pub(crate) type InterruptCallback = XRc<dyn Fn(&Lua) -> Result<VmState> + Send>;
+
+#[cfg(all(not(feature = "send"), feature = "luau"))]
+pub(crate) type InterruptCallback = XRc<dyn Fn(&Lua) -> Result<VmState>>;
+
+#[cfg(all(feature = "send", feature = "luau"))]
+pub(crate) type ThreadCreationCallback = XRc<dyn Fn(&Lua, crate::Thread) -> Result<()> + Send>;
+
+#[cfg(all(not(feature = "send"), feature = "luau"))]
+pub(crate) type ThreadCreationCallback = XRc<dyn Fn(&Lua, crate::Thread) -> Result<()>>;
+
+#[cfg(all(feature = "send", feature = "luau"))]
+pub(crate) type ThreadCollectionCallback = XRc<dyn Fn(crate::LightUserData) + Send>;
+
+#[cfg(all(not(feature = "send"), feature = "luau"))]
+pub(crate) type ThreadCollectionCallback = XRc<dyn Fn(crate::LightUserData)>;
+
+                .try_for_each(|kv| {
+                    let (key, value) = kv?;
+                    process_pair(key, value)
+                })
+        };
+        convert_result(res, serialize_err)?;
+        map.end()
+    }
+}
+
+/// An iterator over the pairs of a Lua table.
+///
+/// This struct is created by the [`Table::pairs`] method.
+///
+/// [`Table::pairs`]: crate::Table::pairs
+pub struct TablePairs<'a, K, V> {
+    guard: LuaGuard,
+    table: &'a Table,
+    key: Option<Value>,
+    _phantom: PhantomData<(K, V)>,
+}
+
+impl<K, V> Iterator for TablePairs<'_, K, V>
+where
+    K: FromLua,
+    V: FromLua,
+{
+    type Item = Result<(K, V)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(prev_key) = self.key.take() {
+            let lua: &RawLua = &self.guard;
+            let state = lua.state();
+
+            let res = (|| unsafe {
+                let _sg = StackGuard::new(state);
+                check_stack(state, 5)?;
+
+                lua.push_ref(&self.table.0);
+                lua.push_value(&prev_key)?;
+
+                // It must be safe to call `lua_next` unprotected as deleting a key from a table is
+                // a permitted operation.
+                // It fails only if the key is not found (never existed) which seems impossible scenario.
+                if ffi::lua_next(state, -2) != 0 {
+                    let key = lua.stack_value(-2, None);
+                    Ok(Some((
+                        key.clone(),
+                        K::from_lua(key, lua.lua())?,
+                        V::from_stack(-1, lua)?,
+                    )))
+                } else {
+                    Ok(None)
+                }
+            })();
+
+use std::cell::RefCell;
+use std::marker::PhantomData;
+use std::mem;
+
+use crate::error::{Error, Result};
+use crate::function::Function;
+use crate::state::{Lua, LuaGuard, RawLua};
+use crate::traits::{FromLuaMulti, IntoLuaMulti};
+use crate::types::{Callback, CallbackUpvalue, ScopedCallback, ValueRef};
+use crate::userdata::{AnyUserData, UserData, UserDataRegistry, UserDataStorage};
+use crate::util::{self, check_stack, get_metatable_ptr, get_userdata, take_userdata, StackGuard};
+
+/// Constructed by the [`Lua::scope`] method, allows temporarily creating Lua userdata and
+/// callbacks that are not required to be `Send` or `'static`.
+///
+/// See [`Lua::scope`] for more details.
+pub struct Scope<'scope, 'env: 'scope> {
+    lua: LuaGuard,
+    // Internal destructors run first, then user destructors (based on the declaration order)
+    destructors: Destructors<'env>,
+    user_destructors: UserDestructors<'env>,
+    _scope_invariant: PhantomData<&'scope mut &'scope ()>,
+    _env_invariant: PhantomData<&'env mut &'env ()>,
+}
+
+type DestructorCallback<'a> = Box<dyn FnOnce(&RawLua, ValueRef) -> Vec<Box<dyn FnOnce() + 'a>>>;
+
+// Implement Drop on Destructors instead of Scope to avoid compilation error
+struct Destructors<'a>(RefCell<Vec<(ValueRef, DestructorCallback<'a>)>>);
+
+struct UserDestructors<'a>(RefCell<Vec<Box<dyn FnOnce() + 'a>>>);
+
+impl<'scope, 'env: 'scope> Scope<'scope, 'env> {
+    pub(crate) fn new(lua: LuaGuard) -> Self {
+        Scope {
+            lua,
+            destructors: Destructors(RefCell::new(Vec::new())),
+            user_destructors: UserDestructors(RefCell::new(Vec::new())),
+            _scope_invariant: PhantomData,
+            _env_invariant: PhantomData,
+        }
+    }
+
+    /// Wraps a Rust function or closure, creating a callable Lua function handle to it.
+    ///
+    /// This is a version of [`Lua::create_function`] that creates a callback which expires on
+    /// scope drop. See [`Lua::scope`] for more details.
+    pub fn create_function<F, A, R>(&'scope self, func: F) -> Result<Function>
+    where
+        F: Fn(&Lua, A) -> Result<R> + 'scope,
+        A: FromLuaMulti,
+        R: IntoLuaMulti,
+    {
+        unsafe {
+            self.create_callback(Box::new(move |rawlua, nargs| {
+                let args = A::from_stack_args(nargs, 1, None, rawlua)?;
+                func(rawlua.lua(), args)?.push_into_stack_multi(rawlua)
+            }))
+        }
+    }
+
+    /// Wraps a Rust mutable closure, creating a callable Lua function handle to it.
+    ///
+    /// This is a version of [`Lua::create_function_mut`] that creates a callback which expires
+    /// on scope drop. See [`Lua::scope`] and [`Scope::create_function`] for more details.
+    pub fn create_function_mut<F, A, R>(&'scope self, func: F) -> Result<Function>
+    where
+        F: FnMut(&Lua, A) -> Result<R> + 'scope,
+        A: FromLuaMulti,
+        R: IntoLuaMulti,
+    {
+        let func = RefCell::new(func);
+        self.create_function(move |lua, args| {
+            (*func.try_borrow_mut().map_err(|_| Error::RecursiveMutCallback)?)(lua, args)
+        })
+    }
+
+    /// Creates a Lua userdata object from a reference to custom userdata type.
+    ///
+    /// This is a version of [`Lua::create_userdata`] that creates a userdata which expires on
+    /// scope drop, and does not require that the userdata type be Send. This method takes
+    /// non-'static reference to the data. See [`Lua::scope`] for more details.
+    ///
+    /// Userdata created with this method will not be able to be mutated from Lua.
+    pub fn create_userdata_ref<T>(&'scope self, data: &'env T) -> Result<AnyUserData>
+    where
+        T: UserData + 'static,
+    {
+        let ud = unsafe { self.lua.make_userdata(UserDataStorage::new_ref(data)) }?;
+        self.seal_userdata::<T>(&ud);
+    /// bytes embedded into the Lua string.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use mlua::{Lua, Result, String};
+    /// # fn main() -> Result<()> {
+    /// # let lua = Lua::new();
+    /// let non_utf8: String = lua.load(r#"  "test\255"  "#).eval()?;
+    /// assert!(non_utf8.to_str().is_err());    // oh no :(
+    /// assert_eq!(non_utf8.as_bytes(), &b"test\xff"[..]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn as_bytes(&self) -> BorrowedBytes<'_> {
+        BorrowedBytes::from(self)
+    }
+
+    /// Get the bytes that make up this string, including the trailing null byte.
+    pub fn as_bytes_with_nul(&self) -> BorrowedBytes<'_> {
+        let BorrowedBytes { buf, borrow, _lua } = BorrowedBytes::from(self);
+        // Include the trailing null byte (it's always present but excluded by default)
+        let buf = unsafe { slice::from_raw_parts((*buf).as_ptr(), (*buf).len() + 1) };
+        BorrowedBytes { buf, borrow, _lua }
+    }
+
+    // Does not return the terminating null byte
+    unsafe fn to_slice(&self) -> (&[u8], Lua) {
+        let lua = self.0.lua.upgrade();
+        let slice = {
+            let rawlua = lua.lock();
+            let ref_thread = rawlua.ref_thread();
+
+            mlua_debug_assert!(
+                ffi::lua_type(ref_thread, self.0.index) == ffi::LUA_TSTRING,
+                "string ref is not string type"
+            );
+
+            // This will not trigger a 'm' error, because the reference is guaranteed to be of
+            // string type
+            let mut size = 0;
+            let data = ffi::lua_tolstring(ref_thread, self.0.index, &mut size);
+            slice::from_raw_parts(data as *const u8, size)
+        };
+        (slice, lua)
+    }
+
+    /// Converts this string to a generic C pointer.
+    ///
+    /// There is no way to convert the pointer back to its original value.
+    ///
+    /// Typically this function is used only for hashing and debug information.
+    #[inline]
+    pub fn to_pointer(&self) -> *const c_void {
+        self.0.to_pointer()
+    }
+}
+
+impl fmt::Debug for String {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    #[inline]
+    unsafe fn push_into_stack(self, lua: &RawLua) -> Result<()> {
+        lua.push_ref(&self.borrow.0);
+        Ok(())
+    }
+}
+
+impl IntoLua for &BorrowedStr<'_> {
+    #[inline]
+    fn into_lua(self, _: &Lua) -> Result<Value> {
+        Ok(Value::String(self.borrow.clone().into_owned()))
+    }
+
+    #[inline]
+    unsafe fn push_into_stack(self, lua: &RawLua) -> Result<()> {
+        lua.push_ref(&self.borrow.0);
+        Ok(())
+    }
+}
+
+impl FromLua for BorrowedStr<'_> {
+    fn from_lua(value: Value, lua: &Lua) -> Result<Self> {
+        let s = String::from_lua(value, lua)?;
+        let BorrowedStr { buf, _lua, .. } = BorrowedStr::try_from(&s)?;
+        let buf = unsafe { mem::transmute::<&str, &'static str>(buf) };
+        let borrow = Cow::Owned(s);
+        Ok(Self { buf, borrow, _lua })
+    }
+
+    unsafe fn from_stack(idx: c_int, lua: &RawLua) -> Result<Self> {
+        let s = String::from_stack(idx, lua)?;
+        let BorrowedStr { buf, _lua, .. } = BorrowedStr::try_from(&s)?;
+        let buf = unsafe { mem::transmute::<&str, &'static str>(buf) };
+        let borrow = Cow::Owned(s);
+        Ok(Self { buf, borrow, _lua })
+    }
+//! Rust data structures are accepted without having to write any boilerplate.
+//!
+//! # Custom Userdata
+//!
+//! The [`UserData`] trait can be implemented by user-defined types to make them available to Lua.
+//! Methods and operators to be used from Lua can be added using the [`UserDataMethods`] API.
+//! Fields are supported using the [`UserDataFields`] API.
+//!
+//! # Serde support
+//!
+//! The [`LuaSerdeExt`] trait implemented for [`Lua`] allows conversion from Rust types to Lua
+//! values and vice versa using serde. Any user defined data type that implements
+//! [`serde::Serialize`] or [`serde::Deserialize`] can be converted.
+//! For convenience, additional functionality to handle `NULL` values and arrays is provided.
+//!
+//! The [`Value`] enum and other types implement [`serde::Serialize`] trait to support serializing
+//! Lua values into Rust values.
+//!
+//! Requires `feature = "serde"`.
+//!
+//! # Async/await support
+//!
+//! The [`Lua::create_async_function`] allows creating non-blocking functions that returns
+//! [`Future`]. Lua code with async capabilities can be executed by [`Function::call_async`] family
+//! of functions or polling [`AsyncThread`] using any runtime (eg. Tokio).
+//!
+//! Requires `feature = "async"`.
+//!
+//! # `Send` and `Sync` support
+//!
+//! By default `mlua` is `!Send`. This can be changed by enabling `feature = "send"` that adds
+//! `Send` requirement to Rust functions and [`UserData`] types.
+//!
+//! In this case [`Lua`] object and their types can be send or used from other threads. Internally
+//! access to Lua VM is synchronized using a reentrant mutex that can be locked many times within
+//! the same thread.
+//!
+//! [Lua programming language]: https://www.lua.org/
+//! [executing]: crate::Chunk::exec
+//! [evaluating]: crate::Chunk::eval
+//! [globals]: crate::Lua::globals
+//! [`Future`]: std::future::Future
+//! [`serde::Serialize`]: https://docs.serde.rs/serde/ser/trait.Serialize.html
+//! [`serde::Deserialize`]: https://docs.serde.rs/serde/de/trait.Deserialize.html
+
+// Deny warnings inside doc tests / examples. When this isn't present, rustdoc doesn't show *any*

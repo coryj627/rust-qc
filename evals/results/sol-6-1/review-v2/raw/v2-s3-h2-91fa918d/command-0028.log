@@ -1,0 +1,318 @@
+warning: use of deprecated module `std::usize`: all constants in this module replaced by associated constants on the type
+  --> /work/crate/tests/h2-support/src/mock.rs:17:20
+   |
+17 | use std::{cmp, io, usize};
+   |                    ^^^^^
+   |
+   = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated constant `std::usize::MAX`: replaced by the `MAX` associated constant on this type
+  --> /work/crate/tests/h2-support/src/mock.rs:66:36
+   |
+66 |     new_with_write_capacity(usize::MAX)
+   |                                    ^^^
+
+warning: use of deprecated constant `std::usize::MAX`: replaced by the `MAX` associated constant on this type
+   --> /work/crate/tests/h2-support/src/mock.rs:267:43
+    |
+267 |                     inner.tx_rem = usize::MAX;
+    |                                           ^^^
+
+warning: use of deprecated constant `std::usize::MAX`: replaced by the `MAX` associated constant on this type
+   --> /work/crate/tests/h2-support/src/mock.rs:281:27
+    |
+281 |         i.tx_rem = usize::MAX;
+    |                           ^^^
+
+warning: `h2-support` (lib) generated 4 warnings
+   Compiling h2-review-probes v0.0.0 (/work/tmp/probes)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.80s
+     Running tests/status.rs (/target/debug/deps/status-2721c33787d338eb)
+
+running 1 test
+response with no :status: Ok(Response { status: 200, version: HTTP/2.0, headers: {"content-length": "0"}, body: RecvStream { inner: FlowControl { inner: OpaqueStreamRef { stream_id: StreamId(1), ref_count: 1 } } } })
+
+thread 'missing_response_status_is_an_error' (219) panicked at tests/status.rs:23:5:
+a response without mandatory :status cannot be reported as success
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test missing_response_status_is_an_error ... FAILED
+
+failures:
+
+failures:
+    missing_response_status_is_an_error
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `--test status`
+}
+
+// ===== impl StreamRef =====
+
+impl<B> StreamRef<B> {
+    pub fn send_data(&mut self, data: B, end_stream: bool) -> Result<(), UserError>
+    where
+        B: Buf,
+    {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let stream = me.store.resolve(self.opaque.key);
+        let actions = &mut me.actions;
+        let mut send_buffer = self.send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        me.counts.transition(stream, |counts, stream| {
+            // Create the data frame
+            let mut frame = frame::Data::new(stream.id, data);
+            frame.set_end_stream(end_stream);
+
+            // Send the data frame
+            actions
+                .send
+                .send_data(frame, send_buffer, stream, counts, &mut actions.task)
+        })
+    }
+
+    pub fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), UserError> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let stream = me.store.resolve(self.opaque.key);
+        let actions = &mut me.actions;
+        let mut send_buffer = self.send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        me.counts.transition(stream, |counts, stream| {
+            // Create the trailers frame
+            let frame = frame::Headers::trailers(stream.id, trailers);
+
+            // Send the trailers frame
+            actions
+                .send
+                .send_trailers(frame, send_buffer, stream, counts, &mut actions.task)
+        })
+    }
+
+    pub fn send_reset(&mut self, reason: Reason) {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let stream = me.store.resolve(self.opaque.key);
+        let mut send_buffer = self.send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+        let last_processed_id = self.streams.last_processed_id();
+        let frame = frame::GoAway::new(last_processed_id, e);
+        self.go_away.go_away_from_user(frame);
+
+        // Notify all streams of reason we're abruptly closing.
+        self.streams.handle_error(Error::user_go_away(e));
+    }
+
+    fn handle_poll2_result(&mut self, result: Result<(), Error>) -> Result<(), Error> {
+        match result {
+            // The connection has shutdown normally
+            Ok(()) => {
+                *self.state = State::Closing(Reason::NO_ERROR, Initiator::Library);
+                Ok(())
+            }
+            // Attempting to read a frame resulted in a connection level
+            // error. This is handled by setting a GOAWAY frame followed by
+            // terminating the connection.
+            Err(Error::GoAway(debug_data, reason, initiator)) => {
+                self.handle_go_away(reason, debug_data, initiator);
+                Ok(())
+            }
+            // Attempting to read a frame resulted in a stream level error.
+            // This is handled by resetting the frame then trying to read
+            // another frame.
+            Err(Error::Reset(id, reason, initiator)) => {
+                debug_assert_eq!(initiator, Initiator::Library);
+                tracing::trace!(?id, ?reason, "stream error");
+                match self.streams.send_reset(id, reason) {
+                    Ok(()) => (),
+                    Err(crate::proto::error::GoAway { debug_data, reason }) => {
+                        self.handle_go_away(reason, debug_data, Initiator::Library);
+                    }
+                }
+                Ok(())
+            }
+            // Attempting to read a frame resulted in an I/O error. All
+            // active streams must be reset.
+            //
+            // TODO: Are I/O errors recoverable?
+            Err(Error::Io(kind, inner)) => {
+                tracing::debug!(error = ?kind, "Connection::poll; IO error");
+                let e = Error::Io(kind, inner);
+
+                // Reset all active streams
+                self.streams.handle_error(e.clone());
+
+                // Some client implementations drop the connections without notifying its peer
+                // Attempting to read after the client dropped the connection results in UnexpectedEof
+                // If as a server, we don't have anything more to send, just close the connection
+                // without error
+                //
+                // See https://github.com/hyperium/hyper/issues/3427
+                if self.streams.is_buffer_empty()
+                    && matches!(kind, io::ErrorKind::UnexpectedEof)
+                    && (self.streams.is_server()
+                    && (self.streams.is_server()
+                        || self.error.as_ref().map(|f| f.reason() == Reason::NO_ERROR)
+                            == Some(true))
+                {
+                    *self.state = State::Closed(Reason::NO_ERROR, Initiator::Library);
+                    return Ok(());
+                }
+
+                // Return the error
+                Err(e)
+            }
+        }
+    }
+
+    fn handle_go_away(&mut self, reason: Reason, debug_data: Bytes, initiator: Initiator) {
+        let e = Error::GoAway(debug_data.clone(), reason, initiator);
+        tracing::debug!(error = ?e, "Connection::poll; connection error");
+
+        // We may have already sent a GOAWAY for this error,
+        // if so, don't send another, just flush and close up.
+        if self
+            .go_away
+            .going_away()
+            .map_or(false, |frame| frame.reason() == reason)
+        {
+            tracing::trace!("    -> already going away");
+            *self.state = State::Closing(reason, initiator);
+            return;
+        }
+
+        // Reset all active streams
+        self.streams.handle_error(e);
+        self.go_away_now_data(reason, debug_data);
+    }
+
+    fn recv_frame(&mut self, frame: Option<Frame>) -> Result<ReceivedFrame, Error> {
+        use crate::frame::Frame::*;
+        match frame {
+            Some(Headers(frame)) => {
+                tracing::trace!(?frame, "recv HEADERS");
+                self.streams.recv_headers(frame)?;
+            }
+            Some(Data(frame)) => {
+                tracing::trace!(?frame, "recv DATA");
+                self.streams.recv_data(frame)?;
+            }
+            Some(Reset(frame)) => {
+                tracing::trace!(?frame, "recv RST_STREAM");
+                self.streams.recv_reset(frame)?;
+            }
+            Some(PushPromise(frame)) => {
+                tracing::trace!(?frame, "recv PUSH_PROMISE");
+                self.streams.recv_push_promise(frame)?;
+            }
+            Some(Settings(frame)) => {
+                tracing::trace!(?frame, "recv SETTINGS");
+                return Ok(ReceivedFrame::Settings(frame));
+            }
+            Some(GoAway(frame)) => {
+                tracing::trace!(?frame, "recv GOAWAY");
+                // This should prevent starting new streams,
+                // but should allow continuing to process current streams
+                // until they are all EOS. Once they are, State should
+                // transition to GoAway.
+                self.streams.recv_go_away(&frame)?;
+                *self.error = Some(frame);
+            }
+            Some(Ping(frame)) => {
+                tracing::trace!(?frame, "recv PING");
+                let status = self.ping_pong.recv_ping(frame);
+                if status.is_shutdown() {
+                    assert!(
+                        self.go_away.is_going_away(),
+                        "received unexpected shutdown ping"
+                    );
+
+                    let last_processed_id = self.streams.last_processed_id();
+                    self.go_away(last_processed_id, Reason::NO_ERROR);
+                }
+            }
+            Some(WindowUpdate(frame)) => {
+                tracing::trace!(?frame, "recv WINDOW_UPDATE");
+                self.streams.recv_window_update(frame)?;
+            }
+            Some(Priority(frame)) => {
+                tracing::trace!(?frame, "recv PRIORITY");
+                // TODO: handle
+            }
+            None => {
+                tracing::trace!("codec closed");
+                self.streams.recv_eof(false).expect("mutex poisoned");
+                return Ok(ReceivedFrame::Done);
+            }
+        }
+        Ok(ReceivedFrame::Continue)
+    }
+}
+
+enum ReceivedFrame {
+    Settings(frame::Settings),
+    Continue,
+    Done,
+}
+
+impl<T, B> Connection<T, client::Peer, B>
+where
+    T: AsyncRead + AsyncWrite,
+    B: Buf,
+{
+    pub(crate) fn streams(&self) -> &Streams<B, client::Peer> {
+        &self.inner.streams
+    }
+}
+
+impl<T, B> Connection<T, server::Peer, B>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+    B: Buf,
+{
+    pub fn next_incoming(&mut self) -> Option<StreamRef<B>> {
+        self.inner.streams.next_incoming()
+    }
+
+    // Graceful shutdown only makes sense for server peers.
+    pub fn go_away_gracefully(&mut self) {
+        if self.inner.go_away.is_going_away() {
+            // No reason to start a new one.
+            return;
+        }
+
+        // According to http://httpwg.org/specs/rfc7540.html#GOAWAY:
+        //
+        // > A server that is attempting to gracefully shut down a connection
+        // > SHOULD send an initial GOAWAY frame with the last stream
+        // > identifier set to 2^31-1 and a NO_ERROR code. This signals to the
+        // > client that a shutdown is imminent and that initiating further
+        // > requests is prohibited. After allowing time for any in-flight
+        // > stream creation (at least one round-trip time), the server can
+        // > send another GOAWAY frame with an updated last stream identifier.
+        // > This ensures that a connection can be cleanly shut down without
+        // > losing requests.
+        self.inner.as_dyn().go_away(StreamId::MAX, Reason::NO_ERROR);
+
+        // We take the advice of waiting 1 RTT literally, and wait
+        // for a pong before proceeding.
+        self.inner.ping_pong.ping_shutdown();
+    }
+}
+
+impl<T, P, B> Drop for Connection<T, P, B>
+where
+    P: Peer,
+    B: Buf,
+{
+    fn drop(&mut self) {
+        // Ignore errors as this indicates that the mutex is poisoned.
+        let _ = self.inner.streams.recv_eof(true);
+    }
+}
