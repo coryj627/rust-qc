@@ -19,6 +19,8 @@ Building or testing these crates runs their build scripts, proc macros and tests
 docker build -t rqc-eval:2 evals/sandbox
 ```
 
+Behind a TLS-intercepting proxy, such as a Claude Code cloud session, copy the proxy's CA certificate to `sandbox/ca/<name>.crt` before building, or rustup and `sb fetch` reject the proxy's certificate. In a cloud session the certificate is `/root/.ccr/ca-bundle.crt`, and the Docker daemon may need starting first with `dockerd &`. When `sb` runs as root, it hands the project folder to uid 1000, the container's user.
+
 `sb` keeps per-project folders next to itself, under `projects/<project>/`, mounted as `/work`. Each reproducer expects:
 
 - `/work/repro/`: a copy of `repro/<project>/`
