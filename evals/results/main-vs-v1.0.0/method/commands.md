@@ -42,3 +42,15 @@ The template step reported no instruction files to rename.
     python3 -I pilot_checks.py <results>/stage1
 
 Both transcript checks found nothing in either pilot run. check_runs.py counted 9 and 6 calls that Claude Code's permissions refused.
+
+## Rerun with the closing-summary brief
+
+    # first run's private files moved to private/run1/; probe and pilot workspaces rebuilt
+    python3 -I launch.py rprobe rprobe2 --model claude-haiku-5-5
+    python3 -I launch.py reffort
+    python3 -I prep_workspaces.py runs alacritty_terminal 1
+    # start order drawn at random: r3f1b1f, then rae3760
+    python3 -I launch.py r3f1b1f rae3760
+    python3 -I check_runs.py r3f1b1f=... rae3760=...
+    python3 -I host_builds.py r3f1b1f=... rae3760=...
+    python3 -I pilot_checks.py <results>/stage1

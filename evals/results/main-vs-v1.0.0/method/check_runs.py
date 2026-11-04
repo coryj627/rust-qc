@@ -65,9 +65,9 @@ def programs(command):
     bare = re.sub(
         r"<<-?\s*['\"]?(\w+)['\"]?.*?\n.*?\n\s*\1\s*(\n|$)", "\n", command, flags=re.DOTALL
     )
-    bare = re.sub(r"\d*>&\d+|\d*[<>]+\s*\S+", " ", bare)
     bare = re.sub(r"'[^']*'", "''", bare)
     bare = re.sub(r'"[^"]*"', '""', bare)
+    bare = re.sub(r"\d*>&\d+|\d*[<>]+\s*\S+", " ", bare)
     bare = re.sub(r"\./run\s[^;&|\n]*", "./run", bare)
     for segment in re.split(r"[;&|\n()]+", bare):
         words = [w for w in segment.split() if not re.match(r"^\w+=", w)]
