@@ -23,7 +23,7 @@ Kinds: crash = crash or panic from input; soundness = undefined behaviour from s
 
 ## Evaluation results
 
-The audits for all 10 projects have run, testing skill `v1.0.0`. The results and their limits are in `results/README.md`.
+The audits for all 10 projects have run, testing skill `v1.0.0`. The results and their limits are in `results/README.md` for Opus 5.5 and `results/sol-6-1/README.md` for Sol 6.1.
 
 ## Results of running the candidates
 

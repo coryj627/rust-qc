@@ -1,5 +1,7 @@
 # Answer-key evaluation results
 
+These are the Opus 5.5 results. The separate Sol 6.1 evaluation, which used different tasks and denominators, is in [`sol-6-1/`](sol-6-1/README.md).
+
 Skill version tested: `v1.0.0`. Forty audits ran, four on each of 10 Rust crates at an old release: two with the skill and two without. All ran on Opus 5.5 at high effort with a 45-minute budget.
 
 ## Result

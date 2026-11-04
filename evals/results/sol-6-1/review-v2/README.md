@@ -1,5 +1,7 @@
 # Correctness-review v2
 
+A [later cross-family review](../claude-review/README.md) added the notes on key scope and on the false-finding controls below. The hash for this file in `final-publication-manifest.json` predates those notes. No data file, score or report changed.
+
 The revised ordinary QA comparison is graded. Of 52 planned review attempts,
 51 produced valid reports; one provider capacity failure remains missing, with
 no replacement. There were no v2 policy blocks. All 39 blind grading/verifying
@@ -34,7 +36,11 @@ effort and the unchanged `sb` sandbox. No Rust toolchain or component was instal
 
 The [prospective eligible set](comparison-eligibility.json) contains 50 of the
 old 92 definitions; 47 reproduced entries form the primary subset. The other
-42 entries are outside scope, not misses. Detailed and short stages remain
+42 entries are outside scope, not misses. By kind, the eligible set keeps none of
+the 21 soundness entries, 4 of 16 resource-exhaustion entries, 15 of 21 crash
+entries and 31 of 34 wrong-behavior entries. The prompts also tell the skill arm
+that this scope overrides the skill, so this comparison does not measure the
+skill's soundness and unsafe guidance. Detailed and short stages remain
 separate. The broader historical Sol and Claude conditions used different tasks
 and denominators and must not be pooled with these results. There is no new
 Stage 5 coding experiment here; the [historical coding results](../README.md)
@@ -66,7 +72,12 @@ adjudicators were needed. See [control validation](controls-validation.json),
 | Injected false findings refuted | 50/50 | 15/15 |
 
 Controls never enter substantive totals. The 65 false-finding injections reuse
-50 unique claims across the two stages. Partial decoy matches show that matching
+50 unique claims across the two stages. Injected findings can also be recognized
+by their shape. In the verifier inputs still retained, 7 of 10 injected findings
+were one "title. file:line. explanation" paragraph, a shape that matched 0 of 354
+real passages, and none of the 10 cited evidence. The verifiers ran real
+refutations, but the 65/65 rate does not show they would catch a false finding
+that looks real. Partial decoy matches show that matching
 thresholds still need caution; successful control rejection is not a guarantee
 that every real judgment is correct.
 
