@@ -13,6 +13,9 @@ Changes from prep_grading.py, as issue 30 asks:
 - Every dropped line is written to dropped-lines.txt with its reason, so a lost finding can be
   checked.
 
+- The `## Closing summary` section the brief asks for is removed and logged, like the verification
+  section, so it reaches neither graders nor the report-length measure.
+
 The rest is unchanged: mentions of the skill and its scripts, the verification section, severity
 counts and fixes are removed, and severity words map to one scale.
 """
@@ -46,15 +49,15 @@ def redact(text, run_id):
     dropped = [("before first heading", line) for line in lines[:first_heading] if line.strip()]
     out, skipping = [], False
     for line in lines[first_heading:]:
-        if re.match(r"^#{1,3}\s+Verification\b", line):
-            skipping = True
-            dropped.append(("verification section", line))
+        if re.match(r"^#{1,3}\s+(?:Verification|Closing summary)\b", line):
+            skipping = "closing summary" if "Closing summary" in line else "verification section"
+            dropped.append((skipping, line))
             continue
         if skipping and re.match(r"^#{1,3}\s", line):
             skipping = False
         if skipping:
             if line.strip():
-                dropped.append(("verification section", line))
+                dropped.append((skipping, line))
             continue
         if MENTIONS.search(line):
             dropped.append(("mentions skill, gate or brief", line))

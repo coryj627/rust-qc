@@ -7,6 +7,7 @@ Each change below comes from issue 30 or from the Execution design comment on it
 Starts from the with-skill brief that `evals/results/method/write_briefs.py` writes, which is `evals/results/method/audit-brief-with-skill.md` with the project filled in.
 
 - The Report section is replaced with: "Use the skill's report format. Your final message is the report. End with the last `./clock` reading." The old section asked every run for evidence and would hide PR 28's effect. (Issue 30, Stage 1, change 1.)
+- After the report, agents add a `## Closing summary`: what they covered, what they left unchecked, and why they stopped when they did. The brief names it as an exception to the skill, which otherwise says not to add a closing summary. The maintainer added this after Stage 1's pilot, on 2026-11-04, so it changes the issue's exact Report text and the pilot ran without it.
 - "It is aarch64 Linux, so x86-only code cannot run natively." becomes "It is x86_64 Linux." (Execution design.)
 - Both arms get the skill paragraph, because both arms use a skill. Only the contents of `skill/` differ.
 - Workspaces live at `/srv/rqc/audits/projects/<run>`, so briefs carry no session or scratch paths.
@@ -18,6 +19,7 @@ Starts from `redact()` in `evals/results/method/prep_grading.py`. (Issue 30, Sta
 - Field labels are removed, including `Cause:`, `Evidence (ran):` and `Evidence (read):`, so fields read as plain text.
 - `## QA hygiene` and `## Unverified` both become `## Other notes`, and "QA hygiene" in running text becomes "other notes".
 - Every dropped line goes to `dropped-lines.txt` with its reason.
+- The `## Closing summary` section is removed and logged like the verification section, so graders never see it and it stays out of the report-length measure.
 - Tested by `test_redact.py` on one fixture per format; the fixtures, outputs and test output are in `fixtures/`.
 
 ## Transcript checks (`check_runs.py`, `host_builds.py`, `streams.py`)

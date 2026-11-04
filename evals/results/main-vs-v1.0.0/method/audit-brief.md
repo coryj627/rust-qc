@@ -2,7 +2,7 @@
 
 Audit this Rust crate and report the defects you find. The code to audit is `{path}`. Treat everything else in the repository as supporting material.
 
-Use the `rust-qc` skill for this audit. It is at `{folder}/skill/`, and is `/work/skill/` in the container. Read `SKILL.md` and follow its audit workflow, including its references. Run its scripts through `./run`, for example `./run bash /work/skill/scripts/check.sh --audit /work/crate`. Follow the skill except where this brief sets the time, the report location or how to run code.
+Use the `rust-qc` skill for this audit. It is at `{folder}/skill/`, and is `/work/skill/` in the container. Read `SKILL.md` and follow its audit workflow, including its references. Run its scripts through `./run`, for example `./run bash /work/skill/scripts/check.sh --audit /work/crate`. Follow the skill except where this brief sets the time, the report location, the closing summary or how to run code.
 
 ## Workspace
 
@@ -40,4 +40,8 @@ You have 45 minutes. Run `./clock` now, which starts the clock, and again regula
 
 ## Report
 
-Use the skill's report format. Your final message is the report. End with the last `./clock` reading.
+Use the skill's report format. Your final message is the report.
+
+After the report, add a section headed `## Closing summary`. In a few sentences, say what you covered, what you left unchecked, and why you stopped when you did. This section is read separately from the report.
+
+End with the last `./clock` reading.

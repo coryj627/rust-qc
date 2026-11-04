@@ -32,4 +32,8 @@ Fix: derive Debug.
 - `cargo test --locked`: pass.
 - `cargo clippy --all-targets`: fail, 3 warnings.
 
+## Closing summary
+
+I covered the parser and the grid, and left the PTY code unchecked. This is why I stopped: the remaining time was too short for another probe.
+
 3 findings. Clock: 41 minutes used of 45.

@@ -39,4 +39,8 @@ Problem: rows * cols is computed in u16 and could wrap for very large grids; I c
 - `cargo test --locked`: pass.
 - `cargo +nightly-2026-10-01 miri test`: fail, see the Blocker.
 
+## Closing summary
+
+I covered the parser and the grid, and left the PTY code unchecked. This is why I stopped: the remaining time was too short for another probe.
+
 2 findings. Clock: 44 minutes used of 45.

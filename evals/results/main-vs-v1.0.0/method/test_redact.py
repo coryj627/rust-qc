@@ -46,6 +46,12 @@ for arm, run_id in (("v1.0.0", "rf00000"), ("main", "rf00001")):
         not re.search(r"rust-qc|\bskill\b|\bgate\b|\bbrief\b", out, re.IGNORECASE),
     )
     check(
+        f"{arm}: closing summary dropped and logged",
+        "Closing summary" not in out
+        and "why i stopped" not in out.lower()
+        and any(r == "closing summary" for r, _ in dropped),
+    )
+    check(
         f"{arm}: verification section dropped and logged",
         "Verification" not in out and any(r == "verification section" for r, _ in dropped),
     )
