@@ -1,0 +1,896 @@
+//! Types that specify what is contained in a ZIP.
+use crate::cp437::FromCp437;
+use crate::write::{FileOptionExtension, FileOptions};
+use path::{Component, Path, PathBuf};
+use std::cmp::Ordering;
+use std::ffi::OsStr;
+use std::fmt;
+use std::fmt::{Debug, Formatter};
+use std::mem;
+use std::path;
+use std::sync::{Arc, OnceLock};
+
+#[cfg(feature = "chrono")]
+use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+#[cfg(feature = "jiff-02")]
+use jiff::civil;
+
+use crate::result::{invalid, ZipError, ZipResult};
+use crate::spec::{self, FixedSizeBlock, Pod};
+
+pub(crate) mod ffi {
+    pub const S_IFDIR: u32 = 0o0040000;
+    pub const S_IFREG: u32 = 0o0100000;
+    pub const S_IFLNK: u32 = 0o0120000;
+}
+
+use crate::extra_fields::ExtraField;
+use crate::read::find_data_start;
+use crate::result::DateTimeRangeError;
+use crate::spec::is_dir;
+use crate::types::ffi::S_IFDIR;
+use crate::{CompressionMethod, ZIP64_BYTES_THR};
+use std::io::{Read, Seek};
+#[cfg(feature = "time")]
+use time::{error::ComponentRange, Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
+
+pub(crate) struct ZipRawValues {
+    pub(crate) crc32: u32,
+    pub(crate) compressed_size: u64,
+    pub(crate) uncompressed_size: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum System {
+    Dos = 0,
+    Unix = 3,
+    #[default]
+    Unknown,
+}
+
+impl From<u8> for System {
+    fn from(system: u8) -> Self {
+        match system {
+            0 => Self::Dos,
+            3 => Self::Unix,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl From<System> for u8 {
+    fn from(system: System) -> Self {
+        match system {
+            System::Dos => 0,
+            System::Unix => 3,
+            System::Unknown => 4,
+        }
+    }
+}
+
+/// Representation of a moment in time.
+///
+/// Zip files use an old format from DOS to store timestamps,
+/// with its own set of peculiarities.
+/// For example, it has a resolution of 2 seconds!
+///
+/// A [`DateTime`] can be stored directly in a zipfile with [`FileOptions::last_modified_time`],
+/// or read from one with [`ZipFile::last_modified`](crate::read::ZipFile::last_modified).
+///
+/// # Warning
+///
+/// Because there is no timezone associated with the [`DateTime`], they should ideally only
+/// be used for user-facing descriptions.
+///
+/// Modern zip files store more precise timestamps; see [`crate::extra_fields::ExtendedTimestamp`]
+/// for details.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct DateTime {
+    datepart: u16,
+    timepart: u16,
+}
+
+impl Debug for DateTime {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if *self == Self::default() {
+            return f.write_str("DateTime::default()");
+        }
+        f.write_fmt(format_args!(
+            "DateTime::from_date_and_time({}, {}, {}, {}, {}, {})?",
+            self.year(),
+            self.month(),
+            self.day(),
+            self.hour(),
+            self.minute(),
+            self.second()
+        ))
+    }
+}
+
+impl Ord for DateTime {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if let ord @ (Ordering::Less | Ordering::Greater) = self.year().cmp(&other.year()) {
+            return ord;
+        }
+        if let ord @ (Ordering::Less | Ordering::Greater) = self.month().cmp(&other.month()) {
+            return ord;
+        }
+        if let ord @ (Ordering::Less | Ordering::Greater) = self.day().cmp(&other.day()) {
+            return ord;
+        }
+        if let ord @ (Ordering::Less | Ordering::Greater) = self.hour().cmp(&other.hour()) {
+            return ord;
+        }
+        if let ord @ (Ordering::Less | Ordering::Greater) = self.minute().cmp(&other.minute()) {
+            return ord;
+        }
+        self.second().cmp(&other.second())
+    }
+}
+
+impl PartialOrd for DateTime {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl DateTime {
+    /// Returns the current time if possible, otherwise the default of 1980-01-01.
+    #[cfg(feature = "time")]
+    pub fn default_for_write() -> Self {
+        let now = OffsetDateTime::now_utc();
+        PrimitiveDateTime::new(now.date(), now.time())
+            .try_into()
+            .unwrap_or_else(|_| DateTime::default())
+    }
+
+    /// Returns the current time if possible, otherwise the default of 1980-01-01.
+    #[cfg(not(feature = "time"))]
+    pub fn default_for_write() -> Self {
+        DateTime::default()
+    }
+}
+
+#[cfg(fuzzing)]
+impl arbitrary::Arbitrary<'_> for DateTime {
+    fn arbitrary(u: &mut arbitrary::Unstructured) -> arbitrary::Result<Self> {
+        let year: u16 = u.int_in_range(1980..=2107)?;
+        let month: u16 = u.int_in_range(1..=12)?;
+        let day: u16 = u.int_in_range(1..=31)?;
+        let datepart = day | (month << 5) | ((year - 1980) << 9);
+        let hour: u16 = u.int_in_range(0..=23)?;
+        let minute: u16 = u.int_in_range(0..=59)?;
+        let second: u16 = u.int_in_range(0..=58)?;
+        let timepart = (second >> 1) | (minute << 5) | (hour << 11);
+        Ok(DateTime { datepart, timepart })
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl TryFrom<NaiveDateTime> for DateTime {
+    type Error = DateTimeRangeError;
+
+    fn try_from(value: NaiveDateTime) -> Result<Self, Self::Error> {
+        DateTime::from_date_and_time(
+            value.year().try_into()?,
+            value.month().try_into()?,
+            value.day().try_into()?,
+            value.hour().try_into()?,
+            value.minute().try_into()?,
+            value.second().try_into()?,
+        )
+    }
+}
+
+#[cfg(feature = "chrono")]
+impl TryFrom<DateTime> for NaiveDateTime {
+    type Error = DateTimeRangeError;
+
+    fn try_from(value: DateTime) -> Result<Self, Self::Error> {
+        let date = NaiveDate::from_ymd_opt(
+            value.year().into(),
+            value.month().into(),
+            value.day().into(),
+        )
+        .ok_or(DateTimeRangeError)?;
+        let time = NaiveTime::from_hms_opt(
+            value.hour().into(),
+            value.minute().into(),
+            value.second().into(),
+        )
+        .ok_or(DateTimeRangeError)?;
+        Ok(NaiveDateTime::new(date, time))
+    }
+}
+
+#[cfg(feature = "jiff-02")]
+impl TryFrom<civil::DateTime> for DateTime {
+    type Error = DateTimeRangeError;
+
+    fn try_from(value: civil::DateTime) -> Result<Self, Self::Error> {
+        Self::from_date_and_time(
+            value.year().try_into()?,
+            value.month() as u8,
+            value.day() as u8,
+            value.hour() as u8,
+            value.minute() as u8,
+            value.second() as u8,
+        )
+    }
+}
+
+#[cfg(feature = "jiff-02")]
+impl TryFrom<DateTime> for civil::DateTime {
+    type Error = jiff::Error;
+
+    fn try_from(value: DateTime) -> Result<Self, Self::Error> {
+        Self::new(
+            value.year() as i16,
+            value.month() as i8,
+            value.day() as i8,
+            value.hour() as i8,
+            value.minute() as i8,
+            value.second() as i8,
+            0,
+        )
+    }
+}
+
+impl TryFrom<(u16, u16)> for DateTime {
+    type Error = DateTimeRangeError;
+
+    #[inline]
+    fn try_from(values: (u16, u16)) -> Result<Self, Self::Error> {
+        Self::try_from_msdos(values.0, values.1)
+    }
+}
+
+impl From<DateTime> for (u16, u16) {
+    #[inline]
+    fn from(dt: DateTime) -> Self {
+        (dt.datepart(), dt.timepart())
+    }
+}
+
+impl Default for DateTime {
+    /// Constructs an 'default' datetime of 1980-01-01 00:00:00
+    fn default() -> DateTime {
+        DateTime {
+            datepart: 0b0000000000100001,
+            timepart: 0,
+        }
+    }
+}
+
+impl fmt::Display for DateTime {
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            self.year(),
+            self.month(),
+            self.day(),
+            self.hour(),
+            self.minute(),
+            self.second()
+        )
+    }
+}
+
+impl DateTime {
+    /// Converts an msdos (u16, u16) pair to a DateTime object
+    ///
+    /// # Safety
+    /// The caller must ensure the date and time are valid.
+    pub const unsafe fn from_msdos_unchecked(datepart: u16, timepart: u16) -> DateTime {
+        DateTime { datepart, timepart }
+    }
+
+    /// Converts an msdos (u16, u16) pair to a DateTime object if it represents a valid date and
+    /// time.
+    pub fn try_from_msdos(datepart: u16, timepart: u16) -> Result<DateTime, DateTimeRangeError> {
+        let seconds = (timepart & 0b0000000000011111) << 1;
+        let minutes = (timepart & 0b0000011111100000) >> 5;
+        let hours = (timepart & 0b1111100000000000) >> 11;
+        let days = datepart & 0b0000000000011111;
+        let months = (datepart & 0b0000000111100000) >> 5;
+        let years = (datepart & 0b1111111000000000) >> 9;
+        Self::from_date_and_time(
+            years.checked_add(1980).ok_or(DateTimeRangeError)?,
+            months.try_into()?,
+            days.try_into()?,
+            hours.try_into()?,
+            minutes.try_into()?,
+            seconds.try_into()?,
+        )
+    }
+
+    /// Constructs a DateTime from a specific date and time
+    ///
+    /// The bounds are:
+    /// * year: [1980, 2107]
+    /// * month: [1, 12]
+    /// * day: [1, 28..=31]
+    /// * hour: [0, 23]
+    /// * minute: [0, 59]
+    /// * second: [0, 58]
+    pub fn from_date_and_time(
+        year: u16,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) -> Result<DateTime, DateTimeRangeError> {
+        fn is_leap_year(year: u16) -> bool {
+            (year % 4 == 0) && ((year % 25 != 0) || (year % 16 == 0))
+        }
+
+        if (1980..=2107).contains(&year)
+            && (1..=12).contains(&month)
+            && (1..=31).contains(&day)
+            && hour <= 23
+            && minute <= 59
+            && second <= 60
+        {
+            let second = second.min(58); // exFAT can't store leap seconds
+            let max_day = match month {
+                1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                4 | 6 | 9 | 11 => 30,
+                2 if is_leap_year(year) => 29,
+                2 => 28,
+                _ => unreachable!(),
+            };
+            if day > max_day {
+                return Err(DateTimeRangeError);
+            }
+            let datepart = (day as u16) | ((month as u16) << 5) | ((year - 1980) << 9);
+            let timepart = ((second as u16) >> 1) | ((minute as u16) << 5) | ((hour as u16) << 11);
+            Ok(DateTime { datepart, timepart })
+        } else {
+            Err(DateTimeRangeError)
+        }
+    }
+
+    /// Indicates whether this date and time can be written to a zip archive.
+    pub fn is_valid(&self) -> bool {
+        Self::try_from_msdos(self.datepart, self.timepart).is_ok()
+    }
+
+    #[cfg(feature = "time")]
+    /// Converts a OffsetDateTime object to a DateTime
+    ///
+    /// Returns `Err` when this object is out of bounds
+    #[deprecated(since = "0.6.4", note = "use `DateTime::try_from()` instead")]
+    pub fn from_time(dt: OffsetDateTime) -> Result<DateTime, DateTimeRangeError> {
+        dt.try_into()
+    }
+
+    /// Gets the time portion of this datetime in the msdos representation
+    pub const fn timepart(&self) -> u16 {
+        self.timepart
+    }
+
+    /// Gets the date portion of this datetime in the msdos representation
+    pub const fn datepart(&self) -> u16 {
+        self.datepart
+    }
+
+    #[cfg(feature = "time")]
+    /// Converts the DateTime to a OffsetDateTime structure
+    #[deprecated(since = "1.3.1", note = "use `OffsetDateTime::try_from()` instead")]
+    pub fn to_time(&self) -> Result<OffsetDateTime, ComponentRange> {
+        (*self).try_into()
+    }
+
+    /// Get the year. There is no epoch, i.e. 2018 will be returned as 2018.
+    pub const fn year(&self) -> u16 {
+        (self.datepart >> 9) + 1980
+    }
+
+    /// Get the month, where 1 = january and 12 = december
+    ///
+    /// # Warning
+    ///
+    /// When read from a zip file, this may not be a reasonable value
+    pub const fn month(&self) -> u8 {
+        ((self.datepart & 0b0000000111100000) >> 5) as u8
+    }
+
+    /// Get the day
+    ///
+    /// # Warning
+    ///
+    /// When read from a zip file, this may not be a reasonable value
+    pub const fn day(&self) -> u8 {
+        (self.datepart & 0b0000000000011111) as u8
+    }
+
+    /// Get the hour
+    ///
+    /// # Warning
+    ///
+    /// When read from a zip file, this may not be a reasonable value
+    pub const fn hour(&self) -> u8 {
+        (self.timepart >> 11) as u8
+    }
+
+    /// Get the minute
+    ///
+    /// # Warning
+    ///
+    /// When read from a zip file, this may not be a reasonable value
+    pub const fn minute(&self) -> u8 {
+        ((self.timepart & 0b0000011111100000) >> 5) as u8
+    }
+
+    /// Get the second
+    ///
+    /// # Warning
+    ///
+    /// When read from a zip file, this may not be a reasonable value
+    pub const fn second(&self) -> u8 {
+        ((self.timepart & 0b0000000000011111) << 1) as u8
+    }
+}
+
+#[cfg(feature = "time")]
+impl TryFrom<OffsetDateTime> for DateTime {
+    type Error = DateTimeRangeError;
+
+    fn try_from(dt: OffsetDateTime) -> Result<Self, Self::Error> {
+        Self::try_from(PrimitiveDateTime::new(dt.date(), dt.time()))
+    }
+    /// A default [`Config`] is used.
+    pub fn new(reader: R) -> ZipResult<ZipArchive<R>> {
+        Self::with_config(Default::default(), reader)
+    }
+
+    /// Read a ZIP archive providing a read configuration, collecting the files it contains.
+    ///
+    /// This uses the central directory record of the ZIP file, and ignores local file headers.
+    pub fn with_config(config: Config, mut reader: R) -> ZipResult<ZipArchive<R>> {
+        let shared = Self::get_metadata(config, &mut reader)?;
+
+        Ok(ZipArchive {
+            reader,
+            shared: shared.into(),
+        })
+    }
+
+    /// Extract a Zip archive into a directory, overwriting files if they
+    /// already exist. Paths are sanitized with [`ZipFile::enclosed_name`]. Symbolic links are only
+    /// created and followed if the target is within the destination directory (this is checked
+    /// conservatively using [`std::fs::canonicalize`]).
+    ///
+    /// Extraction is not atomic. If an error is encountered, some of the files
+    /// may be left on disk. However, on Unix targets, no newly-created directories with part but
+    /// not all of their contents extracted will be readable, writable or usable as process working
+    /// directories by any non-root user except you.
+    ///
+    /// On Unix and Windows, symbolic links are extracted correctly. On other platforms such as
+    /// WebAssembly, symbolic links aren't supported, so they're extracted as normal files
+    /// containing the target path in UTF-8.
+    pub fn extract<P: AsRef<Path>>(&mut self, directory: P) -> ZipResult<()> {
+        self.extract_internal(directory, None::<fn(&Path) -> bool>)
+    }
+    }
+
+    #[allow(clippy::wrong_self_convention)]
+    #[inline(always)]
+    pub fn from_le(self) -> Self {
+        Self(u16::from_le(self.0))
+    }
+
+    #[allow(clippy::wrong_self_convention)]
+    #[inline(always)]
+    pub fn to_le(self) -> Self {
+        Self(u16::to_le(self.0))
+    }
+
+    pub const ZIP64_EXTRA_FIELD_TAG: Self = Self::literal(0x0001);
+}
+
+/// The file size at which a ZIP64 record becomes necessary.
+///
+/// If a file larger than this threshold attempts to be written, compressed or uncompressed, and
+/// [`FileOptions::large_file()`](crate::write::FileOptions) was not true, then [`ZipWriter`] will
+/// raise an [`io::Error`] with [`io::ErrorKind::Other`].
+///
+/// If the zip file itself is larger than this value, then a zip64 central directory record will be
+/// written to the end of the file.
+///
+///```
+/// # fn main() -> Result<(), zip::result::ZipError> {
+/// # #[cfg(target_pointer_width = "64")]
+/// # {
+/// use std::io::{self, Cursor, prelude::*};
+/// use std::error::Error;
+/// use zip::{ZipWriter, write::SimpleFileOptions};
+///
+/// let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+/// // Writing an extremely large file for this test is faster without compression.
+/// let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+///
+/// let big_len: usize = (zip::ZIP64_BYTES_THR as usize) + 1;
+/// let big_buf = vec![0u8; big_len];
+/// zip.start_file("zero.dat", options)?;
+/// // This is too big!
+/// let res = zip.write_all(&big_buf[..]).err().unwrap();
+/// assert_eq!(res.kind(), io::ErrorKind::Other);
+/// let description = format!("{}", &res);
+/// assert_eq!(description, "Large file option has not been set");
+/// // Attempting to write anything further to the same zip will still succeed, but the previous
+/// // failing entry has been removed.
+/// zip.start_file("one.dat", options)?;
+/// let zip = zip.finish_into_readable()?;
+/// let names: Vec<_> = zip.file_names().collect();
+/// assert_eq!(&names, &["one.dat"]);
+///
+/// // Create a new zip output.
+/// let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+/// // This time, create a zip64 record for the file.
+/// let options = options.large_file(true);
+/// zip.start_file("zero.dat", options)?;
+/// // This succeeds because we specified that it could be a large file.
+/// assert!(zip.write_all(&big_buf[..]).is_ok());
+/// # }
+/// # Ok(())
+/// # }
+///```
+pub const ZIP64_BYTES_THR: u64 = u32::MAX as u64;
+/// The number of entries within a single zip necessary to allocate a zip64 central
+/// directory record.
+///
+/// If more than this number of entries is written to a [`ZipWriter`], then [`ZipWriter::finish()`]
+/// will write out extra zip64 data to the end of the zip file.
+pub const ZIP64_ENTRY_THR: usize = u16::MAX as usize;
+
+/// # Safety
+///
+/// - No padding/uninit bytes
+/// - All bytes patterns must be valid
+/// - No cell, pointers
+///
+/// See `bytemuck::Pod` for more details.
+pub(crate) unsafe trait Pod: Copy + 'static {
+    #[inline]
+            CompressionMethod::Deflate64 => {
+                Decompressor::Deflate64(deflate64::Deflate64Decoder::with_buffer(reader))
+            }
+            #[cfg(feature = "bzip2")]
+            CompressionMethod::Bzip2 => Decompressor::Bzip2(bzip2::bufread::BzDecoder::new(reader)),
+            #[cfg(feature = "zstd")]
+            CompressionMethod::Zstd => Decompressor::Zstd(zstd::Decoder::with_buffer(reader)?),
+            #[cfg(feature = "lzma")]
+            CompressionMethod::Lzma => Decompressor::Lzma(Lzma::Uninitialized {
+                reader: Some(reader),
+                uncompressed_size,
+            }),
+            #[cfg(feature = "xz")]
+            CompressionMethod::Xz => {
+                Decompressor::Xz(Box::new(lzma_rust2::XzReader::new(reader, false)))
+            }
+            #[cfg(feature = "ppmd")]
+            CompressionMethod::Ppmd => Decompressor::Ppmd(Ppmd::Uninitialized(Some(reader))),
+            #[cfg(feature = "legacy-zip")]
+            CompressionMethod::Shrink => Decompressor::Shrink(
+                crate::legacy::shrink::ShrinkDecoder::new(reader, uncompressed_size),
+            ),
+            #[cfg(feature = "legacy-zip")]
+            CompressionMethod::Reduce(n) => Decompressor::Reduce(
+                crate::legacy::reduce::ReduceDecoder::new(reader, uncompressed_size, n),
+            ),
+            #[cfg(feature = "legacy-zip")]
+            CompressionMethod::Implode => Decompressor::Implode(
+                crate::legacy::implode::ImplodeDecoder::new(reader, uncompressed_size, flags),
+            ),
+            _ => {
+                return Err(crate::result::ZipError::UnsupportedArchive(
+                    "Compression method not supported",
+                ))
+            }
+        })
+    }
+
+    /// Consumes this decoder, returning the underlying reader.
+    #[allow(clippy::infallible_destructuring_match)]
+    pub fn into_inner(self) -> io::Result<R> {
+        let inner = match self {
+            Decompressor::Stored(r) => r,
+            #[cfg(feature = "deflate-flate2")]
+            Decompressor::Deflated(r) => r.into_inner(),
+            #[cfg(feature = "deflate64")]
+            Decompressor::Deflate64(r) => r.into_inner(),
+            #[cfg(feature = "bzip2")]
+            Decompressor::Bzip2(r) => r.into_inner(),
+            #[cfg(feature = "zstd")]
+            Decompressor::Zstd(r) => r.finish(),
+            #[cfg(feature = "lzma")]
+            Decompressor::Lzma(r) => match r {
+                Lzma::Uninitialized { mut reader, .. } => reader
+                    .take()
+                    .ok_or_else(|| io::Error::other("Reader was not set"))?,
+                Lzma::Initialized(decoder) => decoder.into_inner(),
+            },
+            #[cfg(feature = "legacy-zip")]
+            Decompressor::Shrink(r) => r.into_inner(),
+            #[cfg(feature = "legacy-zip")]
+            Decompressor::Reduce(r) => r.into_inner(),
+            #[cfg(feature = "legacy-zip")]
+            Decompressor::Implode(r) => r.into_inner(),
+            #[cfg(feature = "xz")]
+            Decompressor::Xz(r) => r.into_inner(),
+            #[cfg(feature = "ppmd")]
+            Decompressor::Ppmd(r) => match r {
+                Ppmd::Uninitialized(mut reader) => reader
+                    .take()
+                    .ok_or_else(|| io::Error::other("Reader was not set"))?,
+                Ppmd::Initialized(decoder) => decoder.into_inner(),
+            },
+        };
+        Ok(inner)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::{CompressionMethod, SUPPORTED_COMPRESSION_METHODS};
+#[cfg(feature = "deflate-flate2")]
+use std::fs;
+#[cfg(feature = "deflate-flate2")]
+use std::io::Read;
+use std::io::Write;
+#[cfg(feature = "deflate-flate2")]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(feature = "deflate-flate2")]
+use tempfile::TempDir;
+use zip::read::root_dir_common_filter;
+use zip::write::SimpleFileOptions;
+use zip::{ZipArchive, ZipWriter};
+
+fn create_zip_with_root_dir() -> Vec<u8> {
+    let buf = Vec::new();
+    let mut writer = ZipWriter::new(std::io::Cursor::new(buf));
+    let options = SimpleFileOptions::default();
+
+    // Create a zip with a single top-level directory that contains everything else
+    writer.add_directory("root/", options).unwrap();
+    writer.add_directory("root/subdir/", options).unwrap();
+    writer.start_file("root/file1.txt", options).unwrap();
+    writer.write_all(b"File 1 content").unwrap();
+    writer.start_file("root/subdir/file2.txt", options).unwrap();
+    writer.write_all(b"File 2 content").unwrap();
+
+    writer.finish().unwrap().into_inner()
+}
+
+fn create_zip_without_root_dir() -> Vec<u8> {
+    let buf = Vec::new();
+    let mut writer = ZipWriter::new(std::io::Cursor::new(buf));
+    let options = SimpleFileOptions::default();
+
+    // Create a zip with multiple top-level entries
+    writer.add_directory("dir1/", options).unwrap();
+    writer.add_directory("dir2/", options).unwrap();
+    writer.start_file("file1.txt", options).unwrap();
+    writer.write_all(b"File 1 content").unwrap();
+    writer.start_file("dir1/file2.txt", options).unwrap();
+    writer.write_all(b"File 2 content").unwrap();
+
+    writer.finish().unwrap().into_inner()
+}
+
+fn create_zip_with_root_dir_and_ds_store() -> Vec<u8> {
+    let buf = Vec::new();
+    let mut writer = ZipWriter::new(std::io::Cursor::new(buf));
+    let options = SimpleFileOptions::default();
+
+    // Create a zip with a single top-level directory and a .DS_Store file
+    writer.start_file(".DS_Store", options).unwrap();
+    writer.write_all(b"DS_Store content").unwrap();
+    writer.add_directory("root/", options).unwrap();
+    writer.add_directory("root/subdir/", options).unwrap();
+    writer.start_file("root/file1.txt", options).unwrap();
+    writer.write_all(b"File 1 content").unwrap();
+    writer.start_file("root/subdir/file2.txt", options).unwrap();
+    writer.write_all(b"File 2 content").unwrap();
+
+    writer.finish().unwrap().into_inner()
+}
+
+fn create_zip_with_macosx_dir() -> Vec<u8> {
+    let buf = Vec::new();
+    let mut writer = ZipWriter::new(std::io::Cursor::new(buf));
+    let options = SimpleFileOptions::default();
+
+    // Create a zip with __MACOSX directory alongside the root dir
+    writer.add_directory("__MACOSX/", options).unwrap();
+    writer.start_file("__MACOSX/._file1.txt", options).unwrap();
+    writer.write_all(b"Resource fork").unwrap();
+
+    writer.add_directory("root/", options).unwrap();
+    writer.start_file("root/file1.txt", options).unwrap();
+    writer.write_all(b"File 1 content").unwrap();
+
+    writer.finish().unwrap().into_inner()
+}
+
+fn create_zip_with_multiple_root_dirs() -> Vec<u8> {
+    let buf = Vec::new();
+    let mut writer = ZipWriter::new(std::io::Cursor::new(buf));
+    let options = SimpleFileOptions::default();
+
+    // Create a zip with multiple top-level directories
+    writer.add_directory("root1/", options).unwrap();
+    writer.start_file("root1/file1.txt", options).unwrap();
+    writer.write_all(b"File 1 content").unwrap();
+
+    writer.add_directory("root2/", options).unwrap();
+    writer.start_file("root2/file2.txt", options).unwrap();
+    writer.write_all(b"File 2 content").unwrap();
+
+    writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn test_root_dir_with_single_root() {
+    let zip_data = create_zip_with_root_dir();
+    let archive = ZipArchive::new(std::io::Cursor::new(zip_data)).unwrap();
+
+    // Use the default common filter
+    let root_dir = archive.root_dir(root_dir_common_filter).unwrap();
+
+    assert!(root_dir.is_some());
+    assert_eq!(root_dir.unwrap(), PathBuf::from("root"));
+}
+
+#[test]
+fn test_root_dir_without_root() {
+    let zip_data = create_zip_without_root_dir();
+    let archive = ZipArchive::new(std::io::Cursor::new(zip_data)).unwrap();
+
+    let root_dir = archive.root_dir(root_dir_common_filter).unwrap();
+
+    assert!(root_dir.is_none());
+}
+
+#[test]
+fn test_root_dir_with_ds_store() {
+    let zip_data = create_zip_with_root_dir_and_ds_store();
+    let archive = ZipArchive::new(std::io::Cursor::new(zip_data)).unwrap();
+
+    // Without filtering, it should return None because .DS_Store is at the root level
+    let root_dir = archive.root_dir(|_| true).unwrap();
+    assert!(root_dir.is_none());
+
+    // With common filter, it should ignore .DS_Store and find the root directory
+    let root_dir = archive.root_dir(root_dir_common_filter).unwrap();
+    assert!(root_dir.is_some());
+    assert_eq!(root_dir.unwrap(), PathBuf::from("root"));
+}
+
+#[test]
+fn test_root_dir_with_macosx_dir() {
+    let zip_data = create_zip_with_macosx_dir();
+    let archive = ZipArchive::new(std::io::Cursor::new(zip_data)).unwrap();
+
+    // Without filtering, it should return None because __MACOSX is at the root level
+    let root_dir = archive.root_dir(|_| true).unwrap();
+    assert!(root_dir.is_none());
+
+    // With common filter, it should ignore __MACOSX and find the root directory
+    let root_dir = archive.root_dir(root_dir_common_filter).unwrap();
+    assert!(root_dir.is_some());
+    assert_eq!(root_dir.unwrap(), PathBuf::from("root"));
+}
+
+#[test]
+fn test_root_dir_with_multiple_root_dirs() {
+    let zip_data = create_zip_with_multiple_root_dirs();
+    let archive = ZipArchive::new(std::io::Cursor::new(zip_data)).unwrap();
+
+    // Should return None because there are multiple top-level directories
+    let root_dir = archive.root_dir(root_dir_common_filter).unwrap();
+    assert!(root_dir.is_none());
+}
+
+#[test]
+#[cfg(feature = "deflate-flate2")]
+fn test_extract_without_root_dir() {
+    let zip_data = create_zip_with_root_dir();
+    let mut archive = ZipArchive::new(std::io::Cursor::new(zip_data)).unwrap();
+
+    let temp_dir = TempDir::new().unwrap();
+    archive
+        .extract_unwrapped_root_dir(temp_dir.path(), root_dir_common_filter)
+        .unwrap();
+
+    // Files should be extracted directly without the root directory
+    assert!(temp_dir.path().join("file1.txt").exists());
+    assert!(temp_dir.path().join("subdir").exists());
+    assert!(temp_dir.path().join("subdir/file2.txt").exists());
+
+    // The root directory should not exist
+    assert!(!temp_dir.path().join("root").exists());
+
+    // Check file contents
+    let mut content = String::new();
+    fs::File::open(temp_dir.path().join("file1.txt"))
+        .unwrap()
+        .read_to_string(&mut content)
+        .unwrap();
+    assert_eq!(content, "File 1 content");
+}
+
+#[test]
+#[cfg(feature = "deflate-flate2")]
+fn test_extract_without_root_dir_but_no_root_found() {
+    let zip_data = create_zip_without_root_dir();
+    let mut archive = ZipArchive::new(std::io::Cursor::new(zip_data)).unwrap();
+
+    let temp_dir = TempDir::new().unwrap();
+    archive
+        .extract_unwrapped_root_dir(temp_dir.path(), root_dir_common_filter)
+        .unwrap();
+
+    // All files should be extracted normally since there's no single root directory
+    assert!(temp_dir.path().join("file1.txt").exists());
+    assert!(temp_dir.path().join("dir1").exists());
+    assert!(temp_dir.path().join("dir2").exists());
+    assert!(temp_dir.path().join("dir1/file2.txt").exists());
+}
+
+#[test]
+#[cfg(feature = "deflate-flate2")]
+fn test_extract_without_root_dir_with_ds_store() {
+    let zip_data = create_zip_with_root_dir_and_ds_store();
+    let mut archive = ZipArchive::new(std::io::Cursor::new(zip_data)).unwrap();
+
+    let temp_dir = TempDir::new().unwrap();
+    archive
+        .extract_unwrapped_root_dir(temp_dir.path(), root_dir_common_filter)
+        .unwrap();
+
+    // .DS_Store should be ignored when finding the root dir
+    assert!(temp_dir.path().join("file1.txt").exists());
+    assert!(temp_dir.path().join("subdir").exists());
+    assert!(temp_dir.path().join("subdir/file2.txt").exists());
+
+    // The root directory should not exist
+    assert!(!temp_dir.path().join("root").exists());
+
+    // .DS_Store should still be extracted at the root level though
+    assert!(temp_dir.path().join(".DS_Store").exists());
+}
+
+#[test]
+#[cfg(feature = "deflate-flate2")]
+fn test_custom_root_dir_filter() {
+    let zip_data = create_zip_with_root_dir();
+    let mut archive = ZipArchive::new(std::io::Cursor::new(zip_data)).unwrap();
+
+    // Define a custom filter that ignores files with "file1" in their name
+    let custom_filter = |path: &Path| !path.to_string_lossy().contains("file1");
+
+    let root_dir = archive.root_dir(custom_filter).unwrap();
+
+    // Should still find the root directory even with our custom filter
+    assert!(root_dir.is_some());
+    assert_eq!(root_dir.unwrap(), PathBuf::from("root"));
+
+    // Extract with our custom filter
+    let temp_dir = TempDir::new().unwrap();
+    archive
+        .extract_unwrapped_root_dir(temp_dir.path(), custom_filter)
+        .unwrap();
+
+    // file1.txt should be skipped during root directory detection
+    // but still extracted normally
+    assert!(temp_dir.path().join("file1.txt").exists());
+    assert!(temp_dir.path().join("subdir").exists());
+    assert!(temp_dir.path().join("subdir/file2.txt").exists());
+}

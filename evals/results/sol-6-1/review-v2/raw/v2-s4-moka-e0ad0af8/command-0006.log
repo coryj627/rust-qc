@@ -1,0 +1,818 @@
+impl<K, V, S> SegmentedCache<K, V, S> {
+    fn is_waiter_map_empty(&self) -> bool {
+        self.inner.segments.iter().all(Cache::is_waiter_map_empty)
+    }
+}
+
+#[cfg(test)]
+impl<K, V, S> SegmentedCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn invalidation_predicate_count(&self) -> usize {
+        self.inner
+            .segments
+            .iter()
+            .map(|seg| seg.invalidation_predicate_count())
+            .sum()
+    }
+
+    fn reconfigure_for_testing(&mut self) {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("There are other strong reference to self.inner Arc");
+
+        for segment in inner.segments.iter_mut() {
+            segment.reconfigure_for_testing();
+        }
+    }
+
+    fn key_locks_map_is_empty(&self) -> bool {
+        self.inner
+            .segments
+            .iter()
+            .all(|seg| seg.key_locks_map_is_empty())
+    }
+}
+
+struct Inner<K, V, S> {
+    desired_capacity: Option<u64>,
+    segments: Box<[Cache<K, V, S>]>,
+    build_hasher: S,
+    segment_shift: u32,
+}
+
+impl<K, V, S> Inner<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is 0.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        name: Option<String>,
+        max_capacity: Option<u64>,
+        initial_capacity: Option<usize>,
+        num_segments: usize,
+        build_hasher: S,
+        weigher: Option<Weigher<K, V>>,
+        eviction_policy: EvictionPolicy,
+        eviction_listener: Option<EvictionListener<K, V>>,
+        expiration_policy: ExpirationPolicy<K, V>,
+        housekeeper_config: HousekeeperConfig,
+        invalidator_enabled: bool,
+        clock: Clock,
+    ) -> Self {
+        assert!(num_segments > 0);
+
+        let actual_num_segments = num_segments.next_power_of_two();
+        let segment_shift = 64 - actual_num_segments.trailing_zeros();
+        let seg_max_capacity =
+            max_capacity.map(|n| (n as f64 / actual_num_segments as f64).ceil() as u64);
+        let seg_init_capacity =
+            initial_capacity.map(|cap| (cap as f64 / actual_num_segments as f64).ceil() as usize);
+        // NOTE: We cannot initialize the segments as `vec![cache; actual_num_segments]`
+        // because Cache::clone() does not clone its inner but shares the same inner.
+        let segments = (0..actual_num_segments)
+            .map(|_| {
+                Cache::with_everything(
+                    name.clone(),
+                    seg_max_capacity,
+                    seg_init_capacity,
+                    build_hasher.clone(),
+                    weigher.clone(),
+                    eviction_policy.clone(),
+                    eviction_listener.clone(),
+                    expiration_policy.clone(),
+                    housekeeper_config.clone(),
+                    invalidator_enabled,
+                    clock.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        Self {
+            desired_capacity: max_capacity,
+            segments: segments.into_boxed_slice(),
+            build_hasher,
+            segment_shift,
+        }
+    }
+
+    #[inline]
+    fn hash<Q>(&self, key: &Q) -> u64
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        let mut hasher = self.build_hasher.build_hasher();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[inline]
+    fn select(&self, hash: u64) -> &Cache<K, V, S> {
+        let index = self.segment_index_from_hash(hash);
+        &self.segments[index]
+    }
+
+    #[inline]
+    fn segment_index_from_hash(&self, hash: u64) -> usize {
+        if self.segment_shift == 64 {
+            0
+        } else {
+            (hash >> self.segment_shift) as usize
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SegmentedCache;
+    use crate::notification::RemovalCause;
+    use parking_lot::Mutex;
+    use std::{error::Error, fmt::Display, sync::Arc, time::Duration};
+
+    #[test]
+    fn max_capacity_zero() {
+        let mut cache = SegmentedCache::new(0, 1);
+        cache.reconfigure_for_testing();
+
+        // Make the cache exterior immutable.
+        let cache = cache;
+
+        cache.insert(0, ());
+
+        assert!(!cache.contains_key(&0));
+        assert!(cache.get(&0).is_none());
+        cache.run_pending_tasks();
+        assert!(!cache.contains_key(&0));
+        assert!(cache.get(&0).is_none());
+        assert_eq!(cache.entry_count(), 0)
+    }
+
+    #[test]
+    fn basic_single_thread() {
+        // The following `Vec`s will hold actual and expected notifications.
+        let actual = Arc::new(Mutex::new(Vec::new()));
+        let mut expected = Vec::new();
+
+        // Create an eviction listener.
+        let a1 = Arc::clone(&actual);
+        let listener = move |k, v, cause| a1.lock().push((k, v, cause));
+
+        // Create a cache with the eviction listener.
+        let mut cache = SegmentedCache::builder(1)
+            .max_capacity(3)
+            .eviction_listener(listener)
+            .build();
+        cache.reconfigure_for_testing();
+
+        // Make the cache exterior immutable.
+        let cache = cache;
+
+        cache.insert("a", "alice");
+        cache.insert("b", "bob");
+        assert_eq!(cache.get(&"a"), Some("alice"));
+        assert!(cache.contains_key(&"a"));
+        assert!(cache.contains_key(&"b"));
+        assert_eq!(cache.get(&"b"), Some("bob"));
+        cache.run_pending_tasks();
+        // counts: a -> 1, b -> 1
+
+        cache.insert("c", "cindy");
+        assert_eq!(cache.get(&"c"), Some("cindy"));
+        assert!(cache.contains_key(&"c"));
+        // counts: a -> 1, b -> 1, c -> 1
+        cache.run_pending_tasks();
+
+        assert!(cache.contains_key(&"a"));
+        assert_eq!(cache.get(&"a"), Some("alice"));
+        assert_eq!(cache.get(&"b"), Some("bob"));
+        assert!(cache.contains_key(&"b"));
+        cache.run_pending_tasks();
+        // counts: a -> 2, b -> 2, c -> 1
+
+        // "d" should not be admitted because its frequency is too low.
+        cache.insert("d", "david"); //   count: d -> 0
+        expected.push((Arc::new("d"), "david", RemovalCause::Size));
+use crate::common::{concurrent::arc::MiniArc, deque::DeqNode, time::Instant};
+
+use parking_lot::Mutex;
+use std::{fmt, ptr::NonNull, sync::Arc};
+use tagptr::TagNonNull;
+
+pub(crate) mod arc;
+pub(crate) mod constants;
+pub(crate) mod deques;
+pub(crate) mod entry_info;
+
+#[cfg(feature = "sync")]
+pub(crate) mod housekeeper;
+
+#[cfg(feature = "unstable-debug-counters")]
+pub(crate) mod debug_counters;
+
+use self::entry_info::EntryInfo;
+
+use super::timer_wheel::TimerNode;
+
+pub(crate) type Weigher<K, V> = Arc<dyn Fn(&K, &V) -> u32 + Send + Sync + 'static>;
+
+pub(crate) trait AccessTime {
+    fn last_accessed(&self) -> Option<Instant>;
+    fn set_last_accessed(&self, timestamp: Instant);
+    fn last_modified(&self) -> Option<Instant>;
+    fn set_last_modified(&self, timestamp: Instant);
+}
+
+#[derive(Debug)]
+pub(crate) struct KeyHash<K> {
+    pub(crate) key: Arc<K>,
+    pub(crate) hash: u64,
+}
+
+impl<K> KeyHash<K> {
+    pub(crate) fn new(key: Arc<K>, hash: u64) -> Self {
+        Self { key, hash }
+    }
+}
+
+impl<K> Clone for KeyHash<K> {
+    fn clone(&self) -> Self {
+        Self {
+            key: Arc::clone(&self.key),
+            hash: self.hash,
+        }
+    }
+}
+
+pub(crate) struct KeyHashDate<K> {
+    entry_info: MiniArc<EntryInfo<K>>,
+}
+
+impl<K> KeyHashDate<K> {
+    pub(crate) fn new(entry_info: &MiniArc<EntryInfo<K>>) -> Self {
+        Self {
+            entry_info: MiniArc::clone(entry_info),
+        }
+    }
+
+    pub(crate) fn key(&self) -> &Arc<K> {
+        &self.entry_info.key_hash().key
+    }
+
+    pub(crate) fn hash(&self) -> u64 {
+        self.entry_info.key_hash().hash
+    }
+
+    pub(crate) fn entry_info(&self) -> &EntryInfo<K> {
+        &self.entry_info
+    }
+
+    pub(crate) fn last_modified(&self) -> Option<Instant> {
+        self.entry_info.last_modified()
+    }
+
+    pub(crate) fn last_accessed(&self) -> Option<Instant> {
+        self.entry_info.last_accessed()
+    }
+
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.entry_info.is_dirty()
+    }
+}
+
+pub(crate) struct KvEntry<K, V> {
+    pub(crate) key: Arc<K>,
+    pub(crate) entry: MiniArc<ValueEntry<K, V>>,
+}
+
+impl<K, V> KvEntry<K, V> {
+    pub(crate) fn new(key: Arc<K>, entry: MiniArc<ValueEntry<K, V>>) -> Self {
+        Self { key, entry }
+    }
+}
+
+impl<K, V> Clone for KvEntry<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            key: Arc::clone(&self.key),
+            entry: MiniArc::clone(&self.entry),
+        }
+    }
+}
+
+impl<K> AccessTime for DeqNode<KeyHashDate<K>> {
+    #[inline]
+    fn last_accessed(&self) -> Option<Instant> {
+        self.element.entry_info.last_accessed()
+    }
+
+    #[inline]
+    fn set_last_accessed(&self, timestamp: Instant) {
+        self.element.entry_info.set_last_accessed(timestamp);
+    }
+
+    #[inline]
+    fn last_modified(&self) -> Option<Instant> {
+        self.element.entry_info.last_modified()
+    }
+
+    #[inline]
+    fn set_last_modified(&self, timestamp: Instant) {
+        self.element.entry_info.set_last_modified(timestamp);
+    }
+}
+
+// DeqNode for an access order queue.
+type KeyDeqNodeAo<K> = TagNonNull<DeqNode<KeyHashDate<K>>, 2>;
+
+// DeqNode for the write order queue.
+type KeyDeqNodeWo<K> = NonNull<DeqNode<KeyHashDate<K>>>;
+
+// DeqNode for the timer wheel.
+type DeqNodeTimer<K> = NonNull<DeqNode<TimerNode<K>>>;
+
+pub(crate) struct DeqNodes<K> {
+    access_order_q_node: Option<KeyDeqNodeAo<K>>,
+    write_order_q_node: Option<KeyDeqNodeWo<K>>,
+    timer_node: Option<DeqNodeTimer<K>>,
+}
+
+impl<K> Default for DeqNodes<K> {
+    fn default() -> Self {
+        Self {
+            access_order_q_node: None,
+            write_order_q_node: None,
+            timer_node: None,
+        }
+    }
+}
+
+// We need this `unsafe impl` as DeqNodes have NonNull pointers.
+unsafe impl<K> Send for DeqNodes<K> {}
+
+impl<K> DeqNodes<K> {
+    pub(crate) fn set_timer_node(&mut self, timer_node: Option<DeqNodeTimer<K>>) {
+        self.timer_node = timer_node;
+    }
+}
+
+pub(crate) struct ValueEntry<K, V> {
+    pub(crate) value: V,
+    info: MiniArc<EntryInfo<K>>,
+    nodes: MiniArc<Mutex<DeqNodes<K>>>,
+}
+
+impl<K, V> ValueEntry<K, V> {
+    pub(crate) fn new(value: V, entry_info: MiniArc<EntryInfo<K>>) -> Self {
+        #[cfg(feature = "unstable-debug-counters")]
+        self::debug_counters::InternalGlobalDebugCounters::value_entry_created();
+
+        Self {
+            value,
+            info: entry_info,
+            nodes: MiniArc::new(Mutex::new(DeqNodes::default())),
+        }
+    }
+
+    pub(crate) fn new_from(value: V, entry_info: MiniArc<EntryInfo<K>>, other: &Self) -> Self {
+        #[cfg(feature = "unstable-debug-counters")]
+        self::debug_counters::InternalGlobalDebugCounters::value_entry_created();
+        Self {
+            value,
+            info: entry_info,
+            nodes: MiniArc::clone(&other.nodes),
+        }
+    }
+
+    pub(crate) fn entry_info(&self) -> &MiniArc<EntryInfo<K>> {
+        &self.info
+    }
+
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.info.is_admitted()
+    }
+
+    pub(crate) fn set_admitted(&self, value: bool) {
+        self.info.set_admitted(value);
+    }
+
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.info.is_dirty()
+    }
+
+    #[inline]
+    pub(crate) fn policy_weight(&self) -> u32 {
+        self.info.policy_weight()
+    }
+
+    pub(crate) fn deq_nodes(&self) -> &MiniArc<Mutex<DeqNodes<K>>> {
+        &self.nodes
+    }
+
+    pub(crate) fn access_order_q_node(&self) -> Option<KeyDeqNodeAo<K>> {
+        self.nodes.lock().access_order_q_node
+    }
+
+    pub(crate) fn set_access_order_q_node(&self, node: Option<KeyDeqNodeAo<K>>) {
+        self.nodes.lock().access_order_q_node = node;
+    }
+
+    pub(crate) fn take_access_order_q_node(&self) -> Option<KeyDeqNodeAo<K>> {
+        self.nodes.lock().access_order_q_node.take()
+    }
+
+    pub(crate) fn write_order_q_node(&self) -> Option<KeyDeqNodeWo<K>> {
+        self.nodes.lock().write_order_q_node
+    }
+
+    pub(crate) fn set_write_order_q_node(&self, node: Option<KeyDeqNodeWo<K>>) {
+        self.nodes.lock().write_order_q_node = node;
+    }
+
+    pub(crate) fn take_write_order_q_node(&self) -> Option<KeyDeqNodeWo<K>> {
+        self.nodes.lock().write_order_q_node.take()
+    }
+
+use async_lock::{RwLock, RwLockWriteGuard};
+use futures_util::FutureExt;
+use std::{
+    any::{Any, TypeId},
+    fmt,
+    future::Future,
+    hash::{BuildHasher, Hash},
+    pin::Pin,
+    sync::Arc,
+};
+
+use crate::{
+    common::concurrent::arc::MiniArc,
+    ops::compute::{CompResult, Op},
+    Entry,
+};
+
+use super::{Cache, ComputeNone, OptionallyNone};
+
+const WAITER_MAP_NUM_SEGMENTS: usize = 64;
+
+type ErrorObject = Arc<dyn Any + Send + Sync + 'static>;
+
+pub(crate) enum InitResult<V, E> {
+    Initialized(V),
+    ReadExisting(V),
+    InitErr(Arc<E>),
+}
+
+enum WaiterValue<V> {
+    Computing,
+    Ready(Result<V, ErrorObject>),
+    ReadyNone,
+    // https://github.com/moka-rs/moka/issues/43
+    InitFuturePanicked,
+    // https://github.com/moka-rs/moka/issues/59
+    EnclosingFutureAborted,
+}
+
+impl<V> fmt::Debug for WaiterValue<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WaiterValue::Computing => write!(f, "Computing"),
+            WaiterValue::Ready(_) => write!(f, "Ready"),
+            WaiterValue::ReadyNone => write!(f, "ReadyNone"),
+            WaiterValue::InitFuturePanicked => write!(f, "InitFuturePanicked"),
+            WaiterValue::EnclosingFutureAborted => write!(f, "EnclosingFutureAborted"),
+        }
+    }
+}
+
+type Waiter<V> = MiniArc<RwLock<WaiterValue<V>>>;
+type WaiterMap<K, V, S> = crate::cht::SegmentedHashMap<(Arc<K>, TypeId), Waiter<V>, S>;
+
+struct WaiterGuard<'a, K, V, S>
+// NOTE: We usually do not attach trait bounds to here at the struct definition, but
+// the Drop trait requires these bounds here.
+where
+    K: Eq + Hash,
+    V: Clone,
+    S: BuildHasher,
+{
+    w_key: Option<(Arc<K>, TypeId)>,
+    w_hash: u64,
+    waiters: &'a WaiterMap<K, V, S>,
+    write_lock: RwLockWriteGuard<'a, WaiterValue<V>>,
+}
+
+impl<'a, K, V, S> WaiterGuard<'a, K, V, S>
+where
+    K: Eq + Hash,
+    V: Clone,
+    S: BuildHasher,
+{
+    fn new(
+        w_key: (Arc<K>, TypeId),
+        w_hash: u64,
+        waiters: &'a WaiterMap<K, V, S>,
+        write_lock: RwLockWriteGuard<'a, WaiterValue<V>>,
+    ) -> Self {
+        Self {
+            w_key: Some(w_key),
+            w_hash,
+            waiters,
+            write_lock,
+        }
+    }
+
+    fn set_waiter_value(mut self, v: WaiterValue<V>) {
+        *self.write_lock = v;
+        if let Some(w_key) = self.w_key.take() {
+            remove_waiter(self.waiters, w_key, self.w_hash);
+        }
+    }
+}
+
+impl<K, V, S> Drop for WaiterGuard<'_, K, V, S>
+where
+    K: Eq + Hash,
+    V: Clone,
+    S: BuildHasher,
+{
+    fn drop(&mut self) {
+        if let Some(w_key) = self.w_key.take() {
+            // Value is not set. This means the future containing `*get_with` method
+            // has been aborted. Remove our waiter to prevent the issue described in
+            // https://github.com/moka-rs/moka/issues/59
+            *self.write_lock = WaiterValue::EnclosingFutureAborted;
+            remove_waiter(self.waiters, w_key, self.w_hash);
+        }
+    }
+}
+
+pub(crate) struct ValueInitializer<K, V, S> {
+    // TypeId is the type ID of the concrete error type of generic type E in the
+    // try_get_with method. We use the type ID as a part of the key to ensure that we
+    // can always downcast the trait object ErrorObject (in Waiter<V>) into its
+    // concrete type.
+    waiters: MiniArc<WaiterMap<K, V, S>>,
+}
+
+impl<K, V, S> ValueInitializer<K, V, S>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn with_hasher(hasher: S) -> Self {
+        Self {
+            waiters: MiniArc::new(crate::cht::SegmentedHashMap::with_num_segments_and_hasher(
+                WAITER_MAP_NUM_SEGMENTS,
+                hasher,
+            )),
+        }
+    }
+
+    //
+    // NOTES: We use `Pin<&mut impl Future>` instead of `impl Future` here for the
+    // `init` argument. This is because we want to avoid the future size inflation
+    // caused by calling nested async functions. See the following links for more
+    // details:
+    //
+    // - https://github.com/moka-rs/moka/issues/212
+    // - https://swatinem.de/blog/future-size/
+    //
+
+    /// # Panics
+    /// Panics if the `init` future has been panicked.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn try_init_or_read<I, O, E>(
+        &self,
+        c_key: &Arc<K>,
+        c_hash: u64,
+        type_id: TypeId,
+        cache: &Cache<K, V, S>,
+        mut ignore_if: Option<I>,
+        // Future to initialize a new value.
+        init: Pin<&mut impl Future<Output = O>>,
+        // Function to convert a value O, returned from the init future, into
+        // Result<V, E>.
+        post_init: fn(O) -> Result<V, E>,
+    ) -> InitResult<V, E>
+    where
+        I: FnMut(&V) -> bool + Send,
+        E: Send + Sync + 'static,
+    {
+        use std::panic::{resume_unwind, AssertUnwindSafe};
+        use InitResult::{InitErr, Initialized, ReadExisting};
+
+        const MAX_RETRIES: usize = 200;
+        let mut retries = 0;
+
+        let (w_key, w_hash) = waiter_key_hash(&self.waiters, c_key, type_id);
+
+        let waiter = MiniArc::new(RwLock::new(WaiterValue::Computing));
+        // NOTE: We have to acquire a write lock before `try_insert_waiter`,
+        // so that any concurrent attempt will get our lock and wait on it.
+        let lock = waiter.write().await;
+
+        loop {
+            let Some(existing_waiter) =
+                try_insert_waiter(&self.waiters, w_key.clone(), w_hash, &waiter)
+            else {
+                // Inserted.
+                break;
+            };
+
+            // Somebody else's waiter already exists, so wait for its result to become available.
+            let waiter_result = existing_waiter.read().await;
+            match &*waiter_result {
+                WaiterValue::Ready(Ok(value)) => return ReadExisting(value.clone()),
+                WaiterValue::Ready(Err(e)) => return InitErr(Arc::clone(e).downcast().unwrap()),
+                // Somebody else's init future has been panicked.
+                WaiterValue::InitFuturePanicked => {
+                    retries += 1;
+                    panic_if_retry_exhausted_for_panicking(retries, MAX_RETRIES);
+                    // Retry from the beginning.
+                    continue;
+                }
+                // Somebody else (a future containing `get_with`/`try_get_with`)
+                // has been aborted.
+                WaiterValue::EnclosingFutureAborted => {
+                    retries += 1;
+                    panic_if_retry_exhausted_for_aborting(retries, MAX_RETRIES);
+                    // Retry from the beginning.
+                    continue;
+                }
+                // Unexpected state.
+                s @ (WaiterValue::Computing | WaiterValue::ReadyNone) => panic!(
+                    "Got unexpected state `{s:?}` after resolving `init` future. \
+                    This might be a bug in Moka"
+                ),
+            }
+        }
+
+        // Our waiter was inserted.
+
+        // Create a guard. This will ensure to remove our waiter when the
+        // enclosing future has been aborted:
+        // https://github.com/moka-rs/moka/issues/59
+64:    fn clone(&self) -> Self {
+75:    fn drop(&mut self) {
+82:    pub(crate) fn name(&self) -> Option<&str> {
+86:    pub(crate) fn policy(&self) -> Policy {
+90:    pub(crate) fn entry_count(&self) -> u64 {
+94:    pub(crate) fn weighted_size(&self) -> u64 {
+98:    pub(crate) fn is_map_disabled(&self) -> bool {
+103:    pub(crate) fn is_removal_notifier_enabled(&self) -> bool {
+108:    pub(crate) fn current_time(&self) -> Instant {
+112:    pub(crate) fn notify_invalidate(&self, key: &Arc<K>, entry: &MiniArc<ValueEntry<K, V>>)
+126:    pub(crate) fn maybe_key_lock(&self, key: &Arc<K>) -> Option<KeyLock<'_, K, S>> {
+139:    pub(crate) fn new(
+191:    pub(crate) fn hash<Q>(&self, key: &Q) -> u64
+198:    pub(crate) fn contains_key_with_hash<Q>(&self, key: &Q, hash: u64) -> bool
+217:    pub(crate) fn get_with_hash<Q>(&self, key: &Q, hash: u64, need_key: bool) -> Option<Entry<K, V>>
+230:    pub(crate) fn get_with_hash_and_ignore_if<Q, I>(
+249:    pub(crate) fn get_with_hash_without_recording<Q, I>(
+265:    fn do_get_with_hash<Q, R, I>(
+314:            // Call the user supplied `expire_after_read` method if any.
+327:                // Call the user supplied `expire_after_read` method.
+346:                is_expiry_modified = Self::expire_after_read_or_update(
+347:                    |k, v, t, d| expiry.expire_after_read(k, v, t, d, lm),
+372:    pub(crate) fn get_key_with_hash<Q>(&self, key: &Q, hash: u64) -> Option<Arc<K>>
+381:    pub(crate) fn remove_entry<Q>(&self, key: &Q, hash: u64) -> Option<KvEntry<K, V>>
+389:    pub(crate) fn apply_reads_writes_if_needed(
+404:    pub(crate) fn invalidate_all(&self) {
+409:    pub(crate) fn invalidate_entries_if(
+427:    fn num_cht_segments(&self) -> usize {
+431:    fn scanning_get(&self, key: &Arc<K>) -> Option<V> {
+452:    fn keys(&self, cht_segment: usize) -> Option<Vec<Arc<K>>> {
+467:    fn record_read_op(
+482:    pub(crate) fn do_insert_with_hash(
+551:    fn do_post_insert_steps(
+560:            Self::expire_after_create(expiry, key, value_entry, ts, self.inner.clock());
+565:    fn do_post_update_steps(
+575:            Self::expire_after_read_or_update(
+576:                |k, v, t, d| expiry.expire_after_update(k, v, t, d),
+599:    fn apply_reads_if_needed(&self, inner: &Inner<K, V, S>, now: Instant) {
+610:    fn should_apply_reads(hk: &HouseKeeperArc, ch_len: usize, now: Instant) -> bool {
+615:    fn should_apply_writes(hk: &HouseKeeperArc, ch_len: usize, now: Instant) -> bool {
+622:    fn new_value_entry(
+637:    fn new_value_entry_from(
+654:    fn expire_after_create(
+662:            expiry.expire_after_create(key, &value_entry.value, clock.to_std_instant(ts));
+669:    fn expire_after_read_or_update(
+719:    pub(crate) fn invalidation_predicate_count(&self) -> usize {
+723:    pub(crate) fn reconfigure_for_testing(&mut self) {
+732:    pub(crate) fn key_locks_map_is_empty(&self) -> bool {
+744:    fn new(
+756:    fn is_notifier_enabled(&self) -> bool {
+760:    fn notify_entry_removal(
+785:    fn new(entry_count: u64, weighted_size: u64) -> Self {
+794:    fn saturating_add(&mut self, entry_count: u64, weight: u32) {
+801:    fn saturating_sub(&mut self, entry_count: u64, weight: u32) {
+808:    fn incr_eviction_count(&mut self) {
+821:    fn new(policy_weight: u32) -> Self {
+828:    fn add_policy_weight(&mut self, weight: u32) {
+832:    fn add_frequency(&mut self, freq: &FrequencySketch, hash: u64) {
+879:    fn drop(&mut self) {
+898:    fn name(&self) -> Option<&str> {
+902:    fn policy(&self) -> Policy {
+908:    fn entry_count(&self) -> u64 {
+913:    fn weighted_size(&self) -> u64 {
+918:    pub(crate) fn is_removal_notifier_enabled(&self) -> bool {
+922:    pub(crate) fn maybe_key_lock(&self, key: &Arc<K>) -> Option<KeyLock<'_, K, S>>
+931:    fn current_time(&self) -> Instant {
+935:    fn clock(&self) -> &Clock {
+939:    fn num_cht_segments(&self) -> usize {
+944:    fn time_to_live(&self) -> Option<Duration> {
+949:    fn time_to_idle(&self) -> Option<Duration> {
+954:    fn has_expiry(&self) -> bool {
+960:    fn is_write_order_queue_enabled(&self) -> bool {
+965:    fn valid_after(&self) -> Option<Instant> {
+970:    fn set_valid_after(&self, timestamp: Instant) {
+975:    fn has_valid_after(&self) -> bool {
+989:    fn new(
+1061:    fn hash<Q>(&self, key: &Q) -> u64
+1071:    fn get_key_value_and<Q, F, T>(&self, key: &Q, hash: u64, with_entry: F) -> Option<T>
+1081:    fn get_key_value_and_then<Q, F, T>(&self, key: &Q, hash: u64, with_entry: F) -> Option<T>
+1091:    fn remove_entry<Q>(&self, key: &Q, hash: u64) -> Option<KvEntry<K, V>>
+1100:    fn keys(&self, cht_segment: usize) -> Option<Vec<Arc<K>>> {
+1110:    fn register_invalidation_predicate(
+1124:    fn is_invalidated_entry(&self, key: &Arc<K>, entry: &MiniArc<ValueEntry<K, V>>) -> bool
+1135:    fn weigh(&self, key: &K, value: &V) -> u32 {
+1146:    fn run_pending_tasks(
+1155:    fn now(&self) -> Instant {
+1166:    fn do_run_pending_tasks(
+1315:    fn has_enough_capacity(&self, candidate_weight: u32, counters: &EvictionCounters) -> bool {
+1321:    fn weights_to_evict(&self, counters: &EvictionCounters) -> u64 {
+1328:    fn should_enable_frequency_sketch(&self, counters: &EvictionCounters) -> bool {
+1342:    fn enable_frequency_sketch(&self, counters: &EvictionCounters) {
+1355:    fn enable_frequency_sketch_for_testing(&self) {
+1362:    fn do_enable_frequency_sketch(&self, cache_capacity: u64) {
+1368:    fn apply_reads(&self, deqs: &mut Deques<K>, timer_wheel: &mut TimerWheel<K>, count: usize) {
+1391:    fn apply_writes(
+1441:    fn handle_upsert(
+1621:    fn admit(
+1687:    fn handle_admit(
+1712:    fn update_timer_wheel(
+1760:    fn handle_remove(
+1773:    fn handle_remove_without_timer_wheel(
+1793:    fn handle_remove_with_deques(
+1815:    fn evict_expired_entries_using_timers(
+1886:    fn evict_expired_entries_using_deqs(
+1912:    fn remove_expired_ao(
+2011:    fn skip_updated_entry_ao(
+2036:    fn skip_updated_entry_wo(&self, key: &K, hash: u64, deqs: &mut Deques<K>) {
+2052:    fn remove_expired_wo(
+2130:    fn invalidate_entries(
+2192:    fn evict_lru_entries(
+2294:    pub(crate) fn notify_single_removal(
+2306:    fn notify_upsert(
+2336:    fn notify_invalidate(&self, key: &Arc<K>, entry: &MiniArc<ValueEntry<K, V>>) {
+2367:    fn invalidation_predicate_count(&self) -> usize {
+2375:    fn key_locks_map_is_empty(&self) -> bool {
+src/cht/map/bucket.rs:496:                    // TODO: If else, we may need to count tombstone.
+src/common/concurrent/constants.rs:15:// TODO: Calculate the batch size based on the number of entries in the cache (or an
+src/common/concurrent/deques.rs:18:// TODO: https://github.com/moka-rs/moka/issues/54
+src/common/concurrent/deques.rs:206:// TODO: Add tests and run Miri with them.
+src/common/concurrent/arc.rs:161:        // TODO: pointer equality is incorrect if `T` is not `Eq`.
+src/common/concurrent/arc.rs:266:        // TODO: this is a bug.
+src/common/timer_wheel.rs:162:// TODO: https://github.com/moka-rs/moka/issues/54
+src/sync/cache.rs:610:    // TODO: Remove these bounds from S.
+src/sync/cache.rs:968:    /// TODO: Remove this in v0.13.0.
+src/sync/cache.rs:1587:            // TODO: Enhance this if possible. This is rather hack now because
+src/sync/cache.rs:1817:    // TODO: Like future::Cache, move this method to BaseCache.
+src/sync/cache.rs:2355:        // Run the invalidation task and wait for it to finish. (TODO: Need a better way than sleeping)
+src/sync/cache.rs:2384:        // Run the invalidation task and wait for it to finish. (TODO: Need a better way than sleeping)
+src/sync/cache.rs:3044:                            // TODO: Update keys in a random order?
+src/sync/segment.rs:69:    // TODO: Remove these bounds from S.
+src/sync/segment.rs:297:    /// TODO: Remove this in v0.13.0.
+src/sync/segment.rs:304:    /// TODO: Remove this in v0.13.0.
+src/sync/segment.rs:1184:        // Run the invalidation task and wait for it to finish. (TODO: Need a better way than sleeping)
+src/sync/segment.rs:1212:        // Run the invalidation task and wait for it to finish. (TODO: Need a better way than sleeping)
+src/sync/segment.rs:1303:                            // TODO: Update keys in a random order?
+src/sync/base_cache.rs:202:        // TODO: Maybe we can just call ScanningGet::scanning_get.
+src/sync/base_cache.rs:500:        // TODO: Instead using Arc<AtomicU8> to check if the actual operation was
+src/sync/base_cache.rs:1003:        // TODO: Calculate the number of segments based on the max capacity and the
+src/sync/base_cache.rs:1506:        // TODO: Refactoring the policy implementations.
+src/sync/base_cache.rs:1677:        // TODO: Implement some randomness to mitigate hash DoS attack.
+src/sync/base_cache.rs:1952:                // TODO: Remove the second pattern `Some((_key, false, None))` once
+src/sync/base_cache.rs:2089:                // TODO: Remove the second pattern `Some((_key, false, None))` once
+src/sync/base_cache.rs:2226:                // TODO: Remove the second pattern `Some((_key, false, None))` once we change
+src/future/cache.rs:680:    // TODO: Remove these bounds from S.
+src/future/cache.rs:1074:    /// TODO: Remove this in v0.13.0.
+src/future/cache.rs:1941:            // TODO: Enhance this if possible. This is rather hack now because
+src/future/cache.rs:2715:        // Run the invalidation task and wait for it to finish. (TODO: Need a better way than sleeping)
+src/future/cache.rs:2744:        // Run the invalidation task and wait for it to finish. (TODO: Need a better way than sleeping)
+src/future/cache.rs:3425:                            // TODO: Update keys in a random order?
+src/future/base_cache.rs:228:        // TODO: Maybe we can just call ScanningGet::scanning_get.
+src/future/base_cache.rs:500:        // TODO: Instead using Arc<AtomicU8> to check if the actual operation was
+src/future/base_cache.rs:1147:        // TODO: Calculate the number of segments based on the max capacity and
+src/future/base_cache.rs:1663:        // TODO: Refactoring the policy implementations.
+src/future/base_cache.rs:1842:        // TODO: Implement some randomness to mitigate hash DoS attack.
+src/future/base_cache.rs:2129:                // TODO: Remove the second pattern `Some((_key, false, None))` once
+src/future/base_cache.rs:2275:                // TODO: Remove the second pattern `Some((_key, false, None))` once
+src/future/base_cache.rs:2424:                // TODO: Remove the second pattern `Some((_key, false, None))` once

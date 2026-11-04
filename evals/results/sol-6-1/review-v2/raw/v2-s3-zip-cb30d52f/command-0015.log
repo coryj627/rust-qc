@@ -1,0 +1,1201 @@
+#![macro_use]
+
+use crate::read::magic_finder::{Backwards, Forward, MagicFinder, OptimisticMagicFinder};
+use crate::read::ArchiveOffset;
+use crate::result::{invalid, ZipError, ZipResult};
+use core::mem;
+use std::io;
+use std::io::prelude::*;
+use std::slice;
+
+/// "Magic" header values used in the zip spec to locate metadata records.
+///
+/// These values currently always take up a fixed four bytes, so we can parse and wrap them in this
+/// struct to enforce some small amount of type safety.
+#[derive(Copy, Clone, Debug, PartialOrd, Ord, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub(crate) struct Magic(u32);
+
+impl Magic {
+    pub const fn literal(x: u32) -> Self {
+        Self(x)
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub const fn from_le_bytes(bytes: [u8; 4]) -> Self {
+        Self(u32::from_le_bytes(bytes))
+    }
+
+    #[inline(always)]
+    pub const fn to_le_bytes(self) -> [u8; 4] {
+        self.0.to_le_bytes()
+    }
+
+    #[allow(clippy::wrong_self_convention)]
+    #[inline(always)]
+    pub fn from_le(self) -> Self {
+        Self(u32::from_le(self.0))
+    }
+
+    #[allow(clippy::wrong_self_convention)]
+    #[inline(always)]
+    pub fn to_le(self) -> Self {
+        Self(u32::to_le(self.0))
+    }
+
+    pub const LOCAL_FILE_HEADER_SIGNATURE: Self = Self::literal(0x04034b50);
+    pub const CENTRAL_DIRECTORY_HEADER_SIGNATURE: Self = Self::literal(0x02014b50);
+    pub const CENTRAL_DIRECTORY_END_SIGNATURE: Self = Self::literal(0x06054b50);
+    pub const ZIP64_CENTRAL_DIRECTORY_END_SIGNATURE: Self = Self::literal(0x06064b50);
+    pub const ZIP64_CENTRAL_DIRECTORY_END_LOCATOR_SIGNATURE: Self = Self::literal(0x07064b50);
+    pub const DATA_DESCRIPTOR_SIGNATURE: Self = Self::literal(0x08074b50);
+}
+
+/// Similar to [`Magic`], but used for extra field tags as per section 4.5.3 of APPNOTE.TXT.
+#[derive(Copy, Clone, Debug, PartialOrd, Ord, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub(crate) struct ExtraFieldMagic(u16);
+
+/* TODO: maybe try to use this for parsing extra fields as well as writing them? */
+#[allow(dead_code)]
+impl ExtraFieldMagic {
+    pub const fn literal(x: u16) -> Self {
+        Self(x)
+    }
+
+    #[inline(always)]
+    pub const fn from_le_bytes(bytes: [u8; 2]) -> Self {
+        Self(u16::from_le_bytes(bytes))
+    }
+
+    #[inline(always)]
+    pub const fn to_le_bytes(self) -> [u8; 2] {
+        self.0.to_le_bytes()
+    }
+
+    #[allow(clippy::wrong_self_convention)]
+    #[inline(always)]
+    pub fn from_le(self) -> Self {
+        Self(u16::from_le(self.0))
+    }
+
+    #[allow(clippy::wrong_self_convention)]
+    #[inline(always)]
+    pub fn to_le(self) -> Self {
+        Self(u16::to_le(self.0))
+    }
+
+    pub const ZIP64_EXTRA_FIELD_TAG: Self = Self::literal(0x0001);
+}
+
+/// The file size at which a ZIP64 record becomes necessary.
+///
+/// If a file larger than this threshold attempts to be written, compressed or uncompressed, and
+/// [`FileOptions::large_file()`](crate::write::FileOptions) was not true, then [`ZipWriter`] will
+/// raise an [`io::Error`] with [`io::ErrorKind::Other`].
+///
+/// If the zip file itself is larger than this value, then a zip64 central directory record will be
+/// written to the end of the file.
+///
+///```
+/// # fn main() -> Result<(), zip::result::ZipError> {
+/// # #[cfg(target_pointer_width = "64")]
+/// # {
+/// use std::io::{self, Cursor, prelude::*};
+/// use std::error::Error;
+/// use zip::{ZipWriter, write::SimpleFileOptions};
+///
+/// let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+/// // Writing an extremely large file for this test is faster without compression.
+/// let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+///
+/// let big_len: usize = (zip::ZIP64_BYTES_THR as usize) + 1;
+/// let big_buf = vec![0u8; big_len];
+/// zip.start_file("zero.dat", options)?;
+/// // This is too big!
+/// let res = zip.write_all(&big_buf[..]).err().unwrap();
+/// assert_eq!(res.kind(), io::ErrorKind::Other);
+/// let description = format!("{}", &res);
+/// assert_eq!(description, "Large file option has not been set");
+/// // Attempting to write anything further to the same zip will still succeed, but the previous
+/// // failing entry has been removed.
+/// zip.start_file("one.dat", options)?;
+/// let zip = zip.finish_into_readable()?;
+/// let names: Vec<_> = zip.file_names().collect();
+/// assert_eq!(&names, &["one.dat"]);
+///
+/// // Create a new zip output.
+/// let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+/// // This time, create a zip64 record for the file.
+/// let options = options.large_file(true);
+/// zip.start_file("zero.dat", options)?;
+/// // This succeeds because we specified that it could be a large file.
+/// assert!(zip.write_all(&big_buf[..]).is_ok());
+/// # }
+/// # Ok(())
+/// # }
+///```
+pub const ZIP64_BYTES_THR: u64 = u32::MAX as u64;
+/// The number of entries within a single zip necessary to allocate a zip64 central
+/// directory record.
+///
+/// If more than this number of entries is written to a [`ZipWriter`], then [`ZipWriter::finish()`]
+/// will write out extra zip64 data to the end of the zip file.
+pub const ZIP64_ENTRY_THR: usize = u16::MAX as usize;
+
+/// # Safety
+///
+/// - No padding/uninit bytes
+/// - All bytes patterns must be valid
+/// - No cell, pointers
+///
+/// See `bytemuck::Pod` for more details.
+pub(crate) unsafe trait Pod: Copy + 'static {
+    #[inline]
+    fn zeroed() -> Self {
+        unsafe { mem::zeroed() }
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self as *const Self as *const u8, mem::size_of::<Self>()) }
+    }
+
+    #[inline]
+    fn as_bytes_mut(&mut self) -> &mut [u8] {
+        unsafe { slice::from_raw_parts_mut(self as *mut Self as *mut u8, mem::size_of::<Self>()) }
+    }
+}
+
+pub(crate) trait FixedSizeBlock: Pod {
+    const MAGIC: Magic;
+
+    fn magic(self) -> Magic;
+
+    const WRONG_MAGIC_ERROR: ZipError;
+
+    #[allow(clippy::wrong_self_convention)]
+    fn from_le(self) -> Self;
+
+    fn parse<R: Read>(reader: &mut R) -> ZipResult<Self> {
+        let mut block = Self::zeroed();
+        reader.read_exact(block.as_bytes_mut())?;
+        let block = Self::from_le(block);
+
+        if block.magic() != Self::MAGIC {
+            return Err(Self::WRONG_MAGIC_ERROR);
+        }
+        Ok(block)
+    }
+
+    fn to_le(self) -> Self;
+
+    fn write<T: Write>(self, writer: &mut T) -> ZipResult<()> {
+        let block = self.to_le();
+        writer.write_all(block.as_bytes())?;
+        Ok(())
+    }
+}
+
+/// Convert all the fields of a struct *from* little-endian representations.
+macro_rules! from_le {
+    ($obj:ident, $field:ident, $type:ty) => {
+        $obj.$field = <$type>::from_le($obj.$field);
+    };
+    ($obj:ident, [($field:ident, $type:ty) $(,)?]) => {
+        from_le![$obj, $field, $type];
+    };
+    ($obj:ident, [($field:ident, $type:ty), $($rest:tt),+ $(,)?]) => {
+        from_le![$obj, $field, $type];
+        from_le!($obj, [$($rest),+]);
+    };
+}
+
+/// Convert all the fields of a struct *into* little-endian representations.
+macro_rules! to_le {
+    ($obj:ident, $field:ident, $type:ty) => {
+        $obj.$field = <$type>::to_le($obj.$field);
+    };
+    ($obj:ident, [($field:ident, $type:ty) $(,)?]) => {
+        to_le![$obj, $field, $type];
+    };
+    ($obj:ident, [($field:ident, $type:ty), $($rest:tt),+ $(,)?]) => {
+        to_le![$obj, $field, $type];
+        to_le!($obj, [$($rest),+]);
+    };
+}
+
+/* TODO: derive macro to generate these fields? */
+/// Implement `from_le()` and `to_le()`, providing the field specification to both macros
+/// and methods.
+macro_rules! to_and_from_le {
+    ($($args:tt),+ $(,)?) => {
+        #[inline(always)]
+        fn from_le(mut self) -> Self {
+            from_le![self, [$($args),+]];
+            self
+        }
+        #[inline(always)]
+        fn to_le(mut self) -> Self {
+            to_le![self, [$($args),+]];
+            self
+        }
+    };
+}
+
+#[derive(Copy, Clone, Debug)]
+#[repr(packed, C)]
+pub(crate) struct Zip32CDEBlock {
+    magic: Magic,
+    pub disk_number: u16,
+    pub disk_with_central_directory: u16,
+    pub number_of_files_on_this_disk: u16,
+    pub number_of_files: u16,
+    pub central_directory_size: u32,
+    pub central_directory_offset: u32,
+    pub zip_file_comment_length: u16,
+}
+
+unsafe impl Pod for Zip32CDEBlock {}
+
+impl FixedSizeBlock for Zip32CDEBlock {
+    const MAGIC: Magic = Magic::CENTRAL_DIRECTORY_END_SIGNATURE;
+
+    #[inline(always)]
+    fn magic(self) -> Magic {
+        self.magic
+    }
+
+    const WRONG_MAGIC_ERROR: ZipError = invalid!("Invalid digital signature header");
+
+    to_and_from_le![
+        (magic, Magic),
+        (disk_number, u16),
+        (disk_with_central_directory, u16),
+        (number_of_files_on_this_disk, u16),
+        (number_of_files, u16),
+        (central_directory_size, u32),
+        (central_directory_offset, u32),
+        (zip_file_comment_length, u16)
+    ];
+}
+
+#[derive(Debug)]
+pub(crate) struct Zip32CentralDirectoryEnd {
+    pub disk_number: u16,
+    pub disk_with_central_directory: u16,
+    pub number_of_files_on_this_disk: u16,
+    pub number_of_files: u16,
+    pub central_directory_size: u32,
+    pub central_directory_size: u32,
+    pub central_directory_offset: u32,
+    pub zip_file_comment: Box<[u8]>,
+}
+
+impl Zip32CentralDirectoryEnd {
+    fn into_block_and_comment(self) -> (Zip32CDEBlock, Box<[u8]>) {
+        let Self {
+            disk_number,
+            disk_with_central_directory,
+            number_of_files_on_this_disk,
+            number_of_files,
+            central_directory_size,
+            central_directory_offset,
+            zip_file_comment,
+        } = self;
+        let block = Zip32CDEBlock {
+            magic: Zip32CDEBlock::MAGIC,
+            disk_number,
+            disk_with_central_directory,
+            number_of_files_on_this_disk,
+            number_of_files,
+            central_directory_size,
+            central_directory_offset,
+            zip_file_comment_length: zip_file_comment.len() as u16,
+        };
+
+        (block, zip_file_comment)
+    }
+
+    pub fn parse<T: Read>(reader: &mut T) -> ZipResult<Zip32CentralDirectoryEnd> {
+        let Zip32CDEBlock {
+            // magic,
+            disk_number,
+            disk_with_central_directory,
+            number_of_files_on_this_disk,
+            number_of_files,
+            central_directory_size,
+            central_directory_offset,
+            zip_file_comment_length,
+            ..
+        } = Zip32CDEBlock::parse(reader)?;
+
+        let mut zip_file_comment = vec![0u8; zip_file_comment_length as usize].into_boxed_slice();
+        if let Err(e) = reader.read_exact(&mut zip_file_comment) {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                return Err(invalid!("EOCD comment exceeds file boundary"));
+            }
+
+            return Err(e.into());
+        }
+
+        Ok(Zip32CentralDirectoryEnd {
+            disk_number,
+            disk_with_central_directory,
+            number_of_files_on_this_disk,
+            number_of_files,
+            central_directory_size,
+            central_directory_offset,
+            zip_file_comment,
+        })
+    }
+
+    pub fn write<T: Write>(self, writer: &mut T) -> ZipResult<()> {
+        let (block, comment) = self.into_block_and_comment();
+
+        if comment.len() > u16::MAX as usize {
+            return Err(invalid!("EOCD comment length exceeds u16::MAX"));
+        }
+
+        block.write(writer)?;
+        writer.write_all(&comment)?;
+        Ok(())
+    }
+
+    pub fn may_be_zip64(&self) -> bool {
+        self.number_of_files == u16::MAX || self.central_directory_offset == u32::MAX
+    }
+}
+
+#[derive(Copy, Clone)]
+#[repr(packed, C)]
+pub(crate) struct Zip64CDELocatorBlock {
+    magic: Magic,
+    pub disk_with_central_directory: u32,
+    pub end_of_central_directory_offset: u64,
+    pub number_of_disks: u32,
+}
+
+unsafe impl Pod for Zip64CDELocatorBlock {}
+
+impl FixedSizeBlock for Zip64CDELocatorBlock {
+    const MAGIC: Magic = Magic::ZIP64_CENTRAL_DIRECTORY_END_LOCATOR_SIGNATURE;
+
+    #[inline(always)]
+    fn magic(self) -> Magic {
+        self.magic
+    }
+
+    const WRONG_MAGIC_ERROR: ZipError = invalid!("Invalid zip64 locator digital signature header");
+
+    to_and_from_le![
+        (magic, Magic),
+        (disk_with_central_directory, u32),
+        (end_of_central_directory_offset, u64),
+        (number_of_disks, u32),
+    ];
+}
+
+pub(crate) struct Zip64CentralDirectoryEndLocator {
+    pub disk_with_central_directory: u32,
+    pub end_of_central_directory_offset: u64,
+    pub number_of_disks: u32,
+}
+
+impl Zip64CentralDirectoryEndLocator {
+    pub fn parse<T: Read>(reader: &mut T) -> ZipResult<Zip64CentralDirectoryEndLocator> {
+        let Zip64CDELocatorBlock {
+            // magic,
+            disk_with_central_directory,
+            end_of_central_directory_offset,
+            number_of_disks,
+            ..
+        } = Zip64CDELocatorBlock::parse(reader)?;
+
+        Ok(Zip64CentralDirectoryEndLocator {
+            disk_with_central_directory,
+            end_of_central_directory_offset,
+            number_of_disks,
+        })
+    }
+
+    pub fn block(self) -> Zip64CDELocatorBlock {
+        let Self {
+            disk_with_central_directory,
+            end_of_central_directory_offset,
+            number_of_disks,
+        } = self;
+        Zip64CDELocatorBlock {
+            magic: Zip64CDELocatorBlock::MAGIC,
+            disk_with_central_directory,
+            end_of_central_directory_offset,
+            number_of_disks,
+        }
+    }
+
+    pub fn write<T: Write>(self, writer: &mut T) -> ZipResult<()> {
+        self.block().write(writer)
+    }
+}
+
+#[derive(Copy, Clone)]
+#[repr(packed, C)]
+pub(crate) struct Zip64CDEBlock {
+    magic: Magic,
+    pub record_size: u64,
+    pub version_made_by: u16,
+    pub version_needed_to_extract: u16,
+    pub disk_number: u32,
+    pub disk_with_central_directory: u32,
+    pub number_of_files_on_this_disk: u64,
+    pub number_of_files: u64,
+    pub central_directory_size: u64,
+    pub central_directory_offset: u64,
+}
+
+unsafe impl Pod for Zip64CDEBlock {}
+
+impl FixedSizeBlock for Zip64CDEBlock {
+    const MAGIC: Magic = Magic::ZIP64_CENTRAL_DIRECTORY_END_SIGNATURE;
+
+    fn magic(self) -> Magic {
+        self.magic
+    }
+
+    const WRONG_MAGIC_ERROR: ZipError = invalid!("Invalid digital signature header");
+
+    to_and_from_le![
+        (magic, Magic),
+        (record_size, u64),
+        (version_made_by, u16),
+        (version_needed_to_extract, u16),
+        (disk_number, u32),
+        (disk_with_central_directory, u32),
+        (number_of_files_on_this_disk, u64),
+        (number_of_files, u64),
+        (central_directory_size, u64),
+        (central_directory_offset, u64),
+    ];
+}
+
+pub(crate) struct Zip64CentralDirectoryEnd {
+    pub record_size: u64,
+    pub version_made_by: u16,
+    pub version_needed_to_extract: u16,
+    pub disk_number: u32,
+    pub disk_with_central_directory: u32,
+    pub number_of_files_on_this_disk: u64,
+    pub number_of_files: u64,
+    pub central_directory_size: u64,
+    pub central_directory_offset: u64,
+    pub extensible_data_sector: Box<[u8]>,
+}
+
+impl Zip64CentralDirectoryEnd {
+    pub fn parse<T: Read>(reader: &mut T, max_size: u64) -> ZipResult<Zip64CentralDirectoryEnd> {
+        let Zip64CDEBlock {
+            record_size,
+            version_made_by,
+            version_needed_to_extract,
+            disk_number,
+            disk_with_central_directory,
+            number_of_files_on_this_disk,
+            number_of_files,
+            central_directory_size,
+            central_directory_offset,
+            ..
+        } = Zip64CDEBlock::parse(reader)?;
+
+        if record_size < 44 {
+            return Err(invalid!("Low EOCD64 record size"));
+        } else if record_size.saturating_add(12) > max_size {
+            return Err(invalid!("EOCD64 extends beyond EOCD64 locator"));
+        }
+
+        let mut zip_file_comment = vec![0u8; record_size as usize - 44].into_boxed_slice();
+        reader.read_exact(&mut zip_file_comment)?;
+
+        Ok(Self {
+            record_size,
+            version_made_by,
+            version_needed_to_extract,
+            disk_number,
+            disk_with_central_directory,
+            number_of_files_on_this_disk,
+            number_of_files,
+            central_directory_size,
+            central_directory_offset,
+            extensible_data_sector: zip_file_comment,
+        })
+    }
+
+    pub fn into_block_and_comment(self) -> (Zip64CDEBlock, Box<[u8]>) {
+        let Self {
+            record_size,
+            version_made_by,
+            version_needed_to_extract,
+            disk_number,
+            disk_with_central_directory,
+            number_of_files_on_this_disk,
+            number_of_files,
+            central_directory_size,
+            central_directory_offset,
+            extensible_data_sector,
+        } = self;
+
+        (
+            Zip64CDEBlock {
+                magic: Zip64CDEBlock::MAGIC,
+                record_size,
+                version_made_by,
+                version_needed_to_extract,
+                disk_number,
+                disk_with_central_directory,
+                number_of_files_on_this_disk,
+                number_of_files,
+                central_directory_size,
+                central_directory_offset,
+            },
+            extensible_data_sector,
+        )
+    }
+
+    pub fn write<T: Write>(self, writer: &mut T) -> ZipResult<()> {
+        let (block, comment) = self.into_block_and_comment();
+        block.write(writer)?;
+        writer.write_all(&comment)?;
+        Ok(())
+    }
+}
+
+pub(crate) struct DataAndPosition<T> {
+    pub data: T,
+    #[allow(dead_code)]
+    pub position: u64,
+}
+
+impl<T> From<(T, u64)> for DataAndPosition<T> {
+    fn from(value: (T, u64)) -> Self {
+        Self {
+            data: value.0,
+            position: value.1,
+        }
+    }
+}
+
+pub(crate) struct CentralDirectoryEndInfo {
+    pub eocd: DataAndPosition<Zip32CentralDirectoryEnd>,
+    pub eocd64: Option<DataAndPosition<Zip64CentralDirectoryEnd>>,
+
+    pub archive_offset: u64,
+}
+
+/// Finds the EOCD and possibly the EOCD64 block and determines the archive offset.
+///
+/// In the best case scenario (no prepended junk), this function will not backtrack
+/// in the reader.
+pub(crate) fn find_central_directory<R: Read + Seek>(
+    reader: &mut R,
+    archive_offset: ArchiveOffset,
+    end_exclusive: u64,
+    file_len: u64,
+) -> ZipResult<CentralDirectoryEndInfo> {
+    const EOCD_SIG_BYTES: [u8; mem::size_of::<Magic>()] =
+        Magic::CENTRAL_DIRECTORY_END_SIGNATURE.to_le_bytes();
+
+    const EOCD64_SIG_BYTES: [u8; mem::size_of::<Magic>()] =
+        Magic::ZIP64_CENTRAL_DIRECTORY_END_SIGNATURE.to_le_bytes();
+
+    const CDFH_SIG_BYTES: [u8; mem::size_of::<Magic>()] =
+        Magic::CENTRAL_DIRECTORY_HEADER_SIGNATURE.to_le_bytes();
+
+    // Instantiate the mandatory finder
+    let mut eocd_finder = MagicFinder::<Backwards<'static>>::new(&EOCD_SIG_BYTES, 0, end_exclusive);
+    let mut subfinder: Option<OptimisticMagicFinder<Forward<'static>>> = None;
+
+    // Keep the last errors for cases of improper EOCD instances.
+    let mut parsing_error = None;
+
+    while let Some(eocd_offset) = eocd_finder.next(reader)? {
+        // Attempt to parse the EOCD block
+        let eocd = match Zip32CentralDirectoryEnd::parse(reader) {
+            Ok(eocd) => eocd,
+            Err(e) => {
+                if parsing_error.is_none() {
+                    parsing_error = Some(e);
+                }
+                continue;
+            }
+        };
+
+        // ! Relaxed (inequality) due to garbage-after-comment Python files
+        // Consistency check: the EOCD comment must terminate before the end of file
+        if eocd.zip_file_comment.len() as u64 + eocd_offset + 22 > file_len {
+            parsing_error = Some(invalid!("Invalid EOCD comment length"));
+            continue;
+        }
+
+        let zip64_metadata = if eocd.may_be_zip64() {
+            fn try_read_eocd64_locator(
+                reader: &mut (impl Read + Seek),
+                eocd_offset: u64,
+            ) -> ZipResult<(u64, Zip64CentralDirectoryEndLocator)> {
+                if eocd_offset < mem::size_of::<Zip64CDELocatorBlock>() as u64 {
+                    return Err(invalid!("EOCD64 Locator does not fit in file"));
+                }
+
+                let locator64_offset = eocd_offset - mem::size_of::<Zip64CDELocatorBlock>() as u64;
+
+                reader.seek(io::SeekFrom::Start(locator64_offset))?;
+                Ok((
+//! Possible ZIP compression methods.
+
+use std::{fmt, io};
+
+#[allow(deprecated)]
+/// Identifies the storage format used to compress a file within a ZIP archive.
+///
+/// Each file's compression method is stored alongside it, allowing the
+/// contents to be read without context.
+///
+/// When creating ZIP files, you may choose the method to use with
+/// [`crate::write::FileOptions::compression_method`]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[cfg_attr(fuzzing, derive(arbitrary::Arbitrary))]
+#[non_exhaustive]
+pub enum CompressionMethod {
+    /// Store the file as is
+    Stored,
+    /// Compress the file using Deflate
+    #[cfg(feature = "_deflate-any")]
+    Deflated,
+    /// Compress the file using Deflate64.
+    /// Decoding deflate64 is supported but encoding deflate64 is not supported.
+    #[cfg(feature = "deflate64")]
+    Deflate64,
+    /// Compress the file using BZIP2
+    #[cfg(feature = "bzip2")]
+    Bzip2,
+    /// Encrypted using AES.
+    ///
+    /// The actual compression method has to be taken from the AES extra data field
+    /// or from `ZipFileData`.
+    #[cfg(feature = "aes-crypto")]
+    Aes,
+    /// Compress the file using ZStandard
+    #[cfg(feature = "zstd")]
+    Zstd,
+    /// Compress the file using LZMA
+    #[cfg(feature = "lzma")]
+    Lzma,
+    #[cfg(feature = "legacy-zip")]
+    /// Method 1 Shrink
+    Shrink,
+    #[cfg(feature = "legacy-zip")]
+    /// Reduce (Method 2-5)
+    Reduce(u8),
+    #[cfg(feature = "legacy-zip")]
+    /// Method 6 Implode/explode
+    Implode,
+    /// Compress the file using XZ
+    #[cfg(feature = "xz")]
+    Xz,
+    /// Compress the file using PPMd
+    #[cfg(feature = "ppmd")]
+    Ppmd,
+    /// Unsupported compression method
+    #[cfg_attr(
+        not(fuzzing),
+        deprecated(since = "0.5.7", note = "use the constants instead")
+    )]
+    Unsupported(u16),
+}
+#[allow(deprecated, missing_docs)]
+/// All compression methods defined for the ZIP format
+impl CompressionMethod {
+    pub const STORE: Self = CompressionMethod::Stored;
+    #[cfg(feature = "legacy-zip")]
+    pub const SHRINK: Self = CompressionMethod::Shrink;
+    #[cfg(not(feature = "legacy-zip"))]
+    /// Legacy compression method (enable feature `legacy-zip` to get support)
+    pub const SHRINK: Self = CompressionMethod::Unsupported(1);
+    #[cfg(feature = "legacy-zip")]
+    /// Legacy compression method
+    pub const REDUCE_1: Self = CompressionMethod::Reduce(1);
+    #[cfg(not(feature = "legacy-zip"))]
+    /// Legacy compression method (enable feature `legacy-zip` to get support)
+    pub const REDUCE_1: Self = CompressionMethod::Unsupported(2);
+    #[cfg(feature = "legacy-zip")]
+    /// Legacy compression method
+    pub const REDUCE_2: Self = CompressionMethod::Reduce(2);
+    #[cfg(not(feature = "legacy-zip"))]
+    /// Legacy compression method (enable feature `legacy-zip` to get support)
+    pub const REDUCE_2: Self = CompressionMethod::Unsupported(3);
+    #[cfg(feature = "legacy-zip")]
+    /// Legacy compression method
+    pub const REDUCE_3: Self = CompressionMethod::Reduce(3);
+    #[cfg(not(feature = "legacy-zip"))]
+    /// Legacy compression method (enable feature `legacy-zip` to get support)
+    pub const REDUCE_3: Self = CompressionMethod::Unsupported(4);
+    #[cfg(feature = "legacy-zip")]
+    /// Legacy compression method
+    pub const REDUCE_4: Self = CompressionMethod::Reduce(4);
+    #[cfg(not(feature = "legacy-zip"))]
+    /// Legacy compression method (enable feature `legacy-zip` to get support)
+    pub const REDUCE_4: Self = CompressionMethod::Unsupported(5);
+    #[cfg(feature = "legacy-zip")]
+    /// Legacy compression method
+    pub const IMPLODE: Self = CompressionMethod::Implode;
+    #[cfg(not(feature = "legacy-zip"))]
+    /// Legacy compression method (enable feature `legacy-zip` to get support)
+    pub const IMPLODE: Self = CompressionMethod::Unsupported(6);
+    #[cfg(feature = "_deflate-any")]
+    pub const DEFLATE: Self = CompressionMethod::Deflated;
+    #[cfg(not(feature = "_deflate-any"))]
+    pub const DEFLATE: Self = CompressionMethod::Unsupported(8);
+    #[cfg(feature = "deflate64")]
+    pub const DEFLATE64: Self = CompressionMethod::Deflate64;
+    #[cfg(not(feature = "deflate64"))]
+    pub const DEFLATE64: Self = CompressionMethod::Unsupported(9);
+    pub const PKWARE_IMPLODE: Self = CompressionMethod::Unsupported(10);
+    #[cfg(feature = "bzip2")]
+    pub const BZIP2: Self = CompressionMethod::Bzip2;
+    #[cfg(not(feature = "bzip2"))]
+    pub const BZIP2: Self = CompressionMethod::Unsupported(12);
+    #[cfg(not(feature = "lzma"))]
+    pub const LZMA: Self = CompressionMethod::Unsupported(14);
+    #[cfg(feature = "lzma")]
+    pub const LZMA: Self = CompressionMethod::Lzma;
+    pub const IBM_ZOS_CMPSC: Self = CompressionMethod::Unsupported(16);
+    pub const IBM_TERSE: Self = CompressionMethod::Unsupported(18);
+    pub const ZSTD_DEPRECATED: Self = CompressionMethod::Unsupported(20);
+    #[cfg(feature = "zstd")]
+    pub const ZSTD: Self = CompressionMethod::Zstd;
+    #[cfg(not(feature = "zstd"))]
+    pub const ZSTD: Self = CompressionMethod::Unsupported(93);
+    pub const MP3: Self = CompressionMethod::Unsupported(94);
+    #[cfg(feature = "xz")]
+    pub const XZ: Self = CompressionMethod::Xz;
+    #[cfg(not(feature = "xz"))]
+    pub const XZ: Self = CompressionMethod::Unsupported(95);
+    pub const JPEG: Self = CompressionMethod::Unsupported(96);
+    pub const WAVPACK: Self = CompressionMethod::Unsupported(97);
+    #[cfg(feature = "ppmd")]
+    pub const PPMD: Self = CompressionMethod::Ppmd;
+    #[cfg(not(feature = "ppmd"))]
+    pub const PPMD: Self = CompressionMethod::Unsupported(98);
+    #[cfg(feature = "aes-crypto")]
+    pub const AES: Self = CompressionMethod::Aes;
+    #[cfg(not(feature = "aes-crypto"))]
+    pub const AES: Self = CompressionMethod::Unsupported(99);
+}
+impl CompressionMethod {
+    pub(crate) const fn parse_from_u16(val: u16) -> Self {
+        match val {
+            0 => CompressionMethod::Stored,
+            #[cfg(feature = "legacy-zip")]
+            1 => CompressionMethod::Shrink,
+            #[cfg(feature = "legacy-zip")]
+            2 => CompressionMethod::Reduce(1),
+            #[cfg(feature = "legacy-zip")]
+            3 => CompressionMethod::Reduce(2),
+            #[cfg(feature = "legacy-zip")]
+            4 => CompressionMethod::Reduce(3),
+            #[cfg(feature = "legacy-zip")]
+            5 => CompressionMethod::Reduce(4),
+            #[cfg(feature = "legacy-zip")]
+            6 => CompressionMethod::Implode,
+            #[cfg(feature = "_deflate-any")]
+            8 => CompressionMethod::Deflated,
+            #[cfg(feature = "deflate64")]
+            9 => CompressionMethod::Deflate64,
+            #[cfg(feature = "bzip2")]
+            12 => CompressionMethod::Bzip2,
+            #[cfg(feature = "lzma")]
+            14 => CompressionMethod::Lzma,
+            #[cfg(feature = "xz")]
+            95 => CompressionMethod::Xz,
+            #[cfg(feature = "zstd")]
+            93 => CompressionMethod::Zstd,
+            #[cfg(feature = "ppmd")]
+            98 => CompressionMethod::Ppmd,
+            #[cfg(feature = "aes-crypto")]
+            99 => CompressionMethod::Aes,
+            #[allow(deprecated)]
+            v => CompressionMethod::Unsupported(v),
+        }
+    }
+
+    /// Converts a u16 to its corresponding CompressionMethod
+    #[deprecated(
+        since = "0.5.7",
+        note = "use a constant to construct a compression method"
+    )]
+    pub const fn from_u16(val: u16) -> CompressionMethod {
+        Self::parse_from_u16(val)
+    }
+
+    pub(crate) const fn serialize_to_u16(self) -> u16 {
+        match self {
+            CompressionMethod::Stored => 0,
+            #[cfg(feature = "legacy-zip")]
+            CompressionMethod::Shrink => 1,
+            #[cfg(feature = "legacy-zip")]
+            CompressionMethod::Reduce(n) => 1 + n as u16,
+            #[cfg(feature = "legacy-zip")]
+            CompressionMethod::Implode => 6,
+
+            #[cfg(feature = "_deflate-any")]
+            CompressionMethod::Deflated => 8,
+            #[cfg(feature = "deflate64")]
+            CompressionMethod::Deflate64 => 9,
+            #[cfg(feature = "bzip2")]
+            CompressionMethod::Bzip2 => 12,
+            #[cfg(feature = "aes-crypto")]
+            CompressionMethod::Aes => 99,
+            #[cfg(feature = "zstd")]
+            CompressionMethod::Zstd => 93,
+            #[cfg(feature = "lzma")]
+            CompressionMethod::Lzma => 14,
+            #[cfg(feature = "xz")]
+            CompressionMethod::Xz => 95,
+            #[cfg(feature = "ppmd")]
+            CompressionMethod::Ppmd => 98,
+            #[allow(deprecated)]
+            CompressionMethod::Unsupported(v) => v,
+        }
+    }
+
+    /// Converts a CompressionMethod to a u16
+    #[deprecated(
+        since = "0.5.7",
+        note = "to match on other compression methods, use a constant"
+    )]
+    pub const fn to_u16(self) -> u16 {
+        self.serialize_to_u16()
+    }
+}
+
+impl Default for CompressionMethod {
+    fn default() -> Self {
+        #[cfg(feature = "_deflate-any")]
+        return CompressionMethod::Deflated;
+
+        #[cfg(not(feature = "_deflate-any"))]
+        return CompressionMethod::Stored;
+    }
+}
+
+impl fmt::Display for CompressionMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Just duplicate what the Debug format looks like, i.e, the enum key:
+        write!(f, "{self:?}")
+    }
+}
+
+/// The compression methods which have been implemented.
+pub const SUPPORTED_COMPRESSION_METHODS: &[CompressionMethod] = &[
+    CompressionMethod::Stored,
+    #[cfg(feature = "_deflate-any")]
+    CompressionMethod::Deflated,
+    #[cfg(feature = "deflate64")]
+    CompressionMethod::Deflate64,
+    #[cfg(feature = "bzip2")]
+    CompressionMethod::Bzip2,
+    #[cfg(feature = "zstd")]
+    CompressionMethod::Zstd,
+    #[cfg(feature = "xz")]
+    CompressionMethod::Xz,
+    #[cfg(feature = "ppmd")]
+    CompressionMethod::Ppmd,
+];
+
+pub(crate) enum Decompressor<R: io::BufRead> {
+    Stored(R),
+    #[cfg(feature = "deflate-flate2")]
+    Deflated(flate2::bufread::DeflateDecoder<R>),
+    #[cfg(feature = "deflate64")]
+    Deflate64(deflate64::Deflate64Decoder<R>),
+    #[cfg(feature = "bzip2")]
+    Bzip2(bzip2::bufread::BzDecoder<R>),
+    #[cfg(feature = "zstd")]
+    Zstd(zstd::Decoder<'static, R>),
+    #[cfg(feature = "lzma")]
+    Lzma(Lzma<R>),
+    #[cfg(feature = "legacy-zip")]
+    Shrink(crate::legacy::shrink::ShrinkDecoder<R>),
+    #[cfg(feature = "legacy-zip")]
+    Reduce(crate::legacy::reduce::ReduceDecoder<R>),
+    #[cfg(feature = "legacy-zip")]
+    Implode(crate::legacy::implode::ImplodeDecoder<R>),
+    #[cfg(feature = "xz")]
+    Xz(Box<lzma_rust2::XzReader<R>>),
+    #[cfg(feature = "ppmd")]
+    Ppmd(Ppmd<R>),
+}
+
+#[cfg(feature = "lzma")]
+pub(crate) enum Lzma<R: io::BufRead> {
+    Uninitialized {
+        reader: Option<R>,
+        uncompressed_size: u64,
+    },
+    Initialized(Box<lzma_rust2::LzmaReader<R>>),
+}
+
+#[cfg(feature = "ppmd")]
+pub(crate) enum Ppmd<R: io::BufRead> {
+    Uninitialized(Option<R>),
+    Initialized(Box<ppmd_rust::Ppmd8Decoder<R>>),
+}
+
+impl<R: io::BufRead> io::Read for Decompressor<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Decompressor::Stored(r) => r.read(buf),
+            #[cfg(feature = "deflate-flate2")]
+            Decompressor::Deflated(r) => r.read(buf),
+            #[cfg(feature = "deflate64")]
+            Decompressor::Deflate64(r) => r.read(buf),
+            #[cfg(feature = "bzip2")]
+            Decompressor::Bzip2(r) => r.read(buf),
+            #[cfg(feature = "zstd")]
+            Decompressor::Zstd(r) => r.read(buf),
+            #[cfg(feature = "lzma")]
+            Decompressor::Lzma(r) => match r {
+                Lzma::Uninitialized {
+                    reader,
+                    uncompressed_size,
+                } => {
+                    let mut reader = reader.take().ok_or_else(|| {
+                        io::Error::other("Reader was not set while reading LZMA data")
+                    })?;
+
+                    // 5.8.8.1 LZMA Version Information & 5.8.8.2 LZMA Properties Size
+                    let mut header = [0; 4];
+                    reader.read_exact(&mut header)?;
+                    let _version_information = u16::from_le_bytes(header[0..2].try_into().unwrap());
+                    let properties_size = u16::from_le_bytes(header[2..4].try_into().unwrap());
+                    if properties_size != 5 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("unexpected LZMA properties size of {properties_size}"),
+                        ));
+                    }
+
+                    let mut props_data = [0; 5];
+                    reader.read_exact(&mut props_data)?;
+                    let props = props_data[0];
+                    let dict_size = u32::from_le_bytes(props_data[1..5].try_into().unwrap());
+
+                    // We don't need to handle the end-of-stream marker here, since the LZMA reader
+                    // stops at the end-of-stream marker OR when it has decoded uncompressed_size bytes, whichever comes first.
+                    let mut decompressor = lzma_rust2::LzmaReader::new_with_props(
+                        reader,
+                        *uncompressed_size,
+                        props,
+                        dict_size,
+                        None,
+                    )?;
+
+                    let read = decompressor.read(buf)?;
+
+                    *r = Lzma::Initialized(Box::new(decompressor));
+
+                    Ok(read)
+                }
+                Lzma::Initialized(decompressor) => decompressor.read(buf),
+            },
+            #[cfg(feature = "xz")]
+            Decompressor::Xz(r) => r.read(buf),
+            #[cfg(feature = "ppmd")]
+            Decompressor::Ppmd(r) => match r {
+                Ppmd::Uninitialized(reader) => {
+                    let mut reader = reader.take().ok_or_else(|| {
+                        io::Error::other("Reader was not set while reading PPMd data")
+                    })?;
+
+                    let mut buffer = [0; 2];
+                    reader.read_exact(&mut buffer)?;
+                    let parameters = u16::from_le_bytes(buffer);
+src/aes.rs:116:        let hmac = Hmac::<Sha1>::new_from_slice(hmac_key).unwrap();
+src/aes.rs:189:            assert!(
+src/aes.rs:256:        let hmac = Hmac::<Sha1>::new_from_slice(hmac_key).unwrap();
+src/aes.rs:357:        assert!(roundtrip(AesMode::Aes256, password, plaintext).expect("could encrypt and decrypt"));
+src/aes.rs:365:        assert!(roundtrip(AesMode::Aes128, password, plaintext).expect("could encrypt and decrypt"));
+src/aes.rs:373:        assert!(roundtrip(AesMode::Aes192, password, plaintext).expect("could encrypt and decrypt"));
+src/aes.rs:381:        assert!(roundtrip(AesMode::Aes256, password, plaintext).expect("could encrypt and decrypt"));
+src/aes.rs:389:        assert!(roundtrip(AesMode::Aes128, password, plaintext).expect("could encrypt and decrypt"));
+src/aes.rs:397:        assert!(roundtrip(AesMode::Aes192, password, plaintext).expect("could encrypt and decrypt"));
+src/aes.rs:405:        assert!(roundtrip(AesMode::Aes256, password, plaintext).expect("could encrypt and decrypt"));
+src/aes_ctr.rs:116:                    .expect("did not expect u128 le conversion to fail");
+src/compression.rs:327:                    let _version_information = u16::from_le_bytes(header[0..2].try_into().unwrap());
+src/compression.rs:328:                    let properties_size = u16::from_le_bytes(header[2..4].try_into().unwrap());
+src/compression.rs:339:                    let dict_size = u32::from_le_bytes(props_data[1..5].try_into().unwrap());
+src/cp437.rs:19:            ::std::str::from_utf8(self).unwrap().into()
+src/cp437.rs:31:            String::from_utf8(self.into()).unwrap()
+src/cp437.rs:171:    ::std::char::from_u32(output).unwrap()
+src/cp437.rs:196:        assert!(::std::str::from_utf8(data).is_err());
+src/cp437.rs:204:        assert!(String::from_utf8(data.clone()).is_err());
+src/crc32.rs:96:        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+src/crc32.rs:99:        assert!(reader
+src/crc32.rs:112:        assert_eq!(reader.read(&mut buf).unwrap(), 1);
+src/crc32.rs:113:        assert_eq!(reader.read(&mut buf).unwrap(), 1);
+src/crc32.rs:114:        assert_eq!(reader.read(&mut buf).unwrap(), 1);
+src/crc32.rs:115:        assert_eq!(reader.read(&mut buf).unwrap(), 1);
+src/crc32.rs:116:        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+src/crc32.rs:118:        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+src/crc32.rs:127:        assert_eq!(reader.read(&mut buf[..0]).unwrap(), 0);
+src/crc32.rs:128:        assert_eq!(reader.read(&mut buf).unwrap(), 4);
+src/read.rs:378:            debug_assert_eq!(*data.data_start.get().unwrap(), data_start);
+src/read.rs:876:                        debug_assert!(false, "Invalid root dir path");
+src/read.rs:1668:                    debug_assert!(
+src/read.rs:1818:        *self.data.data_start.get().unwrap()
+src/read.rs:2010:/// assert!(zip::read::root_dir_common_filter(Path::new("foo.txt")));
+src/read.rs:2011:/// assert!(!zip::read::root_dir_common_filter(Path::new(".DS_Store")));
+src/read.rs:2012:/// assert!(!zip::read::root_dir_common_filter(Path::new("Thumbs.db")));
+src/read.rs:2013:/// assert!(!zip::read::root_dir_common_filter(Path::new("__MACOSX")));
+src/read.rs:2014:/// assert!(!zip::read::root_dir_common_filter(Path::new("__MACOSX/foo.txt")));
+src/read.rs:2082:        assert!(reader.is_err());
+src/read.rs:2092:        assert!(reader.is_err());
+src/read.rs:2100:            ZipArchive::new(Cursor::new(include_bytes!("../tests/data/zip64_demo.zip"))).unwrap();
+src/read.rs:2109:            ZipArchive::new(Cursor::new(include_bytes!("../tests/data/mimetype.zip"))).unwrap();
+src/read.rs:2111:        assert_eq!(reader.by_index(0).unwrap().central_header_start(), 77);
+src/read.rs:2120:            if read_zipfile_from_stream(&mut reader).unwrap().is_none() {
+src/read.rs:2132:            ZipArchive::new(Cursor::new(include_bytes!("../tests/data/mimetype.zip"))).unwrap();
+src/read.rs:2135:        let mut file1 = reader1.by_index(0).unwrap();
+src/read.rs:2136:        let mut file2 = reader2.by_index(0).unwrap();
+src/read.rs:2138:        let t = file1.last_modified().unwrap();
+src/read.rs:2156:        file1.read_exact(&mut buf1).unwrap();
+src/read.rs:2157:        file2.read_exact(&mut buf2).unwrap();
+src/read.rs:2158:        file1.read_exact(&mut buf3).unwrap();
+src/read.rs:2159:        file2.read_exact(&mut buf4).unwrap();
+src/read.rs:2173:        .unwrap();
+src/read.rs:2176:            let zip_file = zip.by_index(i).unwrap();
+src/read.rs:2177:            let full_name = zip_file.enclosed_name().unwrap();
+src/read.rs:2178:            let file_name = full_name.file_name().unwrap().to_str().unwrap();
+src/read.rs:2179:            assert!(
+src/read.rs:2198:            ZipArchive::new(Cursor::new(file)).unwrap();
+src/read.rs:2212:        assert!(reader.is_err() || reader.unwrap().is_empty());
+src/read.rs:2225:        assert!(reader.is_err());
+src/read.rs:2255:        .unwrap();
+src/read.rs:2257:        let mut file = reader.by_index(0).unwrap();
+src/read.rs:2258:        assert_eq!(file.read(&mut decompressed).unwrap(), 12);
+src/read.rs:2264:        assert!(reader.by_index(0)?.is_symlink());
+src/read.rs:2267:        assert!(tempdir.path().join("bar").is_symlink());
+src/read.rs:2275:            ZipArchive::new(Cursor::new(include_bytes!("../tests/data/chinese.zip"))).unwrap();
+src/read.rs:2276:        reader.by_name("七个房间.txt").unwrap();
+src/read.rs:2282:            ZipArchive::new(Cursor::new(include_bytes!("../tests/data/linux-7z.zip"))).unwrap();
+src/read.rs:2283:        reader.by_name("你好.txt").unwrap();
+src/read.rs:2291:        .unwrap();
+src/read.rs:2292:        reader.by_name("你好.txt").unwrap();
+src/read.rs:2340:        assert!(reader.extract(dest).is_err());
+src/read.rs:2341:        assert!(!dest_sibling.join("dest-file").exists());
+src/read.rs:2351:        assert!(dest.path().join("mimetype").exists());
+src/read.rs:2361:        assert!(!contents.is_empty(), "chrome.manifest should not be empty");
+src/result.rs:40:    /// # let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&[])).unwrap();
+src/spec.rs:117:/// let res = zip.write_all(&big_buf[..]).err().unwrap();
+src/spec.rs:134:/// assert!(zip.write_all(&big_buf[..]).is_ok());
+src/spec.rs:154:pub(crate) unsafe trait Pod: Copy + 'static {
+src/spec.rs:157:        unsafe { mem::zeroed() }
+src/spec.rs:162:        unsafe { slice::from_raw_parts(self as *const Self as *const u8, mem::size_of::<Self>()) }
+src/spec.rs:167:        unsafe { slice::from_raw_parts_mut(self as *mut Self as *mut u8, mem::size_of::<Self>()) }
+src/spec.rs:260:unsafe impl Pod for Zip32CDEBlock {}
+src/spec.rs:379:unsafe impl Pod for Zip64CDELocatorBlock {}
+src/spec.rs:456:unsafe impl Pod for Zip64CDEBlock {}
+src/spec.rs:824:    unsafe impl Pod for TestBlock {}
+src/spec.rs:846:        block.write(&mut c).unwrap();
+src/spec.rs:848:        let block2 = TestBlock::parse(&mut c).unwrap();
+src/types.rs:287:    pub const unsafe fn from_msdos_unchecked(datepart: u16, timepart: u16) -> DateTime {
+src/types.rs:344:                _ => unreachable!(),
+src/types.rs:804:        let system: u8 = (version_made_by >> 8).try_into().unwrap();
+src/types.rs:871:            field.min(spec::ZIP64_BYTES_THR).try_into().unwrap()
+src/types.rs:902:            file_name_length: self.file_name_raw.len().try_into().unwrap(),
+src/types.rs:908:        let extra_field_len: u16 = self.extra_field_len().try_into().unwrap();
+src/types.rs:909:        let central_extra_field_len: u16 = self.central_extra_field_len().try_into().unwrap();
+src/types.rs:928:                .unwrap(),
+src/types.rs:933:                .unwrap(),
+src/types.rs:934:            file_name_length: self.file_name_raw.len().try_into().unwrap(),
+src/types.rs:938:            file_comment_length: self.file_comment.len().try_into().unwrap(),
+src/types.rs:946:                .unwrap(),
+src/types.rs:1004:unsafe impl Pod for ZipCentralEntryBlock {}
+src/types.rs:1053:unsafe impl Pod for ZipLocalEntryBlock {}
+src/types.rs:1133:        assert!(self.size > 0);
+src/types.rs:1176:unsafe impl Pod for ZipDataDescriptorBlock {}
+src/types.rs:1205:unsafe impl Pod for Zip64DataDescriptorBlock {}
+src/types.rs:1329:        let dt = DateTime::from_date_and_time(2107, 12, 31, 23, 59, 58).unwrap();
+src/types.rs:1338:        let dt = DateTime::from_date_and_time(2018, 11, 17, 10, 38, 30).unwrap();
+src/types.rs:1341:            DateTime::from_date_and_time(2018, 11, 17, 10, 38, 30).unwrap()
+src/types.rs:1352:        let dt = DateTime::from_date_and_time(2018, 11, 17, 10, 38, 30).unwrap();
+src/types.rs:1354:            dt.cmp(&DateTime::from_date_and_time(2018, 11, 17, 10, 38, 30).unwrap()),
+src/types.rs:1358:        assert!(dt < DateTime::from_date_and_time(2019, 11, 17, 10, 38, 30).unwrap());
+src/types.rs:1359:        assert!(dt > DateTime::from_date_and_time(2017, 11, 17, 10, 38, 30).unwrap());
+src/types.rs:1361:        assert!(dt < DateTime::from_date_and_time(2018, 12, 17, 10, 38, 30).unwrap());
+src/types.rs:1362:        assert!(dt > DateTime::from_date_and_time(2018, 10, 17, 10, 38, 30).unwrap());
+src/types.rs:1364:        assert!(dt < DateTime::from_date_and_time(2018, 11, 18, 10, 38, 30).unwrap());
+src/types.rs:1365:        assert!(dt > DateTime::from_date_and_time(2018, 11, 16, 10, 38, 30).unwrap());
+src/types.rs:1367:        assert!(dt < DateTime::from_date_and_time(2018, 11, 17, 11, 38, 30).unwrap());
+src/types.rs:1368:        assert!(dt > DateTime::from_date_and_time(2018, 11, 17, 9, 38, 30).unwrap());
+src/types.rs:1370:        assert!(dt < DateTime::from_date_and_time(2018, 11, 17, 10, 39, 30).unwrap());
+src/types.rs:1371:        assert!(dt > DateTime::from_date_and_time(2018, 11, 17, 10, 37, 30).unwrap());
+src/types.rs:1373:        assert!(dt < DateTime::from_date_and_time(2018, 11, 17, 10, 38, 32).unwrap());
+src/types.rs:1375:            dt.cmp(&DateTime::from_date_and_time(2018, 11, 17, 10, 38, 31).unwrap()),
+src/types.rs:1378:        assert!(dt > DateTime::from_date_and_time(2018, 11, 17, 10, 38, 29).unwrap());
+src/types.rs:1379:        assert!(dt > DateTime::from_date_and_time(2018, 11, 17, 10, 38, 28).unwrap());
+src/types.rs:1390:                DateTime::from_date_and_time(2018, 11, 17, 10, 38, 30).unwrap()
+src/types.rs:1397:                DateTime::from_date_and_time(2107, 12, 31, 23, 59, 58).unwrap()
+src/types.rs:1407:        assert!(DateTime::from_date_and_time(2000, 1, 1, 23, 59, 60).is_ok());
+src/types.rs:1408:        assert!(DateTime::from_date_and_time(2000, 1, 1, 24, 0, 0).is_err());
+src/types.rs:1409:        assert!(DateTime::from_date_and_time(2000, 1, 1, 0, 60, 0).is_err());
+src/types.rs:1410:        assert!(DateTime::from_date_and_time(2000, 1, 1, 0, 0, 61).is_err());
+src/types.rs:1412:        assert!(DateTime::from_date_and_time(2107, 12, 31, 0, 0, 0).is_ok());
+src/types.rs:1413:        assert!(DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0).is_ok());
+src/types.rs:1414:        assert!(DateTime::from_date_and_time(1979, 1, 1, 0, 0, 0).is_err());
+src/types.rs:1415:        assert!(DateTime::from_date_and_time(1980, 0, 1, 0, 0, 0).is_err());
+src/types.rs:1416:        assert!(DateTime::from_date_and_time(1980, 1, 0, 0, 0, 0).is_err());
+src/types.rs:1417:        assert!(DateTime::from_date_and_time(2108, 12, 31, 0, 0, 0).is_err());
+src/types.rs:1418:        assert!(DateTime::from_date_and_time(2107, 13, 31, 0, 0, 0).is_err());
+src/types.rs:1419:        assert!(DateTime::from_date_and_time(2107, 12, 32, 0, 0, 0).is_err());
+src/types.rs:1421:        assert!(DateTime::from_date_and_time(2018, 1, 31, 0, 0, 0).is_ok());
+src/types.rs:1422:        assert!(DateTime::from_date_and_time(2018, 2, 28, 0, 0, 0).is_ok());
+src/types.rs:1423:        assert!(DateTime::from_date_and_time(2018, 2, 29, 0, 0, 0).is_err());
+src/types.rs:1424:        assert!(DateTime::from_date_and_time(2018, 3, 31, 0, 0, 0).is_ok());
+src/types.rs:1425:        assert!(DateTime::from_date_and_time(2018, 4, 30, 0, 0, 0).is_ok());
+src/types.rs:1426:        assert!(DateTime::from_date_and_time(2018, 4, 31, 0, 0, 0).is_err());
+src/types.rs:1427:        assert!(DateTime::from_date_and_time(2018, 5, 31, 0, 0, 0).is_ok());
+src/types.rs:1428:        assert!(DateTime::from_date_and_time(2018, 6, 30, 0, 0, 0).is_ok());
+src/types.rs:1429:        assert!(DateTime::from_date_and_time(2018, 6, 31, 0, 0, 0).is_err());
+src/types.rs:1430:        assert!(DateTime::from_date_and_time(2018, 7, 31, 0, 0, 0).is_ok());
+src/types.rs:1431:        assert!(DateTime::from_date_and_time(2018, 8, 31, 0, 0, 0).is_ok());
+src/types.rs:1432:        assert!(DateTime::from_date_and_time(2018, 9, 30, 0, 0, 0).is_ok());
+src/types.rs:1433:        assert!(DateTime::from_date_and_time(2018, 9, 31, 0, 0, 0).is_err());
+src/types.rs:1434:        assert!(DateTime::from_date_and_time(2018, 10, 31, 0, 0, 0).is_ok());
+src/types.rs:1435:        assert!(DateTime::from_date_and_time(2018, 11, 30, 0, 0, 0).is_ok());
+src/types.rs:1436:        assert!(DateTime::from_date_and_time(2018, 11, 31, 0, 0, 0).is_err());
+src/types.rs:1437:        assert!(DateTime::from_date_and_time(2018, 12, 31, 0, 0, 0).is_ok());
+src/types.rs:1440:        assert!(DateTime::from_date_and_time(2024, 2, 29, 0, 0, 0).is_ok());
+src/types.rs:1442:        assert!(DateTime::from_date_and_time(2000, 2, 29, 0, 0, 0).is_ok());
+src/types.rs:1444:        assert!(DateTime::from_date_and_time(2100, 2, 29, 0, 0, 0).is_err());
+src/types.rs:1458:        let dt = DateTime::try_from(datetime!(2018-11-17 10:38:30 UTC)).unwrap();
+src/types.rs:1475:        let dt = DateTime::try_from(datetime!(2018-11-17 10:38:30)).unwrap();
+src/types.rs:1491:        assert!(DateTime::try_from(datetime!(1979-12-31 23:59:59)).is_err());
+src/types.rs:1494:        assert!(DateTime::try_from(datetime!(1980-01-01 00:00:00)).is_ok());
+src/types.rs:1497:        assert!(DateTime::try_from(datetime!(2107-12-31 23:59:59)).is_ok());
+src/types.rs:1500:        assert!(DateTime::try_from(datetime!(2108-01-01 00:00:00)).is_err());
+src/types.rs:1512:            OffsetDateTime::try_from(DateTime::try_from_msdos(0x4D71, 0x54CF).unwrap()).unwrap();
+src/types.rs:1525:            PrimitiveDateTime::try_from(DateTime::try_from_msdos(0x4D71, 0x54CF).unwrap()).unwrap();
+src/types.rs:1535:        assert!(OffsetDateTime::try_from(unsafe {
+src/types.rs:1541:        assert!(OffsetDateTime::try_from(unsafe {
+src/types.rs:1553:        assert!(PrimitiveDateTime::try_from(unsafe {
+src/types.rs:1559:        assert!(PrimitiveDateTime::try_from(unsafe {
+src/types.rs:1573:        let dt = DateTime::try_from(civil::datetime(2018, 11, 17, 10, 38, 30, 0)).unwrap();
+src/types.rs:1590:        assert!(DateTime::try_from(civil::datetime(1979, 12, 31, 23, 59, 59, 0)).is_err());
+src/types.rs:1593:        assert!(DateTime::try_from(civil::datetime(1980, 1, 1, 0, 0, 0, 0)).is_ok());
+src/types.rs:1596:        assert!(DateTime::try_from(civil::datetime(2107, 12, 31, 23, 59, 59, 0)).is_ok());
+src/types.rs:1599:        assert!(DateTime::try_from(civil::datetime(2108, 1, 1, 0, 0, 0, 0)).is_err());
+src/types.rs:1611:            civil::DateTime::try_from(DateTime::try_from_msdos(0x4D71, 0x54CF).unwrap()).unwrap();
+src/types.rs:1623:        assert!(civil::DateTime::try_from(unsafe {
+src/types.rs:1629:        assert!(civil::DateTime::try_from(unsafe {
+src/types.rs:1639:        let dt = DateTime::try_from_msdos(0x4D71, 0x54CF).unwrap();
+src/types.rs:1647:        let dt = DateTime::try_from((0x4D71, 0x54CF)).unwrap();

@@ -1,0 +1,483 @@
+    fn extract_internal<P: AsRef<Path>>(
+        &mut self,
+        directory: P,
+        root_dir_filter: Option<impl RootDirFilter>,
+    ) -> ZipResult<()> {
+        use std::fs;
+
+        create_dir_all(&directory)?;
+        let directory = directory.as_ref().canonicalize()?;
+
+        let root_dir = root_dir_filter
+            .and_then(|filter| {
+                self.root_dir(&filter)
+                    .transpose()
+                    .map(|root_dir| root_dir.map(|root_dir| (root_dir, filter)))
+            })
+            .transpose()?;
+
+        // If we have a root dir, simplify the path components to be more
+        // appropriate for passing to `safe_prepare_path`
+        let root_dir = root_dir
+            .as_ref()
+            .map(|(root_dir, filter)| {
+                crate::path::simplified_components(root_dir)
+                    .ok_or_else(|| {
+                        // Should be unreachable
+                        debug_assert!(false, "Invalid root dir path");
+
+                        invalid!("Invalid root dir path")
+                    })
+                    .map(|root_dir| (root_dir, filter))
+            })
+            .transpose()?;
+
+        #[cfg(unix)]
+        let mut files_by_unix_mode = Vec::new();
+
+        for i in 0..self.len() {
+            let mut file = self.by_index(i)?;
+
+            let mut outpath = directory.clone();
+            file.safe_prepare_path(directory.as_ref(), &mut outpath, root_dir.as_ref())?;
+
+            let symlink_target = if file.is_symlink() && (cfg!(unix) || cfg!(windows)) {
+                let mut target = Vec::with_capacity(file.size() as usize);
+                file.read_to_end(&mut target)?;
+                Some(target)
+            } else {
+                if file.is_dir() {
+                    crate::read::make_writable_dir_all(&outpath)?;
+                    continue;
+                }
+                None
+            };
+
+            drop(file);
+
+            if let Some(target) = symlink_target {
+                make_symlink(&outpath, &target, &self.shared.files)?;
+                continue;
+            }
+            let mut file = self.by_index(i)?;
+            let mut outfile = fs::File::create(&outpath)?;
+
+            io::copy(&mut file, &mut outfile)?;
+            #[cfg(unix)]
+            {
+                // Check for real permissions, which we'll set in a second pass
+                if let Some(mode) = file.unix_mode() {
+                    files_by_unix_mode.push((outpath.clone(), mode));
+                }
+            }
+            #[cfg(feature = "chrono")]
+            {
+                // Set original timestamp.
+                if let Some(last_modified) = file.last_modified() {
+                    if let Some(t) = datetime_to_systemtime(&last_modified) {
+                        outfile.set_modified(t)?;
+                    }
+                }
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::cmp::Reverse;
+            use std::os::unix::fs::PermissionsExt;
+
+            if files_by_unix_mode.len() > 1 {
+                // Ensure we update children's permissions before making a parent unwritable
+                files_by_unix_mode.sort_by_key(|(path, _)| Reverse(path.clone()));
+            }
+            for (path, mode) in files_by_unix_mode.into_iter() {
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+            }
+        }
+        Ok(())
+    /// The implementation of the cryptographic algorithms has not
+    /// gone through a correctness review, and you should assume it is insecure:
+    /// passwords used with this API may be compromised.
+    ///
+    /// This function sometimes accepts wrong password. This is because the ZIP spec only allows us
+    /// to check for a 1/256 chance that the password is correct.
+    /// There are many passwords out there that will also pass the validity checks
+    /// we are able to perform. This is a weakness of the ZipCrypto algorithm,
+    /// due to its fairly primitive approach to cryptography.
+    pub fn by_path_decrypt<T: AsRef<Path>>(
+        &mut self,
+        path: T,
+        password: &[u8],
+    ) -> ZipResult<ZipFile<'_, R>> {
+        self.index_for_path(path)
+            .ok_or(ZipError::FileNotFound)
+            .and_then(|index| self.by_index_with_optional_password(index, Some(password)))
+    }
+
+    /// Search for a file entry by path
+    pub fn by_path<T: AsRef<Path>>(&mut self, path: T) -> ZipResult<ZipFile<'_, R>> {
+        self.index_for_path(path)
+            .ok_or(ZipError::FileNotFound)
+            .and_then(|index| self.by_index_with_optional_password(index, None))
+    }
+
+    /// Get the index of a file entry by path, if it's present.
+    #[inline(always)]
+    pub fn index_for_path<T: AsRef<Path>>(&self, path: T) -> Option<usize> {
+        self.index_for_name(&path_to_string(path))
+    }
+
+    /// Get the name of a file entry, if it's present.
+    #[inline(always)]
+    pub fn name_for_index(&self, index: usize) -> Option<&str> {
+        self.shared
+            .files
+            .get_index(index)
+            .map(|(name, _)| name.as_ref())
+    }
+
+    /// Search for a file entry by name and return a seekable object.
+    pub fn by_name_seek(&mut self, name: &str) -> ZipResult<ZipFileSeek<'_, R>> {
+        self.by_index_seek(self.index_for_name(name).ok_or(ZipError::FileNotFound)?)
+    }
+
+    /// Search for a file entry by index and return a seekable object.
+    pub fn by_index_seek(&mut self, index: usize) -> ZipResult<ZipFileSeek<'_, R>> {
+        let reader = &mut self.reader;
+        self.shared
+            .files
+            .get_index(index)
+            .ok_or(ZipError::FileNotFound)
+            .and_then(move |(_, data)| {
+                let seek_reader = match data.compression_method {
+                    CompressionMethod::Stored => {
+                        ZipFileSeekReader::Raw(find_content_seek(data, reader)?)
+                    }
+                    _ => {
+                        return Err(ZipError::UnsupportedArchive(
+                            "Seekable compressed files are not yet supported",
+                        ))
+                    }
+                };
+                Ok(ZipFileSeek {
+                    reader: seek_reader,
+                    data: Cow::Borrowed(data),
+                })
+            })
+    }
+
+    fn by_name_with_optional_password<'a>(
+        &'a mut self,
+        name: &str,
+        password: Option<&[u8]>,
+    ) -> ZipResult<ZipFile<'a, R>> {
+        let Some(index) = self.shared.files.get_index_of(name) else {
+            return Err(ZipError::FileNotFound);
+        };
+        self.by_index_with_optional_password(index, password)
+    }
+
+    /// Get a contained file by index, decrypt with given password
+    ///
+    /// # Warning
+    ///
+    /// The implementation of the cryptographic algorithms has not
+    /// gone through a correctness review, and you should assume it is insecure:
+    /// passwords used with this API may be compromised.
+    ///
+    /// This function sometimes accepts wrong password. This is because the ZIP spec only allows us
+    /// to check for a 1/256 chance that the password is correct.
+    /// There are many passwords out there that will also pass the validity checks
+    /// we are able to perform. This is a weakness of the ZipCrypto algorithm,
+    /// due to its fairly primitive approach to cryptography.
+    pub fn by_index_decrypt(
+        &mut self,
+        file_number: usize,
+        password: &[u8],
+    ) -> ZipResult<ZipFile<'_, R>> {
+        self.by_index_with_optional_password(file_number, Some(password))
+    }
+
+    /// Get a contained file by index
+    pub fn by_index(&mut self, file_number: usize) -> ZipResult<ZipFile<'_, R>> {
+        self.by_index_with_optional_password(file_number, None)
+}
+
+pub(crate) fn parse_single_extra_field<R: Read>(
+    file: &mut ZipFileData,
+    reader: &mut R,
+    bytes_already_read: u64,
+    disallow_zip64: bool,
+) -> ZipResult<bool> {
+    let kind = reader.read_u16_le()?;
+    let len = reader.read_u16_le()?;
+    match kind {
+        // Zip64 extended information extra field
+        0x0001 => {
+            if disallow_zip64 {
+                return Err(invalid!("Can't write a custom field using the ZIP64 ID"));
+            }
+            file.large_file = true;
+            let mut consumed_len = 0;
+            if len >= 24 || file.uncompressed_size == spec::ZIP64_BYTES_THR {
+                file.uncompressed_size = reader.read_u64_le()?;
+                consumed_len += size_of::<u64>();
+            }
+            if len >= 24 || file.compressed_size == spec::ZIP64_BYTES_THR {
+                file.compressed_size = reader.read_u64_le()?;
+                consumed_len += size_of::<u64>();
+            }
+            if len >= 24 || file.header_start == spec::ZIP64_BYTES_THR {
+                file.header_start = reader.read_u64_le()?;
+                consumed_len += size_of::<u64>();
+            }
+            let Some(leftover_len) = (len as usize).checked_sub(consumed_len) else {
+                return Err(invalid!("ZIP64 extra-data field is the wrong length"));
+            };
+            reader.read_exact(&mut vec![0u8; leftover_len])?;
+            return Ok(true);
+        }
+        0x000a => {
+            // NTFS extra field
+            file.extra_fields
+                .push(ExtraField::Ntfs(Ntfs::try_from_reader(reader, len)?));
+        }
+        0x9901 => {
+            // AES
+            if len != 7 {
+                return Err(ZipError::UnsupportedArchive(
+                    "AES extra data field has an unsupported length",
+                ));
+            }
+            let vendor_version = reader.read_u16_le()?;
+            let vendor_id = reader.read_u16_le()?;
+            let mut out = [0u8];
+            reader.read_exact(&mut out)?;
+            let aes_mode = out[0];
+            let compression_method = CompressionMethod::parse_from_u16(reader.read_u16_le()?);
+
+            if vendor_id != 0x4541 {
+                return Err(invalid!("Invalid AES vendor"));
+            }
+            let vendor_version = match vendor_version {
+                0x0001 => AesVendorVersion::Ae1,
+                0x0002 => AesVendorVersion::Ae2,
+                _ => return Err(invalid!("Invalid AES vendor version")),
+            };
+            match aes_mode {
+                0x01 => file.aes_mode = Some((AesMode::Aes128, vendor_version, compression_method)),
+                0x02 => file.aes_mode = Some((AesMode::Aes192, vendor_version, compression_method)),
+                0x03 => file.aes_mode = Some((AesMode::Aes256, vendor_version, compression_method)),
+                _ => return Err(invalid!("Invalid AES encryption strength")),
+            };
+            file.compression_method = compression_method;
+            file.aes_extra_data_start = bytes_already_read;
+        }
+        0x5455 => {
+            // extended timestamp
+            // https://libzip.org/specifications/extrafld.txt
+
+            file.extra_fields.push(ExtraField::ExtendedTimestamp(
+                ExtendedTimestamp::try_from_reader(reader, len)?,
+            ));
+        }
+        0x6375 => {
+            // Info-ZIP Unicode Comment Extra Field
+            // APPNOTE 4.6.8 and https://libzip.org/specifications/extrafld.txt
+            file.file_comment = String::from_utf8(
+                UnicodeExtraField::try_from_reader(reader, len)?
+                    .unwrap_valid(file.file_comment.as_bytes())?
+                    .into_vec(),
+            )?
+            .into();
+        }
+        0x7075 => {
+            // Info-ZIP Unicode Path Extra Field
+            // APPNOTE 4.6.9 and https://libzip.org/specifications/extrafld.txt
+            file.file_name_raw = UnicodeExtraField::try_from_reader(reader, len)?
+                .unwrap_valid(&file.file_name_raw)?;
+            file.file_name =
+                String::from_utf8(file.file_name_raw.clone().into_vec())?.into_boxed_str();
+            file.is_utf8 = true;
+        }
+        _ => {
+            reader.read_exact(&mut vec![0u8; len as usize])?;
+            // Other fields are ignored
+        }
+    }
+    Ok(false)
+}
+
+/// A trait for exposing file metadata inside the zip.
+pub trait HasZipMetadata {
+    /// Get the file metadata
+    fn get_metadata(&self) -> &ZipFileData;
+        }
+    }
+
+    const fn is_closed(&self) -> bool {
+        matches!(*self, Closed)
+    }
+
+    fn get_plain(&mut self) -> &mut W {
+        match *self {
+            Storer(MaybeEncrypted::Unencrypted(ref mut w)) => w,
+            _ => panic!("Should have switched to stored and unencrypted beforehand"),
+        }
+    }
+
+    fn unwrap(self) -> W {
+        match self {
+            Storer(MaybeEncrypted::Unencrypted(w)) => w,
+            _ => panic!("Should have switched to stored and unencrypted beforehand"),
+        }
+    }
+}
+
+#[cfg(feature = "_deflate-any")]
+fn deflate_compression_level_range() -> std::ops::RangeInclusive<i64> {
+    #[cfg(feature = "deflate-flate2")]
+    let min = Compression::fast().level() as i64;
+    #[cfg(all(feature = "deflate-zopfli", not(feature = "deflate-flate2")))]
+    let min = 1;
+
+    #[cfg(feature = "deflate-zopfli")]
+    let max = 264;
+    #[cfg(all(feature = "deflate-flate2", not(feature = "deflate-zopfli")))]
+    let max = Compression::best().level() as i64;
+
+    min..=max
+}
+
+#[cfg(feature = "bzip2")]
+fn bzip2_compression_level_range() -> std::ops::RangeInclusive<i64> {
+    let min = bzip2::Compression::fast().level() as i64;
+    let max = bzip2::Compression::best().level() as i64;
+    min..=max
+}
+
+#[cfg(any(
+    feature = "_deflate-any",
+    feature = "bzip2",
+    feature = "ppmd",
+    feature = "xz",
+#![allow(missing_docs)]
+
+use std::borrow::Cow;
+use std::io;
+use std::io::{Read, Write};
+use std::path::{Component, Path, MAIN_SEPARATOR};
+
+/// Provides high level API for reading from a stream.
+pub mod stream {
+    pub use crate::read::stream::*;
+}
+/// Types for creating ZIP archives.
+pub mod write {
+    use crate::write::{FileOptionExtension, FileOptions};
+    /// Unstable methods for [`FileOptions`].
+    pub trait FileOptionsExt {
+        /// Write the file with the given password using the deprecated ZipCrypto algorithm.
+        ///
+        /// This is not recommended for new archives, as ZipCrypto is not secure.
+        fn with_deprecated_encryption(self, password: &[u8]) -> Self;
+    }
+    impl<T: FileOptionExtension> FileOptionsExt for FileOptions<'_, T> {
+        fn with_deprecated_encryption(self, password: &[u8]) -> FileOptions<'static, T> {
+            self.with_deprecated_encryption(password)
+        }
+    }
+}
+
+/// Helper methods for writing unsigned integers in little-endian form.
+pub trait LittleEndianWriteExt: Write {
+    fn write_u16_le(&mut self, input: u16) -> io::Result<()> {
+        self.write_all(&input.to_le_bytes())
+    }
+
+    fn write_u32_le(&mut self, input: u32) -> io::Result<()> {
+        self.write_all(&input.to_le_bytes())
+    }
+
+    fn write_u64_le(&mut self, input: u64) -> io::Result<()> {
+        self.write_all(&input.to_le_bytes())
+    }
+
+    fn write_u128_le(&mut self, input: u128) -> io::Result<()> {
+        self.write_all(&input.to_le_bytes())
+    }
+}
+
+impl<W: Write + ?Sized> LittleEndianWriteExt for W {}
+
+/// Helper methods for reading unsigned integers in little-endian form.
+pub trait LittleEndianReadExt: Read {
+    fn read_u16_le(&mut self) -> io::Result<u16> {
+        let mut out = [0u8; 2];
+        self.read_exact(&mut out)?;
+        Ok(u16::from_le_bytes(out))
+    }
+
+    fn read_u32_le(&mut self) -> io::Result<u32> {
+        let mut out = [0u8; 4];
+        self.read_exact(&mut out)?;
+        Ok(u32::from_le_bytes(out))
+    }
+
+    fn read_u64_le(&mut self) -> io::Result<u64> {
+        let mut out = [0u8; 8];
+        self.read_exact(&mut out)?;
+        Ok(u64::from_le_bytes(out))
+    }
+}
+
+impl<R: Read> LittleEndianReadExt for R {}
+
+/// Converts a path to the ZIP format (forward-slash-delimited and normalized).
+pub fn path_to_string<T: AsRef<Path>>(path: T) -> Box<str> {
+    let mut maybe_original = None;
+    if let Some(original) = path.as_ref().to_str() {
+        if original.is_empty() || original == "." || original == ".." {
+            return String::new().into_boxed_str();
+        }
+        if original.starts_with(MAIN_SEPARATOR) {
+            if original.len() == 1 {
+                return MAIN_SEPARATOR.to_string().into_boxed_str();
+            } else if (MAIN_SEPARATOR == '/' || !original[1..].contains(MAIN_SEPARATOR))
+                && !original.ends_with('.')
+                && !original.contains([MAIN_SEPARATOR, MAIN_SEPARATOR])
+                && !original.contains([MAIN_SEPARATOR, '.', MAIN_SEPARATOR])
+                && !original.contains([MAIN_SEPARATOR, '.', '.', MAIN_SEPARATOR])
+            {
+                maybe_original = Some(&original[1..]);
+            }
+        } else if !original.contains(MAIN_SEPARATOR) {
+            return original.into();
+        }
+    }
+    let mut recreate = maybe_original.is_none();
+    let mut normalized_components = Vec::new();
+
+    for component in path.as_ref().components() {
+        match component {
+            Component::Normal(os_str) => match os_str.to_str() {
+                Some(valid_str) => normalized_components.push(Cow::Borrowed(valid_str)),
+                None => {
+                    recreate = true;
+                    normalized_components.push(os_str.to_string_lossy());
+                }
+            },
+            Component::ParentDir => {
+                recreate = true;
+                normalized_components.pop();
+            }
+            _ => {
+                recreate = true;
+            }
+        }
+    }
+    if recreate {
+        normalized_components.join("/").into()
+    } else {
+        maybe_original.unwrap().into()
+    }
+}

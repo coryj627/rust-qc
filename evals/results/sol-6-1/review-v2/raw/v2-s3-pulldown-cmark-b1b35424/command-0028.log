@@ -1,0 +1,644 @@
+        let standard_bytes = [
+            b'\n', b'\r', b'*', b'_', b'&', b'\\', b'[', b']', b'<', b'!', b'`',
+        ];
+
+        for &byte in &standard_bytes {
+            add_lookup_byte(&mut lookup, byte);
+        }
+        if options.contains(Options::ENABLE_TABLES) {
+            add_lookup_byte(&mut lookup, b'|');
+        }
+        if options.contains(Options::ENABLE_STRIKETHROUGH)
+            || options.contains(Options::ENABLE_SUBSCRIPT)
+        {
+            add_lookup_byte(&mut lookup, b'~');
+        }
+        if options.contains(Options::ENABLE_SUPERSCRIPT) {
+            add_lookup_byte(&mut lookup, b'^');
+        }
+        if options.contains(Options::ENABLE_MATH) {
+            add_lookup_byte(&mut lookup, b'$');
+            add_lookup_byte(&mut lookup, b'{');
+            add_lookup_byte(&mut lookup, b'}');
+        }
+        if options.contains(Options::ENABLE_SMART_PUNCTUATION) {
+            for &byte in &[b'.', b'-', b'"', b'\''] {
+                add_lookup_byte(&mut lookup, byte);
+            }
+        }
+
+        lookup
+    }
+
+    fn add_lookup_byte(lookup: &mut [u8; 16], byte: u8) {
+        lookup[(byte & 0x0f) as usize] |= 1 << (byte >> 4);
+    }
+
+    /// Computes a bit mask for the given byteslice starting from the given index,
+    /// where the 16 least significant bits indicate (by value of 1) whether or not
+    /// there is a special character at that byte position. The least significant bit
+    /// corresponds to `bytes[ix]` and the most significant bit corresponds to
+    /// `bytes[ix + 15]`.
+    /// It is only safe to call this function when `bytes.len() >= ix + VECTOR_SIZE`.
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn compute_mask(lut: &[u8; 16], bytes: &[u8], ix: usize) -> i32 {
+        debug_assert!(bytes.len() >= ix + VECTOR_SIZE);
+
+        let bitmap = _mm_loadu_si128(lut.as_ptr() as *const __m128i);
+        // Small lookup table to compute single bit bitshifts
+        // for 16 bytes at once.
+        let bitmask_lookup =
+            _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, -128, -1, -1, -1, -1, -1, -1, -1, -1);
+
+        // Load input from memory.
+        let raw_ptr = bytes.as_ptr().add(ix) as *const __m128i;
+        let input = _mm_loadu_si128(raw_ptr);
+        // Compute the bitmap using the bottom nibble as an index
+        // into the lookup table. Note that non-ascii bytes will have
+        // their most significant bit set and will map to lookup[0].
+        let bitset = _mm_shuffle_epi8(bitmap, input);
+        // Compute the high nibbles of the input using a 16-bit rightshift of four
+        // and a mask to prevent most-significant bit issues.
+        let higher_nibbles = _mm_and_si128(_mm_srli_epi16(input, 4), _mm_set1_epi8(0x0f));
+        // Create a bitmask for the bitmap by perform a left shift of the value
+        // of the higher nibble. Bytes with their most significant set are mapped
+        // to -1 (all ones).
+        let bitmask = _mm_shuffle_epi8(bitmask_lookup, higher_nibbles);
+        // Test the bit of the bitmap by AND'ing the bitmap and the mask together.
+        let tmp = _mm_and_si128(bitset, bitmask);
+        // Check whether the result was not null. NEQ is not a SIMD intrinsic,
+        // but comparing to the bitmask is logically equivalent. This also prevents us
+        // from matching any non-ASCII bytes since none of the bitmaps were all ones
+        // (-1).
+        let result = _mm_cmpeq_epi8(tmp, bitmask);
+
+        // Return the resulting bitmask.
+        _mm_movemask_epi8(result)
+    }
+
+    /// Calls callback on byte indices and their value.
+    /// Breaks when callback returns LoopInstruction::BreakAtWith(ix, val). And skips the
+    /// number of bytes in callback return value otherwise.
+    /// Returns the final index and a possible break value.
+    pub(super) fn iterate_special_bytes<F, T>(
+        lut: &LookupTable,
+        bytes: &[u8],
+        ix: usize,
+        callback: F,
+    ) -> (usize, Option<T>)
+    where
+        F: FnMut(usize, u8) -> LoopInstruction<Option<T>>,
+    {
+        if is_x86_feature_detected!("ssse3") && bytes.len() >= VECTOR_SIZE {
+            unsafe { simd_iterate_special_bytes(&lut.simd, bytes, ix, callback) }
+        } else {
+            super::scalar_iterate_special_bytes(&lut.scalar, bytes, ix, callback)
+        }
+    }
+
+    /// Calls the callback function for every 1 in the given bitmask with
+    /// the index `offset + ix`, where `ix` is the position of the 1 in the mask.
+    /// Returns `Ok(ix)` to continue from index `ix`, `Err((end_ix, opt_val)` to break with
+    /// final index `end_ix` and optional value `opt_val`.
+    unsafe fn process_mask<F, T>(
+        mut mask: i32,
+        bytes: &[u8],
+        mut offset: usize,
+        callback: &mut F,
+    ) -> Result<usize, (usize, Option<T>)>
+    where
+        F: FnMut(usize, u8) -> LoopInstruction<Option<T>>,
+    {
+        while mask != 0 {
+            let mask_ix = mask.trailing_zeros() as usize;
+            offset += mask_ix;
+            match callback(offset, *bytes.get_unchecked(offset)) {
+                LoopInstruction::ContinueAndSkip(skip) => {
+                    offset += skip + 1;
+                    let shift = skip + 1 + mask_ix;
+                    if shift >= 32 {
+                        break;
+                    }
+                    mask >>= shift;
+                }
+                LoopInstruction::BreakAtWith(ix, val) => return Err((ix, val)),
+            }
+        }
+        Ok(offset)
+    }
+
+    #[target_feature(enable = "ssse3")]
+    /// Important: only call this function when `bytes.len() >= 16`. Doing
+    /// so otherwise may exhibit undefined behaviour.
+    unsafe fn simd_iterate_special_bytes<F, T>(
+        lut: &[u8; 16],
+        bytes: &[u8],
+        mut ix: usize,
+        mut callback: F,
+    ) -> (usize, Option<T>)
+    where
+        F: FnMut(usize, u8) -> LoopInstruction<Option<T>>,
+    {
+        debug_assert!(bytes.len() >= VECTOR_SIZE);
+        let upperbound = bytes.len() - VECTOR_SIZE;
+
+        while ix < upperbound {
+            let mask = compute_mask(lut, bytes, ix);
+            let block_start = ix;
+            ix = match process_mask(mask, bytes, ix, &mut callback) {
+                Ok(ix) => std::cmp::max(ix, VECTOR_SIZE + block_start),
+                Err((end_ix, val)) => return (end_ix, val),
+            };
+        }
+
+        if bytes.len() > ix {
+            // shift off the bytes at start we have already scanned
+            let mask = compute_mask(lut, bytes, upperbound) >> ix - upperbound;
+            if let Err((end_ix, val)) = process_mask(mask, bytes, ix, &mut callback) {
+                return (end_ix, val);
+            }
+        }
+
+        (bytes.len(), None)
+    }
+
+    #[cfg(test)]
+    mod simd_test {
+        use super::super::create_lut;
+        use super::{iterate_special_bytes, LoopInstruction};
+        use crate::Options;
+
+        fn check_expected_indices(bytes: &[u8], expected: &[usize], skip: usize) {
+            let mut opts = Options::empty();
+            opts.insert(Options::ENABLE_MATH);
+            opts.insert(Options::ENABLE_TABLES);
+            opts.insert(Options::ENABLE_FOOTNOTES);
+            opts.insert(Options::ENABLE_STRIKETHROUGH);
+            opts.insert(Options::ENABLE_SUPERSCRIPT);
+            opts.insert(Options::ENABLE_TASKLISTS);
+
+            let lut = create_lut(&opts);
+            let mut indices = vec![];
+
+            iterate_special_bytes::<_, i32>(&lut, bytes, 0, |ix, _byte_ty| {
+                indices.push(ix);
+                LoopInstruction::ContinueAndSkip(skip)
+            });
+
+            assert_eq!(&indices[..], expected);
+        }
+
+        #[test]
+        fn simple_no_match() {
+            check_expected_indices("abcdef0123456789".as_bytes(), &[], 0);
+        }
+
+        #[test]
+        fn simple_match() {
+            check_expected_indices("*bcd&f0123456789".as_bytes(), &[0, 4], 0);
+        }
+
+        #[test]
+        fn single_open_fish() {
+            check_expected_indices("<".as_bytes(), &[0], 0);
+        }
+
+        #[test]
+        fn long_match() {
+            check_expected_indices("0123456789abcde~*bcd&f0".as_bytes(), &[15, 16, 20], 0);
+        }
+
+        #[test]
+        fn border_skip() {
+            check_expected_indices("0123456789abcde~~~~d&f0".as_bytes(), &[15, 20], 3);
+        }
+
+        #[test]
+        fn exhaustive_search() {
+            let chars = [
+                b'\n', b'\r', b'*', b'_', b'~', b'^', b'|', b'&', b'\\', b'[', b']', b'<', b'!',
+                b'`', b'$', b'{', b'}',
+            ];
+
+            for &c in &chars {
+                for i in 0u8..=255 {
+                    if !chars.contains(&i) {
+                        // full match
+                        let mut buf = [i; 18];
+                        buf[3] = c;
+                        buf[6] = c;
+
+                        check_expected_indices(&buf[..], &[3, 6], 0);
+                    }
+                }
+            }
+        }
+    }
+}
+pulldown-cmark/src/scanners.rs:40:    "blockquote",
+pulldown-cmark/src/scanners.rs:227:    pub(crate) fn scan_blockquote_tag(&mut self) -> Option<BlockQuoteKind> {
+pulldown-cmark/src/scanners.rs:262:    pub(crate) fn scan_blockquote_marker(&mut self) -> bool {
+pulldown-cmark/src/scanners.rs:799:pub(crate) fn scan_blockquote_start(data: &[u8]) -> Option<usize> {
+pulldown-cmark/src/scanners.rs:1262:/// multiple leafs (e.g. over multiple lines in a blockquote),
+pulldown-cmark/src/firstpass.rs:230:            } else if line_start.scan_blockquote_marker() {
+pulldown-cmark/src/firstpass.rs:232:                    line_start.scan_blockquote_tag()
+pulldown-cmark/src/firstpass.rs:244:                    // blockquote tag leaves us at the end of the line
+pulldown-cmark/src/firstpass.rs:261:                        // blockquote tags act as if they were nested in a paragraph
+pulldown-cmark/src/firstpass.rs:2133:        || scan_blockquote_start(bytes).is_some()
+    buffer: &mut Vec<u8>,
+    buffer_ix: &mut usize,
+) -> Option<usize> {
+    match *data.get(i)? {
+        b @ b'"' | b @ b'\'' => {
+            i += 1;
+            while i < data.len() {
+                if data[i] == b {
+                    return Some(i + 1);
+                }
+                if let Some(eol_bytes) = scan_eol(&data[i..]) {
+                    let handler = newline_handler?;
+                    i += eol_bytes;
+                    let skipped_bytes = handler(&data[i..]);
+
+                    if skipped_bytes > 0 {
+                        buffer.extend(&data[*buffer_ix..i]);
+                        *buffer_ix = i + skipped_bytes;
+                    }
+                    i += skipped_bytes;
+                } else {
+                    i += 1;
+                }
+            }
+            return None;
+        }
+        b' ' | b'=' | b'>' | b'<' | b'`' | b'\n' | b'\r' => {
+            return None;
+        }
+        _ => {
+            // unquoted attribute value
+            i += scan_attr_value_chars(&data[i..]);
+        }
+    }
+
+    Some(i)
+}
+
+// Remove backslash escapes and resolve entities
+pub(crate) fn unescape<'a, I: Into<CowStr<'a>>>(input: I, is_in_table: bool) -> CowStr<'a> {
+    let input = input.into();
+    let mut result = String::new();
+    let mut mark = 0;
+    let mut i = 0;
+    let bytes = input.as_bytes();
+    while i < bytes.len() {
+        match bytes[i..] {
+            // Tables are special, because they're parsed as-if the tables
+            // were parsed in a discrete pass, changing `\|` to `|`, and then
+            // passing the changed string to the inline parser.
+            [b'\\', b'\\', b'|', ..] if is_in_table => {
+                // even number of `\`s before pipe
+                // odd number is handled in the normal way below
+                result.push_str(&input[mark..i]);
+                mark = i + 2;
+                i += 3;
+            }
+            [b'\\', cx, ..] if is_ascii_punctuation(cx) => {
+                result.push_str(&input[mark..i]);
+                mark = i + 1;
+                i += 2;
+            }
+            [b'&', ..] => match scan_entity(&bytes[i..]) {
+                (n, Some(value)) => {
+                    result.push_str(&input[mark..i]);
+                    result.push_str(&value);
+                    i += n;
+                    mark = i;
+                }
+                _ => i += 1,
+            },
+            [b'\r', ..] => {
+                result.push_str(&input[mark..i]);
+                i += 1;
+                mark = i;
+            }
+            _ => i += 1,
+        }
+    }
+    if mark == 0 {
+        input
+    } else {
+        result.push_str(&input[mark..]);
+        result.into()
+    }
+}
+
+/// Assumes `data` is preceded by `<`.
+pub(crate) fn starts_html_block_type_6(data: &[u8]) -> bool {
+    let i = scan_ch(data, b'/');
+    let tail = &data[i..];
+    let n = scan_while(tail, is_ascii_alphanumeric);
+    if !is_html_tag(&tail[..n]) {
+        return false;
+    }
+    // Starting condition says the next byte must be either a space, a tab,
+    // the end of the line, the string >, or the string />
+    let tail = &tail[n..];
+    tail.is_empty()
+        || tail[0] == b' '
+        || tail[0] == b'\t'
+        || tail[0] == b'\r'
+        || tail[0] == b'\n'
+        || tail[0] == b'>'
+        || tail.len() >= 2 && &tail[..2] == b"/>"
+}
+
+fn is_html_tag(tag: &[u8]) -> bool {
+    HTML_TAGS
+        .binary_search_by(|probe| {
+            let probe_bytes_iter = probe.as_bytes().iter();
+            let tag_bytes_iter = tag.iter();
+
+            probe_bytes_iter
+                .zip(tag_bytes_iter)
+                .find_map(|(&a, &b)| {
+                    // We can compare case insensitively because the probes are
+                    // all lower case alpha strings.
+                    match a.cmp(&(b | 0x20)) {
+                        std::cmp::Ordering::Equal => None,
+                        inequality => Some(inequality),
+                    }
+                })
+                .unwrap_or_else(|| probe.len().cmp(&tag.len()))
+        })
+        .is_ok()
+}
+
+/// Assumes that `data` starts with `<`.
+/// Returns the index into data directly after the html tag on success.
+pub(crate) fn scan_html_type_7(data: &[u8]) -> Option<usize> {
+    // Block type html does not allow for newlines, so we
+    // do not pass a newline handler.
+    let (_span, i) = scan_html_block_inner(data, None)?;
+    scan_blank_line(&data[i..])?;
+    Some(i)
+}
+
+/// Assumes that `data` starts with `<`.
+/// Returns the number of bytes scanned and the html in case of
+/// success.
+/// When some bytes were skipped, because the html was split over
+/// multiple leafs (e.g. over multiple lines in a blockquote),
+/// the html is returned as a vector of bytes.
+/// If no bytes were skipped, the buffer will be empty.
+pub(crate) fn scan_html_block_inner(
+    data: &[u8],
+    newline_handler: Option<&dyn Fn(&[u8]) -> usize>,
+) -> Option<(Vec<u8>, usize)> {
+    let mut buffer = Vec::new();
+    let mut last_buf_index = 0;
+
+    let close_tag_bytes = scan_ch(&data[1..], b'/');
+    let l = scan_while(&data[(1 + close_tag_bytes)..], is_ascii_alpha);
+    if l == 0 {
+        return None;
+    }
+    let mut i = 1 + close_tag_bytes + l;
+    i += scan_while(&data[i..], is_ascii_letterdigitdash);
+
+    if close_tag_bytes == 0 {
+        loop {
+            let old_i = i;
+            loop {
+                i += scan_whitespace_no_nl(&data[i..]);
+                if let Some(eol_bytes) = scan_eol(&data[i..]) {
+                    if eol_bytes == 0 {
+                        return None;
+                    }
+                    let handler = newline_handler?;
+                    i += eol_bytes;
+                    let skipped_bytes = handler(&data[i..]);
+
+                    let data_len = data.len() - i;
+
+                    debug_assert!(
+                        skipped_bytes <= data_len,
+                        "Handler tried to skip too many bytes, fed {}, skipped {}",
+                        data_len,
+                        skipped_bytes
+                    );
+
+                    if skipped_bytes > 0 {
+                        buffer.extend(&data[last_buf_index..i]);
+                        i += skipped_bytes;
+                        last_buf_index = i;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if let Some(b'/') | Some(b'>') = data.get(i) {
+                break;
+            }
+            if old_i == i {
+                // No whitespace, which is mandatory.
+                return None;
+            }
+            i = scan_attribute(data, i, newline_handler, &mut buffer, &mut last_buf_index)?;
+        }
+    }
+
+    i += scan_whitespace_no_nl(&data[i..]);
+
+    if close_tag_bytes == 0 {
+        i += scan_ch(&data[i..], b'/');
+Run this with `cargo test --features gen-tests suite::heading_attrs`.
+
+Examples and edge cases for attribute blocks for headings.
+
+# Basic usage
+
+Attribute blocks are attributes wrapped by curly braces (`{` and `}`) at the
+end of heading content.
+
+Strictly speaking, attribute blocks satisfies the conditions below:
+
+* Placed at the end of the heading, with optional following spaces.
+* Starts with `{` and ends with `}`.
+* Does not contain any other `{` and `}` except for opening and ending of the block.
+* Does not contain any `<`s (less-than operators), `>`s (greater-than operators),
+  `\`s (backslashes), or newline characters.
+
+Attributes are separated by ASCII non-newline whitespaces.
+An ID attribute is specified as `#id-fragment-here`, and a class attribute is
+specified as `.class-here`. Custom attributes has not a prefix and can optionally
+have a value (`myattr`, `myattr=myvalue`).
+
+Basic usage with setext headings:
+
+```````````````````````````````` example
+with the ID {#myh1}
+===================
+with a class {.myclass}
+------------
+with a custom attribute {myattr=myvalue}
+========================================
+multiple! {.myclass1 myattr #myh3 otherattr=value .myclass2}
+--
+.
+<h1 id="myh1">with the ID</h1>
+<h2 class="myclass">with a class</h2>
+<h1 myattr="myvalue">with a custom attribute</h1>
+<h2 id="myh3" class="myclass1 myclass2" myattr="" otherattr="value">multiple!</h2>
+````````````````````````````````
+
+Basic usage with ATX headings:
+
+```````````````````````````````` example
+# with the ID {#myh1}
+## with a class {.myclass}
+#### with a custom attribute {myattr=myvalue}
+### multiple! {.myclass1 myattr #myh3 otherattr=value .myclass2}
+.
+<h1 id="myh1">with the ID</h1>
+<h2 class="myclass">with a class</h2>
+<h4 myattr="myvalue">with a custom attribute</h4>
+<h3 id="myh3" class="myclass1 myclass2" myattr="" otherattr="value">multiple!</h3>
+````````````````````````````````
+
+If an ATX heading has closing `#`s, the attribute block should be placed after them.
+
+```````````````````````````````` example
+# H1 # {#id1}
+## H2 ## with ## multiple ## hashes ## {#id2}
+### with trailing hash # ### {#id3}
+
+#### non-attribute-block {#id4} ####
+.
+<h1 id="id1">H1</h1>
+<h2 id="id2">H2 ## with ## multiple ## hashes</h2>
+<h3 id="id3">with trailing hash #</h3>
+<h4>non-attribute-block {#id4}</h4>
+````````````````````````````````
+
+Trailing ASCII spaces are allowed.
+
+```````````````````````````````` example
+# spaces {#myid1}    
+## tabs {#myid2}		
+.
+<h1 id="myid1">spaces</h1>
+<h2 id="myid2">tabs</h2>
+````````````````````````````````
+
+ATX heading cannot have multiple lines.
+
+```````````````````````````````` example
+# H1 \
+nextline
+.
+<h1>H1 \</h1>
+<p>nextline</p>
+````````````````````````````````
+
+Of course, attribute blocks cannot be another line in ATX headings.
+
+```````````````````````````````` example
+# H1 \
+{#myid}
+
+## H2 \
+nextline {.class}
+
+### H3 [link
+](https://example.com/) {#myid3}
+.
+<h1>H1 \</h1>
+<p>{#myid}</p>
+<h2>H2 \</h2>
+<p>nextline {.class}</p>
+<h3>H3 [link</h3>
+<p>](https://example.com/) {#myid3}</p>
+````````````````````````````````
+
+<!--
+  Note that the `\` at `H1 \</h1>` should be a single backslash, not double.
+  This is due to how `<Spec as Iterator>::next()` in build.rs parses this file.
+  The file is read as a plain string and the tests cases are generated.
+  The lines after a period in examples are not parsed as a markdown.
+-->
+
+Setext header can have multiple lines.
+
+```````````````````````````````` example
+H1
+cont
+{#myid}
+==
+.
+<h1 id="myid">H1
+cont
+</h1>
+````````````````````````````````
+
+However, an attribute block itself cannot have newline characters.
+
+```````````````````````````````` example
+H1
+{
+  .class1
+  .class2
+}
+==
+.
+<h1>H1
+{
+.class1
+.class2
+}</h1>
+````````````````````````````````
+
+## Leading spaces
+
+It is recommended to separate heading content and attribute blocks by spaces.
+Some implementations supports this style, and some others not.
+
+FYI:
+Attribute blocks without leading spaces are supported by cebe
+(markdown-extra) 1.2.0, markdig (advanced) 0.26.0.0, maruku 0.7.3.beta1, and
+pandoc 2.14.2.
+On the other hand, it is not supported by kramdown 1.2.0 and php-markdown-extra
+1.9.0, while they supports attribute blocks with leading spaces.
+
+This style is supported since the majority of other implementations seems to
+support this, but be careful about incompatibility.
+Put spaces before attribute blocks for more compatibility.
+
+```````````````````````````````` example
+# without space, not recommended{#id1}
+## recommended style with spaces {#id2}
+.
+<h1 id="id1">without space, not recommended</h1>
+<h2 id="id2">recommended style with spaces</h2>
+````````````````````````````````
+
+## Spaces inside braces
+
+Braces can be optionally separated by spaces, and contiguous spaces are handled
+in the same way as a single whitespace.
+
+```````````````````````````````` example
+# H1 { #id1 }
+## H2 {.myclass      #id2 }
+### H3 {     .myclass}
+.
+<h1 id="id1">H1</h1>
+<h2 id="id2" class="myclass">H2</h2>
+<h3 class="myclass">H3</h3>
+````````````````````````````````
+
+## Separators
+
+Separators are mandatory. There are no automagical separation.
+
+```````````````````````````````` example

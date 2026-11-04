@@ -1,0 +1,426 @@
+src/proto/streams/prioritize.rs:158:        if sz > MAX_WINDOW_SIZE as usize {
+src/proto/streams/prioritize.rs:200:            self.reserve_capacity(0, stream, counts);
+src/proto/streams/prioritize.rs:231:    pub fn reserve_capacity(
+src/proto/streams/prioritize.rs:238:            "reserve_capacity",
+src/proto/streams/send.rs:289:        self.prioritize.reserve_capacity(0, stream, counts);
+src/proto/streams/send.rs:311:    pub fn reserve_capacity(
+src/proto/streams/send.rs:317:        self.prioritize.reserve_capacity(capacity, stream, counts)
+src/proto/streams/streams.rs:567:                    assert!(sz <= super::MAX_WINDOW_SIZE as usize);
+src/proto/streams/streams.rs:1255:    pub fn reserve_capacity(&mut self, capacity: WindowSize) {
+src/proto/streams/streams.rs:1263:            .reserve_capacity(capacity, &mut stream, &mut me.counts)
+            "state={:?}",
+            stream.state
+        );
+
+        // The amount of currently available capacity on the connection
+        let conn_available = self.flow.available().as_size();
+
+        // First check if capacity is immediately available
+        if conn_available > 0 {
+            // The amount of capacity to assign to the stream
+            // TODO: Should prioritization factor into this?
+            let assign = cmp::min(conn_available, additional);
+
+            tracing::trace!(capacity = assign, "assigning");
+
+            // Assign the capacity to the stream
+            stream.assign_capacity(assign, self.max_buffer_size);
+
+            // Claim the capacity from the connection
+            // TODO: proper error handling
+            let _res = self.flow.claim_capacity(assign);
+            debug_assert!(_res.is_ok());
+        }
+
+        tracing::trace!(
+            available = %stream.send_flow.available(),
+            requested = stream.requested_send_capacity,
+            buffered = stream.buffered_send_data,
+            has_unavailable = %stream.send_flow.has_unavailable()
+        );
+
+        if stream.send_flow.available() < stream.requested_send_capacity as usize
+            && stream.send_flow.has_unavailable()
+        {
+            // The stream requires additional capacity and the stream's
+            // window has available capacity, but the connection window
+            // does not.
+            //
+            // In this case, the stream needs to be queued up for when the
+            // connection has more capacity.
+            self.pending_capacity.push(stream);
+        }
+
+        // If data is buffered and the stream is send ready, then
+        // schedule the stream for execution
+        if stream.buffered_send_data > 0 && stream.is_send_ready() {
+            // TODO: This assertion isn't *exactly* correct. There can still be
+            // buffered send data while the stream's pending send queue is
+            // empty. This can happen when a large data frame is in the process
+            // of being **partially** sent. Once the window has been sent, the
+            // data frame will be returned to the prioritization layer to be
+            // re-scheduled.
+            //
+            // That said, it would be nice to figure out how to make this
+            // assertion correctly.
+            //
+            // debug_assert!(!stream.pending_send.is_empty());
+
+            self.pending_send.push(stream);
+        }
+    }
+
+    pub fn poll_complete<T, B>(
+        &mut self,
+        cx: &mut Context,
+        buffer: &mut Buffer<Frame<B>>,
+        store: &mut Store,
+        counts: &mut Counts,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        // Ensure codec is ready
+        ready!(dst.poll_ready(cx))?;
+
+        // Reclaim any frame that has previously been written
+        self.reclaim_frame(buffer, store, dst);
+
+        // The max frame length
+        let max_frame_len = dst.max_send_frame_size();
+
+        tracing::trace!("poll_complete");
+
+        loop {
+            if let Some(mut stream) = self.pop_pending_open(store, counts) {
+                self.pending_send.push_front(&mut stream);
+                self.try_assign_capacity(&mut stream);
+            }
+
+            match self.pop_frame(buffer, store, max_frame_len, counts) {
+                Some(frame) => {
+                    tracing::trace!(?frame, "writing");
+
+                    debug_assert_eq!(self.in_flight_data_frame, InFlightData::Nothing);
+                    if let Frame::Data(ref frame) = frame {
+                        self.in_flight_data_frame = InFlightData::DataFrame(frame.payload().stream);
+                    }
+                    dst.buffer(frame).expect("invalid frame");
+
+                    // Ensure the codec is ready to try the loop again.
+                    ready!(dst.poll_ready(cx))?;
+
+                    // Because, always try to reclaim...
+                    self.reclaim_frame(buffer, store, dst);
+                }
+                None => {
+                    // Try to flush the codec.
+                    ready!(dst.flush(cx))?;
+
+                    // This might release a data frame...
+                    if !self.reclaim_frame(buffer, store, dst) {
+                        return Poll::Ready(Ok(()));
+                    }
+
+
+        let mut stream = me.store.resolve(self.opaque.key);
+
+        me.actions.send.poll_capacity(cx, &mut stream)
+    }
+
+    /// Request to be notified for if a `RST_STREAM` is received for this stream.
+    pub(crate) fn poll_reset(
+        &mut self,
+        cx: &Context,
+        mode: proto::PollReset,
+    ) -> Poll<Result<Reason, crate::Error>> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.opaque.key);
+
+        me.actions.send.poll_reset(cx, &mut stream, mode)
+    }
+
+    pub fn clone_to_opaque(&self) -> OpaqueStreamRef {
+        self.opaque.clone()
+    }
+
+    pub fn stream_id(&self) -> StreamId {
+        self.opaque.stream_id()
+    }
+}
+
+impl<B> Clone for StreamRef<B> {
+    fn clone(&self) -> Self {
+        StreamRef {
+            opaque: self.opaque.clone(),
+            send_buffer: self.send_buffer.clone(),
+        }
+    }
+}
+
+// ===== impl OpaqueStreamRef =====
+
+impl OpaqueStreamRef {
+    fn new(inner: Arc<Mutex<Inner>>, stream: &mut store::Ptr) -> OpaqueStreamRef {
+        stream.ref_inc();
+        OpaqueStreamRef {
+            inner,
+            key: stream.key(),
+        }
+    }
+    /// Called by a client to check for a received response.
+    pub fn poll_response(&mut self, cx: &Context) -> Poll<Result<Response<()>, proto::Error>> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.key);
+
+        me.actions.recv.poll_response(cx, &mut stream)
+            .map_ok(|w| w as usize)
+            .map_err(Into::into)
+    }
+
+    /// Sends a single data frame to the remote peer.
+    ///
+    /// This function may be called repeatedly as long as `end_of_stream` is set
+    /// to `false`. Setting `end_of_stream` to `true` sets the end stream flag
+    /// on the data frame. Any further calls to `send_data` or `send_trailers`
+    /// will return an [`Error`].
+    ///
+    /// `send_data` can be called without reserving capacity. In this case, the
+    /// data is buffered and the capacity is implicitly requested. Once the
+    /// capacity becomes available, the data is flushed to the connection.
+    /// However, this buffering is unbounded. As such, sending large amounts of
+    /// data without reserving capacity before hand could result in large
+    /// amounts of data being buffered in memory.
+    ///
+    /// [`Error`]: struct.Error.html
+    pub fn send_data(&mut self, data: B, end_of_stream: bool) -> Result<(), crate::Error> {
+        self.inner
+            .send_data(data, end_of_stream)
+            .map_err(Into::into)
+    }
+
+    /// Sends trailers to the remote peer.
+    ///
+    /// Sending trailers implicitly closes the send stream. Once the send stream
+    /// is closed, no more data can be sent.
+    pub fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), crate::Error> {
+        self.inner.send_trailers(trailers).map_err(Into::into)
+    }
+
+    /// Resets the stream.
+    ///
+    /// This cancels the request / response exchange. If the response has not
+    /// yet been received, the associated `ResponseFuture` will return an
+    /// [`Error`] to reflect the canceled exchange.
+    ///
+    /// [`Error`]: struct.Error.html
+    pub fn send_reset(&mut self, reason: Reason) {
+        self.inner.send_reset(reason)
+    }
+
+    /// Polls to be notified when the client resets this stream.
+    ///
+    /// If stream is still open, this returns `Poll::Pending`, and
+    /// registers the task to be notified if a `RST_STREAM` is received.
+    ///
+    /// If a `RST_STREAM` frame is received for this stream, calling this
+    /// method will yield the `Reason` for the reset.
+    ///
+    /// # Error
+    ///
+    /// If connection sees an error, this returns that error instead of a
+    /// `Reason`.
+    pub fn poll_reset(&mut self, cx: &mut Context) -> Poll<Result<Reason, crate::Error>> {
+        self.inner.poll_reset(cx, proto::PollReset::Streaming)
+    }
+
+    /// Returns the stream ID of this `SendStream`.
+    ///
+    /// # Panics
+    ///
+    /// If the lock on the stream store has been poisoned.
+    pub fn stream_id(&self) -> StreamId {
+        // queued data), it gets sent out immediately even if there is no
+        // available send window.
+        //
+        // Sending out zero length data frames can be done to signal
+        // end-of-stream.
+        //
+        if stream.send_flow.available() > 0 || stream.buffered_send_data == 0 {
+            // The stream currently has capacity to send the data frame, so
+            // queue it up and notify the connection task.
+            self.queue_frame(frame.into(), buffer, stream, task);
+        } else {
+            // The stream has no capacity to send the frame now, save it but
+            // don't notify the connection task. Once additional capacity
+            // becomes available, the frame will be flushed.
+            stream.pending_send.push_back(buffer, frame.into());
+        }
+
+        Ok(())
+    }
+
+    /// Request capacity to send data
+    pub fn reserve_capacity(
+        &mut self,
+        capacity: WindowSize,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) {
+        let span = tracing::trace_span!(
+            "reserve_capacity",
+            ?stream.id,
+            requested = capacity,
+            effective = (capacity as usize) + stream.buffered_send_data,
+            curr = stream.requested_send_capacity
+        );
+        let _e = span.enter();
+
+        // Actual capacity is `capacity` + the current amount of buffered data.
+        // If it were less, then we could never send out the buffered data.
+        let capacity = (capacity as usize) + stream.buffered_send_data;
+
+        match capacity.cmp(&(stream.requested_send_capacity as usize)) {
+            Ordering::Equal => {
+                // Nothing to do
+            }
+            Ordering::Less => {
+                // Update the target requested capacity
+                stream.requested_send_capacity = capacity as WindowSize;
+
+                // Currently available capacity assigned to the stream
+                let available = stream.send_flow.available().as_size();
+
+                // If the stream has more assigned capacity than requested, reclaim
+                // some for the connection
+                if available as usize > capacity {
+                    let diff = available - capacity as WindowSize;
+
+                    // TODO: proper error handling
+                    let _res = stream.send_flow.claim_capacity(diff);
+                    debug_assert!(_res.is_ok());
+
+                    self.assign_connection_capacity(diff, stream, counts);
+                }
+            }
+            Ordering::Greater => {
+                // If trying to *add* capacity, but the stream send side is closed,
+                // there's nothing to be done.
+                if stream.state.is_send_closed() {
+                    return;
+                }
+
+                // Update the target requested capacity
+                stream.requested_send_capacity =
+                    cmp::min(capacity, WindowSize::MAX as usize) as WindowSize;
+
+                // Try to assign additional capacity to the stream. If none is
+                // currently available, the stream will be queued to receive some
+                // when more becomes available.
+                self.try_assign_capacity(stream);
+            }
+        }
+    }
+
+    pub fn recv_stream_window_update(
+        &mut self,
+        inc: WindowSize,
+        stream: &mut store::Ptr,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        self.prioritize
+            .poll_complete(cx, buffer, store, counts, dst)
+    }
+
+    /// Request capacity to send data
+    pub fn reserve_capacity(
+        &mut self,
+        capacity: WindowSize,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) {
+        self.prioritize.reserve_capacity(capacity, stream, counts)
+    }
+
+    pub fn poll_capacity(
+        &mut self,
+        cx: &Context,
+        stream: &mut store::Ptr,
+    ) -> Poll<Option<Result<WindowSize, UserError>>> {
+        if !stream.state.is_send_streaming() {
+            return Poll::Ready(None);
+        }
+
+        if !stream.send_capacity_inc {
+            stream.wait_send(cx);
+            return Poll::Pending;
+        }
+
+        stream.send_capacity_inc = false;
+
+        Poll::Ready(Some(Ok(self.capacity(stream))))
+    }
+
+    /// Current available stream send capacity
+    pub fn capacity(&self, stream: &mut store::Ptr) -> WindowSize {
+        stream.capacity(self.prioritize.max_buffer_size())
+    }
+
+    pub fn poll_reset(
+        &self,
+        cx: &Context,
+        stream: &mut Stream,
+        mode: PollReset,
+    ) -> Poll<Result<Reason, crate::Error>> {
+        match stream.state.ensure_reason(mode)? {
+            Some(reason) => Poll::Ready(Ok(reason)),
+            None => {
+                stream.wait_send(cx);
+                Poll::Pending
+            }
+        }
+    }
+
+    pub fn recv_connection_window_update(
+        &mut self,
+        frame: frame::WindowUpdate,
+        store: &mut Store,
+        counts: &mut Counts,
+    ) -> Result<(), Reason> {
+        self.prioritize
+            .recv_connection_window_update(frame.size_increment(), store, counts)
+    }
+
+    pub fn recv_stream_window_update<B>(
+        &mut self,
+        sz: WindowSize,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), Reason> {
+        if let Err(e) = self.prioritize.recv_stream_window_update(sz, stream) {
+            tracing::debug!("recv_stream_window_update !!; err={:?}", e);
+
+            self.send_reset(
+                Reason::FLOW_CONTROL_ERROR,
+                Initiator::Library,
+                buffer,
+                stream,
+                counts,
+                task,
+            );
+
+            return Err(e);
+        }
+10.796116666666668 minutes used of 15.0

@@ -1,0 +1,489 @@
+            // capacity, and so we shouldn't "transition" on it, but just evict
+            // it and continue the loop.
+            if !(stream.state.is_send_streaming() || stream.buffered_send_data > 0) {
+                continue;
+            }
+
+            counts.transition(stream, |_, stream| {
+                // Try to assign capacity to the stream. This will also re-queue the
+                // stream if there isn't enough connection level capacity to fulfill
+                // the capacity request.
+                self.try_assign_capacity(stream);
+            })
+        }
+    }
+
+    /// Request capacity to send data
+    fn try_assign_capacity(&mut self, stream: &mut store::Ptr) {
+        let total_requested = stream.requested_send_capacity;
+
+        // Total requested should never go below actual assigned
+        // (Note: the window size can go lower than assigned)
+        debug_assert!(stream.send_flow.available() <= total_requested as usize);
+
+        // The amount of additional capacity that the stream requests.
+        // Don't assign more than the window has available!
+        let additional = cmp::min(
+            total_requested - stream.send_flow.available().as_size(),
+            // Can't assign more than what is available
+            stream.send_flow.window_size() - stream.send_flow.available().as_size(),
+        );
+        let span = tracing::trace_span!("try_assign_capacity", ?stream.id);
+        let _e = span.enter();
+        tracing::trace!(
+            requested = total_requested,
+            additional,
+            buffered = stream.buffered_send_data,
+            window = stream.send_flow.window_size(),
+            conn = %self.flow.available()
+        );
+
+        if additional == 0 {
+            // Nothing more to do
+            return;
+        }
+
+        // If the stream has requested capacity, then it must be in the
+        // streaming state (more data could be sent) or there is buffered data
+        // waiting to be sent.
+        debug_assert!(
+            stream.state.is_send_streaming() || stream.buffered_send_data > 0,
+            "state={:?}",
+            stream.state
+        );
+
+        // The amount of currently available capacity on the connection
+        let conn_available = self.flow.available().as_size();
+
+        // First check if capacity is immediately available
+        if conn_available > 0 {
+            // The amount of capacity to assign to the stream
+            // TODO: Should prioritization factor into this?
+            let assign = cmp::min(conn_available, additional);
+
+            tracing::trace!(capacity = assign, "assigning");
+
+            // Assign the capacity to the stream
+            stream.assign_capacity(assign, self.max_buffer_size);
+
+            // Claim the capacity from the connection
+            // TODO: proper error handling
+            let _res = self.flow.claim_capacity(assign);
+            debug_assert!(_res.is_ok());
+        }
+
+        tracing::trace!(
+            available = %stream.send_flow.available(),
+            requested = stream.requested_send_capacity,
+            buffered = stream.buffered_send_data,
+            has_unavailable = %stream.send_flow.has_unavailable()
+        );
+
+        if stream.send_flow.available() < stream.requested_send_capacity as usize
+            && stream.send_flow.has_unavailable()
+        {
+            // The stream requires additional capacity and the stream's
+            // window has available capacity, but the connection window
+            // does not.
+            //
+            // In this case, the stream needs to be queued up for when the
+            // connection has more capacity.
+            self.pending_capacity.push(stream);
+        }
+
+        // If data is buffered and the stream is send ready, then
+        // schedule the stream for execution
+        if stream.buffered_send_data > 0 && stream.is_send_ready() {
+            // TODO: This assertion isn't *exactly* correct. There can still be
+            // buffered send data while the stream's pending send queue is
+            // empty. This can happen when a large data frame is in the process
+            // of being **partially** sent. Once the window has been sent, the
+            // data frame will be returned to the prioritization layer to be
+            // re-scheduled.
+            //
+            // That said, it would be nice to figure out how to make this
+            // assertion correctly.
+            //
+            // debug_assert!(!stream.pending_send.is_empty());
+
+            self.pending_send.push(stream);
+        }
+    }
+
+    pub fn poll_complete<T, B>(
+        &mut self,
+        cx: &mut Context,
+        buffer: &mut Buffer<Frame<B>>,
+        store: &mut Store,
+        counts: &mut Counts,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> Poll<io::Result<()>>
+    where
+
+    pub fn apply_local_settings(&mut self, frame: &frame::Settings) -> Result<(), Error> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        me.actions.recv.apply_local_settings(frame, &mut me.store)
+    }
+
+    pub fn send_request(
+        &mut self,
+        mut request: Request<()>,
+        end_of_stream: bool,
+        pending: Option<&OpaqueStreamRef>,
+    ) -> Result<(StreamRef<B>, bool), SendError> {
+        use super::stream::ContentLength;
+        use http::Method;
+
+        let protocol = request.extensions_mut().remove::<Protocol>();
+
+        // Clear before taking lock, incase extensions contain a StreamRef.
+        request.extensions_mut().clear();
+
+        // TODO: There is a hazard with assigning a stream ID before the
+        // prioritize layer. If prioritization reorders new streams, this
+        // implicitly closes the earlier stream IDs.
+        //
+        // See: hyperium/h2#11
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut send_buffer = self.send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        me.actions.ensure_no_conn_error()?;
+        me.actions.send.ensure_next_stream_id()?;
+
+        // The `pending` argument is provided by the `Client`, and holds
+        // a store `Key` of a `Stream` that may have been not been opened
+        // yet.
+        //
+        // If that stream is still pending, the Client isn't allowed to
+        // queue up another pending stream. They should use `poll_ready`.
+        if let Some(stream) = pending {
+            if me.store.resolve(stream.key).is_pending_open {
+                return Err(UserError::Rejected.into());
+            }
+        }
+
+        if me.counts.peer().is_server() {
+            // Servers cannot open streams. PushPromise must first be reserved.
+            return Err(UserError::UnexpectedFrameType.into());
+        }
+
+        let stream_id = me.actions.send.open()?;
+
+        let mut stream = Stream::new(
+            stream_id,
+            me.actions.send.init_window_sz(),
+            me.actions.recv.init_window_sz(),
+        );
+
+        if *request.method() == Method::HEAD {
+            stream.content_length = ContentLength::Head;
+        }
+
+        // Convert the message
+        let headers =
+            client::Peer::convert_send_message(stream_id, request, protocol, end_of_stream)?;
+
+        let mut stream = me.store.insert(stream.id, stream);
+
+        let sent = me.actions.send.send_headers(
+            headers,
+            send_buffer,
+            &mut stream,
+            &mut me.counts,
+            &mut me.actions.task,
+        );
+
+        // send_headers can return a UserError, if it does,
+        // we should forget about this stream.
+        if let Err(err) = sent {
+            stream.unlink();
+            stream.remove();
+            return Err(err.into());
+        }
+
+        // Given that the stream has been initialized, it should not be in the
+        // closed state.
+        debug_assert!(!stream.state.is_closed());
+
+        // TODO: ideally, OpaqueStreamRefs::new would do this, but we're holding
+        // the lock, so it can't.
+        me.refs += 1;
+
+        let is_full = me.counts.next_send_stream_will_reach_capacity();
+        Ok((
+            StreamRef {
+                opaque: OpaqueStreamRef::new(self.inner.clone(), &mut stream),
+                send_buffer: self.send_buffer.clone(),
+            },
+            is_full,
+        ))
+    }
+
+    pub(crate) fn is_extended_connect_protocol_enabled(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .actions
+            .send
+            .is_extended_connect_protocol_enabled()
+    }
+
+    pub fn current_max_send_streams(&self) -> usize {
+        let me = self.inner.lock().unwrap();
+        me.counts.max_send_streams()
+    }
+
+    pub fn current_max_recv_streams(&self) -> usize {
+        let me = self.inner.lock().unwrap();
+        match stream.state.ensure_reason(mode)? {
+            Some(reason) => Poll::Ready(Ok(reason)),
+            None => {
+                stream.wait_send(cx);
+                Poll::Pending
+            }
+        }
+    }
+
+    pub fn recv_connection_window_update(
+        &mut self,
+        frame: frame::WindowUpdate,
+        store: &mut Store,
+        counts: &mut Counts,
+    ) -> Result<(), Reason> {
+        self.prioritize
+            .recv_connection_window_update(frame.size_increment(), store, counts)
+    }
+
+    pub fn recv_stream_window_update<B>(
+        &mut self,
+        sz: WindowSize,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), Reason> {
+        if let Err(e) = self.prioritize.recv_stream_window_update(sz, stream) {
+            tracing::debug!("recv_stream_window_update !!; err={:?}", e);
+
+            self.send_reset(
+                Reason::FLOW_CONTROL_ERROR,
+                Initiator::Library,
+                buffer,
+                stream,
+                counts,
+                task,
+            );
+
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn recv_go_away(&mut self, last_stream_id: StreamId) -> Result<(), Error> {
+        if last_stream_id > self.max_stream_id {
+            // The remote endpoint sent a `GOAWAY` frame indicating a stream
+            // that we never sent, or that we have already terminated on account
+            // of previous `GOAWAY` frame. In either case, that is illegal.
+            // (When sending multiple `GOAWAY`s, "Endpoints MUST NOT increase
+            // the value they send in the last stream identifier, since the
+            // peers might already have retried unprocessed requests on another
+            // connection.")
+            proto_err!(conn:
+                "recv_go_away: last_stream_id ({:?}) > max_stream_id ({:?})",
+                last_stream_id, self.max_stream_id,
+            );
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+        }
+
+        self.max_stream_id = last_stream_id;
+        Ok(())
+    }
+
+    pub fn handle_error<B>(
+        &mut self,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) {
+        // Clear all pending outbound frames
+        self.prioritize.clear_queue(buffer, stream);
+        self.prioritize.reclaim_all_capacity(stream, counts);
+    }
+
+    pub fn apply_remote_settings<B>(
+        &mut self,
+        settings: &frame::Settings,
+        buffer: &mut Buffer<Frame<B>>,
+        store: &mut Store,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), Error> {
+        if let Some(val) = settings.is_extended_connect_protocol_enabled() {
+            self.is_extended_connect_protocol_enabled = val;
+        }
+
+        // Applies an update to the remote endpoint's initial window size.
+        //
+        // Per RFC 7540 §6.9.2:
+use crate::proto::Error;
+
+use std::{error, fmt, io};
+
+/// Errors caused by sending a message
+#[derive(Debug)]
+pub enum SendError {
+    Connection(Error),
+    User(UserError),
+}
+
+/// Errors caused by users of the library
+#[derive(Debug)]
+pub enum UserError {
+    /// The stream ID is no longer accepting frames.
+    InactiveStreamId,
+
+    /// The stream is not currently expecting a frame of this type.
+    UnexpectedFrameType,
+
+    /// The payload size is too big
+    PayloadTooBig,
+
+    /// The application attempted to initiate too many streams to remote.
+    Rejected,
+
+    /// The released capacity is larger than claimed capacity.
+    ReleaseCapacityTooBig,
+
+    /// The stream ID space is overflowed.
+    ///
+    /// A new connection is needed.
+    OverflowedStreamId,
+
+    /// Illegal headers, such as connection-specific headers.
+    MalformedHeaders,
+
+    /// Request submitted with relative URI.
+    MissingUriSchemeAndAuthority,
+
+    /// Calls `SendResponse::poll_reset` after having called `send_response`.
+    PollResetAfterSendResponse,
+
+    /// Calls `PingPong::send_ping` before receiving a pong.
+    SendPingWhilePending,
+
+    /// Tries to update local SETTINGS while ACK has not been received.
+    SendSettingsWhilePending,
+
+    /// Tries to send push promise to peer who has disabled server push
+    PeerDisabledServerPush,
+}
+
+// ===== impl SendError =====
+
+impl error::Error for SendError {}
+
+impl fmt::Display for SendError {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Self::Connection(ref e) => e.fmt(fmt),
+            Self::User(ref e) => e.fmt(fmt),
+        }
+    }
+}
+
+impl From<io::Error> for SendError {
+    fn from(src: io::Error) -> Self {
+        Self::Connection(src.into())
+    }
+}
+
+impl From<UserError> for SendError {
+    fn from(src: UserError) -> Self {
+        SendError::User(src)
+    }
+}
+
+// ===== impl UserError =====
+
+impl error::Error for UserError {}
+
+impl fmt::Display for UserError {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        use self::UserError::*;
+
+        fmt.write_str(match *self {
+            InactiveStreamId => "inactive stream",
+            UnexpectedFrameType => "unexpected frame type",
+            PayloadTooBig => "payload too big",
+            Rejected => "rejected",
+            ReleaseCapacityTooBig => "release capacity too big",
+            OverflowedStreamId => "stream ID overflowed",
+            MalformedHeaders => "malformed headers",
+            MissingUriSchemeAndAuthority => "request URI missing scheme and authority",
+            PollResetAfterSendResponse => "poll_reset after send_response is illegal",
+            SendPingWhilePending => "send_ping before received previous pong",
+            SendSettingsWhilePending => "sending SETTINGS before received previous ACK",
+            PeerDisabledServerPush => "sending PUSH_PROMISE to peer who disabled server push",
+        })
+    }
+}
+22:    // At this point, the connection should be closed
+91:    // The connection errors
+224:        // we send a simple req here just to drive the connection so we can
+243:        // as long as we let the connection internals tick
+332:        // we send a simple req here just to drive the connection so we can
+375:async fn send_request_poll_ready_when_connection_error() {
+406:        // we send a simple req here just to drive the connection so we can
+426:        // as long as we let the connection internals tick
+589:async fn http_2_connect_request_omit_scheme_and_path_fields() {
+632:async fn request_with_connection_headers() {
+641:        // goaway is required to make sure the connection closes because
+647:        ("connection", "foo"),
+649:        ("proxy-connection", "bar"),
+675:async fn connection_close_notifies_response_future() {
+714:async fn connection_close_notifies_client_poll_ready() {
+754:            "connection closed because of a broken pipe"
+762:async fn sending_request_on_closed_connection() {
+809:        let msg = "connection error detected: unspecific protocol error detected";
+923:        // Because all active requests are finished, connection should shutdown
+925:        // count towards concurrency limit), then connection will not send
+1073:        // Don't close the connection until the client is done doing its
+1289:        // Use up most of the connection window.
+1296:            // Use up the remainder of the connection window.
+1298:            // Queue up for more connection window.
+1327:                .field("content-length", 100),
+1339:            h2.await.expect("connection failed");
+1355:async fn reject_none_zero_content_length_header_with_end_stream() {
+1371:                .field("content-length", 100)
+1383:            h2.await.expect("connection failed");
+1412:        srv.send_frame(frames::headers(1).response(200).field("content-length", 2))
+1423:            h2.await.expect("connection failed");
+1440:async fn informational_while_local_streaming() {
+1450:        srv.send_frame(frames::headers(1).response(200).field("content-length", 2))
+1462:            h2.await.expect("connection failed");
+1484:async fn extended_connect_protocol_disabled_by_default() {
+1504:        // we send a simple req here just to drive the connection so we can
+1511:        assert!(!client.is_extended_connect_protocol_enabled());
+1518:async fn extended_connect_protocol_enabled_during_handshake() {
+1524:            .assert_client_handshake_with_settings(frames::settings().enable_connect_protocol(1))
+1540:        // we send a simple req here just to drive the connection so we can
+1546:        assert!(client.is_extended_connect_protocol_enabled());
+1553:async fn invalid_connect_protocol_enabled_setting() {
+1560:        srv.send(frames::settings().enable_connect_protocol(2).into())
+1582:        // we send a simple req here just to drive the connection so we can
+1595:async fn extended_connect_request() {
+1602:            .assert_client_handshake_with_settings(frames::settings().enable_connect_protocol(1))
+1625:        let request = Request::connect("http://bread/baguette")
+1826:        // Handle the client's connection preface
+1876:        // Handle the client's connection preface
+1916:// If the server has not sent a go_away message before dropping the connection
+1919:async fn server_drop_connection_unexpectedly_return_unexpected_eof_err() {
+1959:async fn server_drop_connection_after_go_away() {
+src/hpack/header.rs:283:        unsafe { std::str::from_utf8_unchecked(self.0.as_ref()) }
+src/lib.rs:85:    clippy::undocumented_unsafe_blocks

@@ -1,0 +1,1576 @@
+use super::{
+    store, Buffer, Codec, Config, Counts, Frame, Prioritize, Prioritized, Store, Stream, StreamId,
+    StreamIdOverflow, WindowSize,
+};
+use crate::codec::UserError;
+use crate::frame::{self, Reason};
+use crate::proto::{self, Error, Initiator};
+
+use bytes::Buf;
+use tokio::io::AsyncWrite;
+
+use std::cmp::Ordering;
+use std::io;
+use std::task::{Context, Poll, Waker};
+
+/// Manages state transitions related to outbound frames.
+#[derive(Debug)]
+pub(super) struct Send {
+    /// Stream identifier to use for next initialized stream.
+    next_stream_id: Result<StreamId, StreamIdOverflow>,
+
+    /// Any streams with a higher ID are ignored.
+    ///
+    /// This starts as MAX, but is lowered when a GOAWAY is received.
+    ///
+    /// > After sending a GOAWAY frame, the sender can discard frames for
+    /// > streams initiated by the receiver with identifiers higher than
+    /// > the identified last stream.
+    max_stream_id: StreamId,
+
+    /// Initial window size of locally initiated streams
+    init_window_sz: WindowSize,
+
+    /// Prioritization layer
+    prioritize: Prioritize,
+
+    is_push_enabled: bool,
+
+    /// If extended connect protocol is enabled.
+    is_extended_connect_protocol_enabled: bool,
+}
+
+/// A value to detect which public API has called `poll_reset`.
+#[derive(Debug)]
+pub(crate) enum PollReset {
+    AwaitingHeaders,
+    Streaming,
+}
+
+impl Send {
+    /// Create a new `Send`
+    pub fn new(config: &Config) -> Self {
+        Send {
+            init_window_sz: config.remote_init_window_sz,
+            max_stream_id: StreamId::MAX,
+            next_stream_id: Ok(config.local_next_stream_id),
+            prioritize: Prioritize::new(config),
+            is_push_enabled: true,
+            is_extended_connect_protocol_enabled: false,
+        }
+    }
+
+    /// Returns the initial send window size
+    pub fn init_window_sz(&self) -> WindowSize {
+        self.init_window_sz
+    }
+
+    pub fn open(&mut self) -> Result<StreamId, UserError> {
+        let stream_id = self.ensure_next_stream_id()?;
+        self.next_stream_id = stream_id.next_id();
+        Ok(stream_id)
+    }
+
+    pub fn reserve_local(&mut self) -> Result<StreamId, UserError> {
+        let stream_id = self.ensure_next_stream_id()?;
+        self.next_stream_id = stream_id.next_id();
+        Ok(stream_id)
+    }
+
+    fn check_headers(fields: &http::HeaderMap) -> Result<(), UserError> {
+        // 8.1.2.2. Connection-Specific Header Fields
+        if fields.contains_key(http::header::CONNECTION)
+            || fields.contains_key(http::header::TRANSFER_ENCODING)
+            || fields.contains_key(http::header::UPGRADE)
+            || fields.contains_key("keep-alive")
+            || fields.contains_key("proxy-connection")
+        {
+            tracing::debug!("illegal connection-specific headers found");
+            return Err(UserError::MalformedHeaders);
+        } else if let Some(te) = fields.get(http::header::TE) {
+            if te != "trailers" {
+                tracing::debug!("illegal connection-specific headers found");
+                return Err(UserError::MalformedHeaders);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn send_push_promise<B>(
+        &mut self,
+        frame: frame::PushPromise,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError> {
+        if !self.is_push_enabled {
+            return Err(UserError::PeerDisabledServerPush);
+        }
+
+        tracing::trace!(
+            "send_push_promise; frame={:?}; init_window={:?}",
+            frame,
+            self.init_window_sz
+        );
+
+        Self::check_headers(frame.fields())?;
+
+        // Queue the frame for sending
+        self.prioritize
+            .queue_frame(frame.into(), buffer, stream, task);
+
+        Ok(())
+    }
+
+    pub fn send_headers<B>(
+        &mut self,
+        frame: frame::Headers,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError> {
+        tracing::trace!(
+            "send_headers; frame={:?}; init_window={:?}",
+            frame,
+            self.init_window_sz
+        );
+
+        Self::check_headers(frame.fields())?;
+
+        let end_stream = frame.is_end_stream();
+
+        // Update the state
+        stream.state.send_open(end_stream)?;
+
+        let mut pending_open = false;
+        if counts.peer().is_local_init(frame.stream_id()) && !stream.is_pending_push {
+            self.prioritize.queue_open(stream);
+            pending_open = true;
+        }
+
+        // Queue the frame for sending
+        //
+        // This call expects that, since new streams are in the open queue, new
+        // streams won't be pushed on pending_send.
+        self.prioritize
+            .queue_frame(frame.into(), buffer, stream, task);
+
+        // Need to notify the connection when pushing onto pending_open since
+        // queue_frame only notifies for pending_send.
+        if pending_open {
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Send an explicit RST_STREAM frame
+    pub fn send_reset<B>(
+        &mut self,
+        reason: Reason,
+        initiator: Initiator,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) {
+        let is_reset = stream.state.is_reset();
+        let is_closed = stream.state.is_closed();
+        let is_empty = stream.pending_send.is_empty();
+        let stream_id = stream.id;
+
+        tracing::trace!(
+            "send_reset(..., reason={:?}, initiator={:?}, stream={:?}, ..., \
+             is_reset={:?}; is_closed={:?}; pending_send.is_empty={:?}; \
+             state={:?} \
+             ",
+            reason,
+            initiator,
+            stream_id,
+            is_reset,
+            is_closed,
+            is_empty,
+            stream.state
+        );
+
+        if is_reset {
+            // Don't double reset
+            tracing::trace!(
+                " -> not sending RST_STREAM ({:?} is already reset)",
+                stream_id
+            );
+            return;
+        }
+
+        // Transition the state to reset no matter what.
+        stream.set_reset(reason, initiator);
+
+        // If closed AND the send queue is flushed, then the stream cannot be
+        // reset explicitly, either. Implicit resets can still be queued.
+        if is_closed && is_empty {
+            tracing::trace!(
+                " -> not sending explicit RST_STREAM ({:?} was closed \
+                 and send queue was flushed)",
+                stream_id
+            );
+            return;
+        }
+
+        // Clear all pending outbound frames.
+        // Note that we don't call `self.recv_err` because we want to enqueue
+        // the reset frame before transitioning the stream inside
+        // `reclaim_all_capacity`.
+        self.prioritize.clear_queue(buffer, stream);
+
+        let frame = frame::Reset::new(stream.id, reason);
+
+        tracing::trace!("send_reset -- queueing; frame={:?}", frame);
+        self.prioritize
+            .queue_frame(frame.into(), buffer, stream, task);
+        self.prioritize.reclaim_all_capacity(stream, counts);
+    }
+
+    pub fn schedule_implicit_reset(
+        &mut self,
+        stream: &mut store::Ptr,
+        reason: Reason,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) {
+        if stream.state.is_closed() {
+            // Stream is already closed, nothing more to do
+            return;
+        }
+
+        stream.state.set_scheduled_reset(reason);
+
+        self.prioritize.reclaim_reserved_capacity(stream, counts);
+use super::store::Resolve;
+use super::*;
+
+use crate::frame::Reason;
+
+use crate::codec::UserError;
+use crate::codec::UserError::*;
+
+use bytes::buf::Take;
+use std::{
+    cmp::{self, Ordering},
+    fmt, io, mem,
+    task::{Context, Poll, Waker},
+};
+
+/// # Warning
+///
+/// Queued streams are ordered by stream ID, as we need to ensure that
+/// lower-numbered streams are sent headers before higher-numbered ones.
+/// This is because "idle" stream IDs – those which have been initiated but
+/// have yet to receive frames – will be implicitly closed on receipt of a
+/// frame on a higher stream ID. If these queues was not ordered by stream
+/// IDs, some mechanism would be necessary to ensure that the lowest-numbered]
+/// idle stream is opened first.
+#[derive(Debug)]
+pub(super) struct Prioritize {
+    /// Queue of streams waiting for socket capacity to send a frame.
+    pending_send: store::Queue<stream::NextSend>,
+
+    /// Queue of streams waiting for window capacity to produce data.
+    pending_capacity: store::Queue<stream::NextSendCapacity>,
+
+    /// Streams waiting for capacity due to max concurrency
+    ///
+    /// The `SendRequest` handle is `Clone`. This enables initiating requests
+    /// from many tasks. However, offering this capability while supporting
+    /// backpressure at some level is tricky. If there are many `SendRequest`
+    /// handles and a single stream becomes available, which handle gets
+    /// assigned that stream? Maybe that handle is no longer ready to send a
+    /// request.
+    ///
+    /// The strategy used is to allow each `SendRequest` handle one buffered
+    /// request. A `SendRequest` handle is ready to send a request if it has no
+    /// associated buffered requests. This is the same strategy as `mpsc` in the
+    /// futures library.
+    pending_open: store::Queue<stream::NextOpen>,
+
+    /// Connection level flow control governing sent data
+    flow: FlowControl,
+
+    /// Stream ID of the last stream opened.
+    last_opened_id: StreamId,
+
+    /// What `DATA` frame is currently being sent in the codec.
+    in_flight_data_frame: InFlightData,
+
+    /// The maximum amount of bytes a stream should buffer.
+    max_buffer_size: usize,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum InFlightData {
+    /// There is no `DATA` frame in flight.
+    Nothing,
+    /// There is a `DATA` frame in flight belonging to the given stream.
+    DataFrame(store::Key),
+    /// There was a `DATA` frame, but the stream's queue was since cleared.
+    Drop,
+}
+
+pub(crate) struct Prioritized<B> {
+    // The buffer
+    inner: Take<B>,
+
+    end_of_stream: bool,
+
+    // The stream that this is associated with
+    stream: store::Key,
+}
+
+// ===== impl Prioritize =====
+
+impl Prioritize {
+    pub fn new(config: &Config) -> Prioritize {
+        let mut flow = FlowControl::new();
+
+        flow.inc_window(config.remote_init_window_sz)
+            .expect("invalid initial window size");
+
+        // TODO: proper error handling
+        let _res = flow.assign_capacity(config.remote_init_window_sz);
+        debug_assert!(_res.is_ok());
+
+        tracing::trace!("Prioritize::new; flow={:?}", flow);
+
+        Prioritize {
+            pending_send: store::Queue::new(),
+            pending_capacity: store::Queue::new(),
+            pending_open: store::Queue::new(),
+            flow,
+            last_opened_id: StreamId::ZERO,
+            in_flight_data_frame: InFlightData::Nothing,
+            max_buffer_size: config.local_max_buffer_size,
+        }
+    }
+
+    pub(crate) fn max_buffer_size(&self) -> usize {
+        self.max_buffer_size
+    }
+
+    /// Queue a frame to be sent to the remote
+    pub fn queue_frame<B>(
+        &mut self,
+        frame: Frame<B>,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        task: &mut Option<Waker>,
+    ) {
+        let span = tracing::trace_span!("Prioritize::queue_frame", ?stream.id);
+        let _e = span.enter();
+        // Queue the frame in the buffer
+        stream.pending_send.push_back(buffer, frame);
+        self.schedule_send(stream, task);
+    }
+
+    pub fn schedule_send(&mut self, stream: &mut store::Ptr, task: &mut Option<Waker>) {
+        // If the stream is waiting to be opened, nothing more to do.
+        if stream.is_send_ready() {
+            tracing::trace!(?stream.id, "schedule_send");
+            // Queue the stream
+            self.pending_send.push(stream);
+
+            // Notify the connection.
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+        }
+    }
+
+    pub fn queue_open(&mut self, stream: &mut store::Ptr) {
+        self.pending_open.push(stream);
+    }
+
+    /// Send a data frame
+    pub fn send_data<B>(
+        &mut self,
+        frame: frame::Data<B>,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError>
+    where
+        B: Buf,
+    {
+        let sz = frame.payload().remaining();
+
+        if sz > MAX_WINDOW_SIZE as usize {
+            return Err(UserError::PayloadTooBig);
+        }
+
+        let sz = sz as WindowSize;
+
+        if !stream.state.is_send_streaming() {
+            if stream.state.is_closed() {
+                return Err(InactiveStreamId);
+            } else {
+                return Err(UnexpectedFrameType);
+            }
+        }
+
+        // Update the buffered data counter
+        stream.buffered_send_data += sz as usize;
+
+        let span =
+            tracing::trace_span!("send_data", sz, requested = stream.requested_send_capacity);
+        let _e = span.enter();
+        tracing::trace!(buffered = stream.buffered_send_data);
+
+        // Implicitly request more send capacity if not enough has been
+        // requested yet.
+        if (stream.requested_send_capacity as usize) < stream.buffered_send_data {
+            // Update the target requested capacity
+            stream.requested_send_capacity =
+                cmp::min(stream.buffered_send_data, WindowSize::MAX as usize) as WindowSize;
+
+            // `try_assign_capacity` will queue the stream to `pending_capacity` if the capcaity
+            // cannot be assigned at the time it is called.
+            //
+            // Streams over the max concurrent count will still call `send_data` so we should be
+            // careful not to put it into `pending_capacity` as it will starve the connection
+            // capacity for other streams
+            if !stream.is_pending_open {
+                self.try_assign_capacity(stream);
+            }
+        }
+
+        if frame.is_end_stream() {
+            stream.state.send_close();
+            self.reserve_capacity(0, stream, counts);
+        }
+
+        tracing::trace!(
+            available = %stream.send_flow.available(),
+            buffered = stream.buffered_send_data,
+        );
+
+        // The `stream.buffered_send_data == 0` check is here so that, if a zero
+        // length data frame is queued to the front (there is no previously
+        // queued data), it gets sent out immediately even if there is no
+        // available send window.
+        //
+        // Sending out zero length data frames can be done to signal
+        // end-of-stream.
+        //
+        if stream.send_flow.available() > 0 || stream.buffered_send_data == 0 {
+            // The stream currently has capacity to send the data frame, so
+            // queue it up and notify the connection task.
+            self.queue_frame(frame.into(), buffer, stream, task);
+        } else {
+            // The stream has no capacity to send the frame now, save it but
+            // don't notify the connection task. Once additional capacity
+            // becomes available, the frame will be flushed.
+            stream.pending_send.push_back(buffer, frame.into());
+        }
+
+        Ok(())
+    }
+
+    /// Request capacity to send data
+    pub fn reserve_capacity(
+        &mut self,
+        capacity: WindowSize,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) {
+        let span = tracing::trace_span!(
+            "reserve_capacity",
+            ?stream.id,
+            requested = capacity,
+            effective = (capacity as usize) + stream.buffered_send_data,
+            curr = stream.requested_send_capacity
+        );
+        let _e = span.enter();
+
+        // Actual capacity is `capacity` + the current amount of buffered data.
+        // If it were less, then we could never send out the buffered data.
+        let capacity = (capacity as usize) + stream.buffered_send_data;
+
+        match capacity.cmp(&(stream.requested_send_capacity as usize)) {
+            Ordering::Equal => {
+                // Nothing to do
+            }
+            Ordering::Less => {
+                // Update the target requested capacity
+                stream.requested_send_capacity = capacity as WindowSize;
+
+                // Currently available capacity assigned to the stream
+                let available = stream.send_flow.available().as_size();
+
+    }
+
+    /// Returns a mutable reference to the push promise's request headers.
+    pub fn request_mut(&mut self) -> &mut Request<()> {
+        &mut self.request
+    }
+
+    /// Consumes `self`, returning the push promise's request headers and
+    /// response future.
+    pub fn into_parts(self) -> (Request<()>, PushedResponseFuture) {
+        (self.request, self.response)
+    }
+}
+
+// ===== impl PushedResponseFuture =====
+
+impl Future for PushedResponseFuture {
+    type Output = Result<Response<RecvStream>, crate::Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.inner).poll(cx)
+    }
+}
+
+impl PushedResponseFuture {
+    /// Returns the stream ID of the response stream.
+    ///
+    /// # Panics
+    ///
+    /// If the lock on the stream store has been poisoned.
+    pub fn stream_id(&self) -> crate::StreamId {
+        self.inner.stream_id()
+    }
+}
+
+// ===== impl Peer =====
+
+impl Peer {
+    pub fn convert_send_message(
+        id: StreamId,
+        request: Request<()>,
+        protocol: Option<Protocol>,
+        end_of_stream: bool,
+    ) -> Result<Headers, SendError> {
+        use http::request::Parts;
+
+        let (
+            Parts {
+                method,
+                uri,
+                headers,
+                version,
+                ..
+            },
+            _,
+        ) = request.into_parts();
+
+        let is_connect = method == Method::CONNECT;
+
+        // Build the set pseudo header set. All requests will include `method`
+        // and `path`.
+        let mut pseudo = Pseudo::request(method, uri, protocol);
+
+        if pseudo.scheme.is_none() {
+            // If the scheme is not set, then there are a two options.
+            //
+            // 1) Authority is not set. In this case, a request was issued with
+            //    a relative URI. This is permitted **only** when forwarding
+            //    HTTP 1.x requests. If the HTTP version is set to 2.0, then
+            //    this is an error.
+            //
+            // 2) Authority is set, then the HTTP method *must* be CONNECT.
+            //
+            // It is not possible to have a scheme but not an authority set (the
+            // `http` crate does not allow it).
+            //
+            if pseudo.authority.is_none() {
+                if version == Version::HTTP_2 {
+                    return Err(UserError::MissingUriSchemeAndAuthority.into());
+                } else {
+                    // This is acceptable as per the above comment. However,
+                    // HTTP/2 requires that a scheme is set. Since we are
+                    // forwarding an HTTP 1.1 request, the scheme is set to
+                    // "http".
+                    pseudo.set_scheme(uri::Scheme::HTTP);
+                }
+            } else if !is_connect {
+                // TODO: Error
+            }
+        }
+
+        // Create the HEADERS frame
+        let mut frame = Headers::new(id, pseudo, headers);
+
+        if end_of_stream {
+            frame.set_end_stream()
+        }
+
+        Ok(frame)
+    }
+}
+
+impl proto::Peer for Peer {
+    type Poll = Response<()>;
+
+    const NAME: &'static str = "Client";
+
+    fn r#dyn() -> proto::DynPeer {
+        proto::DynPeer::Client
+    }
+
+    /*
+    fn is_server() -> bool {
+        false
+    }
+    */
+
+    fn convert_poll_message(
+        pseudo: Pseudo,
+        fields: HeaderMap,
+        stream_id: StreamId,
+    ) -> Result<Self::Poll, Error> {
+        let mut b = Response::builder();
+
+        b = b.version(Version::HTTP_2);
+
+        if let Some(status) = pseudo.status {
+            b = b.status(status);
+        }
+
+        let mut response = match b.body(()) {
+            Ok(response) => response,
+            Err(_) => {
+                // TODO: Should there be more specialized handling for different
+                // kinds of errors
+                return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
+            }
+        };
+
+        *response.headers_mut() = fields;
+
+        Ok(response)
+    }
+}
+                                .builder
+                                .local_max_error_reset_streams,
+                            settings: self.builder.settings.clone(),
+                        },
+                    );
+
+                    tracing::trace!("connection established!");
+                    let mut c = Connection { connection };
+                    if let Some(sz) = self.builder.initial_target_connection_window_size {
+                        c.set_target_window_size(sz);
+                    }
+
+                    return Poll::Ready(Ok(c));
+                }
+                Handshaking::Done => {
+                    panic!("Handshaking::poll() called again after handshaking was complete")
+                }
+            }
+        }
+    }
+}
+
+impl<T, B> fmt::Debug for Handshake<T, B>
+where
+    T: AsyncRead + AsyncWrite + fmt::Debug,
+    B: fmt::Debug + Buf,
+{
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write!(fmt, "server::Handshake")
+    }
+}
+
+impl Peer {
+    pub fn convert_send_message(
+        id: StreamId,
+        response: Response<()>,
+        end_of_stream: bool,
+    ) -> frame::Headers {
+        use http::response::Parts;
+
+        // Extract the components of the HTTP request
+        let (
+            Parts {
+                status, headers, ..
+            },
+            _,
+        ) = response.into_parts();
+
+        // Build the set pseudo header set. All requests will include `method`
+        // and `path`.
+        let pseudo = Pseudo::response(status);
+
+        // Create the HEADERS frame
+        let mut frame = frame::Headers::new(id, pseudo, headers);
+
+        if end_of_stream {
+            frame.set_end_stream()
+        }
+
+        frame
+    }
+
+    pub fn convert_push_message(
+        stream_id: StreamId,
+        promised_id: StreamId,
+        request: Request<()>,
+    ) -> Result<frame::PushPromise, UserError> {
+        use http::request::Parts;
+
+        if let Err(e) = frame::PushPromise::validate_request(&request) {
+            use PushPromiseHeaderError::*;
+            match e {
+                NotSafeAndCacheable => tracing::debug!(
+                    ?promised_id,
+                    "convert_push_message: method {} is not safe and cacheable",
+                    request.method(),
+                ),
+                InvalidContentLength(e) => tracing::debug!(
+                    ?promised_id,
+                    "convert_push_message; promised request has invalid content-length {:?}",
+                    e,
+                ),
+            }
+            return Err(UserError::MalformedHeaders);
+        }
+
+        // Extract the components of the HTTP request
+        let (
+            Parts {
+                method,
+                uri,
+                headers,
+                ..
+            },
+            _,
+        ) = request.into_parts();
+
+        let pseudo = Pseudo::request(method, uri, None);
+
+        Ok(frame::PushPromise::new(
+            stream_id,
+            promised_id,
+            pseudo,
+            headers,
+        ))
+    }
+}
+
+impl proto::Peer for Peer {
+    type Poll = Request<()>;
+
+    const NAME: &'static str = "Server";
+
+    /*
+    fn is_server() -> bool {
+        true
+    }
+    */
+
+    fn r#dyn() -> proto::DynPeer {
+        proto::DynPeer::Server
+    }
+
+    fn convert_poll_message(
+        pseudo: Pseudo,
+        fields: HeaderMap,
+        stream_id: StreamId,
+    ) -> Result<Self::Poll, Error> {
+        use http::{uri, Version};
+
+        let mut b = Request::builder();
+
+        macro_rules! malformed {
+            ($($arg:tt)*) => {{
+                tracing::debug!($($arg)*);
+                return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
+            }}
+        }
+
+        b = b.version(Version::HTTP_2);
+
+        let is_connect;
+        if let Some(method) = pseudo.method {
+            is_connect = method == Method::CONNECT;
+            b = b.method(method);
+        } else {
+            malformed!("malformed headers: missing method");
+        }
+
+        let has_protocol = pseudo.protocol.is_some();
+        if has_protocol {
+            if is_connect {
+                // Assert that we have the right type.
+                b = b.extension::<crate::ext::Protocol>(pseudo.protocol.unwrap());
+            } else {
+                malformed!("malformed headers: :protocol on non-CONNECT request");
+            }
+        }
+
+        if pseudo.status.is_some() {
+            malformed!("malformed headers: :status field on request");
+        }
+
+        // Convert the URI
+        let mut parts = uri::Parts::default();
+
+        // A request translated from HTTP/1 must not include the :authority
+        // header
+        if let Some(authority) = pseudo.authority {
+            let maybe_authority = uri::Authority::from_maybe_shared(authority.clone().into_inner());
+            parts.authority = Some(maybe_authority.or_else(|why| {
+                malformed!(
+                    "malformed headers: malformed authority ({:?}): {}",
+                    authority,
+                    why,
+                )
+            })?);
+        }
+
+        // A :scheme is required, except CONNECT.
+        if let Some(scheme) = pseudo.scheme {
+            if is_connect && !has_protocol {
+                malformed!("malformed headers: :scheme in CONNECT");
+            }
+            let maybe_scheme = scheme.parse();
+            let scheme = maybe_scheme.or_else(|why| {
+                malformed!(
+                    "malformed headers: malformed scheme ({:?}): {}",
+                    scheme,
+                    why,
+                )
+            })?;
+
+            // It's not possible to build an `Uri` from a scheme and path. So,
+            // after validating is was a valid scheme, we just have to drop it
+            // if there isn't an :authority.
+            if parts.authority.is_some() {
+                parts.scheme = Some(scheme);
+            }
+        } else if !is_connect || has_protocol {
+            malformed!("malformed headers: missing scheme");
+        }
+
+        if let Some(path) = pseudo.path {
+            if is_connect && !has_protocol {
+                malformed!("malformed headers: :path in CONNECT");
+            }
+
+            // This cannot be empty
+            if path.is_empty() {
+                malformed!("malformed headers: missing path");
+            }
+
+            let maybe_path = uri::PathAndQuery::from_maybe_shared(path.clone().into_inner());
+            parts.path_and_query = Some(maybe_path.or_else(|why| {
+                malformed!("malformed headers: malformed path ({:?}): {}", path, why,)
+            })?);
+        } else if is_connect && has_protocol {
+            malformed!("malformed headers: missing path in extended CONNECT");
+        }
+
+        b = b.uri(parts);
+
+        let mut request = match b.body(()) {
+            Ok(request) => request,
+            Err(e) => {
+                // TODO: Should there be more specialized handling for different
+                // kinds of errors
+                proto_err!(stream: "error building request: {}; stream={:?}", e, stream_id);
+                return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
+            }
+        };
+
+        *request.headers_mut() = fields;
+
+        Ok(request)
+    }
+}
+
+// ===== impl Handshaking =====
+
+impl<T, B> fmt::Debug for Handshaking<T, B>
+where
+    B: Buf,
+{
+    #[inline]
+use super::{util, StreamDependency, StreamId};
+use crate::ext::Protocol;
+use crate::frame::{Error, Frame, Head, Kind};
+use crate::hpack::{self, BytesStr};
+
+use http::header::{self, HeaderName, HeaderValue};
+use http::{uri, HeaderMap, Method, Request, StatusCode, Uri};
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+use std::fmt;
+use std::io::Cursor;
+
+type EncodeBuf<'a> = bytes::buf::Limit<&'a mut BytesMut>;
+
+/// Header frame
+///
+/// This could be either a request or a response.
+#[derive(Eq, PartialEq)]
+pub struct Headers {
+    /// The ID of the stream with which this frame is associated.
+    stream_id: StreamId,
+
+    /// The stream dependency information, if any.
+    stream_dep: Option<StreamDependency>,
+
+    /// The header block fragment
+    header_block: HeaderBlock,
+
+    /// The associated flags
+    flags: HeadersFlag,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub struct HeadersFlag(u8);
+
+#[derive(Eq, PartialEq)]
+pub struct PushPromise {
+    /// The ID of the stream with which this frame is associated.
+    stream_id: StreamId,
+
+    /// The ID of the stream being reserved by this PushPromise.
+    promised_id: StreamId,
+
+    /// The header block fragment
+    header_block: HeaderBlock,
+
+    /// The associated flags
+    flags: PushPromiseFlag,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub struct PushPromiseFlag(u8);
+
+#[derive(Debug)]
+pub struct Continuation {
+    /// Stream ID of continuation frame
+    stream_id: StreamId,
+
+    header_block: EncodingHeaderBlock,
+}
+
+// TODO: These fields shouldn't be `pub`
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct Pseudo {
+    // Request
+    pub method: Option<Method>,
+    pub scheme: Option<BytesStr>,
+    pub authority: Option<BytesStr>,
+    pub path: Option<BytesStr>,
+    pub protocol: Option<Protocol>,
+
+    // Response
+    pub status: Option<StatusCode>,
+}
+
+#[derive(Debug)]
+pub struct Iter {
+    /// Pseudo headers
+    pseudo: Option<Pseudo>,
+
+    /// Header fields
+    fields: header::IntoIter<HeaderValue>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HeaderBlock {
+    /// The decoded header fields
+    fields: HeaderMap,
+
+    /// Precomputed size of all of our header fields, for perf reasons
+    field_size: usize,
+
+    /// Set to true if decoding went over the max header list size.
+    is_over_size: bool,
+
+    /// Pseudo headers, these are broken out as they must be sent as part of the
+    /// headers frame.
+    pseudo: Pseudo,
+}
+
+#[derive(Debug)]
+struct EncodingHeaderBlock {
+    hpack: Bytes,
+}
+
+const END_STREAM: u8 = 0x1;
+const END_HEADERS: u8 = 0x4;
+const PADDED: u8 = 0x8;
+const PRIORITY: u8 = 0x20;
+const ALL: u8 = END_STREAM | END_HEADERS | PADDED | PRIORITY;
+
+// ===== impl Headers =====
+
+impl Headers {
+    /// Create a new HEADERS frame
+    pub fn new(stream_id: StreamId, pseudo: Pseudo, fields: HeaderMap) -> Self {
+        Headers {
+            stream_id,
+            stream_dep: None,
+            header_block: HeaderBlock {
+                field_size: calculate_headermap_size(&fields),
+                fields,
+                is_over_size: false,
+                pseudo,
+            },
+            flags: HeadersFlag::default(),
+        }
+    }
+
+    pub fn trailers(stream_id: StreamId, fields: HeaderMap) -> Self {
+        let mut flags = HeadersFlag::default();
+        flags.set_end_stream();
+
+        Headers {
+            stream_id,
+            stream_dep: None,
+            header_block: HeaderBlock {
+                field_size: calculate_headermap_size(&fields),
+                fields,
+                is_over_size: false,
+                pseudo: Pseudo::default(),
+            },
+            flags,
+        }
+    }
+
+    /// Loads the header frame but doesn't actually do HPACK decoding.
+    ///
+    /// HPACK decoding is done in the `load_hpack` step.
+    pub fn load(head: Head, mut src: BytesMut) -> Result<(Self, BytesMut), Error> {
+        let flags = HeadersFlag(head.flag());
+        let mut pad = 0;
+
+        tracing::trace!("loading headers; flags={:?}", flags);
+
+        if head.stream_id().is_zero() {
+            return Err(Error::InvalidStreamId);
+        }
+
+        // Read the padding length
+        if flags.is_padded() {
+            if src.is_empty() {
+                return Err(Error::MalformedMessage);
+            }
+            pad = src[0] as usize;
+
+            // Drop the padding
+            src.advance(1);
+        }
+
+        // Read the stream dependency
+        let stream_dep = if flags.is_priority() {
+            if src.len() < 5 {
+                return Err(Error::MalformedMessage);
+            }
+            let stream_dep = StreamDependency::load(&src[..5])?;
+
+            if stream_dep.dependency_id() == head.stream_id() {
+                return Err(Error::InvalidDependencyId);
+            }
+
+            // Drop the next 5 bytes
+            src.advance(5);
+
+            Some(stream_dep)
+        } else {
+            None
+        };
+
+        if pad > 0 {
+            if pad > src.len() {
+                return Err(Error::TooMuchPadding);
+            }
+
+            let len = src.len() - pad;
+            src.truncate(len);
+        }
+
+        let headers = Headers {
+            stream_id: head.stream_id(),
+            stream_dep,
+            header_block: HeaderBlock {
+                fields: HeaderMap::new(),
+                field_size: 0,
+                is_over_size: false,
+                pseudo: Pseudo::default(),
+            },
+            flags,
+        };
+
+        Ok((headers, src))
+    }
+
+    pub fn load_hpack(
+        &mut self,
+        src: &mut BytesMut,
+        max_header_list_size: usize,
+        decoder: &mut hpack::Decoder,
+    ) -> Result<(), Error> {
+        self.header_block.load(src, max_header_list_size, decoder)
+    }
+
+    pub fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    pub fn is_end_headers(&self) -> bool {
+        self.flags.is_end_headers()
+    }
+use std::fmt;
+
+use crate::frame::{util, Error, Frame, FrameSize, Head, Kind, StreamId};
+use bytes::{BufMut, BytesMut};
+
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct Settings {
+    flags: SettingsFlags,
+    // Fields
+    header_table_size: Option<u32>,
+    enable_push: Option<u32>,
+    max_concurrent_streams: Option<u32>,
+    initial_window_size: Option<u32>,
+    max_frame_size: Option<u32>,
+    max_header_list_size: Option<u32>,
+    enable_connect_protocol: Option<u32>,
+}
+
+/// An enum that lists all valid settings that can be sent in a SETTINGS
+/// frame.
+///
+/// Each setting has a value that is a 32 bit unsigned integer (6.5.1.).
+#[derive(Debug)]
+pub enum Setting {
+    HeaderTableSize(u32),
+    EnablePush(u32),
+    MaxConcurrentStreams(u32),
+    InitialWindowSize(u32),
+    MaxFrameSize(u32),
+    MaxHeaderListSize(u32),
+    EnableConnectProtocol(u32),
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Default)]
+pub struct SettingsFlags(u8);
+
+const ACK: u8 = 0x1;
+const ALL: u8 = ACK;
+
+/// The default value of SETTINGS_HEADER_TABLE_SIZE
+pub const DEFAULT_SETTINGS_HEADER_TABLE_SIZE: usize = 4_096;
+
+/// The default value of SETTINGS_INITIAL_WINDOW_SIZE
+pub const DEFAULT_INITIAL_WINDOW_SIZE: u32 = 65_535;
+
+/// The default value of MAX_FRAME_SIZE
+pub const DEFAULT_MAX_FRAME_SIZE: FrameSize = 16_384;
+
+/// INITIAL_WINDOW_SIZE upper bound
+pub const MAX_INITIAL_WINDOW_SIZE: usize = (1 << 31) - 1;
+
+/// MAX_FRAME_SIZE upper bound
+pub const MAX_MAX_FRAME_SIZE: FrameSize = (1 << 24) - 1;
+
+// ===== impl Settings =====
+
+impl Settings {
+    pub fn ack() -> Settings {
+        Settings {
+            flags: SettingsFlags::ack(),
+            ..Settings::default()
+        }
+    }
+
+    pub fn is_ack(&self) -> bool {
+        self.flags.is_ack()
+    }
+
+    pub fn initial_window_size(&self) -> Option<u32> {
+        self.initial_window_size
+    }
+
+    pub fn set_initial_window_size(&mut self, size: Option<u32>) {
+        self.initial_window_size = size;
+    }
+
+    pub fn max_concurrent_streams(&self) -> Option<u32> {
+        self.max_concurrent_streams
+    }
+
+    pub fn set_max_concurrent_streams(&mut self, max: Option<u32>) {
+        self.max_concurrent_streams = max;
+    }
+
+    pub fn max_frame_size(&self) -> Option<u32> {
+        self.max_frame_size
+    }
+
+    pub fn set_max_frame_size(&mut self, size: Option<u32>) {
+        if let Some(val) = size {
+            assert!(DEFAULT_MAX_FRAME_SIZE <= val && val <= MAX_MAX_FRAME_SIZE);
+        }
+        self.max_frame_size = size;
+    }
+
+    pub fn max_header_list_size(&self) -> Option<u32> {
+        self.max_header_list_size
+    }
+
+    pub fn set_max_header_list_size(&mut self, size: Option<u32>) {
+        self.max_header_list_size = size;
+    }
+
+    pub fn is_push_enabled(&self) -> Option<bool> {
+        self.enable_push.map(|val| val != 0)
+    }
+
+    pub fn set_enable_push(&mut self, enable: bool) {
+        self.enable_push = Some(enable as u32);
+    }
+
+    pub fn is_extended_connect_protocol_enabled(&self) -> Option<bool> {
+        self.enable_connect_protocol.map(|val| val != 0)
+    }
+
+    pub fn set_enable_connect_protocol(&mut self, val: Option<u32>) {
+        self.enable_connect_protocol = val;
+    }
+
+    pub fn header_table_size(&self) -> Option<u32> {
+        self.header_table_size
+    }
+
+    pub fn set_header_table_size(&mut self, size: Option<u32>) {
+        self.header_table_size = size;
+    }
+
+    pub fn load(head: Head, payload: &[u8]) -> Result<Settings, Error> {
+        use self::Setting::*;
+
+        debug_assert_eq!(head.kind(), crate::frame::Kind::Settings);
+
+        if !head.stream_id().is_zero() {
+            return Err(Error::InvalidStreamId);
+        }
+
+        // Load the flag
+        let flag = SettingsFlags::load(head.flag());
+
+        if flag.is_ack() {
+            // Ensure that the payload is empty
+            if !payload.is_empty() {
+                return Err(Error::InvalidPayloadLength);
+            }
+
+            // Return the ACK frame
+            return Ok(Settings::ack());
+        }
+
+        // Ensure the payload length is correct, each setting is 6 bytes long.
+        if payload.len() % 6 != 0 {
+            tracing::debug!("invalid settings payload length; len={:?}", payload.len());
+            return Err(Error::InvalidPayloadAckSettings);
+        }
+
+        let mut settings = Settings::default();
+        debug_assert!(!settings.flags.is_ack());
+
+        for raw in payload.chunks(6) {
+            match Setting::load(raw) {
+                Some(HeaderTableSize(val)) => {
+                    settings.header_table_size = Some(val);
+                }
+                Some(EnablePush(val)) => match val {
+                    0 | 1 => {
+                        settings.enable_push = Some(val);
+                    }
+                    _ => {
+                        return Err(Error::InvalidSettingValue);
+                    }
+                },
+                Some(MaxConcurrentStreams(val)) => {
+                    settings.max_concurrent_streams = Some(val);
+                }
+                Some(InitialWindowSize(val)) => {
+                    if val as usize > MAX_INITIAL_WINDOW_SIZE {
+                        return Err(Error::InvalidSettingValue);
+                    } else {
+                        settings.initial_window_size = Some(val);
+                    }
+                }
+                Some(MaxFrameSize(val)) => {
+                    if DEFAULT_MAX_FRAME_SIZE <= val && val <= MAX_MAX_FRAME_SIZE {
+                        settings.max_frame_size = Some(val);
+                    } else {
+                        return Err(Error::InvalidSettingValue);
+                    }
+                }
+                Some(MaxHeaderListSize(val)) => {
+                    settings.max_header_list_size = Some(val);
+                }
+                Some(EnableConnectProtocol(val)) => match val {
+                    0 | 1 => {
+                        settings.enable_connect_protocol = Some(val);
+                    }
+                    _ => {
+                        return Err(Error::InvalidSettingValue);
+                    }
+                },
+                None => {}
+            }
+        }
+
+        Ok(settings)
+    }
+
+    fn payload_len(&self) -> usize {
+        let mut len = 0;
+        self.for_each(|_| len += 6);
+        len
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut) {
+        // Create & encode an appropriate frame head
+        let head = Head::new(Kind::Settings, self.flags.into(), StreamId::zero());
+        let payload_len = self.payload_len();
+
+        tracing::trace!("encoding SETTINGS; len={}", payload_len);
+
+        head.encode(payload_len, dst);
+src/hpack/header.rs:283:        unsafe { std::str::from_utf8_unchecked(self.0.as_ref()) }
+src/proto/streams/streams.rs:33:    /// bit of unsafe code. This optimization has been postponed until it has
+src/lib.rs:85:    clippy::undocumented_unsafe_blocks
+use futures::channel::oneshot;
+use futures::StreamExt;
+use h2_support::assert_ping;
+use h2_support::prelude::*;
+
+#[tokio::test]
+async fn recv_single_ping() {
+    h2_support::trace_init!();
+    let (m, mut mock) = mock::new();
+
+    // Create the handshake
+    let h2 = async move {
+        let (_client, conn) = client::handshake(m).await.unwrap();
+        let _: () = conn.await.unwrap();
+    };
+
+    let mock = async move {
+        let _ = mock.assert_client_handshake().await;
+        let frame = frame::Ping::new(Default::default());
+        mock.send(frame.into()).await.unwrap();
+        let frame = mock.next().await.unwrap();
+
+        let pong = assert_ping!(frame.unwrap());
+
+        // Payload is correct
+        assert_eq!(*pong.payload(), <[u8; 8]>::default());
+
+        // Is ACK
+        assert!(pong.is_ack());
+    };
+
+    join(mock, h2).await;
+}
+
+#[tokio::test]
+async fn recv_multiple_pings() {
+    h2_support::trace_init!();
+    let (io, mut client) = mock::new();
+
+    let client = async move {
+        let settings = client.assert_server_handshake().await;
+        assert_default_settings!(settings);
+        client.send_frame(frames::ping([1; 8])).await;
+        client.send_frame(frames::ping([2; 8])).await;
+        client.recv_frame(frames::ping([1; 8]).pong()).await;
+        client.recv_frame(frames::ping([2; 8]).pong()).await;
+    };
+
+    let srv = async move {
+        let mut s = server::handshake(io).await.expect("handshake");
+        assert!(s.next().await.is_none());
+    };
+
+    join(client, srv).await;
+}
+
+#[tokio::test]
+async fn pong_has_highest_priority() {
+    h2_support::trace_init!();
+    let (io, mut client) = mock::new();
+
+    let data = Bytes::from(vec![0; 16_384]);
+    let data_clone = data.clone();
+
+    let client = async move {
+        let settings = client.assert_server_handshake().await;
+        assert_default_settings!(settings);
+        client
+            .send_frame(frames::headers(1).request("POST", "https://http2.akamai.com/"))
+            .await;
+        client.send_frame(frames::data(1, data_clone).eos()).await;
+        client.send_frame(frames::ping([1; 8])).await;
+        client.recv_frame(frames::ping([1; 8]).pong()).await;
+        client
+            .recv_frame(frames::headers(1).response(200).eos())
+            .await;
+    };
+
+    let srv = async move {
+        let mut s = server::handshake(io).await.expect("handshake");
+        let (req, mut stream) = s.next().await.unwrap().unwrap();
+        assert_eq!(req.method(), "POST");
+        let body = req.into_parts().1;
+
+        let body = util::concat(body).await.expect("body");
+        assert_eq!(body.len(), data.len());
+        let res = Response::builder().status(200).body(()).unwrap();
+        stream.send_response(res, true).expect("response");
+        assert!(s.next().await.is_none());
+    };
+
+    join(client, srv).await;
+}
+
+#[tokio::test]
+async fn user_ping_pong() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(frames::ping(frame::Ping::USER)).await;
+        srv.send_frame(frames::ping(frame::Ping::USER).pong()).await;
+        srv.recv_frame(frames::go_away(0)).await;
+        srv.recv_eof().await;
+    };
+
+    let client = async move {
+        let (client, mut conn) = client::handshake(io).await.expect("client handshake");
+        // yield once so we can ack server settings
+        conn.drive(util::yield_once()).await;
+        // `ping_pong()` method conflict with mock future ext trait.
+        let mut ping_pong = client::Connection::ping_pong(&mut conn).expect("taking ping_pong");
+        ping_pong.send_ping(Ping::opaque()).expect("send ping");
+
+        // multiple pings results in a user error...
+        assert_eq!(
+            ping_pong
+                .send_ping(Ping::opaque())
+                .expect_err("ping 2")
+                .to_string(),
+            "user error: send_ping before received previous pong",
+            "send_ping while ping pending is a user error",
+        );
+
+        conn.drive(futures::future::poll_fn(move |cx| ping_pong.poll_pong(cx)))
+            .await
+            .unwrap();
+        drop(client);
+        conn.await.expect("client");
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn user_notifies_when_connection_closes() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv
+    };
+
+    #[allow(clippy::async_yields_async)]
+    let client = async move {
+        let (_client, mut conn) = client::handshake(io).await.expect("client handshake");
+        // yield once so we can ack server settings
+        conn.drive(util::yield_once()).await;
+        conn
+    };
+
+    let (srv, mut client) = join(srv, client).await;
+
+    // `ping_pong()` method conflict with mock future ext trait.
+    let mut ping_pong = client::Connection::ping_pong(&mut client).expect("taking ping_pong");
+
+    // Spawn a thread so we can park a task waiting on `poll_pong`, and then
+    // drop the client and be sure the parked task is notified...
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        poll_fn(|cx| ping_pong.poll_pong(cx))
+            .await
+            .expect_err("poll_pong should error");
+        tx.send(ping_pong).unwrap();
+    });
+
+    // Sleep to let the ping thread park its task...
+    idle_ms(50).await;
+    drop(client);
+    drop(srv);
+
+    let mut ping_pong = rx.await.expect("ping pong spawn join");
+
+    // Now that the connection is closed, also test `send_ping` errors...
+    assert_eq!(
+        ping_pong
+            .send_ping(Ping::opaque())
+//! Utilities to support tests.
+
+#[macro_use]
+pub mod assert;
+
+pub mod raw;
+
+pub mod frames;
+pub mod mock;
+pub mod prelude;
+pub mod trace;
+pub mod util;
+
+mod client_ext;
+mod future_ext;
+
+pub use crate::client_ext::SendRequestExt;
+pub use crate::future_ext::TestFuture;
+
+pub type WindowSize = usize;
+pub const DEFAULT_WINDOW_SIZE: WindowSize = (1 << 16) - 1;
+
+// This is our test Codec type
+pub type Codec<T> = h2::Codec<T, bytes::Bytes>;
+
+// This is the frame type that is sent
+pub type SendFrame = h2::frame::Frame<bytes::Bytes>;
+
+#[macro_export]
+macro_rules! trace_init {
+    () => {
+        let _guard = $crate::trace::init();
+        let span = $crate::prelude::tracing::info_span!(
+            "test",
+            "{}",
+            // get the name of the test thread to generate a unique span for the test
+            std::thread::current()
+                .name()
+                .expect("test threads must be named")
+        );
+        let _e = span.enter();
+    };
+}

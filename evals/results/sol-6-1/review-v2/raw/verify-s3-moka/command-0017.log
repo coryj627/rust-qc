@@ -1,0 +1,408 @@
+    fn do_get_with_hash<Q, R, I>(
+        &self,
+        key: &Q,
+        hash: u64,
+        read_recorder: R,
+        mut ignore_if: Option<&mut I>,
+        need_key: bool,
+    ) -> Option<Entry<K, V>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+        R: Fn(ReadOp<K, V>, Instant),
+        I: FnMut(&V) -> bool,
+    {
+        if self.is_map_disabled() {
+            return None;
+        }
+
+        let mut now = self.current_time();
+
+        let maybe_entry = self
+            .inner
+            .get_key_value_and_then(key, hash, move |k, entry| {
+                if let Some(ignore_if) = &mut ignore_if {
+                    if ignore_if(&entry.value) {
+                        // Ignore the entry.
+                        return None;
+                    }
+                }
+
+                let i = &self.inner;
+                let (ttl, tti, va) = (&i.time_to_live(), &i.time_to_idle(), &i.valid_after());
+
+                if is_expired_by_per_entry_ttl(entry.entry_info(), now)
+                    || is_expired_entry_wo(ttl, va, entry, now)
+                    || is_expired_entry_ao(tti, va, entry, now)
+                    || i.is_invalidated_entry(k, entry)
+                {
+                    // Expired or invalidated entry.
+                    None
+                } else {
+                    // Valid entry.
+                    let maybe_key = if need_key { Some(Arc::clone(k)) } else { None };
+                    Some((maybe_key, MiniArc::clone(entry)))
+                }
+            });
+
+        if let Some((maybe_key, entry)) = maybe_entry {
+            let mut is_expiry_modified = false;
+
+            // Call the user supplied `expire_after_read` method if any.
+            if let Some(expiry) = &self.inner.expiration_policy.expiry() {
+                let lm = entry.last_modified().expect("Last modified is not set");
+                // Check if the `last_modified` of entry is earlier than or equals to
+                // `now`. If not, update the `now` to `last_modified`. This is needed
+                // because there is a small chance that other threads have inserted
+                // the entry _after_ we obtained `now`.
+                now = now.max(lm);
+
+                // Convert `last_modified` from `moka::common::time::Instant` to
+                // `std::time::Instant`.
+                let lm = self.inner.clock().to_std_instant(lm);
+
+                // Call the user supplied `expire_after_read` method.
+                //
+                // We will put the return value (`is_expiry_modified: bool`) to a
+                // `ReadOp` so that `apply_reads` method can determine whether or not
+                // to reschedule the timer for the entry.
+                //
+                // NOTE: It is not guaranteed that the `ReadOp` is passed to
+                // `apply_reads`. Here are the corner cases that the `ReadOp` will
+                // not be passed to `apply_reads`:
+                //
+                // - If the bounded `read_op_ch` channel is full, the `ReadOp` will
+                //   be discarded.
+                // - If we were called by `get_with_hash_without_recording` method,
+                //   the `ReadOp` will not be recorded at all.
+                //
+                // These cases are okay because when the timer wheel tries to expire
+                // the entry, it will check if the entry is actually expired. If not,
+                // the timer wheel will reschedule the expiration timer for the
+                // entry.
+                is_expiry_modified = Self::expire_after_read_or_update(
+                    |k, v, t, d| expiry.expire_after_read(k, v, t, d, lm),
+                    &entry.entry_info().key_hash().key,
+                    &entry,
+                    self.inner.expiration_policy.time_to_live(),
+                    self.inner.expiration_policy.time_to_idle(),
+                    now,
+                    self.inner.clock(),
+                );
+            }
+
+            entry.set_last_accessed(now);
+
+            let v = entry.value.clone();
+            let op = ReadOp::Hit {
+                value_entry: entry,
+                is_expiry_modified,
+            };
+            read_recorder(op, now);
+            Some(Entry::new(maybe_key, v, false, false))
+        } else {
+            read_recorder(ReadOp::Miss(hash), now);
+            None
+        }
+    }
+
+    pub(crate) fn get_key_with_hash<Q>(&self, key: &Q, hash: u64) -> Option<Arc<K>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+                    counters.weighted_size >= max_cap / 2
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn enable_frequency_sketch(&self, counters: &EvictionCounters) {
+        if let Some(max_cap) = self.max_capacity {
+            let c = counters;
+            let cap = if self.weigher.is_none() {
+                max_cap
+            } else {
+                (c.entry_count as f64 * (c.weighted_size as f64 / max_cap as f64)) as u64
+            };
+            self.do_enable_frequency_sketch(cap);
+        }
+    }
+
+    #[cfg(test)]
+    fn enable_frequency_sketch_for_testing(&self) {
+        if let Some(max_cap) = self.max_capacity {
+            self.do_enable_frequency_sketch(max_cap);
+        }
+    }
+
+    #[inline]
+    fn do_enable_frequency_sketch(&self, cache_capacity: u64) {
+        let skt_capacity = common::sketch_capacity(cache_capacity);
+        self.frequency_sketch.write().ensure_capacity(skt_capacity);
+        self.frequency_sketch_enabled.store(true, Ordering::Release);
+    }
+
+    fn apply_reads(&self, deqs: &mut Deques<K>, timer_wheel: &mut TimerWheel<K>, count: usize) {
+        use ReadOp::{Hit, Miss};
+        let mut freq = self.frequency_sketch.write();
+        let ch = &self.read_op_ch;
+        for _ in 0..count {
+            match ch.try_recv() {
+                Ok(Hit {
+                    value_entry,
+                    is_expiry_modified,
+                }) => {
+                    let kh = value_entry.entry_info().key_hash();
+                    freq.increment(kh.hash);
+                    if is_expiry_modified {
+                        self.update_timer_wheel(&value_entry, timer_wheel);
+                    }
+                    deqs.move_to_back_ao(&value_entry);
+                }
+                Ok(Miss(hash)) => freq.increment(hash),
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn apply_writes(
+        &self,
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        count: usize,
+    }
+
+    pub(crate) fn entry_info(&self) -> &MiniArc<EntryInfo<K>> {
+        &self.info
+    }
+
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.info.is_admitted()
+    }
+
+    pub(crate) fn set_admitted(&self, value: bool) {
+        self.info.set_admitted(value);
+    }
+
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.info.is_dirty()
+    }
+
+    #[inline]
+    pub(crate) fn policy_weight(&self) -> u32 {
+        self.info.policy_weight()
+    }
+
+    pub(crate) fn deq_nodes(&self) -> &MiniArc<Mutex<DeqNodes<K>>> {
+        &self.nodes
+    }
+
+    pub(crate) fn access_order_q_node(&self) -> Option<KeyDeqNodeAo<K>> {
+        self.nodes.lock().access_order_q_node
+    }
+
+    fn expire_after_read(
+        &self,
+        key: &K,
+        value: &V,
+        read_at: Instant,
+        duration_until_expiry: Option<Duration>,
+        last_modified_at: Instant,
+    ) -> Option<Duration> {
+        duration_until_expiry
+    }
+
+    /// Specifies that the entry should be automatically removed from the cache once
+    /// the duration has elapsed after the replacement of its value. This method is
+    /// called for cache write methods such as `insert` but only when the key is
+    /// already present in the cache.
+    ///
+    /// # Parameters
+    ///
+    /// - `key` &mdash; A reference to the key of the entry.
+    /// - `value` &mdash; A reference to the value of the entry.
+    /// - `updated_at` &mdash; The time when this entry was updated.
+    /// - `duration_until_expiry` &mdash; The remaining duration until the entry
+    ///   expires. (Calculated by `expiration_time - updated_at`)
+    ///
+    /// # Return value
+    ///
+    /// The returned `Option<Duration>` is used to set the expiration time of the
+    /// entry.
+    ///
+    /// - Returning `Some(duration)` &mdash; The expiration time is set to
+    ///   `updated_at + duration`.
+    /// - Returning `None` &mdash; The expiration time is cleared (no expiration).
+    /// - Returning `duration_until_expiry` will not modify the expiration time.
+    ///   - This is the value that the default implementation returns.
+    ///
+    /// # Notes on `time_to_live` and `time_to_idle` policies
+    ///
+    /// When the cache is configured with `time_to_live` and/or `time_to_idle`
+    /// policies, then:
+    ///
+    /// - The entry will be evicted after the earliest of the expiration time
+    ///   returned by this expiry, the `time_to_live` and `time_to_idle` policies.
+    /// - The `duration_until_expiry` takes in account the `time_to_live` and
+    ///   `time_to_idle` policies.
+    #[allow(unused_variables)]
+    fn expire_after_update(
+        &self,
+        key: &K,
+        value: &V,
+        updated_at: Instant,
+        duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
+        duration_until_expiry
+    }
+}
+
+pub(crate) struct ExpirationPolicy<K, V> {
+    time_to_live: Option<Duration>,
+    time_to_idle: Option<Duration>,
+    expiry: Option<Arc<dyn Expiry<K, V> + Send + Sync + 'static>>,
+}
+    ///
+    /// [`try_append_value_async.rs`]:
+    ///     https://github.com/moka-rs/moka/tree/main/examples/try_append_value_async.rs
+    ///
+    /// # Concurrent calls on the same key
+    ///
+    /// This method guarantees that concurrent calls on the same key are executed
+    /// serially. That is, `and_try_compute_with` calls on the same key never run
+    /// concurrently. The calls are serialized by the order of their invocation. It
+    /// uses a key-level lock to achieve this.
+    pub async fn and_try_compute_with<F, Fut, E>(self, f: F) -> Result<compute::CompResult<K, V>, E>
+    where
+        F: FnOnce(Option<Entry<K, V>>) -> Fut,
+        Fut: Future<Output = Result<compute::Op<V>, E>>,
+        E: Send + Sync + 'static,
+    {
+        let key = Arc::new(self.owned_key);
+        self.cache
+            .try_compute_with_hash_and_fun(key, self.hash, f)
+            .await
+    }
+
+    pub async fn and_try_compute_if_nobody_else<F, Fut, E>(
+        self,
+        f: F,
+    ) -> Result<compute::CompResult<K, V>, E>
+    where
+        F: FnOnce(Option<Entry<K, V>>) -> Fut,
+        Fut: Future<Output = Result<compute::Op<V>, E>>,
+        E: Send + Sync + 'static,
+    {
+        let key = Arc::new(self.owned_key);
+        self.cache
+            .try_compute_if_nobody_else_with_hash_and_fun(key, self.hash, f)
+            .await
+    }
+
+    /// Performs an upsert of an [`Entry`] by using the given closure `f`. The word
+    /// "upsert" here means "update" or "insert".
+    ///
+    /// The closure `f` should take the current entry of `Option<Entry<K, V>>` for
+    ///
+    /// [`try_append_value_async.rs`]:
+    ///     https://github.com/moka-rs/moka/tree/main/examples/try_append_value_async.rs
+    ///
+    /// # Concurrent calls on the same key
+    ///
+    /// This method guarantees that concurrent calls on the same key are executed
+    /// serially. That is, `and_try_compute_with` calls on the same key never run
+    /// concurrently. The calls are serialized by the order of their invocation. It
+    /// uses a key-level lock to achieve this.
+    pub async fn and_try_compute_with<F, Fut, E>(self, f: F) -> Result<compute::CompResult<K, V>, E>
+    where
+        F: FnOnce(Option<Entry<K, V>>) -> Fut,
+        Fut: Future<Output = Result<compute::Op<V>, E>>,
+        E: Send + Sync + 'static,
+    {
+        let key = Arc::new(self.ref_key.to_owned());
+        self.cache
+            .try_compute_with_hash_and_fun(key, self.hash, f)
+            .await
+    }
+
+    pub async fn and_try_compute_if_nobody_else<F, Fut, E>(
+        self,
+        f: F,
+    ) -> Result<compute::CompResult<K, V>, E>
+    where
+        F: FnOnce(Option<Entry<K, V>>) -> Fut,
+        Fut: Future<Output = Result<compute::Op<V>, E>>,
+        E: Send + Sync + 'static,
+    {
+        let key = Arc::new(self.ref_key.to_owned());
+        self.cache
+            .try_compute_if_nobody_else_with_hash_and_fun(key, self.hash, f)
+            .await
+    }
+        init: Pin<&mut impl Future<Output = V>>,
+        mut replace_if: Option<impl FnMut(&V) -> bool + Send>,
+        need_key: bool,
+    ) -> Entry<K, V>
+    where
+        Q: Equivalent<K> + ToOwned<Owned = K> + Hash + ?Sized,
+    {
+        let maybe_entry = self
+            .base
+            .get_with_hash(key, hash, replace_if.as_mut(), need_key, true)
+            .await;
+        if let Some(entry) = maybe_entry {
+            entry
+        } else {
+            let key = Arc::new(key.to_owned());
+            self.insert_with_hash_and_fun(key, hash, init, replace_if, need_key)
+                .await
+        }
+    }
+
+    async fn insert_with_hash_and_fun(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        init: Pin<&mut impl Future<Output = V>>,
+        replace_if: Option<impl FnMut(&V) -> bool + Send>,
+        need_key: bool,
+    ) -> Entry<K, V> {
+        let k = if need_key {
+            Some(Arc::clone(&key))
+        } else {
+            None
+        };
+
+        let type_id = ValueInitializer::<K, V, S>::type_id_for_get_with();
+        let post_init = ValueInitializer::<K, V, S>::post_init_for_get_with;
+
+        match self
+            .value_initializer
+            .try_init_or_read(&key, hash, type_id, self, replace_if, init, post_init)
+            .await
+        {
+            InitResult::Initialized(v) => {
+                crossbeam_epoch::pin().flush();
+                Entry::new(k, v, true, false)
+            }
+            InitResult::ReadExisting(v) => Entry::new(k, v, false, false),
+            InitResult::InitErr(_) => unreachable!(),
+        }
+    }
+
+    pub(crate) async fn get_or_insert_with_hash(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        init: impl FnOnce() -> V,
+    ) -> Entry<K, V> {
+        match self
+            .base
+            .get_with_hash(&*key, hash, never_ignore(), true, true)
+            .await
+855:pub(crate) struct Inner<K, V, S> {
+860:    pub(crate) cache: CacheStore<K, V, S>,
+1623:        cache: &CacheStore<K, V, S>,
+2583:        fn current_time(cache: &BaseCache<Key, Value>) -> StdInstant {
+2587:        fn insert(cache: &BaseCache<Key, Value>, key: Key, hash: u64, value: Value) {
+2603:            ($cache:ident, $key:ident, $hash:ident, $mock:ident, $duration_secs:expr) => {

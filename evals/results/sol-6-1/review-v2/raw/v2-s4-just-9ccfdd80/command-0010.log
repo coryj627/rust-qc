@@ -1,0 +1,1204 @@
+use {super::*, serde::Serialize};
+
+type Scopes<'src, 'run> = BTreeMap<
+  Modulepath,
+  (
+    &'run Justfile<'src>,
+    &'run Scope<'src, 'run>,
+    &'run BTreeMap<String, String>,
+  ),
+>;
+
+#[derive(Debug, PartialEq, Serialize)]
+pub(crate) struct Justfile<'src> {
+  pub(crate) aliases: Table<'src, Alias<'src>>,
+  pub(crate) assignments: Table<'src, Assignment<'src>>,
+  #[serde(rename = "first", serialize_with = "keyed::serialize_option")]
+  pub(crate) default: Option<Arc<Recipe<'src>>>,
+  pub(crate) doc: Option<String>,
+  #[serde(skip)]
+  pub(crate) functions: Table<'src, FunctionDefinition<'src>>,
+  pub(crate) groups: Vec<StringLiteral<'src>>,
+  #[serde(skip)]
+  pub(crate) loaded: Vec<PathBuf>,
+  pub(crate) module_path: Modulepath,
+  pub(crate) modules: Table<'src, Self>,
+  #[serde(skip)]
+  pub(crate) name: Option<Name<'src>>,
+  #[serde(skip)]
+  pub(crate) private: bool,
+  pub(crate) recipes: Table<'src, Arc<Recipe<'src>>>,
+  pub(crate) settings: Settings,
+  pub(crate) source: PathBuf,
+  pub(crate) unexports: HashSet<String>,
+  #[serde(skip)]
+  pub(crate) unstable_features: BTreeSet<UnstableFeature>,
+  pub(crate) warnings: Vec<Warning>,
+  #[serde(skip)]
+  pub(crate) working_directory: PathBuf,
+}
+
+impl<'src> Justfile<'src> {
+  fn find_suggestion(
+    input: &str,
+    candidates: impl Iterator<Item = Suggestion<'src>>,
+  ) -> Option<Suggestion<'src>> {
+    candidates
+      .map(|suggestion| (edit_distance(input, suggestion.name), suggestion))
+      .filter(|(distance, _suggestion)| *distance < 3)
+      .min_by_key(|(distance, _suggestion)| *distance)
+      .map(|(_distance, suggestion)| suggestion)
+  }
+
+  pub(crate) fn suggest_recipe(&self, input: &str) -> Option<Suggestion<'src>> {
+    Self::find_suggestion(
+      input,
+      self
+        .recipes
+        .values()
+        .filter(|recipe| recipe.is_public())
+        .map(|recipe| Suggestion {
+          name: recipe.name(),
+          target: None,
+        })
+        .chain(
+          self
+            .aliases
+            .values()
+            .filter(|alias| alias.is_public())
+            .map(|alias| Suggestion {
+              name: alias.name.lexeme(),
+              target: Some(alias.target.name.lexeme()),
+            }),
+        ),
+    )
+  }
+
+  pub(crate) fn suggest_submodule(&self, input: &str) -> Option<Suggestion<'src>> {
+    Self::find_suggestion(
+      input,
+      self
+        .modules
+        .keys()
+        .map(|name| Suggestion { name, target: None }),
+    )
+  }
+
+  pub(crate) fn suggest_variable_or_submodule(&self, input: &str) -> Option<Suggestion<'src>> {
+    Self::find_suggestion(
+      input,
+      self
+        .assignments
+        .keys()
+        .chain(self.modules.keys())
+        .map(|name| Suggestion { name, target: None }),
+    )
+  }
+
+  fn evaluate_scopes<'run>(
+    &'run self,
+    config: &'run Config,
+    dotenv_arena: &'run Arena<BTreeMap<String, String>>,
+    overrides: &'run HashMap<Number, String>,
+    parent_dotenv: Option<&'run BTreeMap<String, String>>,
+    root: &'run Scope<'src, 'run>,
+    scope_arena: &'run Arena<Scope<'src, 'run>>,
+    scopes: &mut Scopes<'src, 'run>,
+    search: &'run Search,
+    variable_references: Option<&HashSet<Number>>,
+  ) -> RunResult<'src> {
+    let dotenv = if config.load_dotenv {
+      let working_directory = if self.is_submodule() {
+        &self.working_directory
+      } else {
+        &search.working_directory
+      };
+      load_dotenv(config, &self.settings, working_directory)?
+    } else {
+      BTreeMap::new()
+    };
+
+    let dotenv = if let Some(parent_dotenv) = parent_dotenv {
+      parent_dotenv
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .chain(dotenv)
+        .collect()
+    } else {
+      dotenv
+    };
+
+    let dotenv = dotenv_arena.alloc(dotenv);
+
+    let scope = Evaluator::evaluate_assignments(
+      config,
+      dotenv,
+      self,
+      overrides,
+      root,
+      search,
+      variable_references,
+    )?;
+
+    let scope = scope_arena.alloc(scope);
+    scopes.insert(self.module_path.clone(), (self, scope, dotenv));
+
+    for module in self.modules.values() {
+      module.evaluate_scopes(
+        config,
+        dotenv_arena,
+        overrides,
+        Some(dotenv),
+        scope,
+        scope_arena,
+        scopes,
+        search,
+        variable_references,
+      )?;
+    }
+
+    Ok(())
+  }
+
+  pub(crate) fn run(
+    &self,
+    config: &Config,
+    search: &Search,
+    arguments: &[String],
+    overrides: &HashMap<Number, String>,
+  ) -> RunResult<'src> {
+    let root = Scope::root();
+    let dotenv_arena = Arena::new();
+    let scope_arena = Arena::new();
+    let mut scopes = BTreeMap::new();
+
+    match &config.subcommand {
+      Subcommand::Choose { .. } | Subcommand::Run { .. } => {
+        let arguments = arguments.iter().map(String::as_str).collect::<Vec<&str>>();
+
+        let invocations = InvocationParser::parse_invocations(self, &arguments)?;
+
+        if config.one && invocations.len() > 1 {
+          return Err(Error::ExcessInvocations {
+            invocations: invocations.len(),
+          });
+        }
+
+        let variable_references = if self.settings.lazy {
+          let mut variable_references = HashSet::new();
+
+          let mut stack = Vec::new();
+
+          for invocation in &invocations {
+            stack.push(invocation.recipe);
+          }
+
+          while let Some(recipe) = stack.pop() {
+            variable_references.extend(&recipe.variable_references);
+            for dependency in &recipe.dependencies {
+              stack.push(&dependency.recipe);
+            }
+          }
+
+          Some(variable_references)
+        } else {
+          None
+        };
+
+        self.evaluate_scopes(
+          config,
+          &dotenv_arena,
+          overrides,
+          None,
+          &root,
+          &scope_arena,
+          &mut scopes,
+          search,
+          variable_references.as_ref(),
+        )?;
+
+        let ran = Ran::default();
+        for invocation in invocations {
+          Self::run_recipe(
+            &invocation.arguments,
+            config,
+            false,
+            &ran,
+            invocation.recipe,
+            &scopes,
+            search,
+          )?;
+        }
+
+        Ok(())
+      }
+      Subcommand::Command {
+        binary, arguments, ..
+      } => {
+        let mut command = if config.shell_command {
+          let mut command = self.settings.shell_command(config);
+          command.arg(binary);
+          command
+        } else {
+          Command::resolve(binary)
+        };
+
+        command
+          .args(arguments)
+          .current_dir(&search.working_directory);
+
+        self.evaluate_scopes(
+          config,
+          &dotenv_arena,
+          overrides,
+          None,
+          &root,
+          &scope_arena,
+          &mut scopes,
+          search,
+          Some(HashSet::new()).as_ref(),
+        )?;
+
+        let (_module, scope, dotenv) = scopes.get(&self.module_path).unwrap();
+        let scope = scope.child();
+
+        command.export(&self.settings, dotenv, &scope, &self.unexports);
+
+        let (result, caught) = command.status_guard();
+
+        let status = result.map_err(|io_error| Error::CommandInvoke {
+          binary: binary.clone(),
+          arguments: arguments.clone(),
+          io_error,
+        })?;
+
+        if !status.success() {
+          return Err(Error::CommandStatus {
+            binary: binary.clone(),
+            arguments: arguments.clone(),
+            status,
+          });
+        }
+
+        if let Some(signal) = caught {
+          return Err(Error::Interrupted { signal });
+        }
+
+        Ok(())
+      }
+      Subcommand::Evaluate { format, path } => {
+        let (module, variable, variable_references) = self.evaluation_target(path)?;
+
+        self.evaluate_scopes(
+          config,
+          &dotenv_arena,
+          overrides,
+          None,
+          &root,
+          &scope_arena,
+          &mut scopes,
+          search,
+          Some(&variable_references),
+        )?;
+
+        let scope = scopes.get(&module.module_path).unwrap().1;
+
+        if let Some(variable) = variable {
+          print!("{}", scope.value(variable).unwrap());
+        } else {
+          let width = scope.names().fold(0, |max, name| name.len().max(max));
+
+          for binding in scope.bindings() {
+            if !binding.private {
+              match format {
+                EvaluateFormat::Just => {
+                  println!("{0:1$} := \"{2}\"", binding.name, width, binding.value);
+                }
+                EvaluateFormat::Shell => {
+                  if binding.export || module.settings.export {
+                    print!("export ");
+                  }
+                  print!("{}=\"", binding.name.lexeme().replace('-', "_"));
+                  for c in binding.value.chars() {
+                    if matches!(c, '!' | '"' | '$' | '\\' | '`') {
+                      print!("\\");
+                    }
+                    print!("{c}");
+                  }
+                  println!("\"");
+                }
+              }
+            }
+          }
+        }
+
+        Ok(())
+      }
+      _ => unreachable!(),
+    }
+  }
+
+  pub(crate) fn evaluation_target<'a>(
+    &'a self,
+    path: &'a Modulepath,
+  ) -> RunResult<'src, (&'a Justfile<'a>, Option<&'a str>, HashSet<Number>)> {
+    let mut current = self;
+
+    let mut variable = None;
+
+    for (i, component) in path.components.iter().enumerate() {
+      let last = i + 1 == path.components.len();
+
+      if last && current.assignments.contains_key(component) {
+        variable = Some(component.as_ref());
+        break;
+      }
+
+      if let Some(module) = current.modules.get(component) {
+        current = module;
+      } else if last {
+        return Err(Error::EvalUnknownSubmoduleOrVariable {
+          suggestion: current.suggest_variable_or_submodule(component),
+          component: component.into(),
+        });
+      } else {
+        return Err(Error::EvalUnknownSubmodule {
+          suggestion: current.suggest_submodule(component),
+          component: component.into(),
+        });
+      }
+    }
+
+    let variable_references = if let Some(variable) = variable {
+      HashSet::from([current.assignments.get(variable).unwrap().number])
+    } else {
+      current
+        .assignments
+        .values()
+        .filter(|assignment| !assignment.private)
+        .map(|assignment| assignment.number)
+        .collect()
+    };
+
+    Ok((current, variable, variable_references))
+  }
+
+  pub(crate) fn check_unstable(&self, config: &Config) -> RunResult<'src> {
+    if let Some(&unstable_feature) = self.unstable_features.iter().next() {
+      config.require_unstable(self, unstable_feature)?;
+    }
+
+    for module in self.modules.values() {
+      module.check_unstable(config)?;
+    }
+
+    Ok(())
+  }
+
+  pub(crate) fn get_alias(&self, name: &str) -> Option<&Alias<'src>> {
+    self.aliases.get(name)
+  }
+
+  pub(crate) fn get_recipe(&self, name: &str) -> Option<&Recipe<'src>> {
+    self
+      .recipes
+      .get(name)
+      .map(Arc::as_ref)
+      .or_else(|| self.aliases.get(name).map(|alias| alias.target.as_ref()))
+  }
+
+  pub(crate) fn is_submodule(&self) -> bool {
+    self.name.is_some()
+  }
+
+  pub(crate) fn name(&self) -> &'src str {
+    self.name.map(|name| name.lexeme()).unwrap_or_default()
+  }
+
+  fn run_recipe(
+    arguments: &[Vec<String>],
+    config: &Config,
+    is_dependency: bool,
+    ran: &Ran,
+    recipe: &Recipe<'src>,
+    scopes: &Scopes<'src, '_>,
+    search: &Search,
+  ) -> RunResult<'src> {
+    let mutex = ran.mutex(recipe, arguments);
+
+    let mut guard = mutex.lock().unwrap();
+
+    if *guard {
+      return Ok(());
+    }
+
+    let (module, scope, dotenv) = scopes
+      .get(recipe.module_path())
+      .expect("failed to retrieve scope for module");
+
+    let context = ExecutionContext {
+      config,
+      dotenv,
+      module,
+      search,
+    };
+
+    let (outer, positional) = Evaluator::evaluate_parameters(
+      arguments,
+      &context,
+      is_dependency,
+      &recipe.parameters,
+      recipe,
+      scope,
+    )?;
+
+    let scope = outer.child();
+
+    let mut evaluator = Evaluator::new(&context, BTreeMap::new(), true, &scope);
+
+    if !config.yes && !recipe.confirm(&mut evaluator)? {
+      return Err(Error::NotConfirmed {
+        recipe: recipe.name(),
+      });
+    }
+
+    Self::run_dependencies(
+      config,
+      &context,
+      recipe.priors(),
+      &mut evaluator,
+      ran,
+      recipe,
+      scopes,
+      search,
+    )?;
+
+    recipe.run(&context, &scope, &positional, is_dependency)?;
+
+    Self::run_dependencies(
+      config,
+      &context,
+      recipe.subsequents(),
+      &mut evaluator,
+      &Ran::default(),
+      recipe,
+      scopes,
+      search,
+    )?;
+
+    *guard = true;
+
+    Ok(())
+  }
+
+  fn run_dependencies<'run>(
+    config: &Config,
+    context: &ExecutionContext<'src, 'run>,
+    dependencies: &[Dependency<'src>],
+    evaluator: &mut Evaluator<'src, 'run>,
+    ran: &Ran,
+    recipe: &Recipe<'src>,
+    scopes: &Scopes<'src, 'run>,
+    search: &Search,
+  ) -> RunResult<'src> {
+    if context.config.no_dependencies {
+      return Ok(());
+    }
+
+    let mut evaluated = Vec::new();
+    for Dependency { recipe, arguments } in dependencies {
+      let mut grouped = Vec::new();
+      for group in arguments {
+        let evaluated_group = group
+          .iter()
+          .map(|argument| evaluator.evaluate_expression(argument))
+          .collect::<RunResult<Vec<String>>>()?;
+        grouped.push(evaluated_group);
+      }
+      evaluated.push((recipe, grouped));
+    }
+
+    if recipe.is_parallel() {
+      thread::scope::<_, RunResult>(|thread_scope| {
+        let mut handles = Vec::new();
+        for (recipe, arguments) in evaluated {
+          handles.push(thread_scope.spawn(move || {
+            Self::run_recipe(&arguments, config, true, ran, recipe, scopes, search)
+          }));
+        }
+        for handle in handles {
+          handle
+            .join()
+            .map_err(|_| Error::internal("parallel dependency thread panicked"))??;
+        }
+        Ok(())
+      })?;
+    } else {
+      for (recipe, arguments) in evaluated {
+        Self::run_recipe(&arguments, config, true, ran, recipe, scopes, search)?;
+      }
+    }
+
+    Ok(())
+  }
+
+  pub(crate) fn public_modules(&self, config: &Config) -> Vec<&Justfile> {
+    let mut modules = self
+      .modules
+      .values()
+      .filter(|module| !module.private)
+      .collect::<Vec<&Justfile>>();
+use {
+  super::*,
+  clap::{
+    ArgAction, Args, Parser,
+    builder::{
+      FalseyValueParser, Styles,
+      styling::{AnsiColor, Effects},
+    },
+  },
+};
+
+#[derive(Debug, Parser)]
+#[command(
+  about = concat!(env!("CARGO_PKG_DESCRIPTION"), " - ", env!("CARGO_PKG_HOMEPAGE")),
+  author = env!("CARGO_PKG_AUTHORS"),
+  bin_name = env!("CARGO_PKG_NAME"),
+  name = env!("CARGO_PKG_NAME"),
+  styles = Styles::styled()
+    .error(AnsiColor::Red.on_default() | Effects::BOLD)
+    .header(AnsiColor::Yellow.on_default() | Effects::BOLD)
+    .invalid(AnsiColor::Red.on_default())
+    .literal(AnsiColor::Green.on_default())
+    .placeholder(AnsiColor::Cyan.on_default())
+    .usage(AnsiColor::Yellow.on_default() | Effects::BOLD)
+    .valid(AnsiColor::Green.on_default()),
+  trailing_var_arg = true,
+  version = env!("CARGO_PKG_VERSION"),
+)]
+pub struct Arguments {
+  #[arg(
+    conflicts_with = "no_aliases",
+    default_value = "right",
+    env = "JUST_ALIAS_STYLE",
+    help = "Set list command alias display style",
+    long,
+    value_enum
+  )]
+  pub(crate) alias_style: AliasStyle,
+  #[arg(
+    env = "JUST_ALLOW_MISSING",
+    help = "Ignore missing recipe and module errors",
+    long
+  )]
+  pub(crate) allow_missing: bool,
+  #[arg(
+    add = ArgValueCompleter::new(Completer::complete_argument),
+    help = "Overrides and recipe(s) to run, defaulting to the first recipe in the justfile",
+    num_args = 1..,
+  )]
+  pub(crate) arguments: Vec<String>,
+  #[arg(
+    add = ArgValueCompleter::new(PathCompleter::dir()),
+    env = "JUST_CEILING",
+    help = "Do not ascend above <CEILING> directory when searching for a justfile.",
+    long,
+    value_name = "CEILING"
+  )]
+  pub(crate) ceiling: Option<PathBuf>,
+  #[arg(
+    help = "Run `--fmt` in 'check' mode. Exits with 0 if justfile is formatted correctly. \
+            Exits with 1 and prints a diff if formatting is required.",
+    long,
+    requires = "fmt"
+  )]
+  pub(crate) check: bool,
+  #[arg(
+    add = ArgValueCompleter::new(PathCompleter::file()),
+    env = "JUST_CHOOSER",
+    help = "Override binary invoked by `--choose`",
+    long
+  )]
+  pub(crate) chooser: Option<PathBuf>,
+  #[arg(help = "Clear shell arguments", long, overrides_with = "shell_arg")]
+  pub(crate) clear_shell_args: bool,
+  #[arg(
+    default_value = "auto",
+    env = "JUST_COLOR",
+    help = "Print colorful output",
+    long,
+    value_enum
+  )]
+  pub(crate) color: UseColor,
+  #[arg(
+    env = "JUST_COMMAND_COLOR",
+    help = "Echo recipe lines in <COMMAND-COLOR>",
+    long,
+    value_enum
+  )]
+  pub(crate) command_color: Option<CommandColor>,
+  #[arg(
+    env = "JUST_COMPLETE_ALIASES",
+    help = "Auto-complete recipe aliases",
+    long
+  )]
+  pub(crate) complete_aliases: bool,
+  #[arg(
+    add = ArgValueCompleter::new(PathCompleter::file()),
+    default_value = Self::DEFAULT_CYGPATH,
+    env = "JUST_CYGPATH",
+    help = "Use binary at <CYGPATH> to convert between unix and Windows paths.",
+    long,
+    value_name = "CYGPATH"
+  )]
+  pub(crate) cygpath: PathBuf,
+  #[arg(
+    conflicts_with = "dotenv_path",
+    help = "Search for environment file named <DOTENV-FILENAME> instead of `.env`",
+    long,
+    value_name = "DOTENV-FILENAME"
+  )]
+  pub(crate) dotenv_filename: Option<String>,
+  #[arg(
+    add = ArgValueCompleter::new(PathCompleter::file()),
+    help = "Load <DOTENV-PATH> as environment file instead of searching for one",
+    long,
+    short = 'E',
+    value_name = "DOTENV-PATH"
+  )]
+  pub(crate) dotenv_path: Option<PathBuf>,
+  #[arg(
+    conflicts_with = "quiet",
+    env = "JUST_DRY_RUN",
+    help = "Print what just would do without doing it",
+    long,
+    short = 'n'
+  )]
+  pub(crate) dry_run: bool,
+  #[arg(
+    default_value = "just",
+    env = "JUST_DUMP_FORMAT",
+    help = "Dump justfile as <FORMAT>",
+    long,
+    value_enum,
+    value_name = "FORMAT"
+  )]
+  pub(crate) dump_format: DumpFormat,
+  #[arg(
+    default_value = "just",
+    env = "JUST_EVALUATE_FORMAT",
+    help = "Print evaluated variables in <FORMAT>",
+    long,
+    value_enum,
+    value_name = "FORMAT"
+  )]
+  pub(crate) evaluate_format: EvaluateFormat,
+  #[arg(
+    env = "JUST_EXPLAIN",
+    help = "Print recipe doc comment before running it",
+    long
+  )]
+  pub(crate) explain: bool,
+  #[arg(
+    conflicts_with = "justfile",
+    conflicts_with = "working_directory",
+    help = "Use global justfile",
+    long,
+    short = 'g'
+  )]
+  pub(crate) global_justfile: bool,
+  #[arg(
+    add = ArgValueCompleter::new(Completer::complete_group),
+    env = "JUST_GROUP",
+    help = "Only list recipes in <GROUP>",
+    long = "group",
+    requires = "list"
+  )]
+  pub(crate) group: Vec<String>,
+  #[arg(
+    env = "JUST_HIGHLIGHT",
+    help = "Highlight echoed recipe lines in bold",
+    long,
+    overrides_with = "no_highlight"
+  )]
+  pub(crate) highlight: bool,
+  #[arg(
+    default_value = "    ",
+    env = "JUST_INDENTATION",
+    help = "Indent recipes bodies with <INDENTATION>",
+    long
+  )]
+  pub(crate) indentation: Indentation,
+  #[arg(
+    add = ArgValueCompleter::new(PathCompleter::file()),
+    env = "JUST_JUSTFILE",
+    help = "Use <JUSTFILE> as justfile",
+    long,
+    short = 'f',
+    value_name = "JUSTFILE"
+  )]
+  pub(crate) justfile: Option<PathBuf>,
+  #[arg(
+    env = "JUST_JUSTFILE_NAME",
+    help = "Search for justfile named <NAME>",
+    long = "justfile-name",
+    value_name = "NAME"
+  )]
+  pub(crate) justfile_names: Option<Vec<String>>,
+  #[arg(
+    default_value = Arguments::DEFAULT_LIST_HEADING,
+    env = "JUST_LIST_HEADING",
+    help = "Print <TEXT> before list",
+    long,
+    value_name = "TEXT"
+  )]
+  pub(crate) list_heading: String,
+  #[arg(
+    default_value = Arguments::DEFAULT_LIST_PREFIX,
+    env = "JUST_LIST_PREFIX",
+    help = "Print <TEXT> before each list item",
+    long,
+    value_name = "TEXT"
+  )]
+  pub(crate) list_prefix: String,
+  #[arg(
+    env = "JUST_LIST_SUBMODULES",
+    help = "List recipes in submodules",
+    long,
+    requires = "list"
+  )]
+  pub(crate) list_submodules: bool,
+  #[arg(env = "JUST_NO_ALIASES", help = "Don't show aliases in list", long)]
+  pub(crate) no_aliases: bool,
+  #[arg(
+    alias = "no-dependencies",
+    env = "JUST_NO_DEPS",
+    help = "Don't run recipe dependencies",
+    long = "no-deps"
+  )]
+  pub(crate) no_deps: bool,
+  #[arg(env = "JUST_NO_DOTENV", help = "Don't load `.env` file", long)]
+  pub(crate) no_dotenv: bool,
+  #[arg(
+    env = "JUST_NO_HIGHLIGHT",
+    help = "Don't highlight echoed recipe lines in bold",
+    long,
+    overrides_with = "highlight"
+  )]
+  pub(crate) no_highlight: bool,
+  #[arg(
+    env = "JUST_ONE",
+    help = "Forbid multiple recipes from being invoked on the command line",
+    long
+  )]
+  pub(crate) one: bool,
+  #[arg(
+    conflicts_with = "dry_run",
+    env = "JUST_QUIET",
+    help = "Suppress all output",
+    long,
+    short = 'q'
+use super::*;
+
+pub(crate) fn load_dotenv(
+  config: &Config,
+  settings: &Settings,
+  working_directory: &Path,
+) -> RunResult<'static, BTreeMap<String, String>> {
+  let dotenv_filename = config
+    .dotenv_filename
+    .as_ref()
+    .or(settings.dotenv_filename.as_ref());
+
+  let dotenv_path = config
+    .dotenv_path
+    .as_ref()
+    .or(settings.dotenv_path.as_ref());
+
+  if !settings.dotenv_load
+    && !settings.dotenv_override
+    && !settings.dotenv_required
+    && dotenv_filename.is_none()
+    && dotenv_path.is_none()
+  {
+    return Ok(BTreeMap::new());
+  }
+
+  if let Some(path) = dotenv_path {
+    let path = working_directory.join(path);
+    if let Some(map) = load_from_file(&path, settings)? {
+      return Ok(map);
+    }
+  }
+
+  let filename = dotenv_filename.map_or(".env", |s| s.as_str());
+
+  for directory in working_directory.ancestors() {
+    let path = directory.join(filename);
+    if let Some(map) = load_from_file(&path, settings)? {
+      return Ok(map);
+    }
+  }
+
+  if settings.dotenv_required {
+    Err(Error::DotenvRequired)
+  } else {
+    Ok(BTreeMap::new())
+  }
+}
+
+fn load_from_file(
+  path: &Path,
+  settings: &Settings,
+) -> RunResult<'static, Option<BTreeMap<String, String>>> {
+  if path.is_dir() {
+    return Ok(None);
+  }
+
+  let file = match File::open(path) {
+    Ok(file) => file,
+    Err(source) => {
+      if source.kind() == io::ErrorKind::NotFound {
+        return Ok(None);
+      }
+      return Err(Error::FilesystemIo {
+        path: path.into(),
+        source,
+      });
+    }
+  };
+
+  let mut dotenv = BTreeMap::new();
+
+  for result in dotenvy::from_read_iter(file) {
+    let (key, value) = result.map_err(|dotenv_error| Error::Dotenv {
+      dotenv_error,
+      path: path.into(),
+    })?;
+
+    if settings.dotenv_override || env::var_os(&key).is_none() {
+      dotenv.insert(key, value);
+    }
+  }
+
+  Ok(Some(dotenv))
+}
+use {super::*, std::path::Component};
+
+const DEFAULT_JUSTFILE_NAME: &str = JUSTFILE_NAMES[0];
+pub(crate) const JUSTFILE_NAMES: [&str; 2] = ["justfile", ".justfile"];
+const PROJECT_ROOT_CHILDREN: &[&str] = &[".bzr", ".git", ".hg", ".svn", "_darcs"];
+
+#[derive(Debug)]
+pub(crate) struct Search {
+  pub(crate) justfile: PathBuf,
+  pub(crate) working_directory: PathBuf,
+}
+
+impl Search {
+  fn global_justfile_paths() -> Vec<(PathBuf, &'static str)> {
+    let mut paths = Vec::new();
+
+    if let Some(config_dir) = dirs::config_dir() {
+      paths.push((config_dir.join("just"), DEFAULT_JUSTFILE_NAME));
+    }
+
+    if let Some(home_dir) = dirs::home_dir() {
+      paths.push((home_dir.join(".config").join("just"), DEFAULT_JUSTFILE_NAME));
+
+      for justfile_name in JUSTFILE_NAMES {
+        paths.push((home_dir.clone(), justfile_name));
+      }
+    }
+
+    paths
+  }
+
+  /// Find justfile given search configuration and invocation directory
+  pub(crate) fn search(config: &Config) -> SearchResult<Self> {
+    match &config.search_config {
+      SearchConfig::FromInvocationDirectory => {
+        Self::find_in_directory(config, &config.invocation_directory)
+      }
+      SearchConfig::FromSearchDirectory { search_directory } => {
+        let search_directory = Self::clean(&config.invocation_directory, search_directory);
+        let justfile = Self::justfile(config, &search_directory)?;
+        let working_directory = Self::working_directory_from_justfile(&justfile)?;
+        Ok(Self {
+          justfile,
+          working_directory,
+        })
+      }
+      SearchConfig::GlobalJustfile => Ok(Self {
+        justfile: Self::find_global_justfile()?,
+        working_directory: Self::project_root(config, &config.invocation_directory)?,
+      }),
+      SearchConfig::WithJustfile { justfile } => {
+        let justfile = Self::clean(&config.invocation_directory, justfile);
+        let working_directory = Self::working_directory_from_justfile(&justfile)?;
+        Ok(Self {
+          justfile,
+          working_directory,
+        })
+      }
+      SearchConfig::WithJustfileAndWorkingDirectory {
+        justfile,
+        working_directory,
+      } => Ok(Self {
+        justfile: Self::clean(&config.invocation_directory, justfile),
+        working_directory: Self::clean(&config.invocation_directory, working_directory),
+      }),
+    }
+  }
+
+  fn find_global_justfile() -> SearchResult<PathBuf> {
+    for (directory, filename) in Self::global_justfile_paths() {
+      if let Ok(read_dir) = fs::read_dir(&directory) {
+        for entry in read_dir {
+          let entry = entry.map_err(|io_error| SearchError::Io {
+            io_error,
+            directory: directory.clone(),
+          })?;
+          if let Some(candidate) = entry.file_name().to_str() {
+            if candidate.eq_ignore_ascii_case(filename) {
+              return Ok(entry.path());
+            }
+          }
+        }
+      }
+    }
+
+    Err(SearchError::GlobalJustfileNotFound)
+  }
+
+  /// Find justfile starting from parent directory of current justfile
+  pub(crate) fn search_parent_directory(&self, config: &Config) -> SearchResult<Self> {
+    let parent = self
+      .justfile
+      .parent()
+      .and_then(|path| path.parent())
+      .ok_or_else(|| SearchError::JustfileHadNoParent {
+        path: self.justfile.clone(),
+      })?;
+    Self::find_in_directory(config, parent)
+  }
+
+  /// Find justfile starting in given directory searching upwards in directory tree
+  fn find_in_directory(config: &Config, starting_dir: &Path) -> SearchResult<Self> {
+    let justfile = Self::justfile(config, starting_dir)?;
+    let working_directory = Self::working_directory_from_justfile(&justfile)?;
+    Ok(Self {
+      justfile,
+      working_directory,
+    })
+  }
+
+  /// Get working directory and justfile path for newly-initialized justfile
+  pub(crate) fn init(config: &Config) -> SearchResult<Self> {
+    let default_justfile_name = || {
+      config
+        .justfile_names
+        .as_ref()
+        .and_then(|names| names.first().map(String::as_str))
+        .unwrap_or(DEFAULT_JUSTFILE_NAME)
+    };
+
+    match &config.search_config {
+      SearchConfig::FromInvocationDirectory => {
+        let working_directory = Self::project_root(config, &config.invocation_directory)?;
+        let justfile = working_directory.join(default_justfile_name());
+        Ok(Self {
+          justfile,
+          working_directory,
+        })
+      }
+      SearchConfig::FromSearchDirectory { search_directory } => {
+        let search_directory = Self::clean(&config.invocation_directory, search_directory);
+        let working_directory = Self::project_root(config, &search_directory)?;
+        let justfile = working_directory.join(default_justfile_name());
+        Ok(Self {
+          justfile,
+          working_directory,
+        })
+      }
+      SearchConfig::GlobalJustfile => Err(SearchError::GlobalJustfileInit),
+      SearchConfig::WithJustfile { justfile } => {
+        let justfile = Self::clean(&config.invocation_directory, justfile);
+        let working_directory = Self::working_directory_from_justfile(&justfile)?;
+        Ok(Self {
+          justfile,
+          working_directory,
+        })
+      }
+      SearchConfig::WithJustfileAndWorkingDirectory {
+        justfile,
+        working_directory,
+      } => Ok(Self {
+        justfile: Self::clean(&config.invocation_directory, justfile),
+        working_directory: Self::clean(&config.invocation_directory, working_directory),
+      }),
+    }
+  }
+
+  /// Search upwards from `directory` for a file whose name matches one of
+  /// `JUSTFILE_NAMES`
+  fn justfile(config: &Config, directory: &Path) -> SearchResult<PathBuf> {
+    for directory in directory.ancestors() {
+      let mut candidates = BTreeSet::new();
+
+      let entries = fs::read_dir(directory).map_err(|io_error| SearchError::Io {
+        io_error,
+        directory: directory.to_owned(),
+      })?;
+
+      for entry in entries {
+        let entry = entry.map_err(|io_error| SearchError::Io {
+          io_error,
+          directory: directory.to_owned(),
+        })?;
+        if let Some(name) = entry.file_name().to_str() {
+          let justfile_names: Box<dyn Iterator<Item = &str>> =
+            if let Some(justfile_names) = &config.justfile_names {
+              Box::new(justfile_names.iter().map(String::as_str))
+            } else {
+              Box::new(JUSTFILE_NAMES.into_iter())
+            };
+
+          for justfile_name in justfile_names {
+            if name.eq_ignore_ascii_case(justfile_name) {
+              candidates.insert(entry.path());
+            }
+          }
+        }
+      }
+
+      match candidates.len() {
+        0 => {}
+        1 => return Ok(candidates.into_iter().next().unwrap()),
+        _ => return Err(SearchError::MultipleCandidates { candidates }),
+      }
+
+      if let Some(ceiling) = &config.ceiling {
+        if directory == ceiling {
+          break;
+        }
+      }
+    }
+
+    Err(SearchError::NotFound)
+  }
+
+  fn clean(invocation_directory: &Path, path: &Path) -> PathBuf {
+    let path = invocation_directory.join(path);
+
+    let mut clean = Vec::new();
+
+    for component in path.components() {
+      if component == Component::ParentDir {
+        if let Some(Component::Normal(_)) = clean.last() {
+          clean.pop();
+        }
+      } else {
+        clean.push(component);
+      }
+    }
+
+    clean.into_iter().collect()
+  }
+
+  /// Search upwards from `directory` for the root directory of a software
+  /// project, as determined by the presence of one of the version control
+  /// system directories given in `PROJECT_ROOT_CHILDREN`
+  fn project_root(config: &Config, directory: &Path) -> SearchResult<PathBuf> {
+    for directory in directory.ancestors() {
+      let entries = fs::read_dir(directory).map_err(|io_error| SearchError::Io {
+        io_error,
+        directory: directory.to_owned(),
+      })?;
+
+      for entry in entries {
+        let entry = entry.map_err(|io_error| SearchError::Io {
+          io_error,
+          directory: directory.to_owned(),
+        })?;
+        for project_root_child in PROJECT_ROOT_CHILDREN.iter().copied() {
+          if entry.file_name() == project_root_child {
+            return Ok(directory.to_owned());
+          }
+        }
+      }
+
+      if let Some(ceiling) = &config.ceiling {
+        if directory == ceiling {
+          break;
+        }
+      }
+    }
+
+    Ok(directory.to_owned())
+  }
+
+  fn working_directory_from_justfile(justfile: &Path) -> SearchResult<PathBuf> {
+    Ok(
+      justfile
+        .parent()
+        .ok_or_else(|| SearchError::JustfileHadNoParent {
+          path: justfile.to_path_buf(),
+        })?
+        .to_owned(),
+    )
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn clean() {
+    let cases = &[
+      ("/", "foo", "/foo"),
+      ("/bar", "/foo", "/foo"),
+      if cfg!(windows) {
+        ("//foo", "bar//baz", "//foo\\bar\\baz")
+      } else {
+        ("/", "..", "/")
+      },
+      ("/", "/..", "/"),
+      ("/..", "", "/"),
+      ("/../../../..", "../../../", "/"),
+      ("/.", "./", "/"),
+      ("/foo/../", "bar", "/bar"),
+      ("/foo/bar", "..", "/foo"),
+      ("/foo/bar/", "..", "/foo"),
+    ];
+
+    for (prefix, suffix, want) in cases {
+      let have = Search::clean(Path::new(prefix), Path::new(suffix));
+      assert_eq!(have, Path::new(want));
+    }
+  }
+}
+use super::*;
+
+/// Controls how `just` will search for the justfile.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) enum SearchConfig {
+  /// Recursively search for the justfile upwards from the invocation directory
+  /// to the root, setting the working directory to the directory in which the
+  /// justfile is found.
+  #[default]
+  FromInvocationDirectory,
+  /// As in `Invocation`, but start from `search_directory`.
+  FromSearchDirectory { search_directory: PathBuf },
+  /// Search for global justfile
+  GlobalJustfile,
+  /// Use user-specified justfile, with the working directory set to the
+  /// directory that contains it.
+  WithJustfile { justfile: PathBuf },
+  /// Use user-specified justfile and working directory.
+  WithJustfileAndWorkingDirectory {
+    justfile: PathBuf,
+    working_directory: PathBuf,
+  },
+}

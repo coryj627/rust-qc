@@ -1,0 +1,485 @@
+    let config = &context.config;
+    let settings = &context.module.settings;
+
+    let mut lines = self.body.iter().peekable();
+    let mut line_number = self.line_number() + 1;
+    loop {
+      let Some(line) = lines.peek() else {
+        return Ok(());
+      };
+
+      let mut evaluated = String::new();
+      let mut continued = false;
+
+      let comment_line = settings.ignore_comments && line.is_comment();
+      let sigils = line.sigils(settings);
+
+      loop {
+        if lines.peek().is_none() {
+          break;
+        }
+        let line = lines.next().unwrap();
+        line_number += 1;
+        if !comment_line {
+          evaluated += &evaluator.evaluate_line(line, continued)?;
+        }
+        if line.is_continuation() && !comment_line {
+          continued = true;
+          evaluated.pop();
+        } else {
+          break;
+        }
+      }
+
+      if comment_line {
+        continue;
+      }
+
+      let mut command = evaluated.as_str();
+
+      command = &command[sigils.len()..];
+
+      if command.is_empty() {
+        continue;
+      }
+
+      let guard = sigils.contains(&Sigil::Guard);
+      let infallible = sigils.contains(&Sigil::Infallible);
+      let quiet = sigils.contains(&Sigil::Quiet);
+
+      if config.dry_run
+        || config.verbosity.loquacious()
+        || config.timestamp
+        || !((quiet ^ self.quiet)
+          || (settings.quiet && !self.no_quiet())
+          || config.verbosity.quiet())
+      {
+        let color = if config.highlight {
+          config.color.command(config.command_color)
+        } else {
+          config.color
+        }
+        .stderr();
+
+        if let Some(timestamp) = config.timestamp() {
+          eprint!("[{}] ", color.paint(&timestamp));
+        }
+
+        eprintln!("{}", color.paint(command));
+      }
+
+      if config.dry_run {
+        continue;
+      }
+
+      let mut cmd = settings.shell_command(config);
+
+      if let Some(working_directory) = self.working_directory(context) {
+        cmd.current_dir(working_directory);
+      }
+
+      cmd.arg(command);
+
+      if self.takes_positional_arguments(settings) {
+        cmd.arg(self.name.lexeme());
+        cmd.args(positional);
+      }
+
+      if config.verbosity.quiet() {
+        cmd.stderr(Stdio::null());
+        cmd.stdout(Stdio::null());
+      }
+
+      for attribute in &self.attributes {
+        if let Attribute::Env(key, value) = attribute {
+          cmd.env(&key.cooked, &value.cooked);
+        }
+      }
+
+      cmd.export(settings, context.dotenv, scope, &context.module.unexports);
+
+      let (result, caught) = cmd.status_guard();
+
+      match result {
+        Ok(exit_status) => {
+          if let Some(code) = exit_status.code() {
+            if code != 0 {
+              if guard {
+                if code == 1 {
+                  return Ok(());
+                }
+
+                return Err(Error::GuardCode {
+                  recipe: self.name(),
+                  line_number,
+                  code,
+                });
+              } else if !infallible {
+                return Err(Error::Code {
+                  recipe: self.name(),
+                  line_number: Some(line_number),
+                  code,
+                  print_message: self.print_exit_message(settings),
+                });
+              }
+            }
+          } else if !infallible {
+            return Err(Error::from_signal(
+              exit_status,
+              Some(line_number),
+              self.print_exit_message(settings),
+              self.name(),
+            ));
+          }
+        }
+        Err(io_error) => {
+          return Err(Error::ShellIo {
+            io_error,
+            recipe: self.name(),
+            shell: settings.shell(config).0.into(),
+          });
+        }
+      }
+
+      if !infallible {
+        if let Some(signal) = caught {
+          return Err(Error::Interrupted { signal });
+        }
+      }
+    }
+  }
+
+  pub(crate) fn run_script<'run>(
+    &self,
+    context: &ExecutionContext<'src, 'run>,
+    scope: &Scope<'src, 'run>,
+    positional: &[String],
+    mut evaluator: Evaluator<'src, 'run>,
+  ) -> RunResult<'src> {
+    let config = &context.config;
+
+    if let Some(timestamp) = config.timestamp() {
+      let color = if config.highlight {
+        config.color.command(config.command_color)
+      } else {
+        config.color
+      }
+      .stderr();
+
+      eprintln!("[{}] {}", color.paint(&timestamp), self.name);
+    }
+
+    let mut evaluated_lines = Vec::new();
+    for line in &self.body {
+      evaluated_lines.push(evaluator.evaluate_line(line, false)?);
+    }
+
+    if config.verbosity.loud() && (config.dry_run || self.quiet) {
+      for line in &evaluated_lines {
+        eprintln!(
+          "{}",
+          config
+            .color
+            .command(config.command_color)
+            .stderr()
+            .paint(line)
+        );
+      }
+    }
+
+    if config.dry_run {
+      return Ok(());
+    }
+
+    let executor = if let Some(Attribute::Script(interpreter)) =
+      self.attributes.get(AttributeDiscriminant::Script)
+    {
+      Executor::Command(
+        interpreter
+          .as_ref()
+          .map(|interpreter| Interpreter {
+            command: interpreter.command.cooked.clone(),
+            arguments: interpreter
+              .arguments
+              .iter()
+              .map(|argument| argument.cooked.clone())
+              .collect(),
+          })
+          .or_else(|| context.module.settings.script_interpreter.clone())
+          .unwrap_or_else(|| Interpreter::default_script_interpreter().clone()),
+      )
+    } else {
+      let line = evaluated_lines
+        .first()
+        .ok_or_else(|| Error::internal("evaluated_lines was empty"))?;
+
+      let shebang =
+        Shebang::new(line).ok_or_else(|| Error::internal(format!("bad shebang line: {line}")))?;
+
+      Executor::Shebang(shebang)
+    };
+
+    let tempdir = context.tempdir(self)?;
+
+    let mut path = tempdir.path().to_path_buf();
+
+    let extension = self.attributes.iter().find_map(|attribute| {
+      if let Attribute::Extension(extension) = attribute {
+        Some(extension.cooked.as_str())
+      } else {
+        None
+      }
+    });
+
+    path.push(executor.script_filename(self.name(), extension));
+
+    let script = executor.script(self, &evaluated_lines);
+
+    if config.verbosity.grandiloquent() {
+      eprintln!("{}", config.color.doc().stderr().paint(&script));
+    }
+
+    fs::write(&path, script).map_err(|error| Error::TempdirIo {
+      recipe: self.name(),
+      io_error: error,
+    })?;
+
+    let mut command = executor.command(
+      config,
+      &path,
+      self.name(),
+      self.working_directory(context).as_deref(),
+    )?;
+
+    if self.takes_positional_arguments(&context.module.settings) {
+      command.args(positional);
+    }
+
+    for attribute in &self.attributes {
+      if let Attribute::Env(key, value) = attribute {
+        command.env(&key.cooked, &value.cooked);
+      }
+    }
+
+    command.export(
+      &context.module.settings,
+      context.dotenv,
+      scope,
+      &context.module.unexports,
+    );
+
+    // run it!
+    let (result, caught) = command.status_guard();
+
+    match result {
+      Ok(exit_status) => exit_status.code().map_or_else(
+        || {
+          Err(Error::from_signal(
+            exit_status,
+            None,
+            self.print_exit_message(&context.module.settings),
+            self.name(),
+          ))
+        },
+        |code| {
+          if code == 0 {
+            Ok(())
+
+#### Random
+
+- `choose(n, alphabet)`<sup>1.27.0</sup> - Generate a string of `n` randomly
+  selected characters from `alphabet`, which may not contain repeated
+  characters. For example, `choose('64', HEX)` will generate a random
+  64-character lowercase hex string.
+
+#### Datetime
+
+- `datetime(format)`<sup>1.30.0</sup> - Return local time with `format`.
+- `datetime_utc(format)`<sup>1.30.0</sup> - Return UTC time with `format`.
+
+The arguments to `datetime` and `datetime_utc` are `strftime`-style format
+strings, see the
+[`chrono` library docs](https://docs.rs/chrono/latest/chrono/format/strftime/index.html)
+for details.
+
+#### Semantic Versions
+
+- `semver_matches(version, requirement)`<sup>1.16.0</sup> - Check whether a
+  [semantic `version`](https://semver.org), e.g., `"0.1.0"` matches a
+  `requirement`, e.g., `">=0.1.0"`, returning the string `"true"` if so and the
+  string `"false"` otherwise.
+
+#### Style
+
+- `style(name)`<sup>1.37.0</sup> - Return a named terminal display attribute
+  escape sequence used by `just`. Unlike terminal display attribute escape
+  sequence constants, which contain standard colors and styles, `style(name)`
+  returns an escape sequence used by `just` itself, and can be used to make
+1935-  bosh: ''
+1936-  ```
+1937-
+1938-#### Invocation Information
+1939-
+1940:- `is_dependency()` - Returns the string `true` if the current recipe is being
+1941-  run as a dependency of another recipe, rather than being run directly,
+1942-  otherwise returns the string `false`.
+1943-
+1944-#### Invocation Directory
+1945-
+1946-- `invocation_directory()` - Retrieves the absolute path to the current
+1947-  directory when `just` was invoked, before `just` changed it (chdir'd) prior
+1948-  to executing commands. On Windows, `invocation_directory()` uses `cygpath` to
+1949-  convert the invocation directory to a Cygwin-compatible `/`-separated path.
+1950-  Use `invocation_directory_native()` to return the verbatim invocation
+1951-  directory on all platforms.
+1952-
+1953-For example, to call `rustfmt` on files just under the "current directory"
+1954-(from the user/invoker's perspective), use the following recipe:
+1955-
+1956-```just
+1957-rustfmt:
+296:  pub(crate) timestamp_format: String,
+597:  fn parse_function_definition(&mut self) -> CompileResult<'src, FunctionDefinition<'src>> {
+   125	    })
+   126	  }
+   127	
+   128	  fn resolve_expression(
+   129	    assignments: &Table<'src, Assignment<'src>>,
+   130	    expression: &Expression<'src>,
+   131	    functions: &Table<'src, FunctionDefinition<'src>>,
+   132	    parameters: &[Parameter],
+   133	    variable_references: &mut HashSet<Number>,
+   134	  ) -> CompileResult<'src> {
+   135	    for reference in expression.references() {
+   136	      match reference {
+   137	        Reference::Variable(variable) => {
+   138	          Self::resolve_variable(assignments, parameters, variable, variable_references)?;
+   139	        }
+   140	        Reference::Call { name, arguments } => {
+   141	          Analyzer::resolve_call(functions, name, arguments)?;
+   142	        }
+   143	      }
+   144	    }
+   145	    Ok(())
+   146	  }
+   147	
+   148	  fn resolve_variable(
+   798	    if self.open_delimiters_or_interpolation() {
+   799	      self.token(Whitespace);
+   800	    } else {
+   801	      self.token(Eol);
+   802	    }
+   803	
+   804	    Ok(())
+   805	  }
+   806	
+   807	  /// Lex name: [a-zA-Z_][a-zA-Z0-9_]*
+   808	  fn lex_identifier(&mut self) -> CompileResult<'src> {
+   809	    self.advance()?;
+   810	
+   811	    while let Some(c) = self.next {
+   812	      if !Self::is_identifier_continue(c) {
+   813	        break;
+   814	      }
+   815	
+   816	      self.advance()?;
+   817	    }
+   818	
+   819	    self.token(Identifier);
+   820	
+   821	    Ok(())
+   822	  }
+   823	
+   824	  /// Lex comment: #[^\r\n]
+   825	  fn lex_comment(&mut self) -> CompileResult<'src> {
+   826	    self.presume('#')?;
+   827	
+   828	    while !self.at_eol_or_eof() {
+   829	      self.advance()?;
+   830	    }
+   831	
+   832	    self.token(Comment);
+   833	
+   834	    Ok(())
+   835	  }
+   836	
+   837	  /// Lex whitespace: [ \t]+
+   838	  fn lex_whitespace(&mut self) -> CompileResult<'src> {
+   839	    while self.next_is_whitespace() {
+   840	      self.advance()?;
+   841	    }
+   842	
+   843	    self.token(Whitespace);
+   844	
+   845	    Ok(())
+   846	  }
+   847	
+   848	  /// Lex a backtick, cooked string, or raw string.
+   849	  ///
+   850	  /// Backtick:      ``[^`]*``
+   851	  /// Cooked string: "[^"]*" # also processes escape sequences
+   852	  /// Raw string:    '[^']*'
+   853	  fn lex_string(&mut self, format_string_kind: Option<StringKind>) -> CompileResult<'src> {
+   854	    let format = format_string_kind.is_some()
+   855	      || self.tokens.last().is_some_and(|token| {
+   856	        token.kind == TokenKind::Identifier && token.lexeme() == Keyword::F.lexeme()
+   857	      });
+   858	
+   859	    let kind = if let Some(kind) = format_string_kind {
+   860	      self.presume_str(Self::INTERPOLATION_END)?;
+PANIC-6 src/subcommand.rs:504
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:513
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:528
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:533
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:535
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:541
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:549
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:616
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:679
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:684
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:712
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:721
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:745
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:747
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:751
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:772
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:775
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:785
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:787
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:789
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:792
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:823
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:826
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:874
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:876
+  print macro in library code; return data or use logging.
+PANIC-6 src/subcommand.rs:878
+  print macro in library code; return data or use logging.
+
+Totals: Major: 0, Minor: 60, Note: 0
+Confirm each finding by reading the code; discard false positives.
+8.383916666666668 minutes used of 15.0

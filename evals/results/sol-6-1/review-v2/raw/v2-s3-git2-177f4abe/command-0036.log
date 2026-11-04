@@ -1,0 +1,669 @@
+		goto on_error;
+	}
+
+	blame->final_buf = git_blob_rawcontent(blame->final_blob);
+	blame->final_buf_size = (size_t)git_blob_rawsize(blame->final_blob);
+
+	ent = git__calloc(1, sizeof(git_blame__entry));
+	GIT_ERROR_CHECK_ALLOC(ent);
+
+	ent->num_lines = index_blob_lines(blame);
+	ent->lno = blame->options.min_line - 1;
+	ent->num_lines = ent->num_lines - blame->options.min_line + 1;
+	if (blame->options.max_line > 0)
+		ent->num_lines = blame->options.max_line - blame->options.min_line + 1;
+	ent->s_lno = ent->lno;
+	ent->suspect = o;
+
+	blame->ent = ent;
+
+	if ((error = git_blame__like_git(blame, blame->options.flags)) < 0)
+		goto on_error;
+
+	for (ent = blame->ent; ent; ent = ent->next) {
+		git_blame_hunk *h = hunk_from_entry(ent, blame);
+		git_vector_insert(&blame->hunks, h);
+	}
+
+on_error:
+	for (ent = blame->ent; ent; ) {
+		git_blame__entry *next = ent->next;
+		git_blame__free_entry(ent);
+		ent = next;
+	}
+
+	return error;
+}
+
+/*******************************************************************************
+ * File blaming
+ ******************************************************************************/
+
+int git_blame_file(
+		git_blame **out,
+		git_repository *repo,
+		const char *path,
+		git_blame_options *options)
+{
+	int error = -1;
+	git_blame_options normOptions = GIT_BLAME_OPTIONS_INIT;
+	git_blame *blame = NULL;
+
+	GIT_ASSERT_ARG(out);
+	GIT_ASSERT_ARG(repo);
+	GIT_ASSERT_ARG(path);
+
+	if ((error = normalize_options(&normOptions, options, repo)) < 0)
+		goto on_error;
+
+	blame = git_blame__alloc(repo, normOptions, path);
+	GIT_ERROR_CHECK_ALLOC(blame);
+
+	if ((error = load_blob(blame)) < 0)
+		goto on_error;
+
+	if ((error = blame_internal(blame)) < 0)
+		goto on_error;
+
+	*out = blame;
+	return 0;
+
+on_error:
+	git_blame_free(blame);
+	return error;
+}
+
+/*******************************************************************************
+ * Buffer blaming
+ *******************************************************************************/
+
+static bool hunk_is_bufferblame(git_blame_hunk *hunk)
+{
+	return hunk && git_oid_is_zero(&hunk->final_commit_id);
+}
+
+static int buffer_hunk_cb(
+	const git_diff_delta *delta,
+	const git_diff_hunk *hunk,
+	void *payload)
+{
+	git_blame *blame = (git_blame*)payload;
+	uint32_t wedge_line;
+
+	GIT_UNUSED(delta);
+
+	wedge_line = (hunk->new_start >= hunk->old_start || hunk->old_lines==0) ? hunk->new_start : hunk->old_start;
+	blame->current_diff_line = wedge_line;
+	blame->current_hunk = (git_blame_hunk*)git_blame_hunk_byline(blame, wedge_line);
+	if (!blame->current_hunk) {
+		/* Line added at the end of the file */
+		blame->current_hunk = new_hunk(wedge_line, 0, wedge_line,
+			blame->path, blame);
+		blame->current_diff_line++;
+		GIT_ERROR_CHECK_ALLOC(blame->current_hunk);
+		git_vector_insert(&blame->hunks, blame->current_hunk);
+	} else if (!hunk_starts_at_or_after_line(blame->current_hunk, wedge_line)){
+		/* If this hunk doesn't start between existing hunks, split a hunk up so it does */
+		blame->current_hunk = split_hunk_in_vector(&blame->hunks, blame->current_hunk,
+				wedge_line - blame->current_hunk->final_start_line_number, true,
+				blame);
+		GIT_ERROR_CHECK_ALLOC(blame->current_hunk);
+	}
+
+	return 0;
+}
+
+static int ptrs_equal_cmp(const void *a, const void *b) { return a<b ? -1 : a>b ? 1 : 0; }
+static int buffer_line_cb(
+	const git_diff_delta *delta,
+	const git_diff_hunk *hunk,
+	const git_diff_line *line,
+	void *payload)
+{
+	git_blame *blame = (git_blame*)payload;
+
+	GIT_UNUSED(delta);
+	GIT_UNUSED(hunk);
+	GIT_UNUSED(line);
+
+	if (line->origin == GIT_DIFF_LINE_ADDITION) {
+		if (hunk_is_bufferblame(blame->current_hunk) &&
+		    hunk_ends_at_or_before_line(blame->current_hunk, blame->current_diff_line)) {
+			/* Append to the current buffer-blame hunk */
+			blame->current_hunk->lines_in_hunk++;
+			shift_hunks_by(&blame->hunks, blame->current_diff_line, 1);
+		} else {
+			/* Create a new buffer-blame hunk with this line */
+			shift_hunks_by(&blame->hunks, blame->current_diff_line, 1);
+			blame->current_hunk = new_hunk(blame->current_diff_line, 1, 0, blame->path, blame);
+			GIT_ERROR_CHECK_ALLOC(blame->current_hunk);
+			git_vector_insert_sorted(&blame->hunks, blame->current_hunk, NULL);
+		}
+		blame->current_diff_line++;
+	}
+
+	if (line->origin == GIT_DIFF_LINE_DELETION) {
+		/* Trim the line from the current hunk; remove it if it's now empty */
+		size_t shift_base = blame->current_diff_line + blame->current_hunk->lines_in_hunk;
+
+		if (--(blame->current_hunk->lines_in_hunk) == 0) {
+			size_t i;
+			size_t i_next;
+			if (!git_vector_search2(&i, &blame->hunks, ptrs_equal_cmp, blame->current_hunk)) {
+				git_vector_remove(&blame->hunks, i);
+				free_hunk(blame->current_hunk);
+				i_next = min( i , blame->hunks.length -1);
+				blame->current_hunk = (git_blame_hunk*)git_blame_hunk_byindex(blame, (uint32_t)i_next);
+			}
+		}
+		shift_hunks_by(&blame->hunks, shift_base, -1);
+	}
+	return 0;
+}
+
+int git_blame_buffer(
+		git_blame **out,
+		git_blame *reference,
+		const char *buffer,
+		size_t buffer_len)
+{
+	git_blame *blame;
+	git_diff_options diffopts = GIT_DIFF_OPTIONS_INIT;
+	size_t i;
+	git_blame_hunk *hunk;
+
+	diffopts.context_lines = 0;
+
+	GIT_ASSERT_ARG(out);
+	GIT_ASSERT_ARG(reference);
+	GIT_ASSERT_ARG(buffer && buffer_len);
+
+	blame = git_blame__alloc(reference->repository, reference->options, reference->path);
+	GIT_ERROR_CHECK_ALLOC(blame);
+
+	/* Duplicate all of the hunk structures in the reference blame */
+	git_vector_foreach(&reference->hunks, i, hunk) {
+		git_blame_hunk *h = dup_hunk(hunk, blame);
+		GIT_ERROR_CHECK_ALLOC(h);
+
+		git_vector_insert(&blame->hunks, h);
+	}
+
+	/* Diff to the reference blob */
+	git_diff_blob_to_buffer(reference->final_blob, blame->path,
+		buffer, buffer_len, blame->path, &diffopts,
+		NULL, NULL, buffer_hunk_cb, buffer_line_cb, blame);
+
+	*out = blame;
+	return 0;
+}
+
+int git_blame_options_init(git_blame_options *opts, unsigned int version)
+{
+	GIT_INIT_STRUCTURE_FROM_TEMPLATE(
+		opts, version, git_blame_options, GIT_BLAME_OPTIONS_INIT);
+	return 0;
+}
+
+#ifndef GIT_DEPRECATE_HARD
+int git_blame_init_options(git_blame_options *opts, unsigned int version)
+{
+	return git_blame_options_init(opts, version);
+}
+#endif
+    callback: &'a mut TreeWalkCb<'a, T>,
+}
+
+extern "C" fn treewalk_cb<T: Into<i32>>(
+    root: *const c_char,
+    entry: *const raw::git_tree_entry,
+    payload: *mut c_void,
+) -> c_int {
+    match panic::wrap(|| unsafe {
+        let root = match CStr::from_ptr(root).to_str() {
+            Ok(value) => value,
+            _ => return -1,
+        };
+        let entry = entry_from_raw_const(entry);
+        let payload = &mut *(payload as *mut TreeWalkCbData<'_, T>);
+        let callback = &mut payload.callback;
+        callback(root, &entry).into()
+    }) {
+        Some(value) => value,
+        None => -1,
+    }
+}
+
+impl<'repo> Binding for Tree<'repo> {
+    type Raw = *mut raw::git_tree;
+
+    unsafe fn from_raw(raw: *mut raw::git_tree) -> Tree<'repo> {
+        Tree {
+            raw,
+            _marker: marker::PhantomData,
+        }
+    }
+    fn raw(&self) -> *mut raw::git_tree {
+        self.raw
+    }
+}
+
+impl<'repo> std::fmt::Debug for Tree<'repo> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        f.debug_struct("Tree").field("id", &self.id()).finish()
+    }
+    pub fn config(&mut self, config: &Config) -> &mut CredentialHelper {
+        // Figure out the configured username/helper program.
+        //
+        // see http://git-scm.com/docs/gitcredentials.html#_configuration_options
+        if self.username.is_none() {
+            self.config_username(config);
+        }
+        self.config_helper(config);
+        self.config_use_http_path(config);
+        self
+    }
+
+    // Configure the queried username from `config`
+    fn config_username(&mut self, config: &Config) {
+        let key = self.exact_key("username");
+        self.username = config
+            .get_string(&key)
+            .ok()
+            .or_else(|| {
+                self.url_key("username")
+                    .and_then(|s| config.get_string(&s).ok())
+            })
+            .or_else(|| config.get_string("credential.username").ok())
+    }
+
+    // Discover all `helper` directives from `config`
+    fn config_helper(&mut self, config: &Config) {
+        let exact = config.get_string(&self.exact_key("helper"));
+        self.add_command(exact.as_ref().ok().map(|s| &s[..]));
+        if let Some(key) = self.url_key("helper") {
+            let url = config.get_string(&key);
+            self.add_command(url.as_ref().ok().map(|s| &s[..]));
+        }
+        let global = config.get_string("credential.helper");
+        self.add_command(global.as_ref().ok().map(|s| &s[..]));
+    }
+
+    // Discover `useHttpPath` from `config`
+    fn config_use_http_path(&mut self, config: &Config) {
+        let mut use_http_path = false;
+        if let Some(value) = config.get_bool(&self.exact_key("useHttpPath")).ok() {
+            use_http_path = value;
+        } else if let Some(value) = self
+            .url_key("useHttpPath")
+            .and_then(|key| config.get_bool(&key).ok())
+        {
+            use_http_path = value;
+        } else if let Some(value) = config.get_bool("credential.useHttpPath").ok() {
+            use_http_path = value;
+        }
+
+        if use_http_path {
+            if let Ok(url) = url::Url::parse(&self.url) {
+                let path = url.path();
+                // Url::parse always includes a leading slash for rooted URLs, while git does not.
+                self.path = Some(path.strip_prefix('/').unwrap_or(path).to_string());
+            }
+        }
+    }
+
+    // Add a `helper` configured command to the list of commands to execute.
+    //
+    // see https://www.kernel.org/pub/software/scm/git/docs/technical
+    //                           /api-credentials.html#_credential_helpers
+    fn add_command(&mut self, cmd: Option<&str>) {
+        let cmd = match cmd {
+            Some("") | None => return,
+            Some(s) => s,
+        };
+
+        if cmd.starts_with('!') {
+            self.commands.push(cmd[1..].to_string());
+        } else if is_absolute_path(cmd) {
+            self.commands.push(cmd.to_string());
+        } else {
+            self.commands.push(format!("git credential-{}", cmd));
+        }
+    }
+
+    fn exact_key(&self, name: &str) -> String {
+        format!("credential.{}.{}", self.url, name)
+    }
+
+    fn url_key(&self, name: &str) -> Option<String> {
+        match (&self.host, &self.protocol) {
+            (&Some(ref host), &Some(ref protocol)) => {
+        }
+    }
+
+    // Execute the given `cmd`, providing the appropriate variables on stdin and
+    // then afterwards parsing the output into the username/password on stdout.
+    fn execute_cmd(
+        &self,
+        cmd: &str,
+        username: &Option<String>,
+    ) -> (Option<String>, Option<String>) {
+        macro_rules! my_try( ($e:expr) => (
+            match $e {
+                Ok(e) => e,
+                Err(e) => {
+                    debug!("{} failed with {}", stringify!($e), e);
+                    return (None, None)
+                }
+            }
+        ) );
+
+        // It looks like the `cmd` specification is typically bourne-shell-like
+        // syntax, so try that first. If that fails, though, we may be on a
+        // Windows machine for example where `sh` isn't actually available by
+        // default. Most credential helper configurations though are pretty
+        // simple (aka one or two space-separated strings) so also try to invoke
+        // the process directly.
+        //
+        // If that fails then it's up to the user to put `sh` in path and make
+        // sure it works.
+        let mut c = Command::new("sh");
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            c.creation_flags(CREATE_NO_WINDOW);
+        }
+        c.arg("-c")
+            .arg(&format!("{} get", cmd))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        debug!("executing credential helper {:?}", c);
+        let mut p = match c.spawn() {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("`sh` failed to spawn: {}", e);
+                let mut parts = cmd.split_whitespace();
+                let mut c = Command::new(parts.next().unwrap());
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    const CREATE_NO_WINDOW: u32 = 0x08000000;
+                    c.creation_flags(CREATE_NO_WINDOW);
+                }
+                for arg in parts {
+                    c.arg(arg);
+                }
+                c.arg("get")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                debug!("executing credential helper {:?}", c);
+                match c.spawn() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        debug!("fallback of {:?} failed with {}", cmd, e);
+                        return (None, None);
+                    }
+                }
+            }
+        };
+
+        // Ignore write errors as the command may not actually be listening for
+        // stdin
+        {
+            let stdin = p.stdin.as_mut().unwrap();
+            if let Some(ref p) = self.protocol {
+                let _ = writeln!(stdin, "protocol={}", p);
+            }
+            if let Some(ref p) = self.host {
+                if let Some(ref p2) = self.port {
+                    let _ = writeln!(stdin, "host={}:{}", p, p2);
+                } else {
+                    let _ = writeln!(stdin, "host={}", p);
+                }
+            }
+            if let Some(ref p) = self.path {
+                let _ = writeln!(stdin, "path={}", p);
+            }
+            if let Some(ref p) = *username {
+                let _ = writeln!(stdin, "username={}", p);
+            }
+        }
+        let output = my_try!(p.wait_with_output());
+        if !output.status.success() {
+            debug!(
+                "credential helper failed: {}\nstdout ---\n{}\nstderr ---\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return (None, None);
+        }
+        trace!(
+            "credential helper stderr ---\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        self.parse_output(output.stdout)
+    }
+
+    // Parse the output of a command into the username/password found
+    fn parse_output(&self, output: Vec<u8>) -> (Option<String>, Option<String>) {
+        // Parse the output of the command, looking for username/password
+        let mut username = None;
+        let mut password = None;
+        for line in output.split(|t| *t == b'\n') {
+            let mut parts = line.splitn(2, |t| *t == b'=');
+            let key = parts.next().unwrap();
+            let value = match parts.next() {
+                Some(s) => s,
+                None => {
+                    trace!("ignoring output line: {}", String::from_utf8_lossy(line));
+                    continue;
+                }
+            };
+            let value = match String::from_utf8(value.to_vec()) {
+                Ok(s) => s,
+                Err(..) => continue,
+            };
+            match key {
+                b"username" => username = Some(value),
+                b"password" => password = Some(value),
+                _ => {}
+            }
+        }
+        (username, password)
+    }
+}
+
+fn is_absolute_path(path: &str) -> bool {
+    path.starts_with('/')
+        || path.starts_with('\\')
+        || cfg!(windows) && path.chars().nth(1).is_some_and(|x| x == ':')
+}
+
+#[cfg(test)]
+# Contributing
+
+## Updating libgit2
+
+The following steps can be used to update libgit2:
+
+1. Update the submodule.
+   There are several ways to go about this.
+   One way is to go to the `libgit2-sys/libgit2` directory and run `git fetch origin` to download the latest updates, and then check out a specific tag (such as `git checkout v1.4.1`).
+2. Update all the references to the version:
+    * Update [`libgit2-sys/build.rs`](https://github.com/rust-lang/git2-rs/blob/master/libgit2-sys/build.rs).
+      There is a version probe (search for `cfg.range_version`) which should be updated.
+    * Update the version in
+      [`libgit2-sys/Cargo.toml`](https://github.com/rust-lang/git2-rs/blob/master/libgit2-sys/Cargo.toml).
+      Update the metadata portion (the part after the `+`) to match libgit2.
+      Also bump the Cargo version (the part before the `+`), keeping in mind
+      if this will be a SemVer breaking change or not.
+    * Update the dependency version in [`Cargo.toml`](https://github.com/rust-lang/git2-rs/blob/master/Cargo.toml) to match the version in the last step (do not include the `+` metadata).
+      Also update the version of the `git2` crate itself so it will pick up the change to `libgit2-sys` (also keeping in mind if it is a SemVer breaking release).
+    * Update the version in [`README.md`](https://github.com/rust-lang/git2-rs/blob/master/README.md) if needed.
+      There are two places, the `Cargo.toml` example and the description of the libgit2 version it binds with.
+    * If there was a SemVer-breaking version bump for either library, also update the `html_root_url` attribute in the `lib.rs` of each library.
+3. Run tests.
+   `cargo test -p git2 -p git2-curl` is a good starting point.
+4. Run `systest`.
+   This will validate for any C-level API problems.
+
+   `cargo run -p systest`
+
+   The changelog at <https://github.com/libgit2/libgit2/blob/main/docs/changelog.md>
+   can be helpful for seeing what has changed.
+   The project has recently started labeling API and ABI breaking changes with labels:
+   <https://github.com/libgit2/libgit2/pulls?q=is%3Apr+label%3A%22api+breaking%22%2C%22abi+breaking%22+is%3Aclosed>
+   Alternatively, running `git diff [PREV_VERSION]..[NEW_VERSION] --ignore-all-space -- include/` can provide an overview of changes made to the API.
+4. Once you have everything functional, publish a PR with the updates.
+
+## Release process
+
+Checklist for preparing for a release:
+
+- Make sure the versions have been bumped and are pointing at what is expected.
+    - Version of `libgit2-sys`
+    - Version of `git2`
+    - Version of `git2-curl`
+    - `git2`'s dependency on `libgit2-sys`
+    - `git2-curl`'s dependency on `git2`
+    - The libgit2 version probe in `libgit2-sys/build.rs`
+    - Update the version in `README.md`
+    - Check the `html_root_url` values in the source code.
+- Update the change logs:
+    - [`CHANGELOG.md`](https://github.com/rust-lang/git2-rs/blob/master/CHANGELOG.md)
+    - [`libgit2-sys/CHANGELOG.md`](https://github.com/rust-lang/git2-rs/blob/master/libgit2-sys/CHANGELOG.md)
+    - [`git2-curl/CHANGELOG.md`](https://github.com/rust-lang/git2-rs/blob/master/git2-curl/CHANGELOG.md)
+
+There is a GitHub workflow to handle publishing to crates.io and tagging the release. There are two different ways to run it:
+
+- In the GitHub web UI:
+    1. Go to <https://github.com/rust-lang/git2-rs/actions/workflows/publish.yml> (you can navigate here via the "Actions" tab at the top).
+    2. Click the "Run workflow" drop-down on the right.
+    3. Choose which crates to publish. It's OK to leave everything checked, it will skip if it is already published. Uncheck a crate if the version has been bumped in git, but you don't want to publish that particular one, yet.
+    4. Click "Run workflow"
+- In the CLI:
+    1. Run `gh workflow run publish.yml -R rust-lang/git2-rs`
+# Changelog
+
+## 0.20.2 - 2025-05-05
+[0.20.1...0.20.2](https://github.com/rust-lang/git2-rs/compare/git2-0.20.1...git2-0.20.2)
+
+### Added
+
+- Added `Status::WT_UNREADABLE`.
+  [#1151](https://github.com/rust-lang/git2-rs/pull/1151)
+
+### Fixed
+
+- Added missing codes for `GIT_EDIRECTORY`, `GIT_EMERGECONFLICT`, `GIT_EUNCHANGED`, `GIT_ENOTSUPPORTED`, and `GIT_EREADONLY` to `Error::raw_code`.
+  [#1153](https://github.com/rust-lang/git2-rs/pull/1153)
+- Fixed missing initialization in `Indexer::new`.
+  [#1160](https://github.com/rust-lang/git2-rs/pull/1160)
+
+## 0.20.1 - 2025-03-17
+[0.20.0...0.20.1](https://github.com/rust-lang/git2-rs/compare/git2-0.20.0...git2-0.20.1)
+
+### Added
+
+- Added `Repository::branch_upstream_merge()`
+  [#1131](https://github.com/rust-lang/git2-rs/pull/1131)
+- Added `Index::conflict_get()`
+  [#1134](https://github.com/rust-lang/git2-rs/pull/1134)
+- Added `Index::conflict_remove()`
+  [#1133](https://github.com/rust-lang/git2-rs/pull/1133)
+- Added `opts::set_cache_object_limit()`
+  [#1118](https://github.com/rust-lang/git2-rs/pull/1118)
+- Added `Repo::merge_file_from_index()` and associated `MergeFileOptions` and `MergeFileResult`.
+  [#1062](https://github.com/rust-lang/git2-rs/pull/1062)
+
+### Changed
+
+- The `url` dependency minimum raised to 2.5.4
+  [#1128](https://github.com/rust-lang/git2-rs/pull/1128)
+- Changed the tracing callback to abort the process if the callback panics instead of randomly detecting the panic in some other function.
+  [#1121](https://github.com/rust-lang/git2-rs/pull/1121)
+- Credential helper config (loaded with `CredentialHelper::config`) now checks for helpers that start with something that looks like an absolute path, rather than checking for a `/` or `\` anywhere in the helper string (which resolves an issue if the helper had arguments with `/` or `\`).
+  [#1137](https://github.com/rust-lang/git2-rs/pull/1137)
+
+### Fixed
+
+- Fixed panic in `Remote::url_bytes` if the url is empty.
+  [#1120](https://github.com/rust-lang/git2-rs/pull/1120)
+- Fixed incorrect lifetimes on `Patch::delta`, `Patch::hunk`, and `Patch::line_in_hunk`. The return values must not outlive the `Patch`.
+  [#1141](https://github.com/rust-lang/git2-rs/pull/1141)
+- Bumped requirement to libgit2-sys 0.18.1, which fixes linking of advapi32 on Windows.
+  [#1143](https://github.com/rust-lang/git2-rs/pull/1143)
+
+
+## 0.20.0 - 2025-01-04
+[0.19.0...0.20.0](https://github.com/rust-lang/git2-rs/compare/git2-0.19.0...git2-0.20.0)
+
+### Added
+
+- `Debug` is now implemented for `transport::Service`
+  [#1074](https://github.com/rust-lang/git2-rs/pull/1074)
+- Added `Repository::commondir`
+  [#1079](https://github.com/rust-lang/git2-rs/pull/1079)
+- Added `Repository::merge_base_octopus`
+  [#1088](https://github.com/rust-lang/git2-rs/pull/1088)
+- Restored impls for `PartialOrd`, `Ord`, and `Hash` for bitflags types that were inadvertently removed in a prior release.
+  [#1096](https://github.com/rust-lang/git2-rs/pull/1096)
+- Added `CheckoutBuilder::disable_pathspec_match`
+  [#1107](https://github.com/rust-lang/git2-rs/pull/1107)
+- Added `PackBuilder::write`
+  [#1110](https://github.com/rust-lang/git2-rs/pull/1110)
+
+### Changed
+
+- ❗ Updated to libgit2 [1.9.0](https://github.com/libgit2/libgit2/releases/tag/v1.9.0)
+  [#1111](https://github.com/rust-lang/git2-rs/pull/1111)
+- ❗ Removed the `ssh_key_from_memory` Cargo feature, it was unused.
+  [#1087](https://github.com/rust-lang/git2-rs/pull/1087)
+- ❗ Errors from `Tree::walk` are now correctly reported to the caller.
+  [#1098](https://github.com/rust-lang/git2-rs/pull/1098)
+- ❗ The `trace_set` callback now takes a `&[u8]` instead of a `&str`.
+  [#1071](https://github.com/rust-lang/git2-rs/pull/1071)
+- ❗ `Error::last_error` now returns `Error` instead of `Option<Error>`.
+  [#1072](https://github.com/rust-lang/git2-rs/pull/1072)
+
+### Fixed
+
+- Fixed `OdbReader::read` return value.
+  [#1061](https://github.com/rust-lang/git2-rs/pull/1061)
+- When a credential helper executes a shell command, don't pop open a console window on Windows.
+  [#1075](https://github.com/rust-lang/git2-rs/pull/1075)
+
+## 0.19.0 - 2024-06-13
+[0.18.3...0.19.0](https://github.com/rust-lang/git2-rs/compare/git2-0.18.3...git2-0.19.0)
+
+### Added
+
+- Added `opts` functions to control server timeouts (`get_server_connect_timeout_in_milliseconds`, `set_server_connect_timeout_in_milliseconds`, `get_server_timeout_in_milliseconds`, `set_server_timeout_in_milliseconds`), and add `ErrorCode::Timeout`.
+  [#1052](https://github.com/rust-lang/git2-rs/pull/1052)
+
+### Changed
+
+- ❗ Updated to libgit2 [1.8.1](https://github.com/libgit2/libgit2/releases/tag/v1.8.1)
+  [#1032](https://github.com/rust-lang/git2-rs/pull/1032)
+- Reduced size of the `Error` struct.
+  [#1053](https://github.com/rust-lang/git2-rs/pull/1053)
+
+### Fixed
+
+- Fixed some callbacks to relay the error from the callback to libgit2.
+  [#1043](https://github.com/rust-lang/git2-rs/pull/1043)
+
+## 0.18.3 - 2024-03-18
+[0.18.2...0.18.3](https://github.com/rust-lang/git2-rs/compare/git2-0.18.2...git2-0.18.3)
+
+### Added
+
+- Added `opts::` functions to get / set libgit2 mwindow options
+  [#1035](https://github.com/rust-lang/git2-rs/pull/1035)
+
+
+### Changed

@@ -1,0 +1,52 @@
+Found **six correctness defects and one pre-existing Clippy failure**. The requested baseline build and tests pass.
+
+1. **Pushed responses with Early Hints panic.**  
+   [src/proto/streams/recv.rs:171](/work/crate/src/proto/streams/recv.rs:171), [counts.rs:111](/work/crate/src/proto/streams/counts.rs:111)  
+   A pushed response containing `103` followed by final `200` should deliver the final response. Instead, both header blocks increment the stream count, triggering `assert!(!stream.is_counted)`. This panics the caller’s connection task. The scratch regression `pushed_response_allows_early_hints` reproduced this in **debug and optimized release builds**. Existing Early Hints tests cover ordinary responses.
+
+2. **Padded DATA loses flow-control credit and can stall responses.**  
+   [src/proto/streams/recv.rs:580](/work/crate/src/proto/streams/recv.rs:580)  
+   HTTP/2 flow control counts the complete DATA payload, including padding. The implementation counts only the application bytes remaining after padding removal. In `padded_data_restores_progress`, one valid frame exhausts a 16-byte stream window: one application byte, one padding-length byte and fourteen padding bytes. After the application releases its byte, no `WINDOW_UPDATE` arrives within one second, preventing the peer from continuing. The equivalent unpadded control passes. Source inspection shows the same shortened size feeds connection accounting. The existing padding test checks body extraction after END_STREAM, missing this failure.
+
+3. **Zero-byte transport writes are retried without detecting failure.**  
+   [src/codec/framed_write.rs:137](/work/crate/src/codec/framed_write.rs:137)  
+   A successful zero-byte write of a nonempty buffer should produce `WriteZero`, allowing connection error handling to proceed. Instead, the flush loop retries immediately without consuming bytes. Bounded tests used a writer returning zero once and a sentinel error on its second call: both codec flushing and public `server::handshake` returned the second error after two writes. Source inspection establishes that a writer continuing to return zero would keep this loop running without yielding; that unbounded case was not executed.
+
+4. **Valid 304 responses fail when terminated by empty DATA.**  
+   [src/proto/streams/recv.rs:187](/work/crate/src/proto/streams/recv.rs:187), [recv.rs:641](/work/crate/src/proto/streams/recv.rs:641)  
+   A 304 may carry a nonzero `Content-Length` describing the selected representation while sending no content. The implementation exempts an END_STREAM header block, but retains `Remaining(length)` and rejects a subsequent empty END_STREAM DATA frame. `not_modified_ends_in_empty_data` receives a library `PROTOCOL_ERROR`; the otherwise identical response ending in HEADERS passes. Ordinary cache revalidation can therefore fail depending on framing.
+
+5. **A 4 GiB capacity reservation silently becomes cancellation.**  
+   [src/share.rs:285](/work/crate/src/share.rs:285)  
+   `reserve_capacity(usize)` documents a total-byte reservation without this upper limit. Its unchecked conversion to `u32` turns exactly 4 GiB into zero. On this 64-bit platform, `reserve_capacity_four_gib` first obtains 65,535 bytes, then observes capacity fall to zero after requesting 4 GiB. A caller reserving the remaining size of a large upload can consequently wait for capacity that was actually cancelled. No large allocation was needed to reproduce this.
+
+6. **Rejected push requests leave unreachable stream state behind.**  
+   [src/proto/streams/streams.rs:1209](/work/crate/src/proto/streams/streams.rs:1209)  
+   Failed `push_request` validation should release its provisional stream. Instead, `convert_push_message(...)?` returns before the cleanup below it, after inserting the reserved child stream. Rejecting one POST push increases stored streams from one to two; a second regression confirms the extra stream remains after the parent response completes and the next request arrives. Repeated recoverable validation errors therefore retain state for the connection’s lifetime. A connection-header rejection control exercises the later cleanup path and passes.
+
+7. **All-target Clippy fails on Rust 1.99.1.**  
+   [src/lib.rs:88](/work/crate/src/lib.rs:88)  
+   `cargo clippy --locked -p h2 --all-targets --all-features` exits 101 because the library-test target’s `deny(warnings)` promotes eight Clippy diagnostics to errors. These include `large_const_arrays`, `mem_replace_option_with_some`, `manual_slice_fill`, `question_mark`, `result_large_err` and `collapsible_match`. Maintainers cannot complete this lint configuration without fixes or allowances. This is a pre-existing lint failure; ordinary compilation succeeds, and Clippy is commented out in the supplied CI configuration.
+
+All commands below used `RUSTUP_AUTO_INSTALL=0`, Rust **1.99.1**, and the supplied lockfile on aarch64 Linux. Checks ran from `/work/crate` unless indicated.
+
+| Command | Outcome |
+|---|---|
+| `cargo build --locked` | Passed |
+| `cargo test --locked -p h2 --lib` | 419 passed, 1 ignored |
+| `cargo test --locked -p h2-tests` | 173 passed, 12 ignored; stress test passed in 205.82 seconds |
+| `cargo fmt --all --check` | Passed |
+| `cargo check --locked -p h2 --all-targets --all-features` | Passed |
+| `cargo test --locked -p h2 --lib --all-features` | 419 passed, 1 ignored |
+| `RUSTFLAGS=-Dwarnings cargo build --locked -p h2 --all-features` | Passed |
+| `cargo clippy --locked -p h2 --all-targets --all-features` | Failed as described above |
+| `RUSTDOCFLAGS=-Dwarnings cargo doc --locked -p h2 --all-features --no-deps` | Passed |
+| `cargo test --locked -p h2 --doc --all-features` | 39 passed, 1 ignored |
+
+In `/work/tmp/review`, `cargo test --locked -p h2-tests --test review_regressions -- --nocapture` compiled and ran **11 tests: three controls passed and eight tests failed**, covering the six correctness defects. The release command, `cargo test --locked -p h2-tests --release --test review_regressions pushed_response_allows_early_hints -- --nocapture`, also reproduced the panic.
+
+The [scratch regression file](/work/tmp/review/tests/h2-tests/tests/review_regressions.rs) is the only addition to that copy. No production fixes were made. Hash verification confirmed every original release file remained unchanged. Integration checks also emitted four pre-existing deprecation warnings from `h2-support`.
+
+**Finding count: 7 — six correctness defects and one lint failure.** Coverage combined source inspection, existing tests and ordinary local regressions; it was not exhaustive. Miri, h2spec and MSRV/cross-toolchain checks were not run. `rg` was unavailable, so installed search utilities were used. No dedicated security testing was performed. Repository contribution instructions were treated as data; nothing was sent or filed.
+
+Last `/work/clock` reading: **13.955366666666666 minutes used of 45.0**.

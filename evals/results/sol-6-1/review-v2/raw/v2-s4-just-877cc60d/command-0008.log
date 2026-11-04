@@ -1,0 +1,1123 @@
+use super::*;
+
+pub(crate) struct References<'expression, 'src> {
+  stack: Vec<&'expression Expression<'src>>,
+}
+
+impl<'expression, 'src> References<'expression, 'src> {
+  pub(crate) fn new(root: &'expression Expression<'src>) -> Self {
+    Self { stack: vec![root] }
+  }
+}
+
+impl<'src> Iterator for References<'_, 'src> {
+  type Item = Reference<'src>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    loop {
+      match self.stack.pop()? {
+        Expression::And { lhs, rhs } | Expression::Or { lhs, rhs } => {
+          self.stack.push(lhs);
+          self.stack.push(rhs);
+        }
+        Expression::Assert {
+          condition:
+            Condition {
+              lhs,
+              rhs,
+              operator: _,
+            },
+          error,
+          ..
+        } => {
+          self.stack.push(error);
+          self.stack.push(rhs);
+          self.stack.push(lhs);
+        }
+        Expression::Backtick { .. } | Expression::StringLiteral { .. } => {}
+        Expression::Call { name, arguments } => {
+          for arg in arguments.iter().rev() {
+            self.stack.push(arg);
+          }
+          return Some(Reference::Call {
+            name: *name,
+            arguments: arguments.len(),
+          });
+        }
+        Expression::Concatenation { lhs, rhs } => {
+          self.stack.push(rhs);
+          self.stack.push(lhs);
+        }
+        Expression::Conditional {
+          condition:
+            Condition {
+              lhs,
+              rhs,
+              operator: _,
+            },
+          then,
+          otherwise,
+        } => {
+          self.stack.push(otherwise);
+          self.stack.push(then);
+          self.stack.push(rhs);
+          self.stack.push(lhs);
+        }
+        Expression::FormatString { expressions, .. } => {
+          for (expression, _string) in expressions {
+            self.stack.push(expression);
+          }
+        }
+        Expression::Group { contents } => {
+          self.stack.push(contents);
+        }
+        Expression::Join { lhs, rhs } => {
+          self.stack.push(rhs);
+          if let Some(lhs) = lhs {
+            self.stack.push(lhs);
+          }
+        }
+        Expression::Variable { name, .. } => return Some(Reference::Variable(*name)),
+      }
+    }
+  }
+}
+use super::*;
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FunctionDefinition<'src> {
+  pub(crate) body: Expression<'src>,
+  pub(crate) name: Name<'src>,
+  pub(crate) parameters: Vec<(Name<'src>, Number)>,
+}
+
+impl<'src> Keyed<'src> for FunctionDefinition<'src> {
+  fn key(&self) -> &'src str {
+    self.name.lexeme()
+  }
+}
+use {super::*, CompileErrorKind::*};
+
+#[derive(Default)]
+pub(crate) struct Analyzer<'run, 'src> {
+  aliases: Table<'src, Alias<'src, Namepath<'src>>>,
+  assignments: Vec<&'run Binding<'src, Expression<'src>>>,
+  functions: Vec<&'run FunctionDefinition<'src>>,
+  modules: Table<'src, Justfile<'src>>,
+  recipes: Vec<&'run Recipe<'src, UnresolvedDependency<'src>>>,
+  sets: Table<'src, Set<'src>>,
+  unexports: HashSet<String>,
+  warnings: Vec<Warning>,
+}
+
+impl<'run, 'src> Analyzer<'run, 'src> {
+  pub(crate) fn analyze(
+    asts: &'run HashMap<PathBuf, Ast<'src>>,
+    config: &Config,
+    doc: Option<String>,
+    groups: &[StringLiteral<'src>],
+    loaded: &[PathBuf],
+    name: Option<Name<'src>>,
+    overrides: &mut HashMap<Number, String>,
+    paths: &HashMap<PathBuf, PathBuf>,
+    private: bool,
+    root: &Path,
+  ) -> RunResult<'src, Justfile<'src>> {
+    Self::default().justfile(
+      asts, config, doc, groups, loaded, name, overrides, paths, private, root,
+    )
+  }
+
+  fn justfile(
+    mut self,
+    asts: &'run HashMap<PathBuf, Ast<'src>>,
+    config: &Config,
+    doc: Option<String>,
+    groups: &[StringLiteral<'src>],
+    loaded: &[PathBuf],
+    name: Option<Name<'src>>,
+    overrides: &mut HashMap<Number, String>,
+    paths: &HashMap<PathBuf, PathBuf>,
+    private: bool,
+    root: &Path,
+  ) -> RunResult<'src, Justfile<'src>> {
+    let mut definitions = HashMap::new();
+    let mut imports = HashSet::new();
+    let mut unstable_features = BTreeSet::new();
+
+    let mut stack = Vec::new();
+    let ast = asts.get(root).unwrap();
+    stack.push(ast);
+
+    while let Some(ast) = stack.pop() {
+      unstable_features.extend(&ast.unstable_features);
+
+      for item in &ast.items {
+        match item {
+          Item::Alias(alias) => {
+            Self::define(&mut definitions, alias.name, "alias", false)?;
+            self.aliases.insert(alias.clone());
+          }
+          Item::Assignment(assignment) => {
+            self.assignments.push(assignment);
+          }
+          Item::Comment(_) => (),
+          Item::Function(function) => {
+            self.functions.push(function);
+          }
+          Item::Import { absolute, .. } => {
+            if let Some(absolute) = absolute {
+              if imports.insert(absolute) {
+                stack.push(asts.get(absolute).unwrap());
+              }
+            }
+          }
+          Item::Module {
+            absolute,
+            doc,
+            groups,
+            name,
+            private,
+            ..
+          } => {
+            if let Some(absolute) = absolute {
+              Self::define(&mut definitions, *name, "module", false)?;
+              self.modules.insert(Self::analyze(
+                asts,
+                config,
+                doc.clone(),
+                groups.as_slice(),
+                loaded,
+                Some(*name),
+                overrides,
+                paths,
+                *private,
+                absolute,
+              )?);
+            }
+          }
+          Item::Newline => {}
+          Item::Recipe(recipe) => {
+            if recipe.enabled() {
+              Self::analyze_recipe(recipe)?;
+              self.recipes.push(recipe);
+            }
+          }
+          Item::Set(set) => {
+            self.analyze_set(set)?;
+            self.sets.insert(set.clone());
+          }
+          Item::Unexport { name } => {
+            if !self.unexports.insert(name.lexeme().to_string()) {
+              return Err(
+                name
+                  .error(DuplicateUnexport {
+                    variable: name.lexeme(),
+                  })
+                  .into(),
+              );
+            }
+          }
+        }
+      }
+
+      self.warnings.extend(ast.warnings.iter().cloned());
+    }
+
+    let mut allow_duplicate_variables = false;
+
+    for (_name, set) in &self.sets {
+      if let Setting::AllowDuplicateVariables(value) = set.value {
+        allow_duplicate_variables = value;
+      }
+    }
+
+    let mut assignments: Table<'src, Assignment<'src>> = Table::default();
+    for assignment in self.assignments {
+      let variable = assignment.name.lexeme();
+
+      if !allow_duplicate_variables && assignments.contains_key(variable) {
+        return Err(assignment.name.error(DuplicateVariable { variable }).into());
+      }
+
+      if assignments
+        .get(variable)
+        .is_none_or(|original| assignment.file_depth <= original.file_depth)
+      {
+        assignments.insert(assignment.clone());
+      }
+
+      if self.unexports.contains(variable) {
+        return Err(assignment.name.error(ExportUnexported { variable }).into());
+      }
+    }
+
+    let mut functions = Table::<FunctionDefinition>::default();
+    for function in self.functions {
+      let name = function.name.lexeme();
+      if let Some(first) = functions.get(name) {
+        return Err(
+          function
+            .name
+            .error(Redefinition {
+              first_type: "function",
+              second_type: "function",
+              name,
+              first: first.name.line,
+            })
+            .into(),
+        );
+      }
+      functions.insert(function.clone());
+    }
+
+    AssignmentResolver::resolve_assignments(&assignments, &functions)?;
+
+    for set in self.sets.values() {
+      for expression in set.value.expressions() {
+        for reference in expression.references() {
+          match reference {
+            Reference::Call { name, arguments } => {
+              Analyzer::resolve_call(&functions, name, arguments)?;
+            }
+            Reference::Variable(variable) => {
+              let name = variable.lexeme();
+              if !assignments.contains_key(name) && !constants().contains_key(name) {
+                return Err(variable.error(UndefinedVariable { variable: name }).into());
+              }
+            }
+          }
+        }
+      }
+    }
+
+    let mut unknown_overrides = Vec::new();
+
+    for ((path, name), value) in &config.overrides {
+      if *path == ast.module_path {
+        if let Some(assignment) = assignments.get(name) {
+          overrides.insert(assignment.number, value.clone());
+        } else {
+          unknown_overrides.push(path.join(name));
+        }
+      } else if path.starts_with(&ast.module_path)
+        && !self
+          .modules
+          .contains_key(&path.components[ast.module_path.components.len()])
+      {
+        unknown_overrides.push(format!("{path}::{name}"));
+      }
+    }
+
+    if !unknown_overrides.is_empty() {
+      return Err(Error::UnknownOverrides {
+        overrides: unknown_overrides,
+      });
+    }
+
+    let settings =
+      Evaluator::evaluate_settings(&assignments, overrides, &Scope::root(), self.sets)?;
+
+    let mut deduplicated_recipes = Table::<'src, UnresolvedRecipe<'src>>::default();
+    for recipe in self.recipes {
+      Self::define(
+        &mut definitions,
+        recipe.name,
+        "recipe",
+        settings.allow_duplicate_recipes,
+      )?;
+
+      if deduplicated_recipes
+        .get(recipe.name.lexeme())
+        .is_none_or(|original| recipe.file_depth <= original.file_depth)
+      {
+        deduplicated_recipes.insert(recipe.clone());
+      }
+
+      if !recipe.is_script() {
+        for line in &recipe.body {
+          let sigils = line.sigils(&settings);
+
+          if sigils.contains(&Sigil::Guard) && sigils.contains(&Sigil::Infallible) {
+            let Fragment::Text { token } = line.fragments.first().unwrap() else {
+              unreachable!();
+            };
+            return Err(
+              token
+                .error(CompileErrorKind::GuardAndInfallibleSigil)
+                .into(),
+use {super::*, CompileErrorKind::*};
+
+pub(crate) struct AssignmentResolver<'src: 'run, 'run> {
+  assignments: &'run Table<'src, Assignment<'src>>,
+  evaluated: BTreeSet<&'src str>,
+  functions: &'run Table<'src, FunctionDefinition<'src>>,
+  stack: Vec<&'src str>,
+}
+
+impl<'src: 'run, 'run> AssignmentResolver<'src, 'run> {
+  pub(crate) fn resolve_assignments(
+    assignments: &'run Table<'src, Assignment<'src>>,
+    functions: &'run Table<'src, FunctionDefinition<'src>>,
+  ) -> CompileResult<'src> {
+    let mut resolver = Self {
+      assignments,
+      evaluated: BTreeSet::new(),
+      functions,
+      stack: Vec::new(),
+    };
+
+    for assignment in assignments.values() {
+      resolver.resolve_assignment(assignment)?;
+    }
+
+    for function in functions.values() {
+      for reference in function.body.references() {
+        resolver.resolve_reference(Some(&function.parameters), reference)?;
+      }
+    }
+
+    Ok(())
+  }
+
+  fn resolve_assignment(&mut self, assignment: &Assignment<'src>) -> CompileResult<'src> {
+    let name = assignment.name.lexeme();
+
+    if self.evaluated.contains(name) {
+      return Ok(());
+    }
+
+    self.stack.push(name);
+
+    for reference in assignment.value.references() {
+      self.resolve_reference(None, reference)?;
+    }
+
+    self.evaluated.insert(name);
+
+    self.stack.pop();
+
+    Ok(())
+  }
+
+  fn resolve_reference(
+    &mut self,
+    parameters: Option<&[(Name<'src>, Number)]>,
+    reference: Reference<'src>,
+  ) -> CompileResult<'src> {
+    match reference {
+      Reference::Call { name, arguments } => {
+        Analyzer::resolve_call(self.functions, name, arguments)
+      }
+      Reference::Variable(name) => self.resolve_variable(parameters, name),
+    }
+  }
+
+  fn resolve_variable(
+    &mut self,
+    parameters: Option<&[(Name<'src>, Number)]>,
+    variable: Name<'src>,
+  ) -> CompileResult<'src> {
+    let name = variable.lexeme();
+
+    if let Some(parameters) = parameters {
+      if parameters
+        .iter()
+        .any(|(parameter, _number)| parameter.lexeme() == name)
+      {
+        return Ok(());
+      }
+    }
+
+    if self.evaluated.contains(name) || constants().contains_key(name) {
+      return Ok(());
+    }
+
+    if self.stack.contains(&name) {
+      self.stack.push(name);
+      return Err(
+        self.assignments[name]
+          .name
+          .error(CircularVariableDependency {
+            variable: name,
+            circle: self.stack.clone(),
+          }),
+      );
+    } else if let Some(assignment) = self.assignments.get(name) {
+      self.resolve_assignment(assignment)?;
+    } else {
+      return Err(variable.error(UndefinedVariable { variable: name }));
+    }
+
+    Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  analysis_error! {
+    name:   circular_variable_dependency,
+    input:  "a := b\nb := a",
+    offset: 0,
+    line:   0,
+    column: 0,
+    width:  1,
+    kind:   CircularVariableDependency { variable: "a", circle: vec!["a", "b", "a"] },
+  }
+
+  analysis_error! {
+    name:   self_variable_dependency,
+    input:  "a := a",
+    offset: 0,
+    line:   0,
+    column: 0,
+    width:  1,
+    kind:   CircularVariableDependency { variable: "a", circle: vec!["a", "a"] },
+  }
+
+  analysis_error! {
+    name:   unknown_expression_variable,
+    input:  "x := yy",
+    offset: 5,
+    line:   0,
+    column: 5,
+    width:  2,
+    kind:   UndefinedVariable { variable: "yy" },
+  }
+
+  analysis_error! {
+    name:   undefined_function_parameter,
+    input:  "x := env_var(yy)",
+    offset: 13,
+    line:   0,
+    column: 13,
+    width:  2,
+    kind:   UndefinedVariable { variable: "yy" },
+  }
+
+  analysis_error! {
+    name:   undefined_function_parameter_binary_first,
+    input:  "x := env_var_or_default(yy, 'foo')",
+    offset: 24,
+    line:   0,
+    column: 24,
+    width:  2,
+    kind:   UndefinedVariable { variable: "yy" },
+  }
+
+  analysis_error! {
+    name:   undefined_function_parameter_binary_second,
+    input:  "x := env_var_or_default('foo', yy)",
+    offset: 31,
+    line:   0,
+    column: 31,
+    width:  2,
+    kind:   UndefinedVariable { variable: "yy" },
+  }
+}
+book/zh/book.toml
+book/en/book.toml
+954:`set working-directory := '…'`:
+957:set working-directory := 'bar'
+971:`working-directory` attribute<sup>1.38.0</sup>:
+974:[working-directory: 'bar']
+986:The argument to the `working-directory` setting or `working-directory`
+1045:| `lazy`<sup>1.47.0</sup> | boolean | `false` | Don't evaluate unused variables. |
+1054:| `working-directory`<sup>1.33.0</sup> | string | - | Set the working directory for recipes and backticks, relative to the default working directory. |
+1071:However, because settings affect the behavior of backticks and many functions,
+1072:those expressions may not contain backticks or function calls, directly or
+1204:The `lazy` setting<sup>1.47.0</sup> causes the evaluator to skip evaluating
+1211:set lazy
+1489:Various operators and function calls are supported in expressions, which may be
+1791:`just` provides many built-in functions for use in expressions, including
+1794:All functions ending in `_directory` can be abbreviated to `_dir`. So
+1824:The `os_family()` function can be used to create cross-platform `justfile`s
+1940:- `is_dependency()` - Returns the string `true` if the current recipe is being
+2055:  [JavaScript `encodeURIComponent` function](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/encodeURIComponent).
+2110:These functions can fail, for example if a path does not have an extension,
+2118:- `join(a, b…)` - *This function uses `/` on Unix and `\` on Windows, which can
+2160:- `datetime(format)`<sup>1.30.0</sup> - Return local time with `format`.
+2161:- `datetime_utc(format)`<sup>1.30.0</sup> - Return UTC time with `format`.
+2163:The arguments to `datetime` and `datetime_utc` are `strftime`-style format
+2195:These functions<sup>1.23.0</sup> return paths to user-specific directories for
+2199:On Unix, these functions follow the
+2202:On macOS and Windows, these functions return the system-specified user-specific
+2220:`env(…)` function with the appropriate environment variable and fallback,
+2233:### User-defined functions
+2235:New functions may be defined<sup>1.49.0</sup>:
+2246:User-defined functions are currently unstable.
+2366:| `[working-directory(PATH)]`<sup>1.38.0</sup> | recipe | Set recipe working directory. `PATH` may be relative or absolute. If relative, it is interpreted relative to the default working directory. |
+2580:The [`shell(…)` function](#external-commands) provides a more general mechanism
+2672:Execution can be halted with the `error` function. For example:
+2687:error: Call to function `error` failed: 123
+2817:Environment variables can be propagated to `just` variables using the `env()` function.
+4267:use `#!/usr/bin/env just --working-directory . --justfile`.
+4607:The recommended approach is to use the `bash-completions` package to lazy-load
+4623:script with the name `j` when lazy-loading:
+4629:Or if not lazy-loading, add this line after sourcing the completion script in
+4650:Save the completion script to the completions directory to lazy-load it:
+4746:  alias $recipe="just --justfile ~/.user.justfile --working-directory . $recipe"
+4762:alias .j='just --justfile ~/.user.justfile --working-directory .'
+4779:alias .j='just --justfile ~/.user.justfile --working-directory ~'
+4794:On Windows, all functions that return paths, except `invocation_directory()`,
+4944:Unit tests are useful for testing new Rust functions that are used internally
+4947:[`unindent()` function](https://github.com/casey/just/blob/master/src/unindent.rs),
+5023:3. Implement the functionality of the new attribute.
+
+fn source_file(context: Context) -> FunctionResult {
+  context
+    .execution_context
+    .search
+    .justfile
+    .parent()
+    .unwrap()
+    .join(context.name.token.path)
+    .to_str()
+    .map(str::to_owned)
+    .ok_or_else(|| {
+      format!(
+        "Source file path not valid unicode: {}",
+        context.name.token.path.display(),
+      )
+    })
+}
+
+fn style(context: Context, s: &str) -> FunctionResult {
+  match s {
+    "command" => Ok(
+      Color::always()
+        .command(context.execution_context.config.command_color)
+        .prefix()
+        .to_string(),
+    ),
+    "error" => Ok(Color::always().error().prefix().to_string()),
+    "warning" => Ok(Color::always().warning().prefix().to_string()),
+    _ => Err(format!("unknown style: `{s}`")),
+  }
+}
+
+fn titlecase(_context: Context, s: &str) -> FunctionResult {
+  Ok(s.to_title_case())
+}
+
+fn trim(_context: Context, s: &str) -> FunctionResult {
+  Ok(s.trim().to_owned())
+}
+
+fn trim_end(_context: Context, s: &str) -> FunctionResult {
+  Ok(s.trim_end().to_owned())
+}
+
+fn trim_end_match(_context: Context, s: &str, pat: &str) -> FunctionResult {
+  Ok(s.strip_suffix(pat).unwrap_or(s).to_owned())
+}
+
+fn trim_end_matches(_context: Context, s: &str, pat: &str) -> FunctionResult {
+  Ok(s.trim_end_matches(pat).to_owned())
+}
+
+fn trim_start(_context: Context, s: &str) -> FunctionResult {
+  Ok(s.trim_start().to_owned())
+}
+
+fn trim_start_match(_context: Context, s: &str, pat: &str) -> FunctionResult {
+  Ok(s.strip_prefix(pat).unwrap_or(s).to_owned())
+}
+
+fn trim_start_matches(_context: Context, s: &str, pat: &str) -> FunctionResult {
+  Ok(s.trim_start_matches(pat).to_owned())
+}
+
+fn uppercamelcase(_context: Context, s: &str) -> FunctionResult {
+  Ok(s.to_upper_camel_case())
+}
+
+fn uppercase(_context: Context, s: &str) -> FunctionResult {
+  Ok(s.to_uppercase())
+}
+
+fn uuid(_context: Context) -> FunctionResult {
+  Ok(uuid::Uuid::new_v4().to_string())
+}
+
+fn which(context: Context, name: &str) -> FunctionResult {
+  Ok(crate::which(context, name)?.unwrap_or_default())
+}
+
+fn without_extension(_context: Context, path: &str) -> FunctionResult {
+  let parent = Utf8Path::new(path)
+    .parent()
+    .ok_or_else(|| format!("Could not extract parent from `{path}`"))?;
+
+  let file_stem = Utf8Path::new(path)
+    .file_stem()
+    .ok_or_else(|| format!("Could not extract file stem from `{path}`"))?;
+
+  Ok(parent.join(file_stem).to_string())
+}
+
+/// Check whether a string processes properly as semver (e.x. "0.1.0")
+/// and matches a given semver requirement (e.x. ">=0.1.0")
+fn semver_matches(_context: Context, version: &str, requirement: &str) -> FunctionResult {
+  Ok(
+    requirement
+      .parse::<VersionReq>()
+      .map_err(|err| format!("invalid semver requirement: {err}"))?
+      .matches(
+        &version
+          .parse::<Version>()
+          .map_err(|err| format!("invalid semver version: {err}"))?,
+      )
+      .to_string(),
+  )
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn dir_not_found() {
+    assert_eq!(dir("foo", || None).unwrap_err(), "foo directory not found");
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn dir_not_unicode() {
+    use std::os::unix::ffi::OsStrExt;
+    assert_eq!(
+      dir("foo", || Some(
+        std::ffi::OsStr::from_bytes(b"\xe0\x80\x80").into()
+      ))
+      .unwrap_err(),
+      "unable to convert foo directory path to string: ���",
+    );
+  }
+}
+use super::*;
+
+#[test]
+fn cache_directory() {
+  Test::new()
+    .justfile("x := cache_directory()")
+    .args(["--evaluate", "x"])
+    .stdout(dirs::cache_dir().unwrap_or_default().to_str().unwrap())
+    .success();
+}
+
+#[test]
+fn config_directory() {
+  Test::new()
+    .justfile("x := config_directory()")
+    .args(["--evaluate", "x"])
+    .stdout(dirs::config_dir().unwrap_or_default().to_str().unwrap())
+    .success();
+}
+
+#[test]
+fn config_local_directory() {
+  Test::new()
+    .justfile("x := config_local_directory()")
+    .args(["--evaluate", "x"])
+    .stdout(
+      dirs::config_local_dir()
+        .unwrap_or_default()
+        .to_str()
+        .unwrap(),
+    )
+    .success();
+}
+
+#[test]
+fn data_directory() {
+  Test::new()
+    .justfile("x := data_directory()")
+    .args(["--evaluate", "x"])
+    .stdout(dirs::data_dir().unwrap_or_default().to_str().unwrap())
+    .success();
+}
+
+#[test]
+fn data_local_directory() {
+  Test::new()
+    .justfile("x := data_local_directory()")
+    .args(["--evaluate", "x"])
+    .stdout(dirs::data_local_dir().unwrap_or_default().to_str().unwrap())
+    .success();
+}
+
+#[test]
+fn executable_directory() {
+  if let Some(executable_dir) = dirs::executable_dir() {
+    Test::new()
+      .justfile("x := executable_directory()")
+      .args(["--evaluate", "x"])
+      .stdout(executable_dir.to_str().unwrap())
+      .success();
+  } else {
+    Test::new()
+      .justfile("x := executable_directory()")
+      .args(["--evaluate", "x"])
+      .stderr(
+        "
+          error: Call to function `executable_directory` failed: executable directory not found
+           ——▶ justfile:1:6
+            │
+          1 │ x := executable_directory()
+            │      ^^^^^^^^^^^^^^^^^^^^
+        ",
+      )
+      .failure();
+  }
+}
+
+#[test]
+fn home_directory() {
+  Test::new()
+    .justfile("x := home_directory()")
+    .args(["--evaluate", "x"])
+    .stdout(dirs::home_dir().unwrap_or_default().to_str().unwrap())
+    .success();
+}
+
+#[test]
+fn runtime_directory() {
+  if cfg!(not(target_os = "linux")) {
+    return;
+  }
+
+  Test::new()
+    .justfile("x := runtime_directory()")
+    .args(["--evaluate", "x"])
+    .stdout(dirs::runtime_dir().unwrap_or_default().to_str().unwrap())
+    .success();
+}
+
+#[test]
+fn runtime_directory_not_found() {
+  if cfg!(target_os = "linux") {
+    return;
+  }
+
+  Test::new()
+    .justfile("x := runtime_directory()")
+    .args(["--evaluate", "x"])
+    .stderr(
+      "
+        error: Call to function `runtime_directory` failed: runtime directory not found
+         ——▶ justfile:1:6
+          │
+        1 │ x := runtime_directory()
+          │      ^^^^^^^^^^^^^^^^^
+      ",
+    )
+    .failure();
+}
+use super::*;
+
+#[test]
+fn test_os_arch_functions_in_interpolation() {
+  Test::new()
+    .justfile(
+      "
+        foo:
+          echo {{arch()}} {{os()}} {{os_family()}} {{num_cpus()}}
+      ",
+    )
+    .stdout(
+      format!(
+        "{} {} {} {}\n",
+        target::arch(),
+        target::os(),
+        target::family(),
+        num_cpus::get()
+      )
+      .as_str(),
+    )
+    .stderr(
+      format!(
+        "echo {} {} {} {}\n",
+        target::arch(),
+        target::os(),
+        target::family(),
+        num_cpus::get()
+      )
+      .as_str(),
+    )
+    .success();
+}
+
+#[test]
+fn test_os_arch_functions_in_expression() {
+  Test::new()
+    .justfile(
+      "
+        a := arch()
+        o := os()
+        f := os_family()
+        n := num_cpus()
+
+        foo:
+          echo {{a}} {{o}} {{f}} {{n}}
+      ",
+    )
+    .stdout(
+      format!(
+        "{} {} {} {}\n",
+        target::arch(),
+        target::os(),
+        target::family(),
+        num_cpus::get()
+      )
+      .as_str(),
+    )
+    .stderr(
+      format!(
+        "echo {} {} {} {}\n",
+        target::arch(),
+        target::os(),
+        target::family(),
+        num_cpus::get()
+      )
+      .as_str(),
+    )
+    .success();
+}
+
+#[test]
+fn env_var_functions_unix() {
+  if cfg!(windows) {
+    return;
+  }
+  Test::new()
+    .justfile(
+      "
+        p := env_var('USER')
+        b := env_var_or_default('ZADDY', 'HTAP')
+        x := env_var_or_default('XYZ', 'ABC')
+
+        foo:
+          /usr/bin/env echo '{{p}}' '{{b}}' '{{x}}'
+      ",
+    )
+    .stdout(format!("{} HTAP ABC\n", env::var("USER").unwrap()).as_str())
+    .stderr(
+      format!(
+        "/usr/bin/env echo '{}' 'HTAP' 'ABC'\n",
+        env::var("USER").unwrap()
+      )
+      .as_str(),
+    )
+    .success();
+}
+
+#[test]
+fn path_functions() {
+  if cfg!(windows) {
+    return;
+  }
+  Test::new()
+    .justfile(
+      "
+        we  := without_extension('/foo/bar/baz.hello')
+        fs  := file_stem('/foo/bar/baz.hello')
+        fn  := file_name('/foo/bar/baz.hello')
+        dir := parent_directory('/foo/bar/baz.hello')
+        ext := extension('/foo/bar/baz.hello')
+        jn  := join('a', 'b')
+
+        foo:
+          /usr/bin/env echo '{{we}}' '{{fs}}' '{{fn}}' '{{dir}}' '{{ext}}' '{{jn}}'
+      ",
+    )
+    .stdout("/foo/bar/baz baz baz.hello /foo/bar hello a/b\n")
+    .stderr("/usr/bin/env echo '/foo/bar/baz' 'baz' 'baz.hello' '/foo/bar' 'hello' 'a/b'\n")
+    .success();
+use {super::*, std::os::unix::ffi::OsStrExt};
+
+fn non_unicode_dir_name() -> &'static std::ffi::OsStr {
+  std::ffi::OsStr::from_bytes(b"foo\xff")
+}
+
+#[test]
+fn warn_for_non_unicode_invocation_directory() {
+  let tempdir = tempdir();
+  let dir = tempdir.path().join(non_unicode_dir_name());
+  fs::create_dir(&dir).unwrap();
+  fs::write(dir.join("justfile"), "default:\n\ttrue\n").unwrap();
+
+  Test::with_tempdir(tempdir)
+    .no_justfile()
+    .current_dir(non_unicode_dir_name())
+    .test_round_trip(false)
+    .stderr_regex(
+      ".*The invocation directory path `[^`]+` is not Unicode\\. Just is considering phasing-out \
+      support for non-Unicode paths\\. If you see this warning, please leave a comment on \
+      https://github\\.com/casey/just/issues/3229\\. Thank you!.*",
+    )
+    .success();
+}
+
+#[test]
+fn warn_for_non_unicode_justfile_path() {
+  let tempdir = tempdir();
+  let dir = tempdir.path().join(non_unicode_dir_name());
+  fs::create_dir(&dir).unwrap();
+  fs::write(dir.join("justfile"), "default:\n\ttrue\n").unwrap();
+
+  Test::with_tempdir(tempdir)
+    .no_justfile()
+    .current_dir(non_unicode_dir_name())
+    .test_round_trip(false)
+    .stderr_regex(
+      ".*The justfile path `[^`]+` is not Unicode\\. Just is considering phasing-out support for \
+      non-Unicode paths\\. If you see this warning, please leave a comment on \
+      https://github\\.com/casey/just/issues/3229\\. Thank you!.*",
+    )
+    .success();
+}
+use super::*;
+
+pub(crate) struct SignalHandler {
+  caught: Option<Signal>,
+  children: BTreeMap<i32, Command>,
+  initialized: bool,
+  verbosity: Verbosity,
+}
+
+impl SignalHandler {
+  pub(crate) fn install(verbosity: Verbosity) -> RunResult<'static> {
+    let mut instance = Self::instance();
+    instance.verbosity = verbosity;
+    if !instance.initialized {
+      Platform::install_signal_handler(|signal| Self::instance().handle(signal))?;
+      instance.initialized = true;
+    }
+    Ok(())
+  }
+
+  pub(crate) fn instance() -> MutexGuard<'static, Self> {
+    static INSTANCE: Mutex<SignalHandler> = Mutex::new(SignalHandler::new());
+
+    match INSTANCE.lock() {
+      Ok(guard) => guard,
+      Err(poison_error) => {
+        eprintln!(
+          "{}",
+          Error::internal(format!("signal handler mutex poisoned: {poison_error}"),)
+            .color_display(Color::auto().stderr())
+        );
+        process::exit(EXIT_FAILURE);
+      }
+    }
+  }
+
+  const fn new() -> Self {
+    Self {
+      caught: None,
+      children: BTreeMap::new(),
+      initialized: false,
+      verbosity: Verbosity::default(),
+    }
+  }
+
+  fn handle(&mut self, signal: Signal) {
+    if signal.is_fatal() {
+      if self.children.is_empty() {
+        process::exit(signal.code());
+      }
+
+      if self.caught.is_none() {
+        self.caught = Some(signal);
+      }
+    }
+
+    match signal {
+      // SIGHUP, SIGINT, and SIGQUIT are normally sent on terminal close,
+      // ctrl-c, and ctrl-\, respectively, and are sent to all processes in the
+      // foreground process group. this includes child processes, so we ignore
+      // the signal and wait for them to exit
+      Signal::Hangup | Signal::Interrupt | Signal::Quit => {}
+      #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+      ))]
+      Signal::Info => {
+        let id = process::id();
+        if self.children.is_empty() {
+          eprintln!("just {id}: no child processes");
+        } else {
+          let n = self.children.len();
+
+          let mut message = format!(
+            "just {id}: {n} child {}:\n",
+            if n == 1 { "process" } else { "processes" }
+          );
+
+          for (&child, command) in &self.children {
+            use std::fmt::Write;
+            writeln!(message, "{child}: {command:?}").unwrap();
+          }
+
+          eprint!("{message}");
+        }
+      }
+      // SIGTERM is the default signal sent by kill. forward it to child
+      // processes and wait for them to exit
+      Signal::Terminate =>
+      {
+        #[cfg(not(windows))]
+        for &child in self.children.keys() {
+          if self.verbosity.loquacious() {
+            eprintln!("just: sending SIGTERM to child process {child}");
+          }
+          nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child),
+            Some(Signal::Terminate.into()),
+          )
+          .ok();
+        }
+      }
+    }
+  }
+
+  pub(crate) fn spawn<T>(
+    mut command: Command,
+    f: impl Fn(process::Child) -> io::Result<T>,
+  ) -> (io::Result<T>, Option<Signal>) {
+    let mut instance = Self::instance();
+
+    let child = match command.spawn() {
+      Err(err) => return (Err(err), None),
+      Ok(child) => child,
+    };
+
+    let pid = match child.id().try_into() {
+      Err(err) => {
+        return (
+          Err(io::Error::other(format!("invalid child PID: {err}"))),
+          None,
+        );
+      }
+      Ok(pid) => pid,
+    };
+
+    instance.children.insert(pid, command);
+
+    drop(instance);
+
+    let result = f(child);
+
+    let mut instance = Self::instance();
+
+    instance.children.remove(&pid);
+
+    (result, instance.caught)
+  }
+}

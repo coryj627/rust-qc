@@ -1,0 +1,864 @@
+            mode,
+            match env {
+                Some(env) => {
+                    self.push_ref(&env.0);
+                    -1
+                }
+                _ => 0,
+            },
+        );
+        #[cfg(feature = "luau-jit")]
+        if status == ffi::LUA_OK {
+            if (*self.extra.get()).enable_jit && ffi::luau_codegen_supported() != 0 {
+                ffi::luau_codegen_compile(state, -1);
+            }
+        }
+        status
+    }
+
+    /// Sets a hook for a thread (coroutine).
+    #[cfg(not(feature = "luau"))]
+    pub(crate) unsafe fn set_thread_hook(
+        &self,
+        thread_state: *mut ffi::lua_State,
+        hook: HookKind,
+    ) -> Result<()> {
+        // Key to store hooks in the registry
+        const HOOKS_KEY: *const c_char = cstr!("__mlua_hooks");
+
+        unsafe fn process_status(state: *mut ffi::lua_State, event: c_int, status: VmState) {
+            match status {
+                VmState::Continue => {}
+                VmState::Yield => {
+                    // Only count and line events can yield
+                    if event == ffi::LUA_HOOKCOUNT || event == ffi::LUA_HOOKLINE {
+                        #[cfg(any(feature = "lua54", feature = "lua53"))]
+                        if ffi::lua_isyieldable(state) != 0 {
+                            ffi::lua_yield(state, 0);
+                        }
+                        #[cfg(any(feature = "lua52", feature = "lua51", feature = "luajit"))]
+                        {
+                            ffi::lua_pushliteral(state, c"attempt to yield from a hook");
+                            ffi::lua_error(state);
+                        }
+                    }
+                }
+            }
+        }
+
+        unsafe extern "C-unwind" fn global_hook_proc(state: *mut ffi::lua_State, ar: *mut ffi::lua_Debug) {
+            let status = callback_error_ext(state, ptr::null_mut(), false, move |extra, _| {
+                match (*extra).hook_callback.clone() {
+                    Some(hook_callback) => {
+                        let rawlua = (*extra).raw_lua();
+                        let debug = Debug::new(rawlua, 0, ar);
+                        hook_callback((*extra).lua(), &debug)
+                    }
+                    None => {
+                        ffi::lua_sethook(state, None, 0, 0);
+                        Ok(VmState::Continue)
+                    }
+                }
+            });
+            process_status(state, (*ar).event, status);
+        }
+
+        unsafe extern "C-unwind" fn hook_proc(state: *mut ffi::lua_State, ar: *mut ffi::lua_Debug) {
+            let top = ffi::lua_gettop(state);
+            let mut hook_callback_ptr = ptr::null();
+            ffi::luaL_checkstack(state, 3, ptr::null());
+            if ffi::lua_getfield(state, ffi::LUA_REGISTRYINDEX, HOOKS_KEY) == ffi::LUA_TTABLE {
+                ffi::lua_pushthread(state);
+                if ffi::lua_rawget(state, -2) == ffi::LUA_TUSERDATA {
+                    hook_callback_ptr = get_internal_userdata::<HookCallback>(state, -1, ptr::null());
+                }
+            }
+            ffi::lua_settop(state, top);
+            if hook_callback_ptr.is_null() {
+                ffi::lua_sethook(state, None, 0, 0);
+                return;
+            }
+
+            let status = callback_error_ext(state, ptr::null_mut(), false, |extra, _| {
+                let rawlua = (*extra).raw_lua();
+                let debug = Debug::new(rawlua, 0, ar);
+                let hook_callback = (*hook_callback_ptr).clone();
+                hook_callback((*extra).lua(), &debug)
+            });
+            process_status(state, (*ar).event, status)
+        }
+
+        let (triggers, callback) = match hook {
+            HookKind::Global if (*self.extra.get()).hook_callback.is_none() => {
+                return Ok(());
+            }
+            HookKind::Global => {
+                let triggers = (*self.extra.get()).hook_triggers;
+                let (mask, count) = (triggers.mask(), triggers.count());
+                ffi::lua_sethook(thread_state, Some(global_hook_proc), mask, count);
+                return Ok(());
+            }
+            HookKind::Thread(triggers, callback) => (triggers, callback),
+        };
+
+        // Hooks for threads stored in the registry (in a weak table)
+        let state = self.state();
+        let _sg = StackGuard::new(state);
+        check_stack(state, 3)?;
+        protect_lua!(state, 0, 0, |state| {
+            if ffi::luaL_getsubtable(state, ffi::LUA_REGISTRYINDEX, HOOKS_KEY) == 0 {
+                // Table just created, initialize it
+                ffi::lua_pushliteral(state, c"k");
+                ffi::lua_setfield(state, -2, cstr!("__mode")); // hooktable.__mode = "k"
+                ffi::lua_pushvalue(state, -1);
+                ffi::lua_setmetatable(state, -2); // metatable(hooktable) = hooktable
+            }
+
+            ffi::lua_pushthread(thread_state);
+            ffi::lua_xmove(thread_state, state, 1); // key (thread)
+            let _ = push_internal_userdata(state, callback, false); // value (hook callback)
+            ffi::lua_rawset(state, -3); // hooktable[thread] = hook callback
+        })?;
+
+        ffi::lua_sethook(thread_state, Some(hook_proc), triggers.mask(), triggers.count());
+
+        Ok(())
+    }
+    /// - Setup local environment table that performs writes locally and proxies reads to the global
+    ///   environment.
+    /// - Allow only `count` mode in `collectgarbage` function.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use mlua::{Lua, Result};
+    /// # #[cfg(feature = "luau")]
+    /// # fn main() -> Result<()> {
+    /// let lua = Lua::new();
+    ///
+    /// lua.sandbox(true)?;
+    /// lua.load("var = 123").exec()?;
+    /// assert_eq!(lua.globals().get::<u32>("var")?, 123);
+    ///
+    /// // Restore the global environment (clear changes made in sandbox)
+    /// lua.sandbox(false)?;
+    /// assert_eq!(lua.globals().get::<Option<u32>>("var")?, None);
+    /// # Ok(())
+    /// # }
+    ///
+    /// # #[cfg(not(feature = "luau"))]
+    /// # fn main() {}
+    /// ```
+    #[cfg(any(feature = "luau", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    pub fn sandbox(&self, enabled: bool) -> Result<()> {
+        let lua = self.lock();
+        unsafe {
+            if (*lua.extra.get()).sandboxed != enabled {
+                let state = lua.main_state();
+                check_stack(state, 3)?;
+                protect_lua!(state, 0, 0, |state| {
+                    if enabled {
+                        ffi::luaL_sandbox(state, 1);
+                        ffi::luaL_sandboxthread(state);
+                    } else {
+                        // Restore original `LUA_GLOBALSINDEX`
+                        ffi::lua_xpush(lua.ref_thread(), state, ffi::LUA_GLOBALSINDEX);
+                        ffi::lua_replace(state, ffi::LUA_GLOBALSINDEX);
+                        ffi::luaL_sandbox(state, 0);
+                    }
+                })?;
+                (*lua.extra.get()).sandboxed = enabled;
+            }
+            Ok(())
+        }
+    }
+
+    /// Sets or replaces a global hook function that will periodically be called as Lua code
+    /// executes.
+    ///
+    /// All new threads created (by mlua) after this call will use the global hook function.
+    ///
+    /// For more information see [`Lua::set_hook`].
+    #[cfg(not(feature = "luau"))]
+    #[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
+    pub fn set_global_hook<F>(&self, triggers: HookTriggers, callback: F) -> Result<()>
+    where
+        F: Fn(&Lua, &Debug) -> Result<VmState> + MaybeSend + 'static,
+    {
+        let lua = self.lock();
+        unsafe {
+            (*lua.extra.get()).hook_triggers = triggers;
+            (*lua.extra.get()).hook_callback = Some(XRc::new(callback));
+            lua.set_thread_hook(lua.state(), HookKind::Global)
+        }
+    }
+
+    /// Sets a hook function that will periodically be called as Lua code executes.
+    ///
+    /// When exactly the hook function is called depends on the contents of the `triggers`
+    /// parameter, see [`HookTriggers`] for more details.
+    ///
+    /// The provided hook function can error, and this error will be propagated through the Lua code
+    /// that was executing at the time the hook was triggered. This can be used to implement a
+    /// limited form of execution limits by setting [`HookTriggers.every_nth_instruction`] and
+    /// erroring once an instruction limit has been reached.
+    ///
+    /// This method sets a hook function for the *current* thread of this Lua instance.
+    /// If you want to set a hook function for another thread (coroutine), use
+    /// [`Thread::set_hook`] instead.
+    ///
+    /// # Example
+    ///
+    /// Shows each line number of code being executed by the Lua interpreter.
+    ///
+    /// ```
+    /// # use mlua::{Lua, HookTriggers, Result, VmState};
+    /// # fn main() -> Result<()> {
+    /// let lua = Lua::new();
+    /// lua.set_hook(HookTriggers::EVERY_LINE, |_lua, debug| {
+    ///     println!("line {:?}", debug.current_line());
+    ///     Ok(VmState::Continue)
+    /// });
+    ///
+    /// lua.load(r#"
+    ///     local x = 2 + 3
+    ///     local y = x * 63
+    ///     local z = string.len(x..", "..y)
+    /// "#).exec()
+    /// # }
+    /// ```
+    ///
+    /// [`HookTriggers.every_nth_instruction`]: crate::HookTriggers::every_nth_instruction
+    #[cfg(not(feature = "luau"))]
+    #[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
+    pub fn set_hook<F>(&self, triggers: HookTriggers, callback: F) -> Result<()>
+    where
+        F: Fn(&Lua, &Debug) -> Result<VmState> + MaybeSend + 'static,
+    {
+        let lua = self.lock();
+        unsafe { lua.set_thread_hook(lua.state(), HookKind::Thread(triggers, XRc::new(callback))) }
+    }
+
+    /// Removes a global hook previously set by [`Lua::set_global_hook`].
+    ///
+    /// This function has no effect if a hook was not previously set.
+    #[cfg(not(feature = "luau"))]
+    #[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
+    pub fn remove_global_hook(&self) {
+        let lua = self.lock();
+        unsafe {
+            (*lua.extra.get()).hook_callback = None;
+            (*lua.extra.get()).hook_triggers = HookTriggers::default();
+        }
+    }
+
+    /// Removes any hook from the current thread.
+    ///
+    /// This function has no effect if a hook was not previously set.
+    #[cfg(not(feature = "luau"))]
+    #[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
+    pub fn remove_hook(&self) {
+        let lua = self.lock();
+        unsafe {
+            ffi::lua_sethook(lua.state(), None, 0, 0);
+        }
+    }
+
+    /// Sets an interrupt function that will periodically be called by Luau VM.
+    ///
+    /// Any Luau code is guaranteed to call this handler "eventually"
+    /// (in practice this can happen at any function call or at any loop iteration).
+    /// This is similar to `Lua::set_hook` but in more simplified form.
+    ///
+    /// The provided interrupt function can error, and this error will be propagated through
+    /// the Luau code that was executing at the time the interrupt was triggered.
+    /// Also this can be used to implement continuous execution limits by instructing Luau VM to
+    /// yield by returning [`VmState::Yield`]. The yield will happen only at yieldable points
+    /// of execution (not across metamethod/C-call boundaries).
+    ///
+    /// # Example
+    ///
+    /// Periodically yield Luau VM to suspend execution.
+    ///
+    /// ```
+    /// # use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+    /// # use mlua::{Lua, Result, ThreadStatus, VmState};
+    /// # #[cfg(feature = "luau")]
+    /// # fn main() -> Result<()> {
+    /// let lua = Lua::new();
+    /// let count = Arc::new(AtomicU64::new(0));
+    /// lua.set_interrupt(move |_| {
+    ///     if count.fetch_add(1, Ordering::Relaxed) % 2 == 0 {
+    ///         return Ok(VmState::Yield);
+    ///     }
+    ///     Ok(VmState::Continue)
+    /// });
+    ///
+    /// let co = lua.create_thread(
+    ///     lua.load(r#"
+    ///         local b = 0
+    ///         for _, x in ipairs({1, 2, 3}) do b += x end
+    ///     "#)
+    ///     .into_function()?,
+    /// )?;
+    /// while co.status() == ThreadStatus::Resumable {
+    ///     co.resume::<()>(())?;
+    /// }
+    /// # Ok(())
+    /// # }
+    ///
+    /// # #[cfg(not(feature = "luau"))]
+    /// # fn main() {}
+    /// ```
+    #[cfg(any(feature = "luau", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    pub fn set_interrupt<F>(&self, callback: F)
+    where
+        F: Fn(&Lua) -> Result<VmState> + MaybeSend + 'static,
+    {
+        unsafe extern "C-unwind" fn interrupt_proc(state: *mut ffi::lua_State, gc: c_int) {
+            if gc >= 0 {
+                // We don't support GC interrupts since they cannot survive Lua exceptions
+                return;
+            }
+            let result = callback_error_ext(state, ptr::null_mut(), false, move |extra, _| {
+                let interrupt_cb = (*extra).interrupt_callback.clone();
+                let interrupt_cb = mlua_expect!(interrupt_cb, "no interrupt callback set in interrupt_proc");
+                if XRc::strong_count(&interrupt_cb) > 2 {
+                    return Ok(VmState::Continue); // Don't allow recursion
+                }
+                interrupt_cb((*extra).lua())
+            });
+            match result {
+                VmState::Continue => {}
+                VmState::Yield => {
+                    // We can yield only at yieldable points, otherwise ignore and continue
+                    if ffi::lua_isyieldable(state) != 0 {
+                        ffi::lua_yield(state, 0);
+                    }
+                }
+            }
+        }
+
+        // Set interrupt callback
+        let lua = self.lock();
+        unsafe {
+            (*lua.extra.get()).interrupt_callback = Some(XRc::new(callback));
+            (*ffi::lua_callbacks(lua.main_state())).interrupt = Some(interrupt_proc);
+        }
+    }
+
+    /// Removes any interrupt function previously set by `set_interrupt`.
+    ///
+    /// This function has no effect if an 'interrupt' was not previously set.
+    #[cfg(any(feature = "luau", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    pub fn remove_interrupt(&self) {
+        let lua = self.lock();
+        unsafe {
+            (*lua.extra.get()).interrupt_callback = None;
+            (*ffi::lua_callbacks(lua.main_state())).interrupt = None;
+        }
+    }
+
+    /// Sets a thread creation callback that will be called when a thread is created.
+    #[cfg(any(feature = "luau", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    pub fn set_thread_creation_callback<F>(&self, callback: F)
+    where
+        F: Fn(&Lua, Thread) -> Result<()> + MaybeSend + 'static,
+    {
+        let lua = self.lock();
+        unsafe {
+            (*lua.extra.get()).thread_creation_callback = Some(XRc::new(callback));
+            (*ffi::lua_callbacks(lua.main_state())).userthread = Some(Self::userthread_proc);
+        }
+    }
+
+    /// Sets a thread collection callback that will be called when a thread is destroyed.
+    ///
+    /// Luau GC does not support exceptions during collection, so the callback must be
+    /// non-panicking. If the callback panics, the program will be aborted.
+    #[cfg(any(feature = "luau", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    pub fn set_thread_collection_callback<F>(&self, callback: F)
+    where
+        F: Fn(crate::LightUserData) + MaybeSend + 'static,
+    {
+        let lua = self.lock();
+        unsafe {
+            (*lua.extra.get()).thread_collection_callback = Some(XRc::new(callback));
+            (*ffi::lua_callbacks(lua.main_state())).userthread = Some(Self::userthread_proc);
+#![cfg(not(feature = "luau"))]
+
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use mlua::{DebugEvent, Error, HookTriggers, Lua, Result, ThreadStatus, Value, VmState};
+
+#[test]
+fn test_hook_triggers() {
+    let trigger = HookTriggers::new().on_calls().on_returns()
+        | HookTriggers::new().every_line().every_nth_instruction(5);
+
+    assert!(trigger.on_calls);
+    assert!(trigger.on_returns);
+    assert!(trigger.every_line);
+    assert_eq!(trigger.every_nth_instruction, Some(5));
+}
+
+#[test]
+fn test_line_counts() -> Result<()> {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let hook_output = output.clone();
+
+    let lua = Lua::new();
+    lua.set_hook(HookTriggers::EVERY_LINE, move |_lua, debug| {
+        assert_eq!(debug.event(), DebugEvent::Line);
+        hook_output.lock().unwrap().push(debug.current_line().unwrap());
+        Ok(VmState::Continue)
+    })?;
+    lua.load(
+        r#"
+            local x = 2 + 3
+            local y = x * 63
+            local z = string.len(x..", "..y)
+        "#,
+    )
+    .exec()?;
+
+    lua.remove_hook();
+
+    let output = output.lock().unwrap();
+    if cfg!(feature = "luajit") && lua.load("jit.version_num").eval::<i64>()? >= 20100 {
+        assert_eq!(*output, vec![2, 3, 4, 0, 4]);
+    } else {
+        assert_eq!(*output, vec![2, 3, 4]);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_function_calls() -> Result<()> {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let hook_output = output.clone();
+
+    let lua = Lua::new();
+    lua.set_hook(HookTriggers::ON_CALLS, move |_lua, debug| {
+        assert_eq!(debug.event(), DebugEvent::Call);
+        let names = debug.names();
+        let source = debug.source();
+        let name = names.name.map(|s| s.into_owned());
+        hook_output.lock().unwrap().push((name, source.what));
+        Ok(VmState::Continue)
+    })?;
+
+    lua.load(
+        r#"
+            local v = string.len("Hello World")
+        "#,
+    )
+    .exec()?;
+
+    lua.remove_hook();
+
+    let output = output.lock().unwrap();
+    if cfg!(feature = "luajit") && lua.load("jit.version_num").eval::<i64>()? >= 20100 {
+        #[cfg(not(force_memory_limit))]
+        assert_eq!(*output, vec![(None, "main"), (Some("len".to_string()), "Lua")]);
+        #[cfg(force_memory_limit)]
+        assert_eq!(
+            *output,
+            vec![(None, "C"), (None, "main"), (Some("len".to_string()), "Lua")]
+        );
+    } else {
+        #[cfg(not(force_memory_limit))]
+        assert_eq!(*output, vec![(None, "main"), (Some("len".to_string()), "C")]);
+        #[cfg(force_memory_limit)]
+        assert_eq!(
+            *output,
+            vec![(None, "C"), (None, "main"), (Some("len".to_string()), "C")]
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_error_within_hook() -> Result<()> {
+    let lua = Lua::new();
+
+    lua.set_hook(HookTriggers::EVERY_LINE, |_lua, _debug| {
+        Err(Error::runtime("Something happened in there!"))
+    })?;
+
+    let err = lua.load("x = 1").exec().expect_err("panic didn't propagate");
+    match err {
+        Error::RuntimeError(msg) => assert_eq!(msg, "Something happened in there!"),
+        err => panic!("expected `RuntimeError` with a specific message, got {err:?}"),
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_limit_execution_instructions() -> Result<()> {
+    let lua = Lua::new();
+
+    // For LuaJIT disable JIT, as compiled code does not trigger hooks
+    #[cfg(feature = "luajit")]
+    lua.load("jit.off()").exec()?;
+
+    let max_instructions = AtomicI64::new(10000);
+    lua.set_hook(
+        HookTriggers::new().every_nth_instruction(30),
+        move |_lua, debug| {
+            assert_eq!(debug.event(), DebugEvent::Count);
+            if max_instructions.fetch_sub(30, Ordering::Relaxed) <= 30 {
+                Err(Error::runtime("time's up"))
+            } else {
+                Ok(VmState::Continue)
+            }
+        },
+    )?;
+
+    lua.globals().set("x", Value::Integer(0))?;
+    let _ = lua
+        .load(
+            r#"
+                for i = 1, 10000 do
+                    x = x + 1
+                end
+            "#,
+        )
+        .exec()
+        .expect_err("instruction limit didn't occur");
+
+    Ok(())
+}
+
+#[test]
+fn test_hook_removal() -> Result<()> {
+    let lua = Lua::new();
+
+    lua.set_hook(HookTriggers::new().every_nth_instruction(1), |_lua, _debug| {
+        Err(Error::runtime("this hook should've been removed by this time"))
+    })?;
+
+    assert!(lua.load("local x = 1").exec().is_err());
+    lua.remove_hook();
+    assert!(lua.load("local x = 1").exec().is_ok());
+
+    Ok(())
+}
+
+// Having the code compiled (even not run) on macos and luajit causes a memory reference issue
+// See https://github.com/LuaJIT/LuaJIT/issues/1099
+#[cfg(not(all(feature = "luajit", target_os = "macos")))]
+#[test]
+fn test_hook_swap_within_hook() -> Result<()> {
+    thread_local! {
+        static TL_LUA: std::cell::RefCell<Option<Lua>> = Default::default();
+    }
+
+    TL_LUA.with(|tl| {
+        *tl.borrow_mut() = Some(Lua::new());
+    });
+
+    TL_LUA.with(|tl| {
+        tl.borrow()
+            .as_ref()
+            .unwrap()
+            .set_hook(HookTriggers::EVERY_LINE, move |lua, _debug| {
+                lua.globals().set("ok", 1i64)?;
+                TL_LUA.with(|tl| {
+                    tl.borrow()
+                        .as_ref()
+                        .unwrap()
+                        .set_hook(HookTriggers::EVERY_LINE, move |lua, _debug| {
+                            lua.load(
+                                r#"
+                                    if ok ~= nil then
+                                        ok = ok + 1
+                                    end
+                                "#,
+                            )
+                            .exec()
+                            .expect("exec failure within hook");
+                            TL_LUA.with(|tl| {
+                                tl.borrow().as_ref().unwrap().remove_hook();
+                            });
+                            Ok(VmState::Continue)
+                        })
+                })?;
+                Ok(VmState::Continue)
+            })
+    })?;
+
+    TL_LUA.with(|tl| {
+        let tl = tl.borrow();
+        let lua = tl.as_ref().unwrap();
+        lua.load(
+            r#"
+                local x = 1
+                x = 2
+                local y = 3
+            ));
+        }
+
+        // Collect userdata
+        globals.set("ud", Nil)?;
+        lua.gc_collect()?;
+        assert_eq!(Rc::strong_count(&ud), 1);
+
+        // Check destroying wrapped UserDataRef without references in Lua
+        let ud = lua.convert::<UserDataRef<MyUserData>>(ud)?;
+        lua.gc_collect()?;
+        assert_eq!(ud.0, 30);
+        drop(ud);
+    }
+
+    // Arc<T>
+    {
+        let ud = Arc::new(MyUserData(3));
+        globals.set("ud", ud.clone())?;
+        lua.load(
+            r#"
+            assert(ud.static == "constant")
+            local ok, err = pcall(function() ud.data = 4 end)
+            assert(
+                tostring(err):find("error mutably borrowing userdata") ~= nil,
+                "expected 'error mutably borrowing userdata', got '" .. tostring(err) .. "'"
+            )
+            assert(ud.data == 3)
+            assert(ud:dbg() == "MyUserData(3)")
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        // Test borrowing original userdata
+        {
+            let ud = globals.get::<AnyUserData>("ud")?;
+            assert!(ud.is::<Arc<MyUserData>>());
+            assert!(!ud.is::<MyUserData>());
+
+            assert_eq!(ud.borrow::<MyUserData>()?.0, 3);
+            assert!(matches!(
+                ud.borrow_mut::<MyUserData>(),
+                Err(Error::UserDataBorrowMutError)
+            ));
+            assert!(ud.borrow_mut::<Arc<MyUserData>>().is_ok());
+
+            assert_eq!(ud.borrow_scoped::<MyUserData, _>(|x| x.0)?, 3);
+            assert!(matches!(
+                ud.borrow_mut_scoped::<MyUserData, _>(|_| ()),
+                Err(Error::UserDataBorrowMutError)
+            ));
+        }
+
+        // Collect userdata
+        globals.set("ud", Nil)?;
+        lua.gc_collect()?;
+        assert_eq!(Arc::strong_count(&ud), 1);
+
+        // We must be able to mutate userdata when having one reference only
+        globals.set("ud", ud)?;
+        lua.load(
+            r#"
+            ud.data = 4
+            assert(ud.data == 4)
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    // Arc<Mutex<T>>
+    {
+        use std::sync::Mutex;
+
+        let ud = Arc::new(Mutex::new(MyUserData(5)));
+        globals.set("ud", ud.clone())?;
+        lua.load(
+            r#"
+            assert(ud.static == "constant")
+            assert(ud.data == 5)
+            ud.data = 6
+            assert(ud.data == 6)
+            assert(ud:dbg() == "MyUserData(6)")
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        // Test borrowing original userdata
+        {
+            let ud = globals.get::<AnyUserData>("ud")?;
+            assert!(ud.is::<Arc<Mutex<MyUserData>>>());
+            assert!(!ud.is::<MyUserData>());
+
+            #[rustfmt::skip]
+            assert!(matches!(ud.borrow::<MyUserData>(), Err(Error::UserDataTypeMismatch)));
+            #[rustfmt::skip]
+            assert!(matches!(ud.borrow_mut::<MyUserData>(), Err(Error::UserDataTypeMismatch)));
+
+            assert_eq!(ud.borrow_scoped::<MyUserData, _>(|x| x.0)?, 6);
+            ud.borrow_mut_scoped::<MyUserData, _>(|x| x.0 = 8)?;
+            assert_eq!(ud.borrow_scoped::<MyUserData, _>(|x| x.0)?, 8);
+        }
+
+        // Collect userdata
+        globals.set("ud", Nil)?;
+        lua.gc_collect()?;
+        assert_eq!(Arc::strong_count(&ud), 1);
+    }
+
+    // Arc<RwLock<T>>
+    {
+        use std::sync::RwLock;
+
+        let ud = Arc::new(RwLock::new(MyUserData(9)));
+        globals.set("ud", ud.clone())?;
+        lua.load(
+            r#"
+            assert(ud.static == "constant")
+            assert(ud.data == 9)
+            ud.data = 10
+            assert(ud.data == 10)
+            assert(ud:dbg() == "MyUserData(10)")
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        // Test borrowing original userdata
+        {
+            let ud = globals.get::<AnyUserData>("ud")?;
+            assert!(ud.is::<Arc<RwLock<MyUserData>>>());
+            assert!(!ud.is::<MyUserData>());
+
+            #[rustfmt::skip]
+        Ok(Some(found_path.ok_or(NavigateError::NotFound)?))
+    }
+}
+
+impl Require for TextRequirer {
+    fn is_require_allowed(&self, chunk_name: &str) -> bool {
+        chunk_name.starts_with(Self::CHUNK_PREFIX)
+    }
+
+    fn reset(&mut self, chunk_name: &str) -> StdResult<(), NavigateError> {
+        if !chunk_name.starts_with(Self::CHUNK_PREFIX) {
+            return Err(NavigateError::NotFound);
+        }
+        let chunk_name = Self::normalize_chunk_name(&chunk_name[1..]);
+        let chunk_path = Self::normalize_path(chunk_name.as_ref());
+
+        if chunk_path.extension() == Some("rs".as_ref()) {
+            // Special case for Rust source files, reset to the current directory
+            let chunk_filename = chunk_path.file_name().unwrap();
+            let cwd = env::current_dir().map_err(|_| NavigateError::NotFound)?;
+            self.abs_path = Self::normalize_path(&cwd.join(chunk_filename));
+            self.rel_path = ([Component::CurDir, Component::Normal(chunk_filename)].into_iter()).collect();
+            self.resolved_path = None;
+
+            return Ok(());
+        }
+
+        if chunk_path.is_absolute() {
+            let resolved_path = Self::resolve_module(&chunk_path)?;
+            self.abs_path = chunk_path.clone();
+            self.rel_path = chunk_path;
+            self.resolved_path = resolved_path;
+        } else {
+            // Relative path
+            let cwd = env::current_dir().map_err(|_| NavigateError::NotFound)?;
+            let abs_path = Self::normalize_path(&cwd.join(&chunk_path));
+            let resolved_path = Self::resolve_module(&abs_path)?;
+            self.abs_path = abs_path;
+            self.rel_path = chunk_path;
+            self.resolved_path = resolved_path;
+        }
+
+        Ok(())
+    }
+
+    fn jump_to_alias(&mut self, path: &str) -> StdResult<(), NavigateError> {
+        let path = Self::normalize_path(path.as_ref());
+        let resolved_path = Self::resolve_module(&path)?;
+
+        self.abs_path = path.clone();
+        self.rel_path = path;
+        self.resolved_path = resolved_path;
+
+        Ok(())
+    }
+
+    fn to_parent(&mut self) -> StdResult<(), NavigateError> {
+        let mut abs_path = self.abs_path.clone();
+        if !abs_path.pop() {
+            // It's important to return `NotFound` if we reached the root, as it's a "recoverable" error if we
+            // cannot go beyond the root directory.
+            // Luau "require-by-string` has a special logic to search for config file to resolve aliases.
+            return Err(NavigateError::NotFound);
+        }
+        let mut rel_parent = self.rel_path.clone();
+        rel_parent.pop();
+        let resolved_path = Self::resolve_module(&abs_path)?;
+
+        self.abs_path = abs_path;
+        self.rel_path = Self::normalize_path(&rel_parent);
+        self.resolved_path = resolved_path;
+
+        Ok(())
+    }
+
+    fn to_child(&mut self, name: &str) -> StdResult<(), NavigateError> {
+        let abs_path = self.abs_path.join(name);
+        let rel_path = self.rel_path.join(name);
+        let resolved_path = Self::resolve_module(&abs_path)?;
+
+        self.abs_path = abs_path;
+        self.rel_path = rel_path;
+        self.resolved_path = resolved_path;
+
+        Ok(())
+    }
+
+    fn has_module(&self) -> bool {
+        (self.resolved_path.as_deref())
+            .map(Path::is_file)
+            .unwrap_or(false)
+    }
+
+    fn cache_key(&self) -> String {
+        self.resolved_path.as_deref().unwrap().display().to_string()
+    }
+
+    fn has_config(&self) -> bool {
+        self.abs_path.is_dir() && self.abs_path.join(".luaurc").is_file()
+    }
+
+    fn config(&self) -> IoResult<Vec<u8>> {
+        fs::read(self.abs_path.join(".luaurc"))
+    }
+
+    fn loader(&self, lua: &Lua) -> Result<Function> {
+        let name = format!("@{}", self.rel_path.display());
+        lua.load(self.resolved_path.as_deref().unwrap())
+            .set_name(name)
+            .into_function()
+    }
+}
+
+struct Context(Box<dyn Require>);
+
+impl Deref for Context {
+    type Target = dyn Require;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }

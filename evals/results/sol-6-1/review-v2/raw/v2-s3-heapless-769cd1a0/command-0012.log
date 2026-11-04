@@ -1,0 +1,870 @@
+//! A "history buffer", similar to a write-only ring buffer of fixed length.
+//!
+//! This buffer keeps a fixed number of elements.  On write, the oldest element
+//! is overwritten. Thus, the buffer is useful to keep a history of values with
+//! some desired depth, and for example calculate a rolling average.
+//!
+//! # Examples
+//! ```
+//! use heapless::HistoryBuf;
+//!
+//! // Initialize a new buffer with 8 elements.
+//! let mut buf = HistoryBuf::<_, 8>::new();
+//!
+//! // Starts with no data
+//! assert_eq!(buf.recent(), None);
+//!
+//! buf.write(3);
+//! buf.write(5);
+//! buf.extend(&[4, 4]);
+//!
+//! // The most recent written element is a four.
+//! assert_eq!(buf.recent(), Some(&4));
+//!
+//! // To access all elements in an unspecified order, use `as_slice()`.
+//! for el in buf.as_slice() {
+//!     println!("{:?}", el);
+//! }
+//!
+//! // Now we can prepare an average of all values, which comes out to 4.
+//! let avg = buf.as_slice().iter().sum::<usize>() / buf.len();
+//! assert_eq!(avg, 4);
+//! ```
+
+use core::fmt;
+use core::marker::PhantomData;
+use core::mem::MaybeUninit;
+use core::ops::Deref;
+use core::ptr;
+use core::slice;
+
+mod storage {
+    use core::mem::MaybeUninit;
+
+    use super::{HistoryBufInner, HistoryBufView};
+
+    /// Trait defining how data for a container is stored.
+    ///
+    /// There's two implementations available:
+    ///
+    /// - [`OwnedHistoryBufStorage`]: stores the data in an array `[T; N]` whose size is known at compile time.
+    /// - [`ViewHistoryBufStorage`]: stores the data in an unsized `[T]`.
+    ///
+    /// This allows [`HistoryBuf`] to be generic over either sized or unsized storage. The [`histbuf`]
+    /// module contains a [`HistoryBufInner`] struct that's generic on [`HistoryBufStorage`],
+    /// and two type aliases for convenience:
+    ///
+    /// - [`HistoryBuf<T, N>`](super::HistoryBuf) = `HistoryBufInner<T, OwnedHistoryBufStorage<T, N>>`
+    /// - [`HistoryBufView<T>`](super::HistoryBufView) = `HistoryBufInner<T, ViewHistoryBufStorage<T>>`
+    ///
+    /// `HistoryBuf` can be unsized into `HistoryBufView`, either by unsizing coercions such as `&mut HistoryBuf -> &mut HistoryBufView` or
+    /// `Box<HistoryBuf> -> Box<HistoryBufView>`, or explicitly with [`.as_view()`](super::HistoryBuf::as_view) or [`.as_mut_view()`](super::HistoryBuf::as_mut_view).
+    ///
+    /// This trait is sealed, so you cannot implement it for your own types. You can only use
+    /// the implementations provided by this crate.
+    ///
+    /// [`HistoryBufInner`]: super::HistoryBufInner
+    /// [`HistoryBuf`]: super::HistoryBuf
+    /// [`HistoryBufView`]: super::HistoryBufView
+    /// [`histbuf`]: super
+    #[allow(private_bounds)]
+    pub trait HistoryBufStorage<T>: HistoryBufSealedStorage<T> {}
+
+    pub trait HistoryBufSealedStorage<T> {
+        // part of the sealed trait so that no trait is publicly implemented by `OwnedHistoryBufStorage` besides `Storage`
+        fn borrow(&self) -> &[MaybeUninit<T>];
+        fn borrow_mut(&mut self) -> &mut [MaybeUninit<T>];
+        fn as_hist_buf_view(this: &HistoryBufInner<T, Self>) -> &HistoryBufView<T>
+        where
+            Self: HistoryBufStorage<T>;
+        fn as_hist_buf_mut_view(this: &mut HistoryBufInner<T, Self>) -> &mut HistoryBufView<T>
+        where
+            Self: HistoryBufStorage<T>;
+    }
+
+    // One sealed layer of indirection to hide the internal details (The MaybeUninit).
+    pub struct HistoryBufStorageInner<T: ?Sized> {
+        pub(crate) buffer: T,
+    }
+
+    /// Implementation of [`HistoryBufStorage`] that stores the data in an array `[T; N]` whose size is known at compile time.
+    pub type OwnedHistoryBufStorage<T, const N: usize> =
+        HistoryBufStorageInner<[MaybeUninit<T>; N]>;
+    /// Implementation of [`HistoryBufStorage`] that stores the data in an unsized `[T]`.
+    pub type ViewHistoryBufStorage<T> = HistoryBufStorageInner<[MaybeUninit<T>]>;
+
+    impl<T, const N: usize> HistoryBufSealedStorage<T> for OwnedHistoryBufStorage<T, N> {
+        fn borrow(&self) -> &[MaybeUninit<T>] {
+            &self.buffer
+        }
+        fn borrow_mut(&mut self) -> &mut [MaybeUninit<T>] {
+            &mut self.buffer
+        }
+        fn as_hist_buf_view(this: &HistoryBufInner<T, Self>) -> &HistoryBufView<T>
+        where
+            Self: HistoryBufStorage<T>,
+        {
+            this
+        }
+        fn as_hist_buf_mut_view(this: &mut HistoryBufInner<T, Self>) -> &mut HistoryBufView<T>
+        where
+            Self: HistoryBufStorage<T>,
+        {
+            this
+        }
+    }
+    impl<T, const N: usize> HistoryBufStorage<T> for OwnedHistoryBufStorage<T, N> {}
+
+    impl<T> HistoryBufSealedStorage<T> for ViewHistoryBufStorage<T> {
+        fn borrow(&self) -> &[MaybeUninit<T>] {
+            &self.buffer
+        }
+        fn borrow_mut(&mut self) -> &mut [MaybeUninit<T>] {
+            &mut self.buffer
+        }
+        fn as_hist_buf_view(this: &HistoryBufInner<T, Self>) -> &HistoryBufView<T>
+        where
+            Self: HistoryBufStorage<T>,
+        {
+            this
+        }
+        fn as_hist_buf_mut_view(this: &mut HistoryBufInner<T, Self>) -> &mut HistoryBufView<T>
+        where
+            Self: HistoryBufStorage<T>,
+        {
+            this
+        }
+    }
+    impl<T> HistoryBufStorage<T> for ViewHistoryBufStorage<T> {}
+}
+
+pub use storage::{HistoryBufStorage, OwnedHistoryBufStorage, ViewHistoryBufStorage};
+
+use storage::HistoryBufStorageInner;
+
+use self::storage::HistoryBufSealedStorage;
+
+/// Base struct for [`HistoryBuf`] and [`HistoryBufView`], generic over the [`HistoryBufStorage`].
+///
+/// In most cases you should use [`HistoryBuf`] or [`HistoryBufView`] directly. Only use this
+/// struct if you want to write code that's generic over both.
+pub struct HistoryBufInner<T, S: HistoryBufStorage<T> + ?Sized> {
+    // This phantomdata is required because otherwise rustc thinks that `T` is not used
+    phantom: PhantomData<T>,
+    write_at: usize,
+    filled: bool,
+    data: S,
+}
+
+/// A "history buffer", similar to a write-only ring buffer of fixed length.
+///
+/// This buffer keeps a fixed number of elements.  On write, the oldest element
+/// is overwritten. Thus, the buffer is useful to keep a history of values with
+/// some desired depth, and for example calculate a rolling average.
+///
+/// # Examples
+/// ```
+/// use heapless::HistoryBuf;
+///
+/// // Initialize a new buffer with 8 elements.
+/// let mut buf = HistoryBuf::<_, 8>::new();
+///
+/// // Starts with no data
+/// assert_eq!(buf.recent(), None);
+///
+/// buf.write(3);
+/// buf.write(5);
+/// buf.extend(&[4, 4]);
+///
+/// // The most recent written element is a four.
+/// assert_eq!(buf.recent(), Some(&4));
+///
+/// // To access all elements in an unspecified order, use `as_slice()`.
+/// for el in buf.as_slice() {
+///     println!("{:?}", el);
+/// }
+///
+/// // Now we can prepare an average of all values, which comes out to 4.
+/// let avg = buf.as_slice().iter().sum::<usize>() / buf.len();
+/// assert_eq!(avg, 4);
+/// ```
+pub type HistoryBuf<T, const N: usize> = HistoryBufInner<T, OwnedHistoryBufStorage<T, N>>;
+
+/// A "view" into a [`HistoryBuf`]
+///
+/// Unlike [`HistoryBuf`], it doesn't have the `const N: usize` in its type signature.
+///
+/// # Examples
+/// ```
+/// use heapless::history_buf::{HistoryBuf, HistoryBufView};
+///
+/// // Initialize a new buffer with 8 elements.
+/// let mut owned_buf = HistoryBuf::<_, 8>::new();
+/// let buf: &mut HistoryBufView<_> = &mut owned_buf;
+///
+/// // Starts with no data
+/// assert_eq!(buf.recent(), None);
+///
+/// buf.write(3);
+/// buf.write(5);
+/// buf.extend(&[4, 4]);
+///
+/// // The most recent written element is a four.
+/// assert_eq!(buf.recent(), Some(&4));
+///
+/// // To access all elements in an unspecified order, use `as_slice()`.
+/// for el in buf.as_slice() {
+///     println!("{:?}", el);
+/// }
+///
+/// // Now we can prepare an average of all values, which comes out to 4.
+/// let avg = buf.as_slice().iter().sum::<usize>() / buf.len();
+/// assert_eq!(avg, 4);
+/// ```
+pub type HistoryBufView<T> = HistoryBufInner<T, ViewHistoryBufStorage<T>>;
+
+impl<T, const N: usize> HistoryBuf<T, N> {
+    const INIT: MaybeUninit<T> = MaybeUninit::uninit();
+
+    /// Constructs a new history buffer.
+    ///
+    /// The construction of a `HistoryBuf` works in `const` contexts.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::HistoryBuf;
+    ///
+    /// // Allocate a 16-element buffer on the stack
+    /// let x: HistoryBuf<u8, 16> = HistoryBuf::new();
+    /// assert_eq!(x.len(), 0);
+    /// ```
+    #[inline]
+    pub const fn new() -> Self {
+        const {
+            assert!(N > 0);
+        }
+
+        Self {
+            phantom: PhantomData,
+            data: HistoryBufStorageInner {
+                buffer: [Self::INIT; N],
+            },
+            write_at: 0,
+            filled: false,
+        }
+    }
+}
+
+impl<T, const N: usize> HistoryBuf<T, N>
+where
+    T: Copy + Clone,
+{
+    /// Constructs a new history buffer, where every element is the given value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::HistoryBuf;
+    ///
+    /// // Allocate a 16-element buffer on the stack
+    /// let mut x: HistoryBuf<u8, 16> = HistoryBuf::new_with(4);
+    /// // All elements are four
+    /// assert_eq!(x.as_slice(), [4; 16]);
+    /// ```
+    #[inline]
+    pub fn new_with(t: T) -> Self {
+        Self {
+            phantom: PhantomData,
+            data: HistoryBufStorageInner {
+                buffer: [MaybeUninit::new(t); N],
+            },
+            write_at: 0,
+            filled: true,
+        }
+    }
+}
+
+impl<T: Copy, S: HistoryBufStorage<T> + ?Sized> HistoryBufInner<T, S> {
+    /// Get a reference to the `HistoryBuf`, erasing the `N` const-generic.
+    #[inline]
+    pub fn as_view(&self) -> &HistoryBufView<T> {
+        S::as_hist_buf_view(self)
+    }
+
+    /// Get a mutable reference to the `HistoryBuf`, erasing the `N` const-generic.
+    #[inline]
+    pub fn as_mut_view(&mut self) -> &mut HistoryBufView<T> {
+        S::as_hist_buf_mut_view(self)
+    }
+
+    /// Clears the buffer, replacing every element with the given value.
+    pub fn clear_with(&mut self, t: T) {
+        // SAFETY: we reset the values just after
+        unsafe { self.drop_contents() };
+        self.write_at = 0;
+        self.filled = true;
+
+        for d in self.data.borrow_mut() {
+            *d = MaybeUninit::new(t);
+        }
+    }
+}
+
+impl<T, S: HistoryBufStorage<T> + ?Sized> HistoryBufInner<T, S> {
+    /// Clears the buffer
+    pub fn clear(&mut self) {
+        // SAFETY: we reset the values just after
+        unsafe { self.drop_contents() };
+        self.write_at = 0;
+        self.filled = false;
+    }
+}
+
+impl<T, S: HistoryBufStorage<T> + ?Sized> HistoryBufInner<T, S> {
+    unsafe fn drop_contents(&mut self) {
+        unsafe {
+            ptr::drop_in_place(ptr::slice_from_raw_parts_mut(
+                self.data.borrow_mut().as_mut_ptr().cast::<T>(),
+                self.len(),
+            ));
+        }
+    }
+
+    /// Returns the current fill level of the buffer.
+    #[inline]
+    pub fn len(&self) -> usize {
+        if self.filled {
+            self.capacity()
+        } else {
+            self.write_at
+        }
+    }
+
+    /// Returns true if the buffer is empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::HistoryBuf;
+    ///
+    /// let x: HistoryBuf<u8, 16> = HistoryBuf::new();
+    /// assert!(x.is_empty());
+    /// ```
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the capacity of the buffer, which is the length of the
+    /// underlying backing array.
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.data.borrow().len()
+    }
+
+    /// Returns whether the buffer is full
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        self.filled
+    }
+
+    /// Writes an element to the buffer, overwriting the oldest value.
+    pub fn write(&mut self, t: T) {
+        if self.filled {
+            // Drop the old before we overwrite it.
+            unsafe { ptr::drop_in_place(self.data.borrow_mut()[self.write_at].as_mut_ptr()) }
+        }
+        self.data.borrow_mut()[self.write_at] = MaybeUninit::new(t);
+
+        self.write_at += 1;
+        if self.write_at == self.capacity() {
+            self.write_at = 0;
+            self.filled = true;
+        }
+    }
+
+    /// Clones and writes all elements in a slice to the buffer.
+    ///
+    /// If the slice is longer than the buffer, only the last `self.len()`
+    /// elements will actually be stored.
+    pub fn extend_from_slice(&mut self, other: &[T])
+    where
+        T: Clone,
+    {
+        for item in other {
+            self.write(item.clone());
+        }
+    }
+
+    /// Returns a reference to the most recently written value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::HistoryBuf;
+    ///
+    /// let mut x: HistoryBuf<u8, 16> = HistoryBuf::new();
+    /// x.write(4);
+    /// x.write(10);
+    /// assert_eq!(x.recent(), Some(&10));
+    /// ```
+    pub fn recent(&self) -> Option<&T> {
+        self.recent_index()
+            .map(|i| unsafe { &*self.data.borrow()[i].as_ptr() })
+    }
+
+    /// Returns index of the most recently written value in the underlying slice.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::HistoryBuf;
+    ///
+    /// let mut x: HistoryBuf<u8, 16> = HistoryBuf::new();
+    /// x.write(4);
+    /// x.write(10);
+    /// assert_eq!(x.recent_index(), Some(1));
+    /// ```
+    pub fn recent_index(&self) -> Option<usize> {
+        if self.write_at == 0 {
+//! A fixed capacity map/dictionary that performs lookups via linear search.
+//!
+//! Note that as this map doesn't use hashing so most operations are *O*(n) instead of *O*(1).
+
+use core::{borrow::Borrow, fmt, mem, ops, slice};
+
+use crate::vec::{OwnedVecStorage, Vec, VecInner, ViewVecStorage};
+
+mod storage {
+    use crate::vec::{OwnedVecStorage, VecStorage, ViewVecStorage};
+
+    use super::{LinearMapInner, LinearMapView};
+
+    /// Trait defining how data for a [`LinearMap`](super::LinearMap) is stored.
+    ///
+    /// There's two implementations available:
+    ///
+    /// - [`OwnedStorage`]: stores the data in an array whose size is known at compile time.
+    /// - [`ViewStorage`]: stores the data in an unsized slice
+    ///
+    /// This allows [`LinearMap`] to be generic over either sized or unsized storage. The [`linear_map`](super)
+    /// module contains a [`LinearMapInner`] struct that's generic on [`LinearMapStorage`],
+    /// and two type aliases for convenience:
+    ///
+    /// - [`LinearMap<N>`](crate::linear_map::LinearMap) = `LinearMapInner<OwnedStorage<u8, N>>`
+    /// - [`LinearMapView<T>`](crate::linear_map::LinearMapView) = `LinearMapInner<ViewStorage<u8>>`
+    ///
+    /// `LinearMap` can be unsized into `StrinsgView`, either by unsizing coercions such as `&mut LinearMap -> &mut LinearMapView` or
+    /// `Box<LinearMap> -> Box<LinearMapView>`, or explicitly with [`.as_view()`](crate::linear_map::LinearMap::as_view) or [`.as_mut_view()`](crate::linear_map::LinearMap::as_mut_view).
+    ///
+    /// This trait is sealed, so you cannot implement it for your own types. You can only use
+    /// the implementations provided by this crate.
+    ///
+    /// [`LinearMapInner`]: super::LinearMapInner
+    /// [`LinearMap`]: super::LinearMap
+    /// [`OwnedStorage`]: super::OwnedStorage
+    /// [`ViewStorage`]: super::ViewStorage
+    pub trait LinearMapStorage<K, V>: LinearMapStorageSealed<K, V> {}
+    pub trait LinearMapStorageSealed<K, V>: VecStorage<(K, V)> {
+        fn as_linear_map_view(this: &LinearMapInner<K, V, Self>) -> &LinearMapView<K, V>
+        where
+            Self: LinearMapStorage<K, V>;
+        fn as_linear_map_mut_view(
+            this: &mut LinearMapInner<K, V, Self>,
+        ) -> &mut LinearMapView<K, V>
+        where
+            Self: LinearMapStorage<K, V>;
+    }
+
+    impl<K, V, const N: usize> LinearMapStorage<K, V> for OwnedVecStorage<(K, V), N> {}
+    impl<K, V, const N: usize> LinearMapStorageSealed<K, V> for OwnedVecStorage<(K, V), N> {
+        fn as_linear_map_view(this: &LinearMapInner<K, V, Self>) -> &LinearMapView<K, V>
+        where
+            Self: LinearMapStorage<K, V>,
+        {
+            this
+        }
+        fn as_linear_map_mut_view(this: &mut LinearMapInner<K, V, Self>) -> &mut LinearMapView<K, V>
+        where
+            Self: LinearMapStorage<K, V>,
+        {
+            this
+        }
+    }
+
+    impl<K, V> LinearMapStorage<K, V> for ViewVecStorage<(K, V)> {}
+
+    impl<K, V> LinearMapStorageSealed<K, V> for ViewVecStorage<(K, V)> {
+        fn as_linear_map_view(this: &LinearMapInner<K, V, Self>) -> &LinearMapView<K, V>
+        where
+            Self: LinearMapStorage<K, V>,
+        {
+            this
+        }
+        fn as_linear_map_mut_view(this: &mut LinearMapInner<K, V, Self>) -> &mut LinearMapView<K, V>
+        where
+            Self: LinearMapStorage<K, V>,
+        {
+            this
+        }
+    }
+}
+
+pub use storage::LinearMapStorage;
+/// Implementation of [`LinearMapStorage`] that stores the data in an array whose size is known at compile time.
+pub type OwnedStorage<K, V, const N: usize> = OwnedVecStorage<(K, V), N>;
+/// Implementation of [`LinearMapStorage`] that stores the data in an unsized slice.
+pub type ViewStorage<K, V> = ViewVecStorage<(K, V)>;
+
+/// Base struct for [`LinearMap`] and [`LinearMapView`]
+pub struct LinearMapInner<K, V, S: LinearMapStorage<K, V> + ?Sized> {
+    pub(crate) buffer: VecInner<(K, V), usize, S>,
+}
+
+/// A fixed capacity map/dictionary that performs lookups via linear search.
+///
+/// Note that as this map doesn't use hashing so most operations are *O*(n) instead of *O*(1).
+pub type LinearMap<K, V, const N: usize> = LinearMapInner<K, V, OwnedStorage<K, V, N>>;
+
+/// A dynamic capacity map/dictionary that performs lookups via linear search.
+///
+/// Note that as this map doesn't use hashing so most operations are *O*(n) instead of *O*(1).
+pub type LinearMapView<K, V> = LinearMapInner<K, V, ViewStorage<K, V>>;
+
+impl<K, V, const N: usize> LinearMap<K, V, N> {
+    /// Creates an empty `LinearMap`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// // allocate the map on the stack
+    /// let mut map: LinearMap<&str, isize, 8> = LinearMap::new();
+    ///
+    /// // allocate the map in a static variable
+    /// static mut MAP: LinearMap<&str, isize, 8> = LinearMap::new();
+    /// ```
+    pub const fn new() -> Self {
+        Self { buffer: Vec::new() }
+    }
+}
+
+impl<K, V, S: LinearMapStorage<K, V> + ?Sized> LinearMapInner<K, V, S>
+where
+    K: Eq,
+{
+    /// Get a reference to the `LinearMap`, erasing the `N` const-generic.
+    pub fn as_view(&self) -> &LinearMapView<K, V> {
+        S::as_linear_map_view(self)
+    }
+
+    /// Get a mutable reference to the `LinearMap`, erasing the `N` const-generic.
+    pub fn as_mut_view(&mut self) -> &mut LinearMapView<K, V> {
+        S::as_linear_map_mut_view(self)
+    }
+
+    /// Returns the number of elements that the map can hold.
+    ///
+    /// Computes in *O*(1) time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let map: LinearMap<&str, isize, 8> = LinearMap::new();
+    /// assert_eq!(map.capacity(), 8);
+    /// ```
+    pub fn capacity(&self) -> usize {
+        self.buffer.capacity()
+    }
+
+    /// Clears the map, removing all key-value pairs.
+    ///
+    /// Computes in *O*(1) time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// map.insert(1, "a").unwrap();
+    /// map.clear();
+    /// assert!(map.is_empty());
+    /// ```
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+    }
+
+    /// Returns true if the map contains a value for the specified key.
+    ///
+    /// Computes in *O*(n) time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// map.insert(1, "a").unwrap();
+    /// assert_eq!(map.contains_key(&1), true);
+    /// assert_eq!(map.contains_key(&2), false);
+    /// ```
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.get(key).is_some()
+    }
+
+    /// Returns a reference to the value corresponding to the key.
+    ///
+    /// Computes in *O*(n) time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// map.insert(1, "a").unwrap();
+    /// assert_eq!(map.get(&1), Some(&"a"));
+    /// assert_eq!(map.get(&2), None);
+    /// ```
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        self.iter()
+            .find(|&(k, _)| k.borrow() == key)
+            .map(|(_, v)| v)
+    }
+
+    /// Returns a mutable reference to the value corresponding to the key.
+    ///
+    /// Computes in *O*(n) time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// map.insert(1, "a").unwrap();
+    /// if let Some(x) = map.get_mut(&1) {
+    ///     *x = "b";
+    /// }
+    /// assert_eq!(map[&1], "b");
+    /// ```
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        self.iter_mut()
+            .find(|&(k, _)| k.borrow() == key)
+            .map(|(_, v)| v)
+    }
+
+    /// Returns the number of elements in this map.
+    ///
+    /// Computes in *O*(1) time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut a: LinearMap<_, _, 8> = LinearMap::new();
+    /// assert_eq!(a.len(), 0);
+    /// a.insert(1, "a").unwrap();
+    /// assert_eq!(a.len(), 1);
+    /// ```
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Inserts a key-value pair into the map.
+    ///
+    /// If the map did not have this key present, `None` is returned.
+    ///
+    /// If the map did have this key present, the value is updated, and the old value is returned.
+    ///
+    /// Computes in *O*(n) time
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// assert_eq!(map.insert(37, "a").unwrap(), None);
+    /// assert_eq!(map.is_empty(), false);
+    ///
+    /// map.insert(37, "b").unwrap();
+    /// assert_eq!(map.insert(37, "c").unwrap(), Some("b"));
+    /// assert_eq!(map[&37], "c");
+    /// ```
+    pub fn insert(&mut self, key: K, mut value: V) -> Result<Option<V>, (K, V)> {
+        if let Some((_, v)) = self.iter_mut().find(|&(k, _)| *k == key) {
+            mem::swap(v, &mut value);
+            return Ok(Some(value));
+        }
+
+        self.buffer.push((key, value))?;
+        Ok(None)
+    }
+
+    /// Returns true if the map contains no elements.
+    ///
+    /// Computes in *O*(1) time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut a: LinearMap<_, _, 8> = LinearMap::new();
+    /// assert!(a.is_empty());
+    /// a.insert(1, "a").unwrap();
+    /// assert!(!a.is_empty());
+    /// ```
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns true if the map is full.
+    ///
+    /// Computes in *O*(1) time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut a: LinearMap<_, _, 4> = LinearMap::new();
+    /// assert!(!a.is_full());
+    /// a.insert(1, "a").unwrap();
+    /// a.insert(2, "b").unwrap();
+    /// a.insert(3, "c").unwrap();
+    /// a.insert(4, "d").unwrap();
+    /// assert!(a.is_full());
+    /// ```
+    pub fn is_full(&self) -> bool {
+        self.len() == self.capacity()
+    }
+
+    /// An iterator visiting all key-value pairs in arbitrary order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// map.insert("a", 1).unwrap();
+    /// map.insert("b", 2).unwrap();
+    /// map.insert("c", 3).unwrap();
+    ///
+    /// for (key, val) in map.iter() {
+    ///     println!("key: {} val: {}", key, val);
+    /// }
+    /// ```
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        Iter {
+            iter: self.buffer.as_slice().iter(),
+        }
+    }
+
+    /// An iterator visiting all key-value pairs in arbitrary order,
+    /// with mutable references to the values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// map.insert("a", 1).unwrap();
+    /// map.insert("b", 2).unwrap();
+    /// map.insert("c", 3).unwrap();
+    ///
+    /// // Update all values
+    /// for (_, val) in map.iter_mut() {
+    ///     *val = 2;
+    /// }
+    ///
+    /// for (key, val) in &map {
+    ///     println!("key: {} val: {}", key, val);
+    /// }
+    /// ```
+    pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
+        IterMut {
+            iter: self.buffer.as_mut_slice().iter_mut(),
+        }
+    }
+
+    /// An iterator visiting all keys in arbitrary order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// map.insert("a", 1).unwrap();
+    /// map.insert("b", 2).unwrap();
+    /// map.insert("c", 3).unwrap();
+    ///
+    /// for key in map.keys() {
+    ///     println!("{}", key);
+    /// }
+    /// ```
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.iter().map(|(k, _)| k)
+    }
+
+    /// Removes a key from the map, returning the value at
+    /// the key if the key was previously in the map.
+    ///
+    /// Computes in *O*(n) time
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// map.insert(1, "a").unwrap();
+    /// assert_eq!(map.remove(&1), Some("a"));
+    /// assert_eq!(map.remove(&1), None);
+    /// ```
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+        Q: Eq + ?Sized,
+    {
+        let idx = self
+            .keys()
+            .enumerate()
+            .find(|&(_, k)| k.borrow() == key)
+            .map(|(idx, _)| idx);
+
+        idx.map(|idx| self.buffer.swap_remove(idx).1)
+    }
+
+    /// An iterator visiting all values in arbitrary order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use heapless::LinearMap;
+    ///
+    /// let mut map: LinearMap<_, _, 8> = LinearMap::new();
+    /// map.insert("a", 1).unwrap();
+    /// map.insert("b", 2).unwrap();
+    /// map.insert("c", 3).unwrap();
+    ///
+    /// for val in map.values() {
+    ///     println!("{}", val);

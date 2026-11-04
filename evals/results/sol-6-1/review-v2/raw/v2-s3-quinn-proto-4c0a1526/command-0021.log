@@ -1,0 +1,861 @@
+//! QUIC connection transport parameters
+//!
+//! The `TransportParameters` type is used to represent the transport parameters
+//! negotiated by peers while establishing a QUIC connection. This process
+//! happens as part of the establishment of the TLS session. As such, the types
+//! contained in this modules should generally only be referred to by custom
+//! implementations of the `crypto::Session` trait.
+
+use std::{
+    convert::TryFrom,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
+};
+
+use bytes::{Buf, BufMut};
+use rand::{Rng as _, RngCore, seq::SliceRandom as _};
+use thiserror::Error;
+
+use crate::{
+    LOC_CID_COUNT, MAX_CID_SIZE, MAX_STREAM_COUNT, RESET_TOKEN_SIZE, ResetToken, Side,
+    TIMER_GRANULARITY, TransportError, VarInt,
+    cid_generator::ConnectionIdGenerator,
+    cid_queue::CidQueue,
+    coding::{BufExt, BufMutExt, UnexpectedEnd},
+    config::{EndpointConfig, ServerConfig, TransportConfig},
+    shared::ConnectionId,
+};
+
+// Apply a given macro to a list of all the transport parameters having integer types, along with
+// their codes and default values. Using this helps us avoid error-prone duplication of the
+// contained information across decoding, encoding, and the `Default` impl. Whenever we want to do
+// something with transport parameters, we'll handle the bulk of cases by writing a macro that
+// takes a list of arguments in this form, then passing it to this macro.
+macro_rules! apply_params {
+    ($macro:ident) => {
+        $macro! {
+            // #[doc] name (id) = default,
+            /// Milliseconds, disabled if zero
+            max_idle_timeout(MaxIdleTimeout) = 0,
+            /// Limits the size of UDP payloads that the endpoint is willing to receive
+            max_udp_payload_size(MaxUdpPayloadSize) = 65527,
+
+            /// Initial value for the maximum amount of data that can be sent on the connection
+            initial_max_data(InitialMaxData) = 0,
+            /// Initial flow control limit for locally-initiated bidirectional streams
+            initial_max_stream_data_bidi_local(InitialMaxStreamDataBidiLocal) = 0,
+            /// Initial flow control limit for peer-initiated bidirectional streams
+            initial_max_stream_data_bidi_remote(InitialMaxStreamDataBidiRemote) = 0,
+            /// Initial flow control limit for unidirectional streams
+            initial_max_stream_data_uni(InitialMaxStreamDataUni) = 0,
+
+            /// Initial maximum number of bidirectional streams the peer may initiate
+            initial_max_streams_bidi(InitialMaxStreamsBidi) = 0,
+            /// Initial maximum number of unidirectional streams the peer may initiate
+            initial_max_streams_uni(InitialMaxStreamsUni) = 0,
+
+            /// Exponent used to decode the ACK Delay field in the ACK frame
+            ack_delay_exponent(AckDelayExponent) = 3,
+            /// Maximum amount of time in milliseconds by which the endpoint will delay sending
+            /// acknowledgments
+            max_ack_delay(MaxAckDelay) = 25,
+            /// Maximum number of connection IDs from the peer that an endpoint is willing to store
+            active_connection_id_limit(ActiveConnectionIdLimit) = 2,
+        }
+    };
+}
+
+macro_rules! make_struct {
+    {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
+        /// Transport parameters used to negotiate connection-level preferences between peers
+        #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+        pub struct TransportParameters {
+            $($(#[$doc])* pub(crate) $name : VarInt,)*
+
+            /// Does the endpoint support active connection migration
+            pub(crate) disable_active_migration: bool,
+            /// Maximum size for datagram frames
+            pub(crate) max_datagram_frame_size: Option<VarInt>,
+            /// The value that the endpoint included in the Source Connection ID field of the first
+            /// Initial packet it sends for the connection
+            pub(crate) initial_src_cid: Option<ConnectionId>,
+            /// The endpoint is willing to receive QUIC packets containing any value for the fixed
+            /// bit
+            pub(crate) grease_quic_bit: bool,
+
+            /// Minimum amount of time in microseconds by which the endpoint is able to delay
+            /// sending acknowledgments
+            ///
+            /// If a value is provided, it implies that the endpoint supports QUIC Acknowledgement
+            /// Frequency
+            pub(crate) min_ack_delay: Option<VarInt>,
+
+            // Server-only
+            /// The value of the Destination Connection ID field from the first Initial packet sent
+            /// by the client
+            pub(crate) original_dst_cid: Option<ConnectionId>,
+            /// The value that the server included in the Source Connection ID field of a Retry
+            /// packet
+            pub(crate) retry_src_cid: Option<ConnectionId>,
+            /// Token used by the client to verify a stateless reset from the server
+            pub(crate) stateless_reset_token: Option<ResetToken>,
+            /// The server's preferred address for communication after handshake completion
+            pub(crate) preferred_address: Option<PreferredAddress>,
+            /// The randomly generated reserved transport parameter to sustain future extensibility
+            /// of transport parameter extensions.
+            /// When present, it is included during serialization but ignored during deserialization.
+            pub(crate) grease_transport_parameter: Option<ReservedTransportParameter>,
+
+            /// Defines the order in which transport parameters are serialized.
+            ///
+            /// This field is initialized only for outgoing `TransportParameters` instances and
+            /// is set to `None` for `TransportParameters` received from a peer.
+            pub(crate) write_order: Option<[u8; TransportParameterId::SUPPORTED.len()]>,
+        }
+
+        // We deliberately don't implement the `Default` trait, since that would be public, and
+        // downstream crates should never construct `TransportParameters` except by decoding those
+        // supplied by a peer.
+        impl TransportParameters {
+            /// Standard defaults, used if the peer does not supply a given parameter.
+            pub(crate) fn default() -> Self {
+                Self {
+                    $($name: VarInt::from_u32($default),)*
+
+                    disable_active_migration: false,
+                    max_datagram_frame_size: None,
+                    initial_src_cid: None,
+                    grease_quic_bit: false,
+                    min_ack_delay: None,
+
+                    original_dst_cid: None,
+                    retry_src_cid: None,
+                    stateless_reset_token: None,
+                    preferred_address: None,
+                    grease_transport_parameter: None,
+                    write_order: None,
+                }
+            }
+        }
+    }
+}
+
+apply_params!(make_struct);
+
+impl TransportParameters {
+    pub(crate) fn new(
+        config: &TransportConfig,
+        endpoint_config: &EndpointConfig,
+        cid_gen: &dyn ConnectionIdGenerator,
+        initial_src_cid: ConnectionId,
+        server_config: Option<&ServerConfig>,
+        rng: &mut impl RngCore,
+    ) -> Self {
+        Self {
+            initial_src_cid: Some(initial_src_cid),
+            initial_max_streams_bidi: config.max_concurrent_bidi_streams,
+            initial_max_streams_uni: config.max_concurrent_uni_streams,
+            initial_max_data: config.receive_window,
+            initial_max_stream_data_bidi_local: config.stream_receive_window,
+            initial_max_stream_data_bidi_remote: config.stream_receive_window,
+            initial_max_stream_data_uni: config.stream_receive_window,
+            max_udp_payload_size: endpoint_config.max_udp_payload_size,
+            max_idle_timeout: config.max_idle_timeout.unwrap_or(VarInt(0)),
+            disable_active_migration: server_config.is_some_and(|c| !c.migration),
+            active_connection_id_limit: if cid_gen.cid_len() == 0 {
+                2 // i.e. default, i.e. unsent
+            } else {
+                CidQueue::LEN as u32
+            }
+            .into(),
+            max_datagram_frame_size: config
+                .datagram_receive_buffer_size
+                .map(|x| (x.min(u16::MAX.into()) as u16).into()),
+            grease_quic_bit: endpoint_config.grease_quic_bit,
+            min_ack_delay: Some(
+                VarInt::from_u64(u64::try_from(TIMER_GRANULARITY.as_micros()).unwrap()).unwrap(),
+            ),
+            grease_transport_parameter: Some(ReservedTransportParameter::random(rng)),
+            write_order: Some({
+                let mut order = std::array::from_fn(|i| i as u8);
+                order.shuffle(rng);
+                order
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// Check that these parameters are legal when resuming from
+    /// certain cached parameters
+    pub(crate) fn validate_resumption_from(&self, cached: &Self) -> Result<(), TransportError> {
+        if cached.active_connection_id_limit > self.active_connection_id_limit
+            || cached.initial_max_data > self.initial_max_data
+            || cached.initial_max_stream_data_bidi_local > self.initial_max_stream_data_bidi_local
+            || cached.initial_max_stream_data_bidi_remote > self.initial_max_stream_data_bidi_remote
+            || cached.initial_max_stream_data_uni > self.initial_max_stream_data_uni
+            || cached.initial_max_streams_bidi > self.initial_max_streams_bidi
+            || cached.initial_max_streams_uni > self.initial_max_streams_uni
+            || cached.max_datagram_frame_size > self.max_datagram_frame_size
+            || cached.grease_quic_bit && !self.grease_quic_bit
+        {
+            return Err(TransportError::PROTOCOL_VIOLATION(
+                "0-RTT accepted with incompatible transport parameters",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Maximum number of CIDs to issue to this peer
+    ///
+    /// Consider both a) the active_connection_id_limit from the other end; and
+    /// b) LOC_CID_COUNT used locally
+    pub(crate) fn issue_cids_limit(&self) -> u64 {
+        self.active_connection_id_limit.0.min(LOC_CID_COUNT)
+    }
+}
+
+/// A server's preferred address
+///
+/// This is communicated as a transport parameter during TLS session establishment.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct PreferredAddress {
+    pub(crate) address_v4: Option<SocketAddrV4>,
+    pub(crate) address_v6: Option<SocketAddrV6>,
+    pub(crate) connection_id: ConnectionId,
+    pub(crate) stateless_reset_token: ResetToken,
+}
+
+impl PreferredAddress {
+    fn wire_size(&self) -> u16 {
+        4 + 2 + 16 + 2 + 1 + self.connection_id.len() as u16 + 16
+    }
+
+    fn write<W: BufMut>(&self, w: &mut W) {
+        w.write(self.address_v4.map_or(Ipv4Addr::UNSPECIFIED, |x| *x.ip()));
+        w.write::<u16>(self.address_v4.map_or(0, |x| x.port()));
+        w.write(self.address_v6.map_or(Ipv6Addr::UNSPECIFIED, |x| *x.ip()));
+        w.write::<u16>(self.address_v6.map_or(0, |x| x.port()));
+        w.write::<u8>(self.connection_id.len() as u8);
+        w.put_slice(&self.connection_id);
+        w.put_slice(&self.stateless_reset_token);
+    }
+
+    fn read<R: Buf>(r: &mut R) -> Result<Self, Error> {
+        let ip_v4 = r.get::<Ipv4Addr>()?;
+        let port_v4 = r.get::<u16>()?;
+        let ip_v6 = r.get::<Ipv6Addr>()?;
+        let port_v6 = r.get::<u16>()?;
+        let cid_len = r.get::<u8>()?;
+        if r.remaining() < cid_len as usize || cid_len > MAX_CID_SIZE as u8 {
+            return Err(Error::Malformed);
+        }
+        }
+        let mut stage = [0; MAX_CID_SIZE];
+        r.copy_to_slice(&mut stage[0..cid_len as usize]);
+        let cid = ConnectionId::new(&stage[0..cid_len as usize]);
+        if r.remaining() < 16 {
+            return Err(Error::Malformed);
+        }
+        let mut token = [0; RESET_TOKEN_SIZE];
+        r.copy_to_slice(&mut token);
+        let address_v4 = if ip_v4.is_unspecified() && port_v4 == 0 {
+            None
+        } else {
+            Some(SocketAddrV4::new(ip_v4, port_v4))
+        };
+        let address_v6 = if ip_v6.is_unspecified() && port_v6 == 0 {
+            None
+        } else {
+            Some(SocketAddrV6::new(ip_v6, port_v6, 0, 0))
+        };
+        if address_v4.is_none() && address_v6.is_none() {
+            return Err(Error::IllegalValue);
+        }
+        Ok(Self {
+            address_v4,
+            address_v6,
+            connection_id: cid,
+            stateless_reset_token: token.into(),
+        })
+    }
+}
+
+/// Errors encountered while decoding `TransportParameters`
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Error)]
+pub enum Error {
+    /// Parameters that are semantically invalid
+    #[error("parameter had illegal value")]
+    IllegalValue,
+    /// Catch-all error for problems while decoding transport parameters
+    #[error("parameters were malformed")]
+    Malformed,
+}
+
+impl From<Error> for TransportError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::IllegalValue => Self::TRANSPORT_PARAMETER_ERROR("illegal value"),
+            Error::Malformed => Self::TRANSPORT_PARAMETER_ERROR("malformed"),
+        }
+    }
+}
+
+impl From<UnexpectedEnd> for Error {
+    fn from(_: UnexpectedEnd) -> Self {
+        Self::Malformed
+    }
+}
+
+impl TransportParameters {
+    /// Encode `TransportParameters` into buffer
+    pub fn write<W: BufMut>(&self, w: &mut W) {
+        for idx in self
+            .write_order
+            .as_ref()
+            .unwrap_or(&std::array::from_fn(|i| i as u8))
+        {
+            let id = TransportParameterId::SUPPORTED[*idx as usize];
+            match id {
+                TransportParameterId::ReservedTransportParameter => {
+                    if let Some(param) = self.grease_transport_parameter {
+                        param.write(w);
+                    }
+                }
+                TransportParameterId::StatelessResetToken => {
+                    if let Some(ref x) = self.stateless_reset_token {
+                        w.write_var(id as u64);
+                        w.write_var(16);
+                        w.put_slice(x);
+                    }
+                }
+                TransportParameterId::DisableActiveMigration => {
+                    if self.disable_active_migration {
+                        w.write_var(id as u64);
+                        w.write_var(0);
+                    }
+                }
+                TransportParameterId::MaxDatagramFrameSize => {
+                    if let Some(x) = self.max_datagram_frame_size {
+                        w.write_var(id as u64);
+                        w.write_var(x.size() as u64);
+                        w.write(x);
+                    }
+                }
+                TransportParameterId::PreferredAddress => {
+                    if let Some(ref x) = self.preferred_address {
+                        w.write_var(id as u64);
+                        w.write_var(x.wire_size() as u64);
+                        x.write(w);
+                    }
+                }
+                TransportParameterId::OriginalDestinationConnectionId => {
+                    if let Some(ref cid) = self.original_dst_cid {
+                        w.write_var(id as u64);
+                        w.write_var(cid.len() as u64);
+                        w.put_slice(cid);
+                    }
+                }
+                TransportParameterId::InitialSourceConnectionId => {
+                    if let Some(ref cid) = self.initial_src_cid {
+                        w.write_var(id as u64);
+                        w.write_var(cid.len() as u64);
+                        w.put_slice(cid);
+                    }
+                }
+                TransportParameterId::RetrySourceConnectionId => {
+                    if let Some(ref cid) = self.retry_src_cid {
+                        w.write_var(id as u64);
+                        w.write_var(cid.len() as u64);
+                        w.put_slice(cid);
+                    }
+                }
+                TransportParameterId::GreaseQuicBit => {
+                    if self.grease_quic_bit {
+                        w.write_var(id as u64);
+                        w.write_var(0);
+                    }
+                }
+                TransportParameterId::MinAckDelayDraft07 => {
+                    if let Some(x) = self.min_ack_delay {
+                        w.write_var(id as u64);
+                        w.write_var(x.size() as u64);
+                        w.write(x);
+                    }
+                }
+                id => {
+                    macro_rules! write_params {
+                        {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
+                            match id {
+                                $(TransportParameterId::$id => {
+                                    if self.$name.0 != $default {
+                                        w.write_var(id as u64);
+                                        w.write(VarInt::try_from(self.$name.size()).unwrap());
+                                        w.write(self.$name);
+                                    }
+                                })*,
+                                _ => {
+                                    unimplemented!("Missing implementation of write for transport parameter with code {id:?}");
+                                }
+                            }
+                        }
+                    }
+                    apply_params!(write_params);
+                }
+            }
+        }
+    }
+
+    /// Decode `TransportParameters` from buffer
+    pub fn read<R: Buf>(side: Side, r: &mut R) -> Result<Self, Error> {
+        // Initialize to protocol-specified defaults
+        let mut params = Self::default();
+
+        // State to check for duplicate transport parameters.
+        macro_rules! param_state {
+            {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {{
+                struct ParamState {
+                    $($name: bool,)*
+                }
+
+                ParamState {
+                    $($name: false,)*
+                }
+            }}
+        }
+        let mut got = apply_params!(param_state);
+
+        while r.has_remaining() {
+            let id = r.get_var()?;
+            let len = r.get_var()?;
+            if (r.remaining() as u64) < len {
+                return Err(Error::Malformed);
+            }
+            let len = len as usize;
+            let Ok(id) = TransportParameterId::try_from(id) else {
+                // unknown transport parameters are ignored
+                r.advance(len);
+                continue;
+            };
+
+            match id {
+                TransportParameterId::OriginalDestinationConnectionId => {
+                    decode_cid(len, &mut params.original_dst_cid, r)?
+                }
+                TransportParameterId::StatelessResetToken => {
+                    if len != 16 || params.stateless_reset_token.is_some() {
+                        return Err(Error::Malformed);
+                    }
+                    let mut tok = [0; RESET_TOKEN_SIZE];
+                    r.copy_to_slice(&mut tok);
+                    params.stateless_reset_token = Some(tok.into());
+                }
+                TransportParameterId::DisableActiveMigration => {
+                    if len != 0 || params.disable_active_migration {
+                        return Err(Error::Malformed);
+                    }
+                    params.disable_active_migration = true;
+                }
+                TransportParameterId::PreferredAddress => {
+                    if params.preferred_address.is_some() {
+                        return Err(Error::Malformed);
+                    }
+                    params.preferred_address = Some(PreferredAddress::read(&mut r.take(len))?);
+                }
+                TransportParameterId::InitialSourceConnectionId => {
+                    decode_cid(len, &mut params.initial_src_cid, r)?
+                }
+                TransportParameterId::RetrySourceConnectionId => {
+                    decode_cid(len, &mut params.retry_src_cid, r)?
+                }
+                TransportParameterId::MaxDatagramFrameSize => {
+                    if len > 8 || params.max_datagram_frame_size.is_some() {
+                        return Err(Error::Malformed);
+                    }
+                    params.max_datagram_frame_size = Some(r.get().unwrap());
+                }
+                TransportParameterId::GreaseQuicBit => match len {
+                    0 => params.grease_quic_bit = true,
+                    _ => return Err(Error::Malformed),
+                },
+                TransportParameterId::MinAckDelayDraft07 => {
+                    params.min_ack_delay = Some(r.get().unwrap())
+                }
+                _ => {
+                    macro_rules! parse {
+                        {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
+                            match id {
+                                $(TransportParameterId::$id => {
+                                    let value = r.get::<VarInt>()?;
+                                    if len != value.size() || got.$name { return Err(Error::Malformed); }
+                                    params.$name = value.into();
+                                    got.$name = true;
+                                })*
+                                _ => r.advance(len),
+                            }
+                        }
+                    }
+                    apply_params!(parse);
+                }
+            }
+        }
+
+        // Semantic validation
+
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-4.26.1
+        if params.ack_delay_exponent.0 > 20
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-4.28.1
+            || params.max_ack_delay.0 >= 1 << 14
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-6.2.1
+            || params.active_connection_id_limit.0 < 2
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-4.10.1
+            || params.max_udp_payload_size.0 < 1200
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-4.6-2
+            || params.initial_max_streams_bidi.0 > MAX_STREAM_COUNT
+            || params.initial_max_streams_uni.0 > MAX_STREAM_COUNT
+            // https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-08.html#section-3-4
+            || params.min_ack_delay.is_some_and(|min_ack_delay| {
+                // min_ack_delay uses microseconds, whereas max_ack_delay uses milliseconds
+                min_ack_delay.0 > params.max_ack_delay.0 * 1_000
+            })
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-8
+            || (side.is_server()
+                && (params.original_dst_cid.is_some()
+                    || params.preferred_address.is_some()
+                    || params.retry_src_cid.is_some()
+                    || params.stateless_reset_token.is_some()))
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-4.38.1
+            || params
+                .preferred_address.is_some_and(|x| x.connection_id.is_empty())
+        {
+            return Err(Error::IllegalValue);
+        }
+
+        Ok(params)
+    }
+}
+
+/// A reserved transport parameter.
+///
+/// It has an identifier of the form 31 * N + 27 for the integer value of N.
+/// Such identifiers are reserved to exercise the requirement that unknown transport parameters be ignored.
+/// The reserved transport parameter has no semantics and can carry arbitrary values.
+/// It may be included in transport parameters sent to the peer, and should be ignored when received.
+///
+/// See spec: <https://www.rfc-editor.org/rfc/rfc9000.html#section-18.1>
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct ReservedTransportParameter {
+    /// The reserved identifier of the transport parameter
+    id: VarInt,
+
+    /// Buffer to store the parameter payload
+    payload: [u8; Self::MAX_PAYLOAD_LEN],
+
+    /// The number of bytes to include in the wire format from the `payload` buffer
+    payload_len: usize,
+}
+
+impl ReservedTransportParameter {
+    /// Generates a transport parameter with a random payload and a reserved ID.
+    ///
+    /// The implementation is inspired by quic-go and quiche:
+    /// 1. <https://github.com/quic-go/quic-go/blob/3e0a67b2476e1819752f04d75968de042b197b56/internal/wire/transport_parameters.go#L338-L344>
+    /// 2. <https://github.com/google/quiche/blob/cb1090b20c40e2f0815107857324e99acf6ec567/quiche/quic/core/crypto/transport_parameters.cc#L843-L860>
+    fn random(rng: &mut impl RngCore) -> Self {
+        let id = Self::generate_reserved_id(rng);
+
+        let payload_len = rng.random_range(0..Self::MAX_PAYLOAD_LEN);
+
+        let payload = {
+            let mut slice = [0u8; Self::MAX_PAYLOAD_LEN];
+            rng.fill_bytes(&mut slice[..payload_len]);
+            slice
+        };
+
+        Self {
+            id,
+            payload,
+            payload_len,
+        }
+    }
+
+    fn write(&self, w: &mut impl BufMut) {
+        w.write_var(self.id.0);
+        w.write_var(self.payload_len as u64);
+        w.put_slice(&self.payload[..self.payload_len]);
+    }
+
+    /// Generates a random reserved identifier of the form `31 * N + 27`, as required by RFC 9000.
+}
+
+/// Configuration for qlog trace logging
+#[cfg(feature = "qlog")]
+pub struct QlogConfig {
+    writer: Option<Box<dyn io::Write + Send + Sync>>,
+    title: Option<String>,
+    description: Option<String>,
+    start_time: Instant,
+}
+
+#[cfg(feature = "qlog")]
+impl QlogConfig {
+    /// Where to write a qlog `TraceSeq`
+    pub fn writer(&mut self, writer: Box<dyn io::Write + Send + Sync>) -> &mut Self {
+        self.writer = Some(writer);
+        self
+    }
+
+    /// Title to record in the qlog capture
+    pub fn title(&mut self, title: Option<String>) -> &mut Self {
+        self.title = title;
+        self
+    }
+
+    /// Description to record in the qlog capture
+    pub fn description(&mut self, description: Option<String>) -> &mut Self {
+        self.description = description;
+        self
+    }
+
+    /// Epoch qlog event times are recorded relative to
+    pub fn start_time(&mut self, start_time: Instant) -> &mut Self {
+        self.start_time = start_time;
+        self
+    }
+
+    /// Construct the [`QlogStream`] described by this configuration
+    pub fn into_stream(self) -> Option<QlogStream> {
+        use tracing::warn;
+
+        let writer = self.writer?;
+        let trace = qlog::TraceSeq::new(
+            qlog::VantagePoint {
+                name: None,
+                ty: qlog::VantagePointType::Unknown,
+                flow: None,
+            },
+            self.title.clone(),
+            self.description.clone(),
+            Some(qlog::Configuration {
+                time_offset: Some(0.0),
+                original_uris: None,
+            }),
+            None,
+        );
+
+        let mut streamer = QlogStreamer::new(
+            qlog::QLOG_VERSION.into(),
+            self.title,
+            self.description,
+            None,
+            self.start_time,
+            trace,
+            qlog::events::EventImportance::Core,
+            writer,
+        );
+
+        match streamer.start_log() {
+            Ok(()) => Some(QlogStream(Arc::new(Mutex::new(streamer)))),
+            Err(e) => {
+                warn!("could not initialize endpoint qlog streamer: {e}");
+                None
+            }
+        }
+    }
+}
+
+#[cfg(feature = "qlog")]
+impl Default for QlogConfig {
+    fn default() -> Self {
+        Self {
+            writer: None,
+            title: None,
+            description: None,
+            start_time: Instant::now(),
+        }
+    }
+}
+
+/// Parameters governing MTU discovery.
+///
+/// # The why of MTU discovery
+///
+/// By design, QUIC ensures during the handshake that the network path between the client and the
+/// server is able to transmit unfragmented UDP packets with a body of 1200 bytes. In other words,
+/// once the connection is established, we know that the network path's maximum transmission unit
+/// (MTU) is of at least 1200 bytes (plus IP and UDP headers). Because of this, a QUIC endpoint can
+/// split outgoing data in packets of 1200 bytes, with confidence that the network will be able to
+/// deliver them (if the endpoint were to send bigger packets, they could prove too big and end up
+/// being dropped).
+///
+/// There is, however, a significant overhead associated to sending a packet. If the same
+/// information can be sent in fewer packets, that results in higher throughput. The amount of
+/// packets that need to be sent is inversely proportional to the MTU: the higher the MTU, the
+/// bigger the packets that can be sent, and the fewer packets that are needed to transmit a given
+/// amount of bytes.
+///
+/// Most networks have an MTU higher than 1200. Through MTU discovery, endpoints can detect the
+/// path's MTU and, if it turns out to be higher, start sending bigger packets.
+///
+/// # MTU discovery internals
+///
+/// Quinn implements MTU discovery through DPLPMTUD (Datagram Packetization Layer Path MTU
+/// Discovery), described in [section 14.3 of RFC
+/// 9000](https://www.rfc-editor.org/rfc/rfc9000.html#section-14.3). This method consists of sending
+/// QUIC packets padded to a particular size (called PMTU probes), and waiting to see if the remote
+/// peer responds with an ACK. If an ACK is received, that means the probe arrived at the remote
+/// peer, which in turn means that the network path's MTU is of at least the packet's size. If the
+/// probe is lost, it is sent another 2 times before concluding that the MTU is lower than the
+/// packet's size.
+///
+/// MTU discovery runs on a schedule (e.g. every 600 seconds) specified through
+/// [`MtuDiscoveryConfig::interval`]. The first run happens right after the handshake, and
+/// subsequent discoveries are scheduled to run when the interval has elapsed, starting from the
+/// last time when MTU discovery completed.
+///
+/// Since the search space for MTUs is quite big (the smallest possible MTU is 1200, and the highest
+/// is 65527), Quinn performs a binary search to keep the number of probes as low as possible. The
+/// lower bound of the search is equal to [`TransportConfig::initial_mtu`] in the
+/// initial MTU discovery run, and is equal to the currently discovered MTU in subsequent runs. The
+/// upper bound is determined by the minimum of [`MtuDiscoveryConfig::upper_bound`] and the
+/// `max_udp_payload_size` transport parameter received from the peer during the handshake.
+///
+/// # Black hole detection
+///
+/// If, at some point, the network path no longer accepts packets of the detected size, packet loss
+/// will eventually trigger black hole detection and reset the detected MTU to 1200. In that case,
+/// MTU discovery will be triggered after [`MtuDiscoveryConfig::black_hole_cooldown`] (ignoring the
+/// timer that was set based on [`MtuDiscoveryConfig::interval`]).
+///
+/// # Interaction between peers
+///
+/// There is no guarantee that the MTU on the path between A and B is the same as the MTU of the
+/// path between B and A. Therefore, each peer in the connection needs to run MTU discovery
+/// independently in order to discover the path's MTU.
+#[derive(Clone, Debug)]
+pub struct MtuDiscoveryConfig {
+    pub(crate) interval: Duration,
+    pub(crate) upper_bound: u16,
+    pub(crate) minimum_change: u16,
+    pub(crate) black_hole_cooldown: Duration,
+}
+
+impl MtuDiscoveryConfig {
+    /// Specifies the time to wait after completing MTU discovery before starting a new MTU
+    /// discovery run.
+    ///
+    /// Defaults to 600 seconds, as recommended by [RFC
+    /// 8899](https://www.rfc-editor.org/rfc/rfc8899).
+    pub fn interval(&mut self, value: Duration) -> &mut Self {
+        self.interval = value;
+        self
+    }
+
+    /// Specifies the upper bound to the max UDP payload size that MTU discovery will search for.
+    ///
+    /// Defaults to 1452, to stay within Ethernet's MTU when using IPv4 and IPv6. The highest
+    /// allowed value is 65527, which corresponds to the maximum permitted UDP payload on IPv6.
+    ///
+    /// It is safe to use an arbitrarily high upper bound, regardless of the network path's MTU. The
+    /// only drawback is that MTU discovery might take more time to finish.
+    pub fn upper_bound(&mut self, value: u16) -> &mut Self {
+        self.upper_bound = value.min(MAX_UDP_PAYLOAD);
+        self
+    }
+
+    /// Specifies the amount of time that MTU discovery should wait after a black hole was detected
+    /// before running again. Defaults to one minute.
+    ///
+    /// Black hole detection can be spuriously triggered in case of congestion, so it makes sense to
+    /// try MTU discovery again after a short period of time.
+    pub fn black_hole_cooldown(&mut self, value: Duration) -> &mut Self {
+        self.black_hole_cooldown = value;
+        self
+    }
+
+    /// Specifies the minimum MTU change to stop the MTU discovery phase.
+    /// Defaults to 20.
+    pub fn minimum_change(&mut self, value: u16) -> &mut Self {
+        self.minimum_change = value;
+        self
+    }
+}
+
+impl Default for MtuDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(600),
+            upper_bound: 1452,
+            black_hole_cooldown: Duration::from_secs(60),
+            minimum_change: 20,
+        }
+    }
+}
+
+/// Maximum duration of inactivity to accept before timing out the connection
+///
+/// This wraps an underlying [`VarInt`], representing the duration in milliseconds. Values can be
+/// constructed by converting directly from `VarInt`, or using `TryFrom<Duration>`.
+///
+/// ```
+/// # use std::{convert::TryFrom, time::Duration};
+/// # use quinn_proto::{IdleTimeout, VarIntBoundsExceeded, VarInt};
+/// # fn main() -> Result<(), VarIntBoundsExceeded> {
+/// // A `VarInt`-encoded value in milliseconds
+/// let timeout = IdleTimeout::from(VarInt::from_u32(10_000));
+///
+/// // Try to convert a `Duration` into a `VarInt`-encoded timeout
+/// let timeout = IdleTimeout::try_from(Duration::from_secs(10))?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Default, Copy, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct IdleTimeout(VarInt);
+
+impl From<VarInt> for IdleTimeout {
+    fn from(inner: VarInt) -> Self {
+        Self(inner)
+    }
+}
+
+impl std::convert::TryFrom<Duration> for IdleTimeout {
+    type Error = VarIntBoundsExceeded;
+
+    fn try_from(timeout: Duration) -> Result<Self, Self::Error> {
+        let inner = VarInt::try_from(timeout.as_millis())?;
+        Ok(Self(inner))
+    }
+}
+
+impl fmt::Debug for IdleTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+53:    const SIZE_BOUND: usize;
+100:struct DatagramInfo(u8);
+102:impl DatagramInfo {
+284:    const SIZE_BOUND: usize = 1 + 8 + 8 + 8;
+327:    const SIZE_BOUND: usize = 1 + 8 + 8;
+463:    const SIZE_BOUND: usize = 1 + 8 + 8 + 8;
+518:    pub(crate) const SIZE_BOUND: usize = 17;
+838:    const SIZE_BOUND: usize = 1 + 8 + 8 + 8;
+857:    const SIZE_BOUND: usize = 1 + 8 + 8;
+888:    const SIZE_BOUND: usize = 1 + 8 + 8 + 1 + MAX_CID_SIZE + RESET_TOKEN_SIZE;
+892:pub(crate) const RETIRE_CONNECTION_ID_SIZE_BOUND: usize = 9;
+896:pub struct Datagram {
+902:    const SIZE_BOUND: usize = 1 + 8;
+905:impl Datagram {
+27:    pub fn new() -> Self {
+32:    pub fn with_capacity(capacity: u32) -> Self {
+50:    pub fn is_empty(&self) -> bool {
+55:    pub fn len(&self) -> u32 {
+60:    pub fn capacity(&self) -> u32 {
+65:    pub fn vacant_key(&self) -> u32 {
+75:    pub fn insert(&mut self, value: T) -> u32 {
+114:    pub fn lru(&self) -> Option<u32> {
+124:    pub fn remove(&mut self, slot: u32) -> T {
+137:    pub fn get_mut(&mut self, slot: u32) -> &mut T {
+143:    pub fn peek(&self, slot: u32) -> &T {
+148:    pub fn peek_mut(&mut self, slot: u32) -> &mut T {
+153:    pub fn iter(&self) -> Iter<'_, T> {
+162:    pub fn iter_mut(&mut self) -> IterMut<'_, T> {
+182:    fn freshen(&mut self, slot: u32) {

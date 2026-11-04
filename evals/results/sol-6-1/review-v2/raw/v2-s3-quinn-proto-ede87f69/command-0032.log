@@ -1,0 +1,491 @@
+                    0 => params.grease_quic_bit = true,
+                    _ => return Err(Error::Malformed),
+                },
+                TransportParameterId::MinAckDelayDraft07 => {
+                    params.min_ack_delay = Some(r.get().unwrap())
+                }
+                _ => {
+                    macro_rules! parse {
+                        {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
+                            match id {
+                                $(TransportParameterId::$id => {
+                                    let value = r.get::<VarInt>()?;
+                                    if len != value.size() || got.$name { return Err(Error::Malformed); }
+                                    params.$name = value.into();
+                                    got.$name = true;
+                                })*
+                                _ => r.advance(len),
+                            }
+                        }
+                    }
+                    apply_params!(parse);
+                }
+            }
+        }
+
+        // Semantic validation
+
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-4.26.1
+        if params.ack_delay_exponent.0 > 20
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-4.28.1
+            || params.max_ack_delay.0 >= 1 << 14
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-6.2.1
+            || params.active_connection_id_limit.0 < 2
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-4.10.1
+            || params.max_udp_payload_size.0 < 1200
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-4.6-2
+            || params.initial_max_streams_bidi.0 > MAX_STREAM_COUNT
+            || params.initial_max_streams_uni.0 > MAX_STREAM_COUNT
+            // https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-08.html#section-3-4
+            || params.min_ack_delay.is_some_and(|min_ack_delay| {
+                // min_ack_delay uses microseconds, whereas max_ack_delay uses milliseconds
+                min_ack_delay.0 > params.max_ack_delay.0 * 1_000
+            })
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-8
+            || (side.is_server()
+                && (params.original_dst_cid.is_some()
+                    || params.preferred_address.is_some()
+                    || params.retry_src_cid.is_some()
+                    || params.stateless_reset_token.is_some()))
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-4.38.1
+            || params
+                .preferred_address.is_some_and(|x| x.connection_id.is_empty())
+        {
+            return Err(Error::IllegalValue);
+        }
+
+        Ok(params)
+    }
+}
+
+/// A reserved transport parameter.
+///
+/// It has an identifier of the form 31 * N + 27 for the integer value of N.
+/// Such identifiers are reserved to exercise the requirement that unknown transport parameters be ignored.
+/// The reserved transport parameter has no semantics and can carry arbitrary values.
+/// It may be included in transport parameters sent to the peer, and should be ignored when received.
+///
+/// See spec: <https://www.rfc-editor.org/rfc/rfc9000.html#section-18.1>
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct ReservedTransportParameter {
+    /// The reserved identifier of the transport parameter
+    id: VarInt,
+
+    /// Buffer to store the parameter payload
+    payload: [u8; Self::MAX_PAYLOAD_LEN],
+
+    /// The number of bytes to include in the wire format from the `payload` buffer
+    payload_len: usize,
+}
+
+impl ReservedTransportParameter {
+    /// Generates a transport parameter with a random payload and a reserved ID.
+    ///
+    /// The implementation is inspired by quic-go and quiche:
+    /// 1. <https://github.com/quic-go/quic-go/blob/3e0a67b2476e1819752f04d75968de042b197b56/internal/wire/transport_parameters.go#L338-L344>
+    /// 2. <https://github.com/google/quiche/blob/cb1090b20c40e2f0815107857324e99acf6ec567/quiche/quic/core/crypto/transport_parameters.cc#L843-L860>
+    fn random(rng: &mut impl RngCore) -> Self {
+        let id = Self::generate_reserved_id(rng);
+
+        let payload_len = rng.random_range(0..Self::MAX_PAYLOAD_LEN);
+
+        let payload = {
+            let mut slice = [0u8; Self::MAX_PAYLOAD_LEN];
+            rng.fill_bytes(&mut slice[..payload_len]);
+            slice
+        };
+            // Per https://www.rfc-editor.org/rfc/rfc9000.html#name-frames-and-frame-types,
+            // non-ACK-eliciting packets must only contain PADDING, ACK, and CONNECTION_CLOSE
+            // frames, which require no special handling on ACK or loss beyond removal from
+            // in-flight counters if padded.
+            let packet = self
+                .sent_packets
+                .remove(&oldest_after_ack_eliciting)
+                .unwrap();
+            debug_assert!(!packet.ack_eliciting);
+            forgotten = Some(packet);
+        } else {
+            self.unacked_non_ack_eliciting_tail += 1;
+        }
+
+        self.sent_packets.insert(number, packet);
+        forgotten
+    }
+
+    /// Whether any congestion-controlled packets in this space are not yet acknowledged or lost
+    pub(super) fn has_in_flight(&self) -> bool {
+        // The number of non-congestion-controlled (i.e. size == 0) packets in flight at a time
+        // should be small, since otherwise congestion control wouldn't be effective. Therefore,
+        // this shouldn't need to visit many packets before finishing one way or another.
+        self.sent_packets.values().any(|x| x.size != 0)
+    }
+}
+
+impl Index<SpaceId> for [PacketSpace; 3] {
+    type Output = PacketSpace;
+    fn index(&self, space: SpaceId) -> &PacketSpace {
+        &self.as_ref()[space as usize]
+    }
+}
+
+impl IndexMut<SpaceId> for [PacketSpace; 3] {
+    fn index_mut(&mut self, space: SpaceId) -> &mut PacketSpace {
+        &mut self.as_mut()[space as usize]
+    }
+}
+
+/// Represents one or more packets subject to retransmission
+#[derive(Debug, Clone)]
+pub(super) struct SentPacket {
+    /// [`PathData::generation`](super::PathData::generation) of the path on which this packet was sent
+    pub(super) path_generation: u64,
+    /// The time the packet was sent.
+    pub(super) time_sent: Instant,
+    /// The number of bytes sent in the packet, not including UDP or IP overhead, but including QUIC
+    /// framing overhead. Zero if this packet is not counted towards congestion control, i.e. not an
+    /// "in flight" packet.
+    pub(super) size: u16,
+    /// Whether an acknowledgement is expected directly in response to this packet.
+    pub(super) ack_eliciting: bool,
+    /// The largest packet number acknowledged by this packet
+    pub(super) largest_acked: Option<u64>,
+    /// Data which needs to be retransmitted in case the packet is lost.
+    /// The data is boxed to minimize `SentPacket` size for the typical case of
+    /// packets only containing ACKs and STREAM frames.
+    pub(super) retransmits: ThinRetransmits,
+    /// Metadata for stream frames in a packet
+    ///
+    /// The actual application data is stored with the stream state.
+    pub(super) stream_frames: frame::StreamMetaVec,
+}
+
+/// Retransmittable data queue
+#[allow(unreachable_pub)] // fuzzing only
+#[derive(Debug, Default, Clone)]
+pub struct Retransmits {
+    pub(super) max_data: bool,
+    pub(super) max_stream_id: [bool; 2],
+    pub(super) reset_stream: Vec<(StreamId, VarInt)>,
+    pub(super) stop_sending: Vec<frame::StopSending>,
+    pub(super) max_stream_data: FxHashSet<StreamId>,
+    pub(super) crypto: VecDeque<frame::Crypto>,
+    pub(super) new_cids: Vec<IssuedCid>,
+    pub(super) retire_cids: Vec<u64>,
+    pub(super) ack_frequency: bool,
+    pub(super) handshake_done: bool,
+    /// For each enqueued NEW_TOKEN frame, a copy of the path's remote address
+    ///
+    /// There are 2 reasons this is unusual:
+    ///
+    /// - If the path changes, NEW_TOKEN frames bound for the old path are not retransmitted on the
+    ///   new path. That is why this field stores the remote address: so that ones for old paths
+    ///   can be filtered out.
+    /// - If a token is lost, a new randomly generated token is re-transmitted, rather than the
+    ///   original. This is so that if both transmissions are received, the client won't risk
+    ///   sending the same token twice. That is why this field does _not_ store any actual token.
+    ///
+    /// It is true that a QUIC endpoint will only want to effectively have NEW_TOKEN frames
+    /// enqueued for its current path at a given point in time. Based on that, we could conceivably
+    /// change this from a vector to an `Option<(SocketAddr, usize)>` or just a `usize` or
+    /// something. However, due to the architecture of Quinn, it is considerably simpler to not do
+    /// that; consider what such a change would mean for implementing `BitOrAssign` on Self.
+    pub(super) new_tokens: Vec<SocketAddr>,
+}
+
+impl Retransmits {
+    pub(super) fn is_empty(&self, streams: &StreamsState) -> bool {
+        !self.max_data
+            && !self.max_stream_id.into_iter().any(|x| x)
+            && self.reset_stream.is_empty()
+            && self.stop_sending.is_empty()
+            && self
+                .max_stream_data
+                .iter()
+                .all(|&id| !streams.can_send_flow_control(id))
+            && self.crypto.is_empty()
+            && self.new_cids.is_empty()
+            && self.retire_cids.is_empty()
+            && !self.ack_frequency
+            && !self.handshake_done
+            && self.new_tokens.is_empty()
+    }
+}
+
+impl ::std::ops::BitOrAssign for Retransmits {
+    fn bitor_assign(&mut self, rhs: Self) {
+        // We reduce in-stream head-of-line blocking by queueing retransmits before other data for
+        // STREAM and CRYPTO frames.
+        self.max_data |= rhs.max_data;
+        for dir in Dir::iter() {
+            self.max_stream_id[dir as usize] |= rhs.max_stream_id[dir as usize];
+        }
+        self.reset_stream.extend_from_slice(&rhs.reset_stream);
+        self.stop_sending.extend_from_slice(&rhs.stop_sending);
+        self.max_stream_data.extend(&rhs.max_stream_data);
+        for crypto in rhs.crypto.into_iter().rev() {
+            self.crypto.push_front(crypto);
+        }
+        self.new_cids.extend(&rhs.new_cids);
+        self.retire_cids.extend(rhs.retire_cids);
+        self.ack_frequency |= rhs.ack_frequency;
+        self.handshake_done |= rhs.handshake_done;
+        self.new_tokens.extend_from_slice(&rhs.new_tokens);
+    }
+}
+
+impl ::std::ops::BitOrAssign<ThinRetransmits> for Retransmits {
+    fn bitor_assign(&mut self, rhs: ThinRetransmits) {
+        if let Some(retransmits) = rhs.retransmits {
+            self.bitor_assign(*retransmits)
+        }
+    }
+}
+
+impl ::std::iter::FromIterator<Self> for Retransmits {
+    fn from_iter<T>(iter: T) -> Self
+    where
+        T: IntoIterator<Item = Self>,
+    {
+        let mut result = Self::default();
+        for packet in iter {
+            result |= packet;
+        }
+        result
+    }
+}
+
+/// A variant of `Retransmits` which only allocates storage when required
+#[derive(Debug, Default, Clone)]
+pub(super) struct ThinRetransmits {
+    retransmits: Option<Box<Retransmits>>,
+}
+
+impl ThinRetransmits {
+    /// Returns `true` if no retransmits are necessary
+    pub(super) fn is_empty(&self, streams: &StreamsState) -> bool {
+        match &self.retransmits {
+            Some(retransmits) => retransmits.is_empty(streams),
+//! Maintain the state of local connection IDs
+use std::collections::VecDeque;
+
+use rustc_hash::FxHashSet;
+use tracing::{debug, trace};
+
+use crate::{Duration, Instant, TransportError, shared::IssuedCid};
+
+/// Local connection ID management
+pub(super) struct CidState {
+    /// Timestamp when issued cids should be retired
+    retire_timestamp: VecDeque<CidTimestamp>,
+    /// Number of local connection IDs that have been issued in NEW_CONNECTION_ID frames.
+    issued: u64,
+    /// Sequence numbers of local connection IDs not yet retired by the peer
+    active_seq: FxHashSet<u64>,
+    /// Sequence number the peer has already retired all CIDs below at our request via `retire_prior_to`
+    prev_retire_seq: u64,
+    /// Sequence number to set in retire_prior_to field in NEW_CONNECTION_ID frame
+    retire_seq: u64,
+    /// cid length used to decode short packet
+    cid_len: usize,
+    //// cid lifetime
+    cid_lifetime: Option<Duration>,
+}
+
+impl CidState {
+    pub(crate) fn new(
+        cid_len: usize,
+        cid_lifetime: Option<Duration>,
+        now: Instant,
+        issued: u64,
+    ) -> Self {
+        let mut active_seq = FxHashSet::default();
+        // Add sequence number of CIDs used in handshaking into tracking set
+        for seq in 0..issued {
+            active_seq.insert(seq);
+        }
+        let mut this = Self {
+            retire_timestamp: VecDeque::new(),
+            issued,
+            active_seq,
+            prev_retire_seq: 0,
+            retire_seq: 0,
+            cid_len,
+            cid_lifetime,
+        };
+        // Track lifetime of CIDs used in handshaking
+        for seq in 0..issued {
+            this.track_lifetime(seq, now);
+        }
+        this
+    }
+
+    /// Find the next timestamp when previously issued CID should be retired
+    pub(crate) fn next_timeout(&mut self) -> Option<Instant> {
+        self.retire_timestamp.front().map(|nc| {
+            trace!("CID {} will expire at {:?}", nc.sequence, nc.timestamp);
+            nc.timestamp
+        })
+    }
+
+    /// Track the lifetime of issued cids in `retire_timestamp`
+    fn track_lifetime(&mut self, new_cid_seq: u64, now: Instant) {
+        let lifetime = match self.cid_lifetime {
+            Some(lifetime) => lifetime,
+            None => return,
+        };
+
+        let expire_timestamp = now.checked_add(lifetime);
+        let expire_at = match expire_timestamp {
+            Some(expire_at) => expire_at,
+            None => return,
+        };
+
+        let last_record = self.retire_timestamp.back_mut();
+        if let Some(last) = last_record {
+            // Compare the timestamp with the last inserted record
+            // Combine into a single batch if timestamp of current cid is same as the last record
+            if expire_at == last.timestamp {
+                debug_assert!(new_cid_seq > last.sequence);
+                last.sequence = new_cid_seq;
+                return;
+            }
+        }
+
+        self.retire_timestamp.push_back(CidTimestamp {
+            sequence: new_cid_seq,
+            timestamp: expire_at,
+        });
+    }
+
+    /// Update local CID state when previously issued CID is retired
+    ///
+    /// Return whether a new CID needs to be pushed that notifies remote peer to respond `RETIRE_CONNECTION_ID`
+    pub(crate) fn on_cid_timeout(&mut self) -> bool {
+        // Whether the peer hasn't retired all the CIDs we asked it to yet
+        let unretired_ids_found =
+            (self.prev_retire_seq..self.retire_seq).any(|seq| self.active_seq.contains(&seq));
+
+        let current_retire_prior_to = self.retire_seq;
+        let next_retire_sequence = self
+            .retire_timestamp
+            .pop_front()
+            .map(|seq| seq.sequence + 1);
+
+        // According to RFC:
+        // Endpoints SHOULD NOT issue updates of the Retire Prior To field
+        // before receiving RETIRE_CONNECTION_ID frames that retire all
+        // connection IDs indicated by the previous Retire Prior To value.
+        // https://tools.ietf.org/html/draft-ietf-quic-transport-29#section-5.1.2
+        if !unretired_ids_found {
+            // All Cids are retired, `prev_retire_cid_seq` can be assigned to `retire_cid_seq`
+            self.prev_retire_seq = self.retire_seq;
+            // Advance `retire_seq` if next cid that needs to be retired exists
+            if let Some(next_retire_prior_to) = next_retire_sequence {
+                self.retire_seq = next_retire_prior_to;
+            }
+        }
+
+        // Check if retirement of all CIDs that reach their lifetime is still needed
+        // According to RFC:
+        // An endpoint MUST NOT
+        // provide more connection IDs than the peer's limit.  An endpoint MAY
+        // send connection IDs that temporarily exceed a peer's limit if the
+        // NEW_CONNECTION_ID frame also requires the retirement of any excess,
+        // by including a sufficiently large value in the Retire Prior To field.
+        //
+        // If yes (return true), a new CID must be pushed with updated `retire_prior_to` field to remote peer.
+        // If no (return false), it means CIDs that reach the end of lifetime have been retired already. Do not push a new CID in order to avoid violating above RFC.
+        (current_retire_prior_to..self.retire_seq).any(|seq| self.active_seq.contains(&seq))
+    }
+
+    /// Update cid state when `NewIdentifiers` event is received
+    pub(crate) fn new_cids(&mut self, ids: &[IssuedCid], now: Instant) {
+        // `ids` could be `None` once active_connection_id_limit is set to 1 by peer
+        let last_cid = match ids.last() {
+            Some(cid) => cid,
+            None => return,
+        };
+        self.issued += ids.len() as u64;
+        // Record the timestamp of CID with the largest seq number
+        let sequence = last_cid.sequence;
+        ids.iter().for_each(|frame| {
+            self.active_seq.insert(frame.sequence);
+        });
+        self.track_lifetime(sequence, now);
+    }
+
+    /// Update CidState for receipt of a `RETIRE_CONNECTION_ID` frame
+    ///
+    /// Returns whether a new CID can be issued, or an error if the frame was illegal.
+    pub(crate) fn on_cid_retirement(
+        &mut self,
+        sequence: u64,
+        limit: u64,
+    ) -> Result<bool, TransportError> {
+        if self.cid_len == 0 {
+            return Err(TransportError::PROTOCOL_VIOLATION(
+                "RETIRE_CONNECTION_ID when CIDs aren't in use",
+            ));
+        }
+        if sequence > self.issued {
+            debug!(
+                sequence,
+                "got RETIRE_CONNECTION_ID for unissued sequence number"
+            );
+            return Err(TransportError::PROTOCOL_VIOLATION(
+                "RETIRE_CONNECTION_ID for unissued sequence number",
+            ));
+        }
+        self.active_seq.remove(&sequence);
+        // Consider a scenario where peer A has active remote cid 0,1,2.
+        // Peer B first send a NEW_CONNECTION_ID with cid 3 and retire_prior_to set to 1.
+        // Peer A processes this NEW_CONNECTION_ID frame; update remote cid to 1,2,3
+        // and meanwhile send a RETIRE_CONNECTION_ID to retire cid 0 to peer B.
+        // If peer B doesn't check the cid limit here and send a new cid again, peer A will then face CONNECTION_ID_LIMIT_ERROR
+        Ok(limit > self.active_seq.len() as u64)
+    }
+
+    /// Length of local Connection IDs
+    pub(crate) fn cid_len(&self) -> usize {
+        self.cid_len
+    }
+
+    /// The value for `retire_prior_to` field in `NEW_CONNECTION_ID` frame
+    pub(crate) fn retire_prior_to(&self) -> u64 {
+        self.retire_seq
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_seq(&self) -> (u64, u64) {
+        let mut min = u64::MAX;
+        let mut max = u64::MIN;
+        for n in self.active_seq.iter() {
+            if n < &min {
+                min = *n;
+            }
+            if n > &max {
+                max = *n;
+            }
+        }
+        (min, max)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assign_retire_seq(&mut self, v: u64) -> u64 {
+        // Cannot retire more CIDs than what have been issued
+        debug_assert!(v <= *self.active_seq.iter().max().unwrap() + 1);
+        let n = v.checked_sub(self.retire_seq).unwrap();
+        self.retire_seq = v;
+        n
+    }
+}
+
+/// Data structure that records when issued cids should be retired
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct CidTimestamp {
+    /// Highest cid sequence number created in a batch
+    sequence: u64,
+    /// Timestamp when cid needs to be retired
+    timestamp: Instant,
+}
+6.113666666666666 minutes used of 45.0

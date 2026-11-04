@@ -1,0 +1,1290 @@
+use std::{fmt, sync::Arc};
+#[cfg(feature = "qlog")]
+use std::{io, sync::Mutex, time::Instant};
+
+#[cfg(feature = "qlog")]
+use qlog::streamer::QlogStreamer;
+
+#[cfg(feature = "qlog")]
+use crate::QlogStream;
+use crate::{
+    Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion,
+    connection::qlog::QlogSink,
+};
+
+/// Parameters governing the core QUIC state machine
+///
+/// Default values should be suitable for most internet applications. Applications protocols which
+/// forbid remotely-initiated streams should set `max_concurrent_bidi_streams` and
+/// `max_concurrent_uni_streams` to zero.
+///
+/// In some cases, performance or resource requirements can be improved by tuning these values to
+/// suit a particular application and/or network connection. In particular, data window sizes can be
+/// tuned for a particular expected round trip time, link capacity, and memory availability. Tuning
+/// for higher bandwidths and latencies increases worst-case memory consumption, but does not impair
+/// performance at lower bandwidths and latencies. The default configuration is tuned for a 100Mbps
+/// link with a 100ms round trip time.
+pub struct TransportConfig {
+    pub(crate) max_concurrent_bidi_streams: VarInt,
+    pub(crate) max_concurrent_uni_streams: VarInt,
+    pub(crate) max_idle_timeout: Option<VarInt>,
+    pub(crate) stream_receive_window: VarInt,
+    pub(crate) receive_window: VarInt,
+    pub(crate) send_window: u64,
+    pub(crate) send_fairness: bool,
+
+    pub(crate) packet_threshold: u32,
+    pub(crate) time_threshold: f32,
+    pub(crate) initial_rtt: Duration,
+    pub(crate) initial_mtu: u16,
+    pub(crate) min_mtu: u16,
+    pub(crate) mtu_discovery_config: Option<MtuDiscoveryConfig>,
+    pub(crate) pad_to_mtu: bool,
+    pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
+
+    pub(crate) persistent_congestion_threshold: u32,
+    pub(crate) keep_alive_interval: Option<Duration>,
+    pub(crate) crypto_buffer_size: usize,
+    pub(crate) allow_spin: bool,
+    pub(crate) datagram_receive_buffer_size: Option<usize>,
+    pub(crate) datagram_send_buffer_size: usize,
+    #[cfg(test)]
+    pub(crate) deterministic_packet_numbers: bool,
+
+    pub(crate) congestion_controller_factory: Arc<dyn congestion::ControllerFactory + Send + Sync>,
+
+    pub(crate) enable_segmentation_offload: bool,
+
+    pub(crate) qlog_sink: QlogSink,
+}
+
+impl TransportConfig {
+    /// Maximum number of incoming bidirectional streams that may be open concurrently
+    ///
+    /// Must be nonzero for the peer to open any bidirectional streams.
+    ///
+    /// Worst-case memory use is directly proportional to `max_concurrent_bidi_streams *
+    /// stream_receive_window`, with an upper bound proportional to `receive_window`.
+    pub fn max_concurrent_bidi_streams(&mut self, value: VarInt) -> &mut Self {
+        self.max_concurrent_bidi_streams = value;
+        self
+    }
+
+    /// Variant of `max_concurrent_bidi_streams` affecting unidirectional streams
+    pub fn max_concurrent_uni_streams(&mut self, value: VarInt) -> &mut Self {
+        self.max_concurrent_uni_streams = value;
+        self
+    }
+
+    /// Maximum duration of inactivity to accept before timing out the connection.
+    ///
+    /// The true idle timeout is the minimum of this and the peer's own max idle timeout. `None`
+    /// represents an infinite timeout. Defaults to 30 seconds.
+    ///
+    /// **WARNING**: If a peer or its network path malfunctions or acts maliciously, an infinite
+    /// idle timeout can result in permanently hung futures!
+    ///
+    /// ```
+    /// # use std::{convert::TryInto, time::Duration};
+    /// # use quinn_proto::{TransportConfig, VarInt, VarIntBoundsExceeded};
+    /// # fn main() -> Result<(), VarIntBoundsExceeded> {
+    /// let mut config = TransportConfig::default();
+    ///
+    /// // Set the idle timeout as `VarInt`-encoded milliseconds
+    /// config.max_idle_timeout(Some(VarInt::from_u32(10_000).into()));
+    ///
+    /// // Set the idle timeout as a `Duration`
+    /// config.max_idle_timeout(Some(Duration::from_secs(10).try_into()?));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn max_idle_timeout(&mut self, value: Option<IdleTimeout>) -> &mut Self {
+        self.max_idle_timeout = value.map(|t| t.0);
+        self
+    }
+
+    /// Maximum number of bytes the peer may transmit without acknowledgement on any one stream
+    /// before becoming blocked.
+    ///
+    /// This should be set to at least the expected connection latency multiplied by the maximum
+    /// desired throughput. Setting this smaller than `receive_window` helps ensure that a single
+    /// stream doesn't monopolize receive buffers, which may otherwise occur if the application
+    /// chooses not to read from a large stream for a time while still requiring data on other
+    /// streams.
+    pub fn stream_receive_window(&mut self, value: VarInt) -> &mut Self {
+        self.stream_receive_window = value;
+        self
+    }
+
+    /// Maximum number of bytes the peer may transmit across all streams of a connection before
+    /// becoming blocked.
+    ///
+    /// This should be set to at least the expected connection latency multiplied by the maximum
+    /// desired throughput. Larger values can be useful to allow maximum throughput within a
+    /// stream while another is blocked.
+    pub fn receive_window(&mut self, value: VarInt) -> &mut Self {
+        self.receive_window = value;
+        self
+    }
+
+    /// Maximum number of bytes to transmit to a peer without acknowledgment
+    ///
+    /// Provides an upper bound on memory when communicating with peers that issue large amounts of
+    /// flow control credit. Endpoints that wish to handle large numbers of connections robustly
+    /// should take care to set this low enough to guarantee memory exhaustion does not occur if
+    /// every connection uses the entire window.
+    pub fn send_window(&mut self, value: u64) -> &mut Self {
+        self.send_window = value;
+        self
+    }
+
+    /// Whether to implement fair queuing for send streams having the same priority.
+    ///
+    /// When enabled, connections schedule data from outgoing streams having the same priority in a
+    /// round-robin fashion. When disabled, streams are scheduled in the order they are written to.
+    ///
+    /// Note that this only affects streams with the same priority. Higher priority streams always
+    /// take precedence over lower priority streams.
+    ///
+    /// Disabling fairness can reduce fragmentation and protocol overhead for workloads that use
+    /// many small streams.
+    pub fn send_fairness(&mut self, value: bool) -> &mut Self {
+        self.send_fairness = value;
+        self
+    }
+
+    /// Maximum reordering in packet number space before FACK style loss detection considers a
+    /// packet lost. Should not be less than 3, per RFC5681.
+    pub fn packet_threshold(&mut self, value: u32) -> &mut Self {
+        self.packet_threshold = value;
+        self
+    }
+
+    /// Maximum reordering in time space before time based loss detection considers a packet lost,
+    /// as a factor of RTT
+    pub fn time_threshold(&mut self, value: f32) -> &mut Self {
+        self.time_threshold = value;
+        self
+    }
+
+    /// The RTT used before an RTT sample is taken
+    pub fn initial_rtt(&mut self, value: Duration) -> &mut Self {
+        self.initial_rtt = value;
+        self
+    }
+
+    /// The initial value to be used as the maximum UDP payload size before running MTU discovery
+    /// (see [`TransportConfig::mtu_discovery_config`]).
+    ///
+    /// Must be at least 1200, which is the default, and known to be safe for typical internet
+    /// applications. Larger values are more efficient, but increase the risk of packet loss due to
+    /// exceeding the network path's IP MTU. If the provided value is higher than what the network
+    /// path actually supports, packet loss will eventually trigger black hole detection and bring
+    /// it down to [`TransportConfig::min_mtu`].
+    pub fn initial_mtu(&mut self, value: u16) -> &mut Self {
+        self.initial_mtu = value.max(INITIAL_MTU);
+        self
+    }
+
+    pub(crate) fn get_initial_mtu(&self) -> u16 {
+        self.initial_mtu.max(self.min_mtu)
+    }
+
+    /// The maximum UDP payload size guaranteed to be supported by the network.
+    ///
+    /// Must be at least 1200, which is the default, and lower than or equal to
+    /// [`TransportConfig::initial_mtu`].
+    ///
+    /// Real-world MTUs can vary according to ISP, VPN, and properties of intermediate network links
+    /// outside of either endpoint's control. Extreme care should be used when raising this value
+    /// outside of private networks where these factors are fully controlled. If the provided value
+    /// is higher than what the network path actually supports, the result will be unpredictable and
+    /// catastrophic packet loss, without a possibility of repair. Prefer
+    /// [`TransportConfig::initial_mtu`] together with
+    /// [`TransportConfig::mtu_discovery_config`] to set a maximum UDP payload size that robustly
+    /// adapts to the network.
+    pub fn min_mtu(&mut self, value: u16) -> &mut Self {
+        self.min_mtu = value.max(INITIAL_MTU);
+        self
+    }
+
+    /// Specifies the MTU discovery config (see [`MtuDiscoveryConfig`] for details).
+    ///
+    /// Enabled by default.
+    pub fn mtu_discovery_config(&mut self, value: Option<MtuDiscoveryConfig>) -> &mut Self {
+        self.mtu_discovery_config = value;
+        self
+    }
+
+    /// Pad UDP datagrams carrying application data to current maximum UDP payload size
+    ///
+    /// Disabled by default. UDP datagrams containing loss probes are exempt from padding.
+    ///
+    /// Enabling this helps mitigate traffic analysis by network observers, but it increases
+    /// bandwidth usage. Without this mitigation precise plain text size of application datagrams as
+    /// well as the total size of stream write bursts can be inferred by observers under certain
+    /// conditions. This analysis requires either an uncongested connection or application datagrams
+    /// too large to be coalesced.
+    pub fn pad_to_mtu(&mut self, value: bool) -> &mut Self {
+        self.pad_to_mtu = value;
+        self
+    }
+
+    /// Specifies the ACK frequency config (see [`AckFrequencyConfig`] for details)
+    ///
+    /// The provided configuration will be ignored if the peer does not support the acknowledgement
+    /// frequency QUIC extension.
+    ///
+    /// Defaults to `None`, which disables controlling the peer's acknowledgement frequency. Even
+    /// if set to `None`, the local side still supports the acknowledgement frequency QUIC
+    /// extension and may use it in other ways.
+    pub fn ack_frequency_config(&mut self, value: Option<AckFrequencyConfig>) -> &mut Self {
+        self.ack_frequency_config = value;
+        self
+    }
+
+    /// Number of consecutive PTOs after which network is considered to be experiencing persistent congestion.
+    pub fn persistent_congestion_threshold(&mut self, value: u32) -> &mut Self {
+        self.persistent_congestion_threshold = value;
+        self
+    }
+
+    /// Period of inactivity before sending a keep-alive packet
+    ///
+    /// Keep-alive packets prevent an inactive but otherwise healthy connection from timing out.
+    ///
+    /// `None` to disable, which is the default. Only one side of any given connection needs keep-alive
+    /// enabled for the connection to be preserved. Must be set lower than the idle_timeout of both
+    /// peers to be effective.
+    pub fn keep_alive_interval(&mut self, value: Option<Duration>) -> &mut Self {
+        self.keep_alive_interval = value;
+        self
+    }
+
+    /// Maximum quantity of out-of-order crypto layer data to buffer
+    pub fn crypto_buffer_size(&mut self, value: usize) -> &mut Self {
+        self.crypto_buffer_size = value;
+        self
+    }
+
+    /// Whether the implementation is permitted to set the spin bit on this connection
+    ///
+    /// This allows passive observers to easily judge the round trip time of a connection, which can
+    /// be useful for network administration but sacrifices a small amount of privacy.
+    pub fn allow_spin(&mut self, value: bool) -> &mut Self {
+        self.allow_spin = value;
+        self
+    }
+
+    /// Maximum number of incoming application datagram bytes to buffer, or None to disable
+    /// incoming datagrams
+    ///
+    /// The peer is forbidden to send single datagrams larger than this size. If the aggregate size
+    /// of all datagrams that have been received from the peer but not consumed by the application
+    /// exceeds this value, old datagrams are dropped until it is no longer exceeded.
+    pub fn datagram_receive_buffer_size(&mut self, value: Option<usize>) -> &mut Self {
+        self.datagram_receive_buffer_size = value;
+        self
+    }
+
+    /// Maximum number of outgoing application datagram bytes to buffer
+    ///
+    /// While datagrams are sent ASAP, it is possible for an application to generate data faster
+    /// than the link, or even the underlying hardware, can transmit them. This limits the amount of
+    /// memory that may be consumed in that case. When the send buffer is full and a new datagram is
+    /// sent, older datagrams are dropped until sufficient space is available.
+    pub fn datagram_send_buffer_size(&mut self, value: usize) -> &mut Self {
+        self.datagram_send_buffer_size = value;
+        self
+    }
+
+    /// Whether to force every packet number to be used
+    ///
+    /// By default, packet numbers are occasionally skipped to ensure peers aren't ACKing packets
+    /// before they see them.
+    #[cfg(test)]
+    pub(crate) fn deterministic_packet_numbers(&mut self, enabled: bool) -> &mut Self {
+        self.deterministic_packet_numbers = enabled;
+        self
+    }
+
+    /// How to construct new `congestion::Controller`s
+    ///
+    /// Typically the refcounted configuration of a `congestion::Controller`,
+    /// e.g. a `congestion::NewRenoConfig`.
+    ///
+    /// # Example
+    /// ```
+    /// # use quinn_proto::*; use std::sync::Arc;
+    /// let mut config = TransportConfig::default();
+    /// config.congestion_controller_factory(Arc::new(congestion::NewRenoConfig::default()));
+    /// ```
+    pub fn congestion_controller_factory(
+        &mut self,
+        factory: Arc<dyn congestion::ControllerFactory + Send + Sync + 'static>,
+    ) -> &mut Self {
+        self.congestion_controller_factory = factory;
+        self
+    }
+
+    /// Whether to use "Generic Segmentation Offload" to accelerate transmits, when supported by the
+    /// environment
+    ///
+    /// Defaults to `true`.
+    ///
+    /// GSO dramatically reduces CPU consumption when sending large numbers of packets with the same
+    /// headers, such as when transmitting bulk data on a connection. However, it is not supported
+    /// by all network interface drivers or packet inspection tools. `quinn-udp` will attempt to
+    /// disable GSO automatically when unavailable, but this can lead to spurious packet loss at
+    /// startup, temporarily degrading performance.
+    pub fn enable_segmentation_offload(&mut self, enabled: bool) -> &mut Self {
+        self.enable_segmentation_offload = enabled;
+        self
+    }
+
+    /// qlog capture configuration to use for a particular connection
+    #[cfg(feature = "qlog")]
+    pub fn qlog_stream(&mut self, stream: Option<QlogStream>) -> &mut Self {
+        self.qlog_sink = stream.into();
+        self
+    }
+}
+
+impl Default for TransportConfig {
+    fn default() -> Self {
+        const EXPECTED_RTT: u32 = 100; // ms
+        const MAX_STREAM_BANDWIDTH: u32 = 12500 * 1000; // bytes/s
+        // Window size needed to avoid pipeline
+        // stalls
+        const STREAM_RWND: u32 = MAX_STREAM_BANDWIDTH / 1000 * EXPECTED_RTT;
+
+        Self {
+            max_concurrent_bidi_streams: 100u32.into(),
+            max_concurrent_uni_streams: 100u32.into(),
+            // 30 second default recommended by RFC 9308 § 3.2
+            max_idle_timeout: Some(VarInt(30_000)),
+            stream_receive_window: STREAM_RWND.into(),
+            receive_window: VarInt::MAX,
+            send_window: (8 * STREAM_RWND).into(),
+            send_fairness: true,
+
+            packet_threshold: 3,
+            time_threshold: 9.0 / 8.0,
+            initial_rtt: Duration::from_millis(333), // per spec, intentionally distinct from EXPECTED_RTT
+            initial_mtu: INITIAL_MTU,
+            min_mtu: INITIAL_MTU,
+            mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
+            pad_to_mtu: false,
+            ack_frequency_config: None,
+
+            persistent_congestion_threshold: 3,
+            keep_alive_interval: None,
+            crypto_buffer_size: 16 * 1024,
+            allow_spin: true,
+            datagram_receive_buffer_size: Some(STREAM_RWND as usize),
+            datagram_send_buffer_size: 1024 * 1024,
+            #[cfg(test)]
+            deterministic_packet_numbers: false,
+
+            congestion_controller_factory: Arc::new(congestion::CubicConfig::default()),
+
+            enable_segmentation_offload: true,
+
+            qlog_sink: QlogSink::default(),
+        }
+    }
+}
+
+impl fmt::Debug for TransportConfig {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            max_concurrent_bidi_streams,
+            max_concurrent_uni_streams,
+            max_idle_timeout,
+            stream_receive_window,
+            receive_window,
+            send_window,
+            send_fairness,
+            packet_threshold,
+            time_threshold,
+            initial_rtt,
+            initial_mtu,
+            min_mtu,
+            mtu_discovery_config,
+            pad_to_mtu,
+            ack_frequency_config,
+            persistent_congestion_threshold,
+            keep_alive_interval,
+            crypto_buffer_size,
+            allow_spin,
+            datagram_receive_buffer_size,
+            datagram_send_buffer_size,
+            #[cfg(test)]
+                deterministic_packet_numbers: _,
+            congestion_controller_factory: _,
+            enable_segmentation_offload,
+            qlog_sink,
+        } = self;
+        let mut s = fmt.debug_struct("TransportConfig");
+
+        s.field("max_concurrent_bidi_streams", max_concurrent_bidi_streams)
+use std::{
+    cmp,
+    collections::{HashMap, HashSet, VecDeque},
+    env,
+    io::{self, Write},
+    mem,
+    net::{Ipv6Addr, SocketAddr, UdpSocket},
+    ops::RangeFrom,
+    str,
+    sync::{Arc, Mutex},
+};
+
+use assert_matches::assert_matches;
+use bytes::BytesMut;
+use lazy_static::lazy_static;
+use rustls::{
+    KeyLogFile,
+    client::WebPkiServerVerifier,
+    pki_types::{CertificateDer, PrivateKeyDer},
+};
+use tracing::{info_span, trace};
+
+use super::crypto::rustls::{QuicClientConfig, QuicServerConfig, configured_provider};
+use super::*;
+use crate::{Duration, Instant};
+
+pub(super) const DEFAULT_MTU: usize = 1452;
+
+pub(super) struct Pair {
+    pub(super) server: TestEndpoint,
+    pub(super) client: TestEndpoint,
+    /// Start time
+    epoch: Instant,
+    /// Current time
+    pub(super) time: Instant,
+    /// Simulates the maximum size allowed for UDP payloads by the link (packets exceeding this size will be dropped)
+    pub(super) mtu: usize,
+    /// Simulates explicit congestion notification
+    pub(super) congestion_experienced: bool,
+    // One-way
+    pub(super) latency: Duration,
+    /// Number of spin bit flips
+    pub(super) spins: u64,
+    last_spin: bool,
+}
+
+impl Pair {
+    pub(super) fn default_with_deterministic_pns() -> Self {
+        let mut cfg = server_config();
+        let mut transport = TransportConfig::default();
+        transport.deterministic_packet_numbers(true);
+        cfg.transport = Arc::new(transport);
+        Self::new(Default::default(), cfg)
+    }
+
+    pub(super) fn new(endpoint_config: Arc<EndpointConfig>, server_config: ServerConfig) -> Self {
+        let server = Endpoint::new(
+            endpoint_config.clone(),
+            Some(Arc::new(server_config)),
+            true,
+            None,
+        );
+        let client = Endpoint::new(endpoint_config, None, true, None);
+
+        Self::new_from_endpoint(client, server)
+    }
+
+    pub(super) fn new_from_endpoint(client: Endpoint, server: Endpoint) -> Self {
+        let server_addr = SocketAddr::new(
+            Ipv6Addr::LOCALHOST.into(),
+            SERVER_PORTS.lock().unwrap().next().unwrap(),
+        );
+        let client_addr = SocketAddr::new(
+            Ipv6Addr::LOCALHOST.into(),
+            CLIENT_PORTS.lock().unwrap().next().unwrap(),
+        );
+        let now = Instant::now();
+        Self {
+            server: TestEndpoint::new(server, server_addr),
+            client: TestEndpoint::new(client, client_addr),
+            epoch: now,
+            time: now,
+            mtu: DEFAULT_MTU,
+            latency: Duration::ZERO,
+            spins: 0,
+            last_spin: false,
+            congestion_experienced: false,
+        }
+    }
+
+    /// Returns whether the connection is not idle
+    pub(super) fn step(&mut self) -> bool {
+        self.drive_client();
+        self.drive_server();
+        if self.client.is_idle() && self.server.is_idle() {
+            return false;
+        }
+
+        let client_t = self.client.next_wakeup();
+        let server_t = self.server.next_wakeup();
+        match min_opt(client_t, server_t) {
+            Some(t) if Some(t) == client_t => {
+                if t != self.time {
+                    self.time = self.time.max(t);
+                    trace!("advancing to {:?} for client", self.time - self.epoch);
+                }
+                true
+            }
+            Some(t) if Some(t) == server_t => {
+                if t != self.time {
+                    self.time = self.time.max(t);
+                    trace!("advancing to {:?} for server", self.time - self.epoch);
+                }
+                true
+            }
+            Some(_) => unreachable!(),
+            None => false,
+        }
+    }
+
+    /// Advance time until both connections are idle
+    pub(super) fn drive(&mut self) {
+        while self.step() {}
+    }
+
+    /// Advance time until both connections are idle, or after 100 steps have been executed
+    ///
+    /// Returns true if the amount of steps exceeds the bounds, because the connections never became
+    /// idle
+    pub(super) fn drive_bounded(&mut self) -> bool {
+        for _ in 0..100 {
+            if !self.step() {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    pub(super) fn drive_client(&mut self) {
+        let span = info_span!("client");
+        let _guard = span.enter();
+        self.client.drive(self.time, self.server.addr);
+        for (packet, buffer) in self.client.outbound.drain(..) {
+            let packet_size = packet_size(&packet, &buffer);
+            if packet_size > self.mtu {
+                info!(packet_size, "dropping packet (max size exceeded)");
+                continue;
+            }
+            if buffer[0] & packet::LONG_HEADER_FORM == 0 {
+                let spin = buffer[0] & packet::SPIN_BIT != 0;
+                self.spins += (spin == self.last_spin) as u64;
+                self.last_spin = spin;
+            }
+            if let Some(ref socket) = self.client.socket {
+                socket.send_to(&buffer, packet.destination).unwrap();
+            }
+            if self.server.addr == packet.destination {
+                let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced);
+                self.server.inbound.push_back((
+                    self.time + self.latency,
+                    ecn,
+                    buffer.as_ref().into(),
+                ));
+            }
+        }
+    }
+
+    pub(super) fn drive_server(&mut self) {
+        let span = info_span!("server");
+        let _guard = span.enter();
+        self.server.drive(self.time, self.client.addr);
+        for (packet, buffer) in self.server.outbound.drain(..) {
+            let packet_size = packet_size(&packet, &buffer);
+            if packet_size > self.mtu {
+                info!(packet_size, "dropping packet (max size exceeded)");
+                continue;
+            }
+            if let Some(ref socket) = self.server.socket {
+                socket.send_to(&buffer, packet.destination).unwrap();
+            }
+            if self.client.addr == packet.destination {
+                let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced);
+                self.client.inbound.push_back((
+                    self.time + self.latency,
+                    ecn,
+                    buffer.as_ref().into(),
+                ));
+            }
+        }
+    }
+
+    pub(super) fn connect(&mut self) -> (ConnectionHandle, ConnectionHandle) {
+        self.connect_with(client_config())
+    }
+
+    pub(super) fn connect_with(
+        &mut self,
+        config: ClientConfig,
+    ) -> (ConnectionHandle, ConnectionHandle) {
+        info!("connecting");
+        let client_ch = self.begin_connect(config);
+        self.drive();
+        let server_ch = self.server.assert_accept();
+        self.finish_connect(client_ch, server_ch);
+        (client_ch, server_ch)
+    }
+
+    /// Just start connecting the client
+    pub(super) fn begin_connect(&mut self, config: ClientConfig) -> ConnectionHandle {
+        let span = info_span!("client");
+        let _guard = span.enter();
+        let (client_ch, client_conn) = self
+            .client
+            .connect(self.time, config, self.server.addr, "localhost")
+            .unwrap();
+        self.client.connections.insert(client_ch, client_conn);
+        client_ch
+    }
+
+    fn finish_connect(&mut self, client_ch: ConnectionHandle, server_ch: ConnectionHandle) {
+        assert_matches!(
+            self.client_conn_mut(client_ch).poll(),
+            Some(Event::HandshakeDataReady)
+        );
+        assert_matches!(
+            self.client_conn_mut(client_ch).poll(),
+            Some(Event::Connected)
+        );
+        assert_matches!(
+            self.server_conn_mut(server_ch).poll(),
+            Some(Event::HandshakeDataReady)
+        );
+        assert_matches!(
+            self.server_conn_mut(server_ch).poll(),
+            Some(Event::Connected)
+        );
+    }
+
+    pub(super) fn client_conn_mut(&mut self, ch: ConnectionHandle) -> &mut Connection {
+        self.client.connections.get_mut(&ch).unwrap()
+    }
+
+    pub(super) fn client_streams(&mut self, ch: ConnectionHandle) -> Streams<'_> {
+        self.client_conn_mut(ch).streams()
+    }
+
+    pub(super) fn client_send(&mut self, ch: ConnectionHandle, s: StreamId) -> SendStream<'_> {
+        self.client_conn_mut(ch).send_stream(s)
+    }
+
+    pub(super) fn client_recv(&mut self, ch: ConnectionHandle, s: StreamId) -> RecvStream<'_> {
+        self.client_conn_mut(ch).recv_stream(s)
+    }
+
+    pub(super) fn client_datagrams(&mut self, ch: ConnectionHandle) -> Datagrams<'_> {
+        self.client_conn_mut(ch).datagrams()
+    }
+
+    pub(super) fn server_conn_mut(&mut self, ch: ConnectionHandle) -> &mut Connection {
+        self.server.connections.get_mut(&ch).unwrap()
+    }
+
+    pub(super) fn server_streams(&mut self, ch: ConnectionHandle) -> Streams<'_> {
+        self.server_conn_mut(ch).streams()
+    }
+
+    pub(super) fn server_send(&mut self, ch: ConnectionHandle, s: StreamId) -> SendStream<'_> {
+        self.server_conn_mut(ch).send_stream(s)
+    }
+1397:            stream_receive_window: 2000u32.into(),
+1408:            receive_window: 2000u32.into(),
+1790:    // No datagrams frames received in the handshake.
+1792:    assert_eq!(server_stats.frame_rx.datagram, 0);
+1797:    info!("Sending an ack-eliciting datagram");
+1809:    // Still no datagrams frames received by the server.
+1811:    assert_eq!(server_stats.frame_rx.datagram, 0);
+1813:    // Now we can send another batch of datagrams, so the PTO can send them instead of
+1816:    info!("Sending datagram batch");
+1818:        pair.client_datagrams(client_ch)
+1823:    // If this succeeds the datagrams are received by the server and the client did not
+1827:    // Finally the server should have received some datagrams.
+1829:    assert_eq!(server_stats.frame_rx.datagram, DGRAM_NUM);
+1832:// Respect max_datagrams when TLP happens
+1834:fn tail_loss_respect_max_datagrams() {
+1850:    info!("Sending an ack-eliciting datagram");
+1862:    // start sending datagram batches but the first should be a TLP
+1863:    info!("Sending datagram batch");
+1865:        pair.client_datagrams(client_ch)
+1872:    // Finally checking the number of sent udp datagrams match the number of iops
+1874:    assert_eq!(client_stats.udp_tx.ios, client_stats.udp_tx.datagrams);
+1878:fn datagram_send_recv() {
+1883:    assert_matches!(pair.client_datagrams(client_ch).max_size(), Some(x) if x > 0);
+1886:    pair.client_datagrams(client_ch)
+1894:    assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA);
+1895:    assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+1899:fn datagram_recv_buffer_overflow() {
+1904:            datagram_receive_buffer_size: Some(WINDOW),
+1913:        pair.client_conn_mut(client_ch).datagrams().max_size(),
+1920:    pair.client_datagrams(client_ch)
+1923:    pair.client_datagrams(client_ch)
+1926:    pair.client_datagrams(client_ch)
+1934:    assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA2);
+1935:    assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA3);
+1936:    assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+1938:    pair.client_datagrams(client_ch)
+1942:    assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA1);
+1943:    assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+1947:fn datagram_unsupported() {
+1951:            datagram_receive_buffer_size: None,
+1959:    assert_matches!(pair.client_datagrams(client_ch).max_size(), None);
+1961:    match pair.client_datagrams(client_ch).send(Bytes::new(), true) {
+3059:        pair.client_datagrams(client_ch)
+3063:        assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), MSG);
+3147:    // datagram batches
+3159:fn datagram_gso() {
+3167:    // Send 10 datagrams above half the MTU, which fits inside a `tests::util::MAX_DATAGRAMS`
+3168:    // datagram batch
+3173:        pair.client_datagrams(client_ch)
+3196:    // Send three application datagrams such that each is large to be combined with another in a
+3197:    // single MTU, and the second datagram would require an unreasonably large amount of padding to
+3202:        pair.client_datagrams(client_ch)
+3211:            pair.server_datagrams(server_ch)
+3213:                .expect("datagram lost")
+3220:/// Verify that UDP datagrams are padded to MTU if specified in the transport config.
+3243:    // Send two datagrams significantly smaller than MTU, but large enough to require two UDP datagrams.
+3246:    pair.client_datagrams(client_ch)
+3249:    pair.client_datagrams(client_ch)
+3266:    // Check that both datagrams ended up in the same GSO batch
+3271:        pair.server_datagrams(server_ch)
+3273:            .expect("datagram lost")
+3278:        pair.server_datagrams(server_ch)
+3280:            .expect("datagram lost")
+3286:/// Verify that a large application datagram is sent successfully when an ACK frame too large to fit
+3287:/// alongside it is also queued, in exactly 2 UDP datagrams.
+3289:fn large_datagram_with_acks() {
+3303:    let max_size = pair.client_datagrams(client_ch).max_size().unwrap();
+3305:    pair.client_datagrams(client_ch)
+3308:    let initial_datagrams = pair.client_conn_mut(client_ch).stats().udp_tx.datagrams;
+3310:    let final_datagrams = pair.client_conn_mut(client_ch).stats().udp_tx.datagrams;
+3311:    assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), msg);
+3312:    assert_eq!(final_datagrams - initial_datagrams, 2);
+3316:/// outgoing application datagrams too large to coexist in the same packet with it.
+3318:fn voluntary_ack_with_large_datagrams() {
+3324:    let initial_datagrams = pair.client_conn_mut(client_ch).stats().udp_tx.datagrams;
+3329:        let max_size = pair.client_datagrams(client_ch).max_size().unwrap();
+3330:        pair.client_datagrams(client_ch)
+3335:    let final_datagrams = pair.client_conn_mut(client_ch).stats().udp_tx.datagrams;
+3337:    // datagram, which is reasonable behavior but makes this test ineffective.
+3339:        final_datagrams - initial_datagrams,
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, binary_heap::PeekMut},
+    mem,
+};
+
+use bytes::{Buf, Bytes, BytesMut};
+
+use crate::range_set::RangeSet;
+
+/// Helper to assemble unordered stream frames into an ordered stream
+#[derive(Debug, Default)]
+pub(super) struct Assembler {
+    state: State,
+    data: BinaryHeap<Buffer>,
+    /// Total number of buffered bytes, including duplicates in ordered mode.
+    buffered: usize,
+    /// Estimated number of allocated bytes, will never be less than `buffered`.
+    allocated: usize,
+    /// Number of bytes read by the application. When only ordered reads have been used, this is the
+    /// length of the contiguous prefix of the stream which has been consumed by the application,
+    /// aka the stream offset.
+    bytes_read: u64,
+    end: u64,
+}
+
+impl Assembler {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reset to the initial state
+    pub(super) fn reinit(&mut self) {
+        let old_data = mem::take(&mut self.data);
+        *self = Self::default();
+        self.data = old_data;
+        self.data.clear();
+    }
+
+    pub(super) fn ensure_ordering(&mut self, ordered: bool) -> Result<(), IllegalOrderedRead> {
+        if ordered && !self.state.is_ordered() {
+            return Err(IllegalOrderedRead);
+        } else if !ordered && self.state.is_ordered() {
+            // Enter unordered mode
+            if !self.data.is_empty() {
+                // Get rid of possible duplicates
+                self.defragment();
+            }
+            let mut recvd = RangeSet::new();
+            recvd.insert(0..self.bytes_read);
+            for chunk in &self.data {
+                recvd.insert(chunk.offset..chunk.offset + chunk.bytes.len() as u64);
+            }
+            self.state = State::Unordered { recvd };
+        }
+        Ok(())
+    }
+
+    /// Get the the next chunk
+    pub(super) fn read(&mut self, max_length: usize, ordered: bool) -> Option<Chunk> {
+        loop {
+            let mut chunk = self.data.peek_mut()?;
+
+            if ordered {
+                if chunk.offset > self.bytes_read {
+                    // Next chunk is after current read index
+                    return None;
+                } else if (chunk.offset + chunk.bytes.len() as u64) <= self.bytes_read {
+                    // Next chunk is useless as the read index is beyond its end
+                    self.buffered -= chunk.bytes.len();
+                    self.allocated -= chunk.allocation_size;
+                    PeekMut::pop(chunk);
+                    continue;
+                }
+
+                // Determine `start` and `len` of the slice of useful data in chunk
+                let start = (self.bytes_read - chunk.offset) as usize;
+                if start > 0 {
+                    chunk.bytes.advance(start);
+                    chunk.offset += start as u64;
+                    self.buffered -= start;
+                }
+            }
+
+            return Some(if max_length < chunk.bytes.len() {
+                self.bytes_read += max_length as u64;
+                let offset = chunk.offset;
+                chunk.offset += max_length as u64;
+                self.buffered -= max_length;
+                Chunk::new(offset, chunk.bytes.split_to(max_length))
+            } else {
+                self.bytes_read += chunk.bytes.len() as u64;
+                self.buffered -= chunk.bytes.len();
+                self.allocated -= chunk.allocation_size;
+                let chunk = PeekMut::pop(chunk);
+                Chunk::new(chunk.offset, chunk.bytes)
+            });
+        }
+    }
+
+    /// Copy fragmented chunk data to new chunks backed by a single buffer
+    ///
+    /// This makes sure we're not unnecessarily holding on to many larger allocations.
+    /// We merge contiguous chunks in the process of doing so.
+    fn defragment(&mut self) {
+        let new = BinaryHeap::with_capacity(self.data.len());
+        let old = mem::replace(&mut self.data, new);
+        let mut buffers = old.into_sorted_vec();
+        self.buffered = 0;
+        let mut fragmented_buffered = 0;
+        let mut offset = 0;
+        for chunk in buffers.iter_mut().rev() {
+            chunk.try_mark_defragment(offset);
+            let size = chunk.bytes.len();
+            offset = chunk.offset + size as u64;
+            self.buffered += size;
+            if !chunk.defragmented {
+                fragmented_buffered += size;
+            }
+        }
+        self.allocated = self.buffered;
+        let mut buffer = BytesMut::with_capacity(fragmented_buffered);
+        let mut offset = 0;
+        for chunk in buffers.into_iter().rev() {
+            if chunk.defragmented {
+                // bytes might be empty after try_mark_defragment
+                if !chunk.bytes.is_empty() {
+                    self.data.push(chunk);
+                }
+                continue;
+            }
+            // Overlap is resolved by try_mark_defragment
+            if chunk.offset != offset + (buffer.len() as u64) {
+                if !buffer.is_empty() {
+                    self.data
+                        .push(Buffer::new_defragmented(offset, buffer.split().freeze()));
+                }
+                offset = chunk.offset;
+            }
+            buffer.extend_from_slice(&chunk.bytes);
+        }
+        if !buffer.is_empty() {
+            self.data
+                .push(Buffer::new_defragmented(offset, buffer.split().freeze()));
+        }
+    }
+
+    // Note: If a packet contains many frames from the same stream, the estimated over-allocation
+    // will be much higher because we are counting the same allocation multiple times.
+    pub(super) fn insert(&mut self, mut offset: u64, mut bytes: Bytes, allocation_size: usize) {
+        debug_assert!(
+            bytes.len() <= allocation_size,
+            "allocation_size less than bytes.len(): {:?} < {:?}",
+            allocation_size,
+            bytes.len()
+        );
+        self.end = self.end.max(offset + bytes.len() as u64);
+        if let State::Unordered { ref mut recvd } = self.state {
+            // Discard duplicate data
+            for duplicate in recvd.replace(offset..offset + bytes.len() as u64) {
+                if duplicate.start > offset {
+                    let buffer = Buffer::new(
+                        offset,
+                        bytes.split_to((duplicate.start - offset) as usize),
+                        allocation_size,
+                    );
+                    self.buffered += buffer.bytes.len();
+                    self.allocated += buffer.allocation_size;
+                    self.data.push(buffer);
+                    offset = duplicate.start;
+                }
+                bytes.advance((duplicate.end - offset) as usize);
+                offset = duplicate.end;
+            }
+        } else if offset < self.bytes_read {
+            if (offset + bytes.len() as u64) <= self.bytes_read {
+                return;
+            } else {
+                let diff = self.bytes_read - offset;
+                offset += diff;
+                bytes.advance(diff as usize);
+            }
+        }
+
+        if bytes.is_empty() {
+            return;
+        }
+        let buffer = Buffer::new(offset, bytes, allocation_size);
+        self.buffered += buffer.bytes.len();
+        self.allocated += buffer.allocation_size;
+        self.data.push(buffer);
+        // `self.buffered` also counts duplicate bytes, therefore we use
+        // `self.end - self.bytes_read` as an upper bound of buffered unique
+        // bytes. This will cause a defragmentation if the amount of duplicate
+        // bytes exceedes a proportion of the receive window size.
+        let buffered = self.buffered.min((self.end - self.bytes_read) as usize);
+        let over_allocation = self.allocated - buffered;
+        // Rationale: on the one hand, we want to defragment rarely, ideally never
+        // in non-pathological scenarios. However, a pathological or malicious
+        // peer could send us one-byte frames, and since we use reference-counted
+        // buffers in order to prevent copying, this could result in keeping a lot
+        // of memory allocated. This limits over-allocation in proportion to the
+        // buffered data. The constants are chosen somewhat arbitrarily and try to
+        // balance between defragmentation overhead and over-allocation.
+        let threshold = 32768.max(buffered * 3 / 2);
+        if over_allocation > threshold {
+            self.defragment()
+        }
+    }
+
+    /// Number of bytes consumed by the application
+    pub(super) fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// Discard all buffered data
+    pub(super) fn clear(&mut self) {
+        self.data.clear();
+        self.buffered = 0;
+        self.allocated = 0;
+    }
+}
+
+/// A chunk of data from the receive stream
+#[derive(Debug, PartialEq, Eq)]
+pub struct Chunk {
+    /// The offset in the stream
+    pub offset: u64,
+    /// The contents of the chunk
+    pub bytes: Bytes,
+}
+
+impl Chunk {
+    fn new(offset: u64, bytes: Bytes) -> Self {
+        Self { offset, bytes }
+    }
+}
+
+#[derive(Debug, Eq)]
+struct Buffer {
+    offset: u64,
+    bytes: Bytes,
+    /// Size of the allocation behind `bytes`, if `defragmented == false`.
+    /// Otherwise this will be set to `bytes.len()` by `try_mark_defragment`.
+    /// Will never be less than `bytes.len()`.
+    allocation_size: usize,
+    defragmented: bool,
+}
+
+impl Buffer {
+use std::{
+    collections::{VecDeque, hash_map},
+    convert::TryFrom,
+    mem,
+};
+
+use bytes::BufMut;
+use rustc_hash::FxHashMap;
+use tracing::{debug, trace};
+
+use super::{
+    PendingStreamsQueue, Recv, Retransmits, Send, SendState, ShouldTransmit, StreamEvent,
+    StreamHalf, ThinRetransmits,
+};
+use crate::{
+    Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
+    coding::BufMutExt,
+    connection::stats::FrameStats,
+    frame::{self, FrameStruct, StreamMetaVec},
+    transport_parameters::TransportParameters,
+};
+
+/// Wrapper around `Recv` that facilitates reusing `Recv` instances
+#[derive(Debug)]
+pub(super) enum StreamRecv {
+    /// A `Recv` that is ready to be opened
+    Free(Box<Recv>),
+    /// A `Recv` that has been opened
+    Open(Box<Recv>),
+}
+
+impl StreamRecv {
+    /// Returns a reference to the inner `Recv` if the stream is open
+    pub(super) fn as_open_recv(&self) -> Option<&Recv> {
+        match self {
+            Self::Open(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    // Returns a mutable reference to the inner `Recv` if the stream is open
+    pub(super) fn as_open_recv_mut(&mut self) -> Option<&mut Recv> {
+        match self {
+            Self::Open(r) => Some(r),
+            _ => None,
+        }
+    }
+
+    // Returns the inner `Recv`
+    pub(super) fn into_inner(self) -> Box<Recv> {
+        match self {
+            Self::Free(r) | Self::Open(r) => r,
+        }
+    }
+
+    // Reinitialize the stream so the inner `Recv` can be reused
+    pub(super) fn free(self, initial_max_data: u64) -> Self {
+        match self {
+            Self::Free(_) => unreachable!("Self::Free on reinit()"),
+            Self::Open(mut recv) => {
+                recv.reinit(initial_max_data);
+                Self::Free(recv)
+            }
+        }
+    }
+}
+
+#[allow(unreachable_pub)] // fuzzing only
+pub struct StreamsState {
+    pub(super) side: Side,
+    // Set of streams that are currently open, or could be immediately opened by the peer
+    pub(super) send: FxHashMap<StreamId, Option<Box<Send>>>,
+    pub(super) recv: FxHashMap<StreamId, Option<StreamRecv>>,
+    pub(super) free_recv: Vec<StreamRecv>,
+    pub(super) next: [u64; 2],
+    /// Maximum number of locally-initiated streams that may be opened over the lifetime of the
+    /// connection so far, per direction
+    pub(super) max: [u64; 2],
+    /// Maximum number of remotely-initiated streams that may be opened over the lifetime of the
+    /// connection so far, per direction
+    pub(super) max_remote: [u64; 2],
+    /// Value of `max_remote` most recently transmitted to the peer in a `MAX_STREAMS` frame
+    sent_max_remote: [u64; 2],
+    /// Number of streams that we've given the peer permission to open and which aren't fully closed
+    pub(super) allocated_remote_count: [u64; 2],
+    /// Size of the desired stream flow control window. May be smaller than `allocated_remote_count`
+    /// due to `set_max_concurrent` calls.
+    max_concurrent_remote_count: [u64; 2],
+    /// Whether `max_concurrent_remote_count` has ever changed
+    flow_control_adjusted: bool,
+    /// Lowest remotely-initiated stream index that haven't actually been opened by the peer
+    pub(super) next_remote: [u64; 2],
+    /// Whether the remote endpoint has opened any streams the application doesn't know about yet,
+    /// per directionality
+    opened: [bool; 2],
+    // Next to report to the application, once opened
+    pub(super) next_reported_remote: [u64; 2],
+    /// Number of outbound streams
+    ///
+    /// This differs from `self.send.len()` in that it does not include streams that the peer is
+    /// permitted to open but which have not yet been opened.
+    pub(super) send_streams: usize,
+    /// Streams with outgoing data queued, sorted by priority
+    pub(super) pending: PendingStreamsQueue,
+
+    events: VecDeque<StreamEvent>,
+    /// Streams blocked on connection-level flow control or stream window space
+    ///
+    /// Streams are only added to this list when a write fails.
+    pub(super) connection_blocked: Vec<StreamId>,
+    /// Connection-level flow control budget dictated by the peer
+    pub(super) max_data: u64,
+    /// The initial receive window
+    receive_window: u64,
+    /// Limit on incoming data, which is transmitted through `MAX_DATA` frames
+    local_max_data: u64,
+    /// The last value of `MAX_DATA` which had been queued for transmission in
+    /// an outgoing `MAX_DATA` frame
+    sent_max_data: VarInt,
+    /// Sum of current offsets of all send streams.
+    pub(super) data_sent: u64,
+    /// Sum of end offsets of all receive streams. Includes gaps, so it's an upper bound.
+    data_recvd: u64,
+    /// Total quantity of unacknowledged outgoing data
+    pub(super) unacked_data: u64,
+    /// Configured upper bound for `unacked_data`.
+    ///
+    /// Note this may be less than `unacked_data` if the user has set a new value.
+    pub(super) send_window: u64,
+    /// Configured upper bound for how much unacked data the peer can send us per stream
+    pub(super) stream_receive_window: u64,
+
+    // Pertinent state from the TransportParameters supplied by the peer
+    initial_max_stream_data_uni: VarInt,
+    initial_max_stream_data_bidi_local: VarInt,
+    initial_max_stream_data_bidi_remote: VarInt,
+
+    /// The shrink to be applied to local_max_data when receive_window is shrunk
+    receive_window_shrink_debt: u64,
+}
+
+impl StreamsState {
+    #[allow(unreachable_pub)] // fuzzing only
+    pub fn new(
+        side: Side,
+        max_remote_uni: VarInt,
+        max_remote_bi: VarInt,
+        send_window: u64,
+        receive_window: VarInt,
+        stream_receive_window: VarInt,
+    ) -> Self {
+        let mut this = Self {
+            side,
+            send: FxHashMap::default(),
+            recv: FxHashMap::default(),
+            free_recv: Vec::new(),
+            next: [0, 0],
+            max: [0, 0],
+            max_remote: [max_remote_bi.into(), max_remote_uni.into()],
+            sent_max_remote: [max_remote_bi.into(), max_remote_uni.into()],
+            allocated_remote_count: [max_remote_bi.into(), max_remote_uni.into()],
+            max_concurrent_remote_count: [max_remote_bi.into(), max_remote_uni.into()],
+            flow_control_adjusted: false,
+            next_remote: [0, 0],
+            opened: [false, false],
+            next_reported_remote: [0, 0],
+            send_streams: 0,
+            pending: PendingStreamsQueue::new(),
+            events: VecDeque::new(),
+            connection_blocked: Vec::new(),
+            max_data: 0,
+            receive_window: receive_window.into(),
+            local_max_data: receive_window.into(),
+            sent_max_data: receive_window,
+            data_sent: 0,
+            data_recvd: 0,
+            unacked_data: 0,
+            send_window,
+            stream_receive_window: stream_receive_window.into(),
+            initial_max_stream_data_uni: 0u32.into(),
+            initial_max_stream_data_bidi_local: 0u32.into(),
+            initial_max_stream_data_bidi_remote: 0u32.into(),
+            receive_window_shrink_debt: 0,
+        };
+
+        for dir in Dir::iter() {
+            for i in 0..this.max_remote[dir as usize] {
+                this.insert(true, StreamId::new(!side, dir, i));
+            }
+        }
+
+        this
+    }
+
+    pub(crate) fn set_params(&mut self, params: &TransportParameters) {
+        self.initial_max_stream_data_uni = params.initial_max_stream_data_uni;
+        self.initial_max_stream_data_bidi_local = params.initial_max_stream_data_bidi_local;
+        self.initial_max_stream_data_bidi_remote = params.initial_max_stream_data_bidi_remote;
+        self.max[Dir::Bi as usize] = params.initial_max_streams_bidi.into();
+        self.max[Dir::Uni as usize] = params.initial_max_streams_uni.into();
+        self.received_max_data(params.initial_max_data);
+        for i in 0..self.max_remote[Dir::Bi as usize] {
+            let id = StreamId::new(!self.side, Dir::Bi, i);
+            if let Some(s) = self.send.get_mut(&id).and_then(|s| s.as_mut()) {
+                s.max_data = params.initial_max_stream_data_bidi_local.into();
+            }
+        }
+    }
+
+    /// Ensure we have space for at least a full flow control window of remotely-initiated streams
+    /// to be open, and notify the peer if the window has moved
+    fn ensure_remote_streams(&mut self, dir: Dir) {
+        let new_count = self.max_concurrent_remote_count[dir as usize]
+            .saturating_sub(self.allocated_remote_count[dir as usize]);
+        for i in 0..new_count {
+            let id = StreamId::new(!self.side, dir, self.max_remote[dir as usize] + i);
+            self.insert(true, id);
+        }
+        self.allocated_remote_count[dir as usize] += new_count;
+        self.max_remote[dir as usize] += new_count;
+    }
+
+    pub(crate) fn zero_rtt_rejected(&mut self) {
+        // Revert to initial state for outgoing streams
+        for dir in Dir::iter() {
+            for i in 0..self.next[dir as usize] {
+                // We don't bother calling `stream_freed` here because we explicitly reset affected
+                // counters below.
+                let id = StreamId::new(self.side, dir, i);
+                self.send.remove(&id).unwrap();
+                if let Dir::Bi = dir {
+                    self.recv.remove(&id).unwrap();
+                }
+            }
+            self.next[dir as usize] = 0;
+
+            // If 0-RTT was rejected, any flow control frames we sent were lost.
+            if self.flow_control_adjusted {
+                // Conservative approximation of whatever we sent in transport parameters
+                self.sent_max_remote[dir as usize] = 0;
+            }
+        }
+
+        self.pending.clear();
+        self.send_streams = 0;
+        self.data_sent = 0;
+        self.connection_blocked.clear();
+    }
+
+    /// Process incoming stream frame
+    ///
+    /// If successful, returns whether a `MAX_DATA` frame needs to be transmitted
+    pub(crate) fn received(
+        &mut self,
+        frame: frame::Stream,
+        payload_len: usize,
+    ) -> Result<ShouldTransmit, TransportError> {
+        let id = frame.id;
+        self.validate_receive_id(id).map_err(|e| {
+            debug!("received illegal STREAM frame");

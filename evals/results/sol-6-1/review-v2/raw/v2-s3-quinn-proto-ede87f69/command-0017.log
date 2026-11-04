@@ -1,0 +1,808 @@
+use crate::{Instant, MAX_UDP_PAYLOAD, MtuDiscoveryConfig, packet::SpaceId};
+use std::cmp;
+use tracing::trace;
+
+/// Implements Datagram Packetization Layer Path Maximum Transmission Unit Discovery
+///
+/// See [`MtuDiscoveryConfig`] for details
+#[derive(Clone)]
+pub(crate) struct MtuDiscovery {
+    /// Detected MTU for the path
+    current_mtu: u16,
+    /// The state of the MTU discovery, if enabled
+    state: Option<EnabledMtuDiscovery>,
+    /// The state of the black hole detector
+    black_hole_detector: BlackHoleDetector,
+}
+
+impl MtuDiscovery {
+    pub(crate) fn new(
+        initial_plpmtu: u16,
+        min_mtu: u16,
+        peer_max_udp_payload_size: Option<u16>,
+        config: MtuDiscoveryConfig,
+    ) -> Self {
+        debug_assert!(
+            initial_plpmtu >= min_mtu,
+            "initial_max_udp_payload_size must be at least {min_mtu}"
+        );
+
+        let mut mtud = Self::with_state(
+            initial_plpmtu,
+            min_mtu,
+            Some(EnabledMtuDiscovery::new(config)),
+        );
+
+        // We might be migrating an existing connection to a new path, in which case the transport
+        // parameters have already been transmitted, and we already know the value of
+        // `peer_max_udp_payload_size`
+        if let Some(peer_max_udp_payload_size) = peer_max_udp_payload_size {
+            mtud.on_peer_max_udp_payload_size_received(peer_max_udp_payload_size);
+        }
+
+        mtud
+    }
+
+    /// MTU discovery will be disabled and the current MTU will be fixed to the provided value
+    pub(crate) fn disabled(plpmtu: u16, min_mtu: u16) -> Self {
+        Self::with_state(plpmtu, min_mtu, None)
+    }
+
+    fn with_state(current_mtu: u16, min_mtu: u16, state: Option<EnabledMtuDiscovery>) -> Self {
+        Self {
+            current_mtu,
+            state,
+            black_hole_detector: BlackHoleDetector::new(min_mtu),
+        }
+    }
+
+    pub(super) fn reset(&mut self, current_mtu: u16, min_mtu: u16) {
+        self.current_mtu = current_mtu;
+        if let Some(state) = self.state.take() {
+            self.state = Some(EnabledMtuDiscovery::new(state.config));
+            self.on_peer_max_udp_payload_size_received(state.peer_max_udp_payload_size);
+        }
+        self.black_hole_detector = BlackHoleDetector::new(min_mtu);
+    }
+
+    /// Returns the current MTU
+    pub(crate) fn current_mtu(&self) -> u16 {
+        self.current_mtu
+    }
+
+    /// Returns the amount of bytes that should be sent as an MTU probe, if any
+    pub(crate) fn poll_transmit(&mut self, now: Instant, next_pn: u64) -> Option<u16> {
+        self.state
+            .as_mut()
+            .and_then(|state| state.poll_transmit(now, self.current_mtu, next_pn))
+    }
+
+    /// Notifies the [`MtuDiscovery`] that the peer's `max_udp_payload_size` transport parameter has
+    /// been received
+    pub(crate) fn on_peer_max_udp_payload_size_received(&mut self, peer_max_udp_payload_size: u16) {
+        self.current_mtu = self.current_mtu.min(peer_max_udp_payload_size);
+
+        if let Some(state) = self.state.as_mut() {
+            // MTUD is only active after the connection has been fully established, so it is
+            // guaranteed we will receive the peer's transport parameters before we start probing
+            debug_assert!(matches!(state.phase, Phase::Initial));
+            state.peer_max_udp_payload_size = peer_max_udp_payload_size;
+        }
+    }
+
+    /// Notifies the [`MtuDiscovery`] that a packet has been ACKed
+    ///
+    /// Returns true if the packet was an MTU probe
+    pub(crate) fn on_acked(&mut self, space: SpaceId, pn: u64, len: u16) -> bool {
+        // MTU probes are only sent in application data space
+        if space != SpaceId::Data {
+            return false;
+        }
+
+        // Update the state of the MTU search
+        if let Some(new_mtu) = self
+            .state
+            .as_mut()
+            .and_then(|state| state.on_probe_acked(pn))
+        {
+            self.current_mtu = new_mtu;
+            trace!(current_mtu = self.current_mtu, "new MTU detected");
+
+            self.black_hole_detector.on_probe_acked(pn, len);
+            true
+        } else {
+            self.black_hole_detector.on_non_probe_acked(pn, len);
+            false
+        }
+    }
+
+    /// Returns the packet number of the in-flight MTU probe, if any
+    pub(crate) fn in_flight_mtu_probe(&self) -> Option<u64> {
+        match &self.state {
+            Some(EnabledMtuDiscovery {
+                phase: Phase::Searching(search_state),
+                ..
+            }) => search_state.in_flight_probe,
+            _ => None,
+        }
+    }
+
+    /// Notifies the [`MtuDiscovery`] that the in-flight MTU probe was lost
+    pub(crate) fn on_probe_lost(&mut self) {
+        if let Some(state) = &mut self.state {
+            state.on_probe_lost();
+        }
+    }
+
+    /// Notifies the [`MtuDiscovery`] that a non-probe packet was lost
+    ///
+    /// When done notifying of lost packets, [`MtuDiscovery::black_hole_detected`] must be called, to
+    /// ensure the last loss burst is properly processed and to trigger black hole recovery logic if
+    /// necessary.
+    pub(crate) fn on_non_probe_lost(&mut self, pn: u64, len: u16) {
+        self.black_hole_detector.on_non_probe_lost(pn, len);
+    }
+
+    /// Returns true if a black hole was detected
+    ///
+    /// Calling this function will close the previous loss burst. If a black hole is detected, the
+    /// current MTU will be reset to `min_mtu`.
+    pub(crate) fn black_hole_detected(&mut self, now: Instant) -> bool {
+        if !self.black_hole_detector.black_hole_detected() {
+            return false;
+        }
+
+        self.current_mtu = self.black_hole_detector.min_mtu;
+
+        if let Some(state) = &mut self.state {
+            state.on_black_hole_detected(now);
+        }
+
+        true
+    }
+}
+
+/// Additional state for enabled MTU discovery
+#[derive(Debug, Clone)]
+struct EnabledMtuDiscovery {
+    phase: Phase,
+    peer_max_udp_payload_size: u16,
+    config: MtuDiscoveryConfig,
+}
+
+impl EnabledMtuDiscovery {
+    fn new(config: MtuDiscoveryConfig) -> Self {
+        Self {
+            phase: Phase::Initial,
+            peer_max_udp_payload_size: MAX_UDP_PAYLOAD,
+            config,
+        }
+    }
+
+    /// Returns the amount of bytes that should be sent as an MTU probe, if any
+    fn poll_transmit(&mut self, now: Instant, current_mtu: u16, next_pn: u64) -> Option<u16> {
+        if let Phase::Initial = &self.phase {
+            // Start the first search
+            self.phase = Phase::Searching(SearchState::new(
+                current_mtu,
+                self.peer_max_udp_payload_size,
+                &self.config,
+            ));
+        } else if let Phase::Complete(next_mtud_activation) = &self.phase {
+            if now < *next_mtud_activation {
+                return None;
+            }
+
+            // Start a new search (we have reached the next activation time)
+            self.phase = Phase::Searching(SearchState::new(
+                current_mtu,
+                self.peer_max_udp_payload_size,
+                &self.config,
+            ));
+        }
+
+        if let Phase::Searching(state) = &mut self.phase {
+            // Nothing to do while there is a probe in flight
+            if state.in_flight_probe.is_some() {
+                return None;
+            }
+
+            // Retransmit lost probes, if any
+            if 0 < state.lost_probe_count && state.lost_probe_count < MAX_PROBE_RETRANSMITS {
+                state.in_flight_probe = Some(next_pn);
+                return Some(state.last_probed_mtu);
+            }
+
+            let last_probe_succeeded = state.lost_probe_count == 0;
+
+            // The probe is definitely lost (we reached the MAX_PROBE_RETRANSMITS threshold)
+            if !last_probe_succeeded {
+                state.lost_probe_count = 0;
+                state.in_flight_probe = None;
+            }
+
+            if let Some(probe_udp_payload_size) = state.next_mtu_to_probe(last_probe_succeeded) {
+                state.in_flight_probe = Some(next_pn);
+                state.last_probed_mtu = probe_udp_payload_size;
+                return Some(probe_udp_payload_size);
+            } else {
+                let next_mtud_activation = now + self.config.interval;
+                self.phase = Phase::Complete(next_mtud_activation);
+                return None;
+            }
+        }
+
+        None
+    }
+
+    /// Called when a packet is acknowledged in [`SpaceId::Data`]
+    ///
+    /// Returns the new `current_mtu` if the packet number corresponds to the in-flight MTU probe
+    fn on_probe_acked(&mut self, pn: u64) -> Option<u16> {
+        match &mut self.phase {
+            Phase::Searching(state) if state.in_flight_probe == Some(pn) => {
+                state.in_flight_probe = None;
+                state.lost_probe_count = 0;
+                Some(state.last_probed_mtu)
+            }
+            _ => None,
+        }
+    }
+
+    /// Called when the in-flight MTU probe was lost
+    fn on_probe_lost(&mut self) {
+        // We might no longer be searching, e.g. if a black hole was detected
+        if let Phase::Searching(state) = &mut self.phase {
+            state.in_flight_probe = None;
+            state.lost_probe_count += 1;
+        }
+    }
+
+    /// Called when a black hole is detected
+    fn on_black_hole_detected(&mut self, now: Instant) {
+        // Stop searching, if applicable, and reset the timer
+        let next_mtud_activation = now + self.config.black_hole_cooldown;
+        self.phase = Phase::Complete(next_mtud_activation);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Phase {
+    /// We haven't started polling yet
+    Initial,
+    /// We are currently searching for a higher PMTU
+    Searching(SearchState),
+    /// Searching has completed and will be triggered again at the provided instant
+    Complete(Instant),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SearchState {
+    /// The lower bound for the current binary search
+    lower_bound: u16,
+    /// The upper bound for the current binary search
+    upper_bound: u16,
+    /// The minimum change to stop the current binary search
+    minimum_change: u16,
+    /// The UDP payload size we last sent a probe for
+    last_probed_mtu: u16,
+    /// Packet number of an in-flight probe (if any)
+    in_flight_probe: Option<u64>,
+    /// Lost probes at the current probe size
+    lost_probe_count: usize,
+}
+
+impl SearchState {
+    /// Creates a new search state, with the specified lower bound (the upper bound is derived from
+    /// the config and the peer's `max_udp_payload_size` transport parameter)
+    fn new(
+        mut lower_bound: u16,
+        peer_max_udp_payload_size: u16,
+        config: &MtuDiscoveryConfig,
+    ) -> Self {
+        lower_bound = lower_bound.min(peer_max_udp_payload_size);
+        let upper_bound = config
+            .upper_bound
+            .clamp(lower_bound, peer_max_udp_payload_size);
+
+        Self {
+            in_flight_probe: None,
+            lost_probe_count: 0,
+            lower_bound,
+            upper_bound,
+            minimum_change: config.minimum_change,
+            // During initialization, we consider the lower bound to have already been
+            // successfully probed
+            last_probed_mtu: lower_bound,
+        }
+    }
+
+    /// Determines the next MTU to probe using binary search
+            let peer_max_udp_payload_size =
+                u16::try_from(self.peer_params.max_udp_payload_size.into_inner())
+                    .unwrap_or(u16::MAX);
+            PathData::new(
+                remote,
+                self.allow_mtud,
+                Some(peer_max_udp_payload_size),
+                self.path_counter,
+                now,
+                &self.config,
+            )
+        };
+        new_path.challenge = Some(self.rng.random());
+        new_path.challenge_pending = true;
+        let prev_pto = self.pto(SpaceId::Data);
+
+        let mut prev = mem::replace(&mut self.path, new_path);
+        // Don't clobber the original path if the previous one hasn't been validated yet
+        if prev.challenge.is_none() {
+            prev.challenge = Some(self.rng.random());
+            prev.challenge_pending = true;
+            // We haven't updated the remote CID yet, this captures the remote CID we were using on
+            // the previous path.
+            self.prev_path = Some((self.rem_cids.active(), prev));
+        }
+
+        self.timers.set(
+            Timer::PathValidation,
+            now + 3 * cmp::max(self.pto(SpaceId::Data), prev_pto),
+        );
+    }
+
+    /// Handle a change in the local address, i.e. an active migration
+    pub fn local_address_changed(&mut self) {
+        self.update_rem_cid();
+        self.ping();
+    }
+
+    /// Switch to a previously unused remote connection ID, if possible
+    fn update_rem_cid(&mut self) {
+        let (reset_token, retired) = match self.rem_cids.next() {
+            Some(x) => x,
+            None => return,
+        };
+
+        // Retire the current remote CID and any CIDs we had to skip.
+        self.spaces[SpaceId::Data]
+            .pending
+            .retire_cids
+            .extend(retired);
+        self.set_reset_token(reset_token);
+    }
+
+    fn set_reset_token(&mut self, reset_token: ResetToken) {
+        self.endpoint_events
+            .push_back(EndpointEventInner::ResetToken(
+                self.path.remote,
+                reset_token,
+            ));
+        self.peer_params.stateless_reset_token = Some(reset_token);
+    }
+
+    /// Issue an initial set of connection IDs to the peer upon connection
+    fn issue_first_cids(&mut self, now: Instant) {
+        if self.local_cid_state.cid_len() == 0 {
+            return;
+        }
+
+        // Subtract 1 to account for the CID we supplied while handshaking
+        let mut n = self.peer_params.issue_cids_limit() - 1;
+        if let ConnectionSide::Server { server_config } = &self.side {
+            if server_config.has_preferred_address() {
+                // We also sent a CID in the transport parameters
+                n -= 1;
+            }
+        }
+        self.endpoint_events
+            .push_back(EndpointEventInner::NeedIdentifiers(now, n));
+    }
+
+    fn populate_packet(
+        &mut self,
+        now: Instant,
+        space_id: SpaceId,
+        buf: &mut Vec<u8>,
+        max_size: usize,
+        pn: u64,
+    ) -> SentFrames {
+        let mut sent = SentFrames::default();
+        let space = &mut self.spaces[space_id];
+        let is_0rtt = space_id == SpaceId::Data && space.crypto.is_none();
+        space.pending_acks.maybe_ack_non_eliciting();
+
+        // HANDSHAKE_DONE
+        if !is_0rtt && mem::replace(&mut space.pending.handshake_done, false) {
+            buf.write(frame::FrameType::HANDSHAKE_DONE);
+            sent.retransmits.get_or_create().handshake_done = true;
+            // This is just a u8 counter and the frame is typically just sent once
+            self.stats.frame_tx.handshake_done =
+                self.stats.frame_tx.handshake_done.saturating_add(1);
+        }
+
+        // PING
+        if mem::replace(&mut space.ping_pending, false) {
+            trace!("PING");
+            buf.write(frame::FrameType::PING);
+            sent.non_retransmits = true;
+            self.stats.frame_tx.ping += 1;
+        }
+
+        // IMMEDIATE_ACK
+        if mem::replace(&mut space.immediate_ack_pending, false) {
+            trace!("IMMEDIATE_ACK");
+            buf.write(frame::FrameType::IMMEDIATE_ACK);
+            sent.non_retransmits = true;
+            self.stats.frame_tx.immediate_ack += 1;
+        }
+
+        // ACK
+        if space.pending_acks.can_send() {
+            Self::populate_acks(
+// Function bodies in this module are regularly cfg'd out
+#![allow(unused_variables)]
+
+#[cfg(feature = "qlog")]
+use std::sync::{Arc, Mutex};
+
+#[cfg(feature = "qlog")]
+use qlog::{
+    events::{
+        Event, EventData,
+        quic::{
+            PacketHeader, PacketLost, PacketLostTrigger, PacketReceived, PacketSent, PacketType,
+        },
+    },
+    streamer::QlogStreamer,
+};
+#[cfg(feature = "qlog")]
+use tracing::warn;
+
+use crate::{
+    ConnectionId, Instant,
+    connection::{PathData, SentPacket},
+    packet::SpaceId,
+};
+
+/// Shareable handle to a single qlog output stream
+#[cfg(feature = "qlog")]
+#[derive(Clone)]
+pub struct QlogStream(pub(crate) Arc<Mutex<QlogStreamer>>);
+
+#[cfg(feature = "qlog")]
+impl QlogStream {
+    fn emit_event(&self, orig_rem_cid: ConnectionId, event: EventData, now: Instant) {
+        // Time will be overwritten by `add_event_with_instant`
+        let mut event = Event::with_time(0.0, event);
+        event.group_id = Some(orig_rem_cid.to_string());
+
+        let mut qlog_streamer = self.0.lock().unwrap();
+        if let Err(e) = qlog_streamer.add_event_with_instant(event, now) {
+            warn!("could not emit qlog event: {e}");
+        }
+    }
+}
+
+/// A [`QlogStream`] that may be either dynamically disabled or compiled out entirely
+#[derive(Clone, Default)]
+pub(crate) struct QlogSink {
+    #[cfg(feature = "qlog")]
+    stream: Option<QlogStream>,
+}
+
+impl QlogSink {
+    pub(crate) fn is_enabled(&self) -> bool {
+        #[cfg(feature = "qlog")]
+        {
+            self.stream.is_some()
+        }
+        #[cfg(not(feature = "qlog"))]
+        {
+            false
+        }
+    }
+
+    pub(super) fn emit_recovery_metrics(
+        &self,
+        pto_count: u32,
+        path: &mut PathData,
+        now: Instant,
+        orig_rem_cid: ConnectionId,
+    ) {
+        #[cfg(feature = "qlog")]
+        {
+            let Some(stream) = self.stream.as_ref() else {
+                return;
+            };
+
+            let Some(metrics) = path.qlog_recovery_metrics(pto_count) else {
+                return;
+            };
+
+            stream.emit_event(orig_rem_cid, EventData::MetricsUpdated(metrics), now);
+        }
+    }
+
+    pub(super) fn emit_packet_lost(
+        &self,
+        pn: u64,
+        info: &SentPacket,
+        lost_send_time: Instant,
+        space: SpaceId,
+        now: Instant,
+        orig_rem_cid: ConnectionId,
+    ) {
+        #[cfg(feature = "qlog")]
+        {
+            let Some(stream) = self.stream.as_ref() else {
+                return;
+            };
+
+            let event = PacketLost {
+                header: Some(PacketHeader {
+                    packet_number: Some(pn),
+                    packet_type: packet_type(space, false),
+                    length: Some(info.size),
+                    ..Default::default()
+                }),
+                frames: None,
+                trigger: Some(match info.time_sent <= lost_send_time {
+                    true => PacketLostTrigger::TimeThreshold,
+                    false => PacketLostTrigger::ReorderingThreshold,
+                }),
+            };
+
+            stream.emit_event(orig_rem_cid, EventData::PacketLost(event), now);
+        }
+    }
+
+    pub(super) fn emit_packet_sent(
+        &self,
+        pn: u64,
+        len: usize,
+        space: SpaceId,
+        is_0rtt: bool,
+        now: Instant,
+        orig_rem_cid: ConnectionId,
+    ) {
+        #[cfg(feature = "qlog")]
+        {
+            let Some(stream) = self.stream.as_ref() else {
+                return;
+            };
+
+            let event = PacketSent {
+                header: PacketHeader {
+                    packet_number: Some(pn),
+                    packet_type: packet_type(space, is_0rtt),
+                    length: Some(len as u16),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            stream.emit_event(orig_rem_cid, EventData::PacketSent(event), now);
+        }
+    }
+
+    pub(super) fn emit_packet_received(
+        &self,
+        pn: u64,
+        space: SpaceId,
+        is_0rtt: bool,
+        now: Instant,
+        orig_rem_cid: ConnectionId,
+    ) {
+        #[cfg(feature = "qlog")]
+        {
+            let Some(stream) = self.stream.as_ref() else {
+                return;
+            };
+
+            let event = PacketReceived {
+                header: PacketHeader {
+                    packet_number: Some(pn),
+                    packet_type: packet_type(space, is_0rtt),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            stream.emit_event(orig_rem_cid, EventData::PacketReceived(event), now);
+        }
+    }
+}
+
+#[cfg(feature = "qlog")]
+impl From<Option<QlogStream>> for QlogSink {
+    fn from(stream: Option<QlogStream>) -> Self {
+        Self { stream }
+    }
+}
+
+#[cfg(feature = "qlog")]
+fn packet_type(space: SpaceId, is_0rtt: bool) -> PacketType {
+    match space {
+        SpaceId::Initial => PacketType::Initial,
+        SpaceId::Handshake => PacketType::Handshake,
+        SpaceId::Data if is_0rtt => PacketType::ZeroRtt,
+        SpaceId::Data => PacketType::OneRtt,
+    }
+}
+///   outgoing connections.
+/// - The [`rustls::ClientConfig`] must have TLS 1.3 support enabled for conversion to succeed.
+///
+/// The object in the `resumption` field of the inner [`rustls::ClientConfig`] determines whether
+/// calling `into_0rtt` on outgoing connections returns `Ok` or `Err`. It typically allows
+/// `into_0rtt` to proceed if it recognizes the server name, and defaults to an in-memory cache of
+/// 256 server names.
+///
+/// [root_certs]: crate::config::ClientConfig::with_root_certificates()
+/// [platform]: crate::config::ClientConfig::with_platform_verifier()
+pub struct QuicClientConfig {
+    pub(crate) inner: Arc<rustls::ClientConfig>,
+    initial: Suite,
+}
+
+impl QuicClientConfig {
+    #[cfg(feature = "platform-verifier")]
+    pub(crate) fn with_platform_verifier() -> Result<Self, Error> {
+        // Keep in sync with `inner()` below
+        let mut inner = rustls::ClientConfig::builder_with_provider(configured_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap() // The default providers support TLS 1.3
+            .with_platform_verifier()?
+            .with_no_client_auth();
+
+        inner.enable_early_data = true;
+        Ok(Self {
+            // We're confident that the *ring* default provider contains TLS13_AES_128_GCM_SHA256
+            initial: initial_suite_from_provider(inner.crypto_provider())
+                .expect("no initial cipher suite found"),
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// Initialize a sane QUIC-compatible TLS client configuration
+    ///
+    /// QUIC requires that TLS 1.3 be enabled. Advanced users can use any [`rustls::ClientConfig`] that
+    /// satisfies this requirement.
+    pub(crate) fn new(verifier: Arc<dyn ServerCertVerifier>) -> Self {
+        let inner = Self::inner(verifier);
+        Self {
+            // We're confident that the *ring* default provider contains TLS13_AES_128_GCM_SHA256
+            initial: initial_suite_from_provider(inner.crypto_provider())
+                .expect("no initial cipher suite found"),
+            inner: Arc::new(inner),
+        }
+    }
+
+    /// Initialize a QUIC-compatible TLS client configuration with a separate initial cipher suite
+    ///
+    /// This is useful if you want to avoid the initial cipher suite for traffic encryption.
+    pub fn with_initial(
+        inner: Arc<rustls::ClientConfig>,
+        initial: Suite,
+    ) -> Result<Self, NoInitialCipherSuite> {
+        match initial.suite.common.suite {
+            CipherSuite::TLS13_AES_128_GCM_SHA256 => Ok(Self { inner, initial }),
+            _ => Err(NoInitialCipherSuite { specific: true }),
+        }
+    }
+
+    pub(crate) fn inner(verifier: Arc<dyn ServerCertVerifier>) -> rustls::ClientConfig {
+        // Keep in sync with `with_platform_verifier()` above
+        let mut config = rustls::ClientConfig::builder_with_provider(configured_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap() // The default providers support TLS 1.3
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+
+        config.enable_early_data = true;
+        config
+    }
+}
+
+impl crypto::ClientConfig for QuicClientConfig {
+    fn start_session(
+        self: Arc<Self>,
+        version: u32,
+        server_name: &str,
+        params: &TransportParameters,
+    ) -> Result<Box<dyn crypto::Session>, ConnectError> {
+        let version = interpret_version(version)?;
+        Ok(Box::new(TlsSession {
+            version,
+            got_handshake_data: false,
+                None => break,
+            };
+            // We may need to transmit STOP_SENDING even for streams whose state we have discarded,
+            // because we are able to discard local state for stopped streams immediately upon
+            // receiving FIN, even if the peer still has arbitrarily large amounts of data to
+            // (re)transmit due to loss or unconventional sending strategy. We could fine-tune this
+            // a little by dropping the frame if we specifically know the stream's been reset by the
+            // peer, but we discard that information as soon as the application consumes it, so it
+            // can't be relied upon regardless.
+            trace!(stream = %frame.id, "STOP_SENDING");
+            frame.encode(buf);
+            retransmits.get_or_create().stop_sending.push(frame);
+            stats.stop_sending += 1;
+        }
+
+        // MAX_DATA
+        if pending.max_data && buf.len() + 9 < max_size {
+            pending.max_data = false;
+
+            // `local_max_data` can grow bigger than `VarInt`.
+            // For transmission inside QUIC frames we need to clamp it to the
+            // maximum allowed `VarInt` size.
+            let max = VarInt::try_from(self.local_max_data).unwrap_or(VarInt::MAX);
+
+            trace!(value = max.into_inner(), "MAX_DATA");
+            if max > self.sent_max_data {
+                // Record that a `MAX_DATA` announcing a certain window was sent. This will
+                // suppress enqueuing further `MAX_DATA` frames unless either the previous
+                // transmission was not acknowledged or the window further increased.
+                self.sent_max_data = max;
+            }
+
+            retransmits.get_or_create().max_data = true;
+            buf.write(frame::FrameType::MAX_DATA);
+            buf.write(max);
+            stats.max_data += 1;
+        }
+
+        // MAX_STREAM_DATA
+        while buf.len() + 17 < max_size {
+            let id = match pending.max_stream_data.iter().next() {
+                Some(x) => *x,
+                None => break,
+            };
+            pending.max_stream_data.remove(&id);
+            let rs = match self
+                .recv
+                .get_mut(&id)
+                .and_then(|s| s.as_mut())
+                .and_then(|s| s.as_open_recv_mut())
+            {
+                Some(x) => x,
+                None => continue,
+            };
+            if !rs.can_send_flow_control() {
+                continue;
+            }
+            retransmits.get_or_create().max_stream_data.insert(id);
+
+            let (max, _) = rs.max_stream_data(self.stream_receive_window);
+            rs.record_sent_max_stream_data(max);
+
+            trace!(stream = %id, max = max, "MAX_STREAM_DATA");
+            buf.write(frame::FrameType::MAX_STREAM_DATA);
+            buf.write(id);
+            buf.write_var(max);
+            stats.max_stream_data += 1;
+        }
+
+        // MAX_STREAMS
+        for dir in Dir::iter() {
+            if !pending.max_stream_id[dir as usize] || buf.len() + 9 >= max_size {
+                continue;
+            }
+
+            pending.max_stream_id[dir as usize] = false;
+            retransmits.get_or_create().max_stream_id[dir as usize] = true;
+            self.sent_max_remote[dir as usize] = self.max_remote[dir as usize];
+            trace!(
+                value = self.max_remote[dir as usize],
+                "MAX_STREAMS ({:?})", dir
+            );
+            buf.write(match dir {
+                Dir::Uni => frame::FrameType::MAX_STREAMS_UNI,
+                Dir::Bi => frame::FrameType::MAX_STREAMS_BIDI,
+            });
+            buf.write_var(self.max_remote[dir as usize]);
+            match dir {
+                Dir::Uni => stats.max_streams_uni += 1,
+                Dir::Bi => stats.max_streams_bidi += 1,
+            }

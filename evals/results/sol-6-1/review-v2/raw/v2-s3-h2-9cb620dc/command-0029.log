@@ -1,0 +1,835 @@
+use crate::codec::Codec;
+use crate::frame::{self, Reason, StreamId};
+
+use bytes::Buf;
+use std::io;
+use std::task::{Context, Poll};
+use tokio::io::AsyncWrite;
+
+/// Manages our sending of GOAWAY frames.
+#[derive(Debug)]
+pub(super) struct GoAway {
+    /// Whether the connection should close now, or wait until idle.
+    close_now: bool,
+    /// Records if we've sent any GOAWAY before.
+    going_away: Option<GoingAway>,
+    /// Whether the user started the GOAWAY by calling `abrupt_shutdown`.
+    is_user_initiated: bool,
+    /// A GOAWAY frame that must be buffered in the Codec immediately.
+    pending: Option<frame::GoAway>,
+}
+
+/// Keeps a memory of any GOAWAY frames we've sent before.
+///
+/// This looks very similar to a `frame::GoAway`, but is a separate type. Why?
+/// Mostly for documentation purposes. This type is to record status. If it
+/// were a `frame::GoAway`, it might appear like we eventually wanted to
+/// serialize it. We **only** want to be able to look up these fields at a
+/// later time.
+#[derive(Debug)]
+pub(crate) struct GoingAway {
+    /// Stores the highest stream ID of a GOAWAY that has been sent.
+    ///
+    /// It's illegal to send a subsequent GOAWAY with a higher ID.
+    last_processed_id: StreamId,
+
+    /// Records the error code of any GOAWAY frame sent.
+    reason: Reason,
+}
+
+impl GoAway {
+    pub fn new() -> Self {
+        GoAway {
+            close_now: false,
+            going_away: None,
+            is_user_initiated: false,
+            pending: None,
+        }
+    }
+
+    /// Enqueue a GOAWAY frame to be written.
+    ///
+    /// The connection is expected to continue to run until idle.
+    pub fn go_away(&mut self, f: frame::GoAway) {
+        if let Some(ref going_away) = self.going_away {
+            assert!(
+                f.last_stream_id() <= going_away.last_processed_id,
+                "GOAWAY stream IDs shouldn't be higher; \
+                 last_processed_id = {:?}, f.last_stream_id() = {:?}",
+                going_away.last_processed_id,
+                f.last_stream_id(),
+            );
+        }
+
+        self.going_away = Some(GoingAway {
+            last_processed_id: f.last_stream_id(),
+            reason: f.reason(),
+        });
+        self.pending = Some(f);
+    }
+
+    pub fn go_away_now(&mut self, f: frame::GoAway) {
+        self.close_now = true;
+        if let Some(ref going_away) = self.going_away {
+            // Prevent sending the same GOAWAY twice.
+            if going_away.last_processed_id == f.last_stream_id() && going_away.reason == f.reason()
+            {
+                return;
+            }
+        }
+        self.go_away(f);
+    }
+
+    pub fn go_away_from_user(&mut self, f: frame::GoAway) {
+        self.is_user_initiated = true;
+        self.go_away_now(f);
+    }
+
+    /// Return if a GOAWAY has ever been scheduled.
+    pub fn is_going_away(&self) -> bool {
+        self.going_away.is_some()
+    }
+
+    pub fn is_user_initiated(&self) -> bool {
+        self.is_user_initiated
+    }
+
+    /// Returns the going away info, if any.
+    pub fn going_away(&self) -> Option<&GoingAway> {
+        self.going_away.as_ref()
+    }
+
+    /// Returns if the connection should close now, or wait until idle.
+    pub fn should_close_now(&self) -> bool {
+        self.pending.is_none() && self.close_now
+    }
+
+    /// Returns if the connection should be closed when idle.
+    pub fn should_close_on_idle(&self) -> bool {
+        !self.close_now
+            && self
+                .going_away
+                .as_ref()
+                .map(|g| g.last_processed_id != StreamId::MAX)
+                .unwrap_or(false)
+    }
+
+    /// Try to write a pending GOAWAY frame to the buffer.
+    ///
+    /// If a frame is written, the `Reason` of the GOAWAY is returned.
+    pub fn send_pending_go_away<T, B>(
+        &mut self,
+        cx: &mut Context,
+        dst: &mut Codec<T, B>,
+    ) -> Poll<Option<io::Result<Reason>>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        if let Some(frame) = self.pending.take() {
+            if !dst.poll_ready(cx)?.is_ready() {
+                self.pending = Some(frame);
+                return Poll::Pending;
+            }
+
+            let reason = frame.reason();
+            dst.buffer(frame.into()).expect("invalid GOAWAY frame");
+
+            return Poll::Ready(Some(Ok(reason)));
+        } else if self.should_close_now() {
+            return match self.going_away().map(|going_away| going_away.reason) {
+                Some(reason) => Poll::Ready(Some(Ok(reason))),
+                None => Poll::Ready(None),
+            };
+        }
+
+        Poll::Ready(None)
+    }
+}
+
+impl GoingAway {
+    pub(crate) fn reason(&self) -> Reason {
+        self.reason
+    }
+}
+        let last_processed_id = self.streams.last_processed_id();
+        let frame = frame::GoAway::new(last_processed_id, e);
+        self.go_away.go_away_from_user(frame);
+
+        // Notify all streams of reason we're abruptly closing.
+        self.streams.handle_error(Error::user_go_away(e));
+    }
+
+    fn handle_poll2_result(&mut self, result: Result<(), Error>) -> Result<(), Error> {
+        match result {
+            // The connection has shutdown normally
+            Ok(()) => {
+                *self.state = State::Closing(Reason::NO_ERROR, Initiator::Library);
+                Ok(())
+            }
+            // Attempting to read a frame resulted in a connection level
+            // error. This is handled by setting a GOAWAY frame followed by
+            // terminating the connection.
+            Err(Error::GoAway(debug_data, reason, initiator)) => {
+                self.handle_go_away(reason, debug_data, initiator);
+                Ok(())
+            }
+            // Attempting to read a frame resulted in a stream level error.
+            // This is handled by resetting the frame then trying to read
+            // another frame.
+            Err(Error::Reset(id, reason, initiator)) => {
+                debug_assert_eq!(initiator, Initiator::Library);
+                tracing::trace!(?id, ?reason, "stream error");
+                match self.streams.send_reset(id, reason) {
+                    Ok(()) => (),
+                    Err(crate::proto::error::GoAway { debug_data, reason }) => {
+                        self.handle_go_away(reason, debug_data, Initiator::Library);
+                    }
+                }
+                Ok(())
+            }
+            // Attempting to read a frame resulted in an I/O error. All
+            // active streams must be reset.
+            //
+            // TODO: Are I/O errors recoverable?
+            Err(Error::Io(kind, inner)) => {
+                tracing::debug!(error = ?kind, "Connection::poll; IO error");
+                let e = Error::Io(kind, inner);
+
+                // Reset all active streams
+                self.streams.handle_error(e.clone());
+
+                // Some client implementations drop the connections without notifying its peer
+                // Attempting to read after the client dropped the connection results in UnexpectedEof
+                // If as a server, we don't have anything more to send, just close the connection
+                // without error
+                //
+                // See https://github.com/hyperium/hyper/issues/3427
+                if self.streams.is_buffer_empty()
+                    && matches!(kind, io::ErrorKind::UnexpectedEof)
+                    && (self.streams.is_server()
+                        || self.error.as_ref().map(|f| f.reason() == Reason::NO_ERROR)
+                            == Some(true))
+                {
+                    *self.state = State::Closed(Reason::NO_ERROR, Initiator::Library);
+                    return Ok(());
+                }
+
+                // Return the error
+                Err(e)
+            }
+        }
+    }
+
+    fn handle_go_away(&mut self, reason: Reason, debug_data: Bytes, initiator: Initiator) {
+        let e = Error::GoAway(debug_data.clone(), reason, initiator);
+        tracing::debug!(error = ?e, "Connection::poll; connection error");
+
+        // We may have already sent a GOAWAY for this error,
+        // if so, don't send another, just flush and close up.
+        if self
+            .go_away
+            .going_away()
+            .map_or(false, |frame| frame.reason() == reason)
+        {
+            tracing::trace!("    -> already going away");
+            *self.state = State::Closing(reason, initiator);
+            return;
+        }
+
+        // Reset all active streams
+        self.streams.handle_error(e);
+        self.go_away_now_data(reason, debug_data);
+    }
+
+    fn recv_frame(&mut self, frame: Option<Frame>) -> Result<ReceivedFrame, Error> {
+        use crate::frame::Frame::*;
+        match frame {
+            Some(Headers(frame)) => {
+                tracing::trace!(?frame, "recv HEADERS");
+                self.streams.recv_headers(frame)?;
+            }
+            Some(Data(frame)) => {
+                tracing::trace!(?frame, "recv DATA");
+                self.streams.recv_data(frame)?;
+            }
+            Some(Reset(frame)) => {
+                tracing::trace!(?frame, "recv RST_STREAM");
+                self.streams.recv_reset(frame)?;
+            }
+            Some(PushPromise(frame)) => {
+                tracing::trace!(?frame, "recv PUSH_PROMISE");
+                self.streams.recv_push_promise(frame)?;
+            }
+            Some(Settings(frame)) => {
+                tracing::trace!(?frame, "recv SETTINGS");
+                return Ok(ReceivedFrame::Settings(frame));
+            }
+            Some(GoAway(frame)) => {
+                tracing::trace!(?frame, "recv GOAWAY");
+                // This should prevent starting new streams,
+                // but should allow continuing to process current streams
+                // until they are all EOS. Once they are, State should
+                // transition to GoAway.
+                self.streams.recv_go_away(&frame)?;
+                *self.error = Some(frame);
+            }
+            Some(Ping(frame)) => {
+                tracing::trace!(?frame, "recv PING");
+                let status = self.ping_pong.recv_ping(frame);
+                if status.is_shutdown() {
+use super::{DecoderError, NeedMore};
+use crate::ext::Protocol;
+
+use bytes::Bytes;
+use http::header::{HeaderName, HeaderValue};
+use http::{Method, StatusCode};
+use std::fmt;
+
+/// HTTP/2 Header
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum Header<T = HeaderName> {
+    Field { name: T, value: HeaderValue },
+    // TODO: Change these types to `http::uri` types.
+    Authority(BytesStr),
+    Method(Method),
+    Scheme(BytesStr),
+    Path(BytesStr),
+    Protocol(Protocol),
+    Status(StatusCode),
+}
+
+/// The header field name
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub enum Name<'a> {
+    Field(&'a HeaderName),
+    Authority,
+    Method,
+    Scheme,
+    Path,
+    Protocol,
+    Status,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Eq, PartialEq, Default)]
+pub struct BytesStr(Bytes);
+
+pub fn len(name: &HeaderName, value: &HeaderValue) -> usize {
+    let n: &str = name.as_ref();
+    32 + n.len() + value.len()
+}
+
+impl Header<Option<HeaderName>> {
+    pub fn reify(self) -> Result<Header, HeaderValue> {
+        use self::Header::*;
+
+        Ok(match self {
+            Field {
+                name: Some(n),
+                value,
+            } => Field { name: n, value },
+            Field { name: None, value } => return Err(value),
+            Authority(v) => Authority(v),
+            Method(v) => Method(v),
+            Scheme(v) => Scheme(v),
+            Path(v) => Path(v),
+            Protocol(v) => Protocol(v),
+            Status(v) => Status(v),
+        })
+    }
+}
+
+impl Header {
+    pub fn new(name: Bytes, value: Bytes) -> Result<Header, DecoderError> {
+        if name.is_empty() {
+            return Err(DecoderError::NeedMore(NeedMore::UnexpectedEndOfStream));
+        }
+        if name[0] == b':' {
+            match &name[1..] {
+                b"authority" => {
+                    let value = BytesStr::try_from(value)?;
+                    Ok(Header::Authority(value))
+                }
+                b"method" => {
+                    let method = Method::from_bytes(&value)?;
+                    Ok(Header::Method(method))
+                }
+                b"scheme" => {
+                    let value = BytesStr::try_from(value)?;
+                    Ok(Header::Scheme(value))
+                }
+                b"path" => {
+                    let value = BytesStr::try_from(value)?;
+                    Ok(Header::Path(value))
+                }
+                b"protocol" => {
+                    let value = Protocol::try_from(value)?;
+                    Ok(Header::Protocol(value))
+                }
+                b"status" => {
+                    let status = StatusCode::from_bytes(&value)?;
+                    Ok(Header::Status(status))
+                }
+                _ => Err(DecoderError::InvalidPseudoheader),
+            }
+        } else {
+            // HTTP/2 requires lower case header names
+            let name = HeaderName::from_lowercase(&name)?;
+            let value = HeaderValue::from_bytes(&value)?;
+
+            Ok(Header::Field { name, value })
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match *self {
+            Header::Field {
+                ref name,
+                ref value,
+            } => len(name, value),
+            Header::Authority(ref v) => 32 + 10 + v.len(),
+            Header::Method(ref v) => 32 + 7 + v.as_ref().len(),
+            Header::Scheme(ref v) => 32 + 7 + v.len(),
+            Header::Path(ref v) => 32 + 5 + v.len(),
+            Header::Protocol(ref v) => 32 + 9 + v.as_str().len(),
+            Header::Status(_) => 32 + 7 + 3,
+        }
+    }
+
+    /// Returns the header name
+    pub fn name(&self) -> Name<'_> {
+        match *self {
+            Header::Field { ref name, .. } => Name::Field(name),
+            Header::Authority(..) => Name::Authority,
+            Header::Method(..) => Name::Method,
+            Header::Scheme(..) => Name::Scheme,
+            Header::Path(..) => Name::Path,
+            Header::Protocol(..) => Name::Protocol,
+            Header::Status(..) => Name::Status,
+        }
+    }
+
+    pub fn value_slice(&self) -> &[u8] {
+        match *self {
+            Header::Field { ref value, .. } => value.as_ref(),
+            Header::Authority(ref v) => v.as_ref(),
+            Header::Method(ref v) => v.as_ref().as_ref(),
+            Header::Scheme(ref v) => v.as_ref(),
+            Header::Path(ref v) => v.as_ref(),
+            Header::Protocol(ref v) => v.as_ref(),
+            Header::Status(ref v) => v.as_str().as_ref(),
+        }
+    }
+
+    pub fn value_eq(&self, other: &Header) -> bool {
+        match *self {
+            Header::Field { ref value, .. } => {
+                let a = value;
+                match *other {
+                    Header::Field { ref value, .. } => a == value,
+                    _ => false,
+                }
+            }
+            Header::Authority(ref a) => match *other {
+                Header::Authority(ref b) => a == b,
+                _ => false,
+            },
+            Header::Method(ref a) => match *other {
+                Header::Method(ref b) => a == b,
+                _ => false,
+            },
+            Header::Scheme(ref a) => match *other {
+                Header::Scheme(ref b) => a == b,
+                _ => false,
+            },
+            Header::Path(ref a) => match *other {
+                Header::Path(ref b) => a == b,
+                _ => false,
+            },
+            Header::Protocol(ref a) => match *other {
+                Header::Protocol(ref b) => a == b,
+                _ => false,
+            },
+            Header::Status(ref a) => match *other {
+                Header::Status(ref b) => a == b,
+                _ => false,
+            },
+        }
+    }
+
+    pub fn is_sensitive(&self) -> bool {
+        match *self {
+            Header::Field { ref value, .. } => value.is_sensitive(),
+            // TODO: Technically these other header values can be sensitive too.
+            _ => false,
+        }
+    }
+
+    pub fn skip_value_index(&self) -> bool {
+        use http::header;
+use super::{util, StreamDependency, StreamId};
+use crate::ext::Protocol;
+use crate::frame::{Error, Frame, Head, Kind};
+use crate::hpack::{self, BytesStr};
+
+use http::header::{self, HeaderName, HeaderValue};
+use http::{uri, HeaderMap, Method, Request, StatusCode, Uri};
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+use std::fmt;
+use std::io::Cursor;
+
+type EncodeBuf<'a> = bytes::buf::Limit<&'a mut BytesMut>;
+
+/// Header frame
+///
+/// This could be either a request or a response.
+#[derive(Eq, PartialEq)]
+pub struct Headers {
+    /// The ID of the stream with which this frame is associated.
+    stream_id: StreamId,
+
+    /// The stream dependency information, if any.
+    stream_dep: Option<StreamDependency>,
+
+    /// The header block fragment
+    header_block: HeaderBlock,
+
+    /// The associated flags
+    flags: HeadersFlag,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub struct HeadersFlag(u8);
+
+#[derive(Eq, PartialEq)]
+pub struct PushPromise {
+    /// The ID of the stream with which this frame is associated.
+    stream_id: StreamId,
+
+    /// The ID of the stream being reserved by this PushPromise.
+    promised_id: StreamId,
+
+    /// The header block fragment
+    header_block: HeaderBlock,
+
+    /// The associated flags
+    flags: PushPromiseFlag,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub struct PushPromiseFlag(u8);
+
+#[derive(Debug)]
+pub struct Continuation {
+    /// Stream ID of continuation frame
+    stream_id: StreamId,
+
+    header_block: EncodingHeaderBlock,
+}
+
+// TODO: These fields shouldn't be `pub`
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct Pseudo {
+    // Request
+    pub method: Option<Method>,
+    pub scheme: Option<BytesStr>,
+    pub authority: Option<BytesStr>,
+    pub path: Option<BytesStr>,
+    pub protocol: Option<Protocol>,
+
+    // Response
+    pub status: Option<StatusCode>,
+}
+
+#[derive(Debug)]
+pub struct Iter {
+    /// Pseudo headers
+    pseudo: Option<Pseudo>,
+
+    /// Header fields
+    fields: header::IntoIter<HeaderValue>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HeaderBlock {
+    /// The decoded header fields
+    fields: HeaderMap,
+
+    /// Precomputed size of all of our header fields, for perf reasons
+    field_size: usize,
+
+    /// Set to true if decoding went over the max header list size.
+    is_over_size: bool,
+
+    /// Pseudo headers, these are broken out as they must be sent as part of the
+    /// headers frame.
+    pseudo: Pseudo,
+}
+
+#[derive(Debug)]
+struct EncodingHeaderBlock {
+    hpack: Bytes,
+}
+
+const END_STREAM: u8 = 0x1;
+const END_HEADERS: u8 = 0x4;
+const PADDED: u8 = 0x8;
+const PRIORITY: u8 = 0x20;
+const ALL: u8 = END_STREAM | END_HEADERS | PADDED | PRIORITY;
+
+// ===== impl Headers =====
+
+impl Headers {
+    /// Create a new HEADERS frame
+    pub fn new(stream_id: StreamId, pseudo: Pseudo, fields: HeaderMap) -> Self {
+        Headers {
+            stream_id,
+            stream_dep: None,
+            header_block: HeaderBlock {
+                field_size: calculate_headermap_size(&fields),
+                fields,
+                is_over_size: false,
+                pseudo,
+            },
+            flags: HeadersFlag::default(),
+        }
+    }
+
+    pub fn trailers(stream_id: StreamId, fields: HeaderMap) -> Self {
+        let mut flags = HeadersFlag::default();
+        flags.set_end_stream();
+
+        Headers {
+            stream_id,
+            stream_dep: None,
+            header_block: HeaderBlock {
+                field_size: calculate_headermap_size(&fields),
+                fields,
+                is_over_size: false,
+                pseudo: Pseudo::default(),
+            },
+            flags,
+        }
+use crate::Reason;
+
+use super::*;
+
+use std::fmt;
+use std::task::{Context, Waker};
+use std::time::Instant;
+
+/// Tracks Stream related state
+///
+/// # Reference counting
+///
+/// There can be a number of outstanding handles to a single Stream. These are
+/// tracked using reference counting. The `ref_count` field represents the
+/// number of outstanding userspace handles that can reach this stream.
+///
+/// It's important to note that when the stream is placed in an internal queue
+/// (such as an accept queue), this is **not** tracked by a reference count.
+/// Thus, `ref_count` can be zero and the stream still has to be kept around.
+pub(super) struct Stream {
+    /// The h2 stream identifier
+    pub id: StreamId,
+
+    /// Current state of the stream
+    pub state: State,
+
+    /// Set to `true` when the stream is counted against the connection's max
+    /// concurrent streams.
+    pub is_counted: bool,
+
+    /// Number of outstanding handles pointing to this stream
+    pub ref_count: usize,
+
+    // ===== Fields related to sending =====
+    /// Next node in the accept linked list
+    pub next_pending_send: Option<store::Key>,
+
+    /// Set to true when the stream is pending accept
+    pub is_pending_send: bool,
+
+    /// Send data flow control
+    pub send_flow: FlowControl,
+
+    /// Amount of send capacity that has been requested, but not yet allocated.
+    pub requested_send_capacity: WindowSize,
+
+    /// Amount of data buffered at the prioritization layer.
+    /// TODO: Technically this could be greater than the window size...
+    pub buffered_send_data: usize,
+
+    /// Task tracking additional send capacity (i.e. window updates).
+    send_task: Option<Waker>,
+
+    /// Frames pending for this stream being sent to the socket
+    pub pending_send: buffer::Deque,
+
+    /// Next node in the linked list of streams waiting for additional
+    /// connection level capacity.
+    pub next_pending_send_capacity: Option<store::Key>,
+
+    /// True if the stream is waiting for outbound connection capacity
+    pub is_pending_send_capacity: bool,
+
+    /// Set to true when the send capacity has been incremented
+    pub send_capacity_inc: bool,
+
+    /// Next node in the open linked list
+    pub next_open: Option<store::Key>,
+
+    /// Set to true when the stream is pending to be opened
+    pub is_pending_open: bool,
+
+    /// Set to true when a push is pending for this stream
+    pub is_pending_push: bool,
+
+    // ===== Fields related to receiving =====
+    /// Next node in the accept linked list
+    pub next_pending_accept: Option<store::Key>,
+
+    /// Set to true when the stream is pending accept
+    pub is_pending_accept: bool,
+
+    /// Receive data flow control
+    pub recv_flow: FlowControl,
+
+    pub in_flight_recv_data: WindowSize,
+
+    /// Next node in the linked list of streams waiting to send window updates.
+    pub next_window_update: Option<store::Key>,
+
+    /// True if the stream is waiting to send a window update
+    pub is_pending_window_update: bool,
+
+    /// The time when this stream may have been locally reset.
+    pub reset_at: Option<Instant>,
+
+    /// Next node in list of reset streams that should expire eventually
+    pub next_reset_expire: Option<store::Key>,
+
+    /// Frames pending for this stream to read
+    pub pending_recv: buffer::Deque,
+
+    /// When the RecvStream drop occurs, no data should be received.
+    pub is_recv: bool,
+
+    /// Task tracking receiving frames
+    pub recv_task: Option<Waker>,
+
+    /// Task tracking pushed promises.
+    pub push_task: Option<Waker>,
+
+    /// The stream's pending push promises
+    pub pending_push_promises: store::Queue<NextAccept>,
+
+    /// Validate content-length headers
+    pub content_length: ContentLength,
+}
+
+/// State related to validating a stream's content-length
+#[derive(Debug)]
+pub enum ContentLength {
+    Omitted,
+    Head,
+    Remaining(u64),
+}
+
+#[derive(Debug)]
+pub(super) struct NextAccept;
+
+#[derive(Debug)]
+pub(super) struct NextSend;
+
+#[derive(Debug)]
+pub(super) struct NextSendCapacity;
+
+#[derive(Debug)]
+pub(super) struct NextWindowUpdate;
+
+#[derive(Debug)]
+pub(super) struct NextOpen;
+
+#[derive(Debug)]
+pub(super) struct NextResetExpire;
+
+impl Stream {
+    pub fn new(id: StreamId, init_send_window: WindowSize, init_recv_window: WindowSize) -> Stream {
+        let mut send_flow = FlowControl::new();
+        let mut recv_flow = FlowControl::new();
+
+        recv_flow
+            .inc_window(init_recv_window)
+            .expect("invalid initial receive window");
+        // TODO: proper error handling?
+        let _res = recv_flow.assign_capacity(init_recv_window);
+        debug_assert!(_res.is_ok());
+
+        send_flow
+            .inc_window(init_send_window)
+            .expect("invalid initial send window size");
+
+        Stream {
+            id,
+            state: State::default(),
+            ref_count: 0,
+            is_counted: false,
+
+            // ===== Fields related to sending =====
+            next_pending_send: None,
+            is_pending_send: false,
+            send_flow,
+            requested_send_capacity: 0,
+            buffered_send_data: 0,
+            send_task: None,
+            pending_send: buffer::Deque::new(),
+            is_pending_send_capacity: false,
+            next_pending_send_capacity: None,
+            send_capacity_inc: false,
+            is_pending_open: false,
+            next_open: None,
+            is_pending_push: false,
+
+            // ===== Fields related to receiving =====
+            next_pending_accept: None,
+            is_pending_accept: false,
+            recv_flow,
+            in_flight_recv_data: 0,
+            next_window_update: None,
+            is_pending_window_update: false,
+            reset_at: None,
+            next_reset_expire: None,
+            pending_recv: buffer::Deque::new(),
+            is_recv: true,
+            recv_task: None,
+            push_task: None,
+            pending_push_promises: store::Queue::new(),
+            content_length: ContentLength::Omitted,
+        }
+    }
+
+    /// Increment the stream's ref count
+    pub fn ref_inc(&mut self) {
+        assert!(self.ref_count < usize::MAX);
+        self.ref_count += 1;
+    }
+
+    /// Decrements the stream's ref count
+    pub fn ref_dec(&mut self) {
+        assert!(self.ref_count > 0);
+        self.ref_count -= 1;
+    }
+
+    /// Returns true if stream is currently being held for some time because of
+    /// a local reset.
+    pub fn is_pending_reset_expiration(&self) -> bool {
+        self.reset_at.is_some()
+    }
+
+    /// Returns true if frames for this stream are ready to be sent over the wire
+    pub fn is_send_ready(&self) -> bool {
+        // Why do we check pending_open?

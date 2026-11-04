@@ -1,0 +1,726 @@
+        self
+    }
+
+    /// Sets the max size of received header frames.
+    ///
+    /// This advisory setting informs a peer of the maximum size of header list
+    /// that the sender is prepared to accept, in octets. The value is based on
+    /// the uncompressed size of header fields, including the length of the name
+    /// and value in octets plus an overhead of 32 octets for each header field.
+    ///
+    /// This setting is also used to limit the maximum amount of data that is
+    /// buffered to decode HEADERS frames.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use tokio::io::{AsyncRead, AsyncWrite};
+    /// # use h2::client::*;
+    /// # use bytes::Bytes;
+    /// #
+    /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
+    /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), h2::Error>
+    /// # {
+    /// // `client_fut` is a future representing the completion of the HTTP/2
+    /// // handshake.
+    /// let client_fut = Builder::new()
+    ///     .max_header_list_size(16 * 1024)
+    ///     .handshake(my_io);
+    /// # client_fut.await
+    /// # }
+    /// #
+    /// # pub fn main() {}
+    /// ```
+    pub fn max_header_list_size(&mut self, max: u32) -> &mut Self {
+        self.settings.set_max_header_list_size(Some(max));
+        self
+    }
+
+    /// Sets the maximum number of concurrent streams.
+    ///
+    /// The maximum concurrent streams setting only controls the maximum number
+
+    fn recv_headers<B>(
+        &mut self,
+        peer: peer::Dyn,
+        send_buffer: &SendBuffer<B>,
+        frame: frame::Headers,
+    ) -> Result<(), Error> {
+        let id = frame.stream_id();
+
+        // The GOAWAY process has begun. All streams with a greater ID than
+        // specified as part of GOAWAY should be ignored.
+        if id > self.actions.recv.max_stream_id() {
+            tracing::trace!(
+                "id ({:?}) > max_stream_id ({:?}), ignoring HEADERS",
+                id,
+                self.actions.recv.max_stream_id()
+            );
+            return Ok(());
+        }
+
+        let key = match self.store.find_entry(id) {
+            Entry::Occupied(e) => e.key(),
+            Entry::Vacant(e) => {
+                // Client: it's possible to send a request, and then send
+                // a RST_STREAM while the response HEADERS were in transit.
+                //
+                // Server: we can't reset a stream before having received
+                // the request headers, so don't allow.
+                if !peer.is_server() {
+                    // This may be response headers for a stream we've already
+                    // forgotten about...
+                    if self.actions.may_have_forgotten_stream(peer, id) {
+                        tracing::debug!(
+                            "recv_headers for old stream={:?}, sending STREAM_CLOSED",
+                            id,
+                        );
+                        return Err(Error::library_reset(id, Reason::STREAM_CLOSED));
+                    }
+                }
+
+                match self
+                    .actions
+                    .recv
+                    .open(id, Open::Headers, &mut self.counts)?
+                {
+                    Some(stream_id) => {
+                        let stream = Stream::new(
+                            stream_id,
+                            self.actions.send.init_window_sz(),
+                            self.actions.recv.init_window_sz(),
+                        );
+
+                        e.insert(stream)
+                    }
+                    None => return Ok(()),
+                }
+            }
+        };
+
+        let stream = self.store.resolve(key);
+
+        if stream.state.is_local_error() {
+            // Locally reset streams must ignore frames "for some time".
+            // This is because the remote may have sent trailers before
+            // receiving the RST_STREAM frame.
+            tracing::trace!("recv_headers; ignoring trailers on {:?}", stream.id);
+            return Ok(());
+        }
+
+        let actions = &mut self.actions;
+        let mut send_buffer = send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        self.counts.transition(stream, |counts, stream| {
+            tracing::trace!(
+                "recv_headers; stream={:?}; state={:?}",
+                stream.id,
+                stream.state
+            );
+
+            let res = if stream.state.is_recv_headers() {
+                match actions.recv.recv_headers(frame, stream, counts) {
+                    Ok(()) => Ok(()),
+                    Err(RecvHeaderBlockError::Oversize(resp)) => {
+                        if let Some(resp) = resp {
+                            let sent = actions.send.send_headers(
+                                resp, send_buffer, stream, counts, &mut actions.task);
+                            debug_assert!(sent.is_ok(), "oversize response should not fail");
+
+                            actions.send.schedule_implicit_reset(
+                                stream,
+                                Reason::PROTOCOL_ERROR,
+                                counts,
+                                &mut actions.task);
+
+                            actions.recv.enqueue_reset_expiration(stream, counts);
+
+                            Ok(())
+                        } else {
+                            Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR))
+                        }
+                    },
+                    Err(RecvHeaderBlockError::State(err)) => Err(err),
+                }
+            } else {
+                if !frame.is_end_stream() {
+                    // Receiving trailers that don't set EOS is a "malformed"
+                    // message. Malformed messages are a stream error.
+                    proto_err!(stream: "recv_headers: trailers frame was not EOS; stream={:?}", stream.id);
+                    return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
+                }
+
+                actions.recv.recv_trailers(frame, stream)
+            };
+
+            actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
+        })
+    }
+
+    fn recv_data<B>(
+        &mut self,
+        peer: peer::Dyn,
+        send_buffer: &SendBuffer<B>,
+        frame: frame::Data,
+    ) -> Result<(), Error> {
+        let id = frame.stream_id();
+
+        let stream = match self.store.find_mut(&id) {
+            Some(stream) => stream,
+            None => {
+                // The GOAWAY process has begun. All streams with a greater ID
+                // than specified as part of GOAWAY should be ignored.
+                if id > self.actions.recv.max_stream_id() {
+                    tracing::trace!(
+                        "id ({:?}) > max_stream_id ({:?}), ignoring DATA",
+                        id,
+                        self.actions.recv.max_stream_id()
+                    );
+                    return Ok(());
+                }
+
+                if self.actions.may_have_forgotten_stream(peer, id) {
+                    tracing::debug!("recv_data for old stream={:?}, sending STREAM_CLOSED", id,);
+
+                    let sz = frame.payload().len();
+                    // This should have been enforced at the codec::FramedRead layer, so
+                    // this is just a sanity check.
+                    assert!(sz <= super::MAX_WINDOW_SIZE as usize);
+                    let sz = sz as WindowSize;
+
+                    self.actions.recv.ignore_data(sz)?;
+                    return Err(Error::library_reset(id, Reason::STREAM_CLOSED));
+                }
+
+                proto_err!(conn: "recv_data: stream not found; id={:?}", id);
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+            }
+        };
+
+        let actions = &mut self.actions;
+        let mut send_buffer = send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        self.counts.transition(stream, |counts, stream| {
+            let sz = frame.payload().len();
+            let res = actions.recv.recv_data(frame, stream);
+
+            // Any stream error after receiving a DATA frame means
+            // we won't give the data to the user, and so they can't
+            // release the capacity. We do it automatically.
+            if let Err(Error::Reset(..)) = res {
+                actions
+                    .recv
+                    .release_connection_capacity(sz as WindowSize, &mut None);
+            }
+            actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
+        })
+    }
+
+    fn recv_reset<B>(
+        &mut self,
+        send_buffer: &SendBuffer<B>,
+        frame: frame::Reset,
+    ) -> Result<(), Error> {
+        let id = frame.stream_id();
+
+        if id.is_zero() {
+            proto_err!(conn: "recv_reset: invalid stream ID 0");
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+        }
+
+        // The GOAWAY process has begun. All streams with a greater ID than
+        // specified as part of GOAWAY should be ignored.
+        if id > self.actions.recv.max_stream_id() {
+            tracing::trace!(
+                "id ({:?}) > max_stream_id ({:?}), ignoring RST_STREAM",
+                id,
+                self.actions.recv.max_stream_id()
+            );
+            return Ok(());
+        }
+
+        let stream = match self.store.find_mut(&id) {
+            Some(stream) => stream,
+            None => {
+                // TODO: Are there other error cases?
+                self.actions
+                    .ensure_not_idle(self.counts.peer(), id)
+                    .map_err(Error::library_go_away)?;
+
+                return Ok(());
+            }
+        };
+
+        let mut send_buffer = send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        let actions = &mut self.actions;
+
+        self.counts.transition(stream, |counts, stream| {
+            actions.recv.recv_reset(frame, stream, counts)?;
+            actions.send.handle_error(send_buffer, stream, counts);
+            assert!(stream.state.is_closed());
+            Ok(())
+        })
+    }
+
+    fn recv_window_update<B>(
+        &mut self,
+        send_buffer: &SendBuffer<B>,
+        frame: frame::WindowUpdate,
+    ) -> Result<(), Error> {
+        let id = frame.stream_id();
+
+        let mut send_buffer = send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        if id.is_zero() {
+            self.actions
+                .send
+                .recv_connection_window_update(frame, &mut self.store, &mut self.counts)
+                .map_err(Error::library_go_away)?;
+        } else {
+            // The remote may send window updates for streams that the local now
+            // considers closed. It's ok...
+            if let Some(mut stream) = self.store.find_mut(&id) {
+                let res = self
+                    .actions
+                    .send
+                    .recv_stream_window_update(
+                        frame.size_increment(),
+                        send_buffer,
+                        &mut stream,
+                        &mut self.counts,
+                        &mut self.actions.task,
+                    )
+                    .map_err(|reason| Error::library_reset(id, reason));
+
+                return self.actions.reset_on_recv_stream_err(
+                    send_buffer,
+                    &mut stream,
+                    &mut self.counts,
+                    res,
+                );
+            } else {
+                self.actions
+                    .ensure_not_idle(self.counts.peer(), id)
+                    .map_err(Error::library_go_away)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_error<B>(&mut self, send_buffer: &SendBuffer<B>, err: proto::Error) -> StreamId {
+        let actions = &mut self.actions;
+        let counts = &mut self.counts;
+        let mut send_buffer = send_buffer.inner.lock().unwrap();
+        let send_buffer = &mut *send_buffer;
+
+        let last_processed_id = actions.recv.last_processed_id();
+use super::table::{Index, Table};
+use super::{huffman, Header};
+
+use bytes::{BufMut, BytesMut};
+use http::header::{HeaderName, HeaderValue};
+
+#[derive(Debug)]
+pub struct Encoder {
+    table: Table,
+    size_update: Option<SizeUpdate>,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum SizeUpdate {
+    One(usize),
+    Two(usize, usize), // min, max
+}
+
+impl Encoder {
+    pub fn new(max_size: usize, capacity: usize) -> Encoder {
+        Encoder {
+            table: Table::new(max_size, capacity),
+            size_update: None,
+        }
+    }
+
+    /// Queues a max size update.
+    ///
+    /// The next call to `encode` will include a dynamic size update frame.
+    pub fn update_max_size(&mut self, val: usize) {
+        match self.size_update {
+            Some(SizeUpdate::One(old)) => {
+                if val > old {
+                    if old > self.table.max_size() {
+                        self.size_update = Some(SizeUpdate::One(val));
+                    } else {
+                        self.size_update = Some(SizeUpdate::Two(old, val));
+                    }
+                } else {
+                    self.size_update = Some(SizeUpdate::One(val));
+                }
+            }
+            Some(SizeUpdate::Two(min, _)) => {
+                if val < min {
+                    self.size_update = Some(SizeUpdate::One(val));
+                } else {
+                    self.size_update = Some(SizeUpdate::Two(min, val));
+                }
+            }
+            None => {
+                if val != self.table.max_size() {
+                    // Don't bother writing a frame if the value already matches
+                    // the table's max size.
+                    self.size_update = Some(SizeUpdate::One(val));
+                }
+            }
+        }
+    }
+
+    /// Encode a set of headers into the provide buffer
+    pub fn encode<I>(&mut self, headers: I, dst: &mut BytesMut)
+    where
+        I: IntoIterator<Item = Header<Option<HeaderName>>>,
+    {
+        let span = tracing::trace_span!("hpack::encode");
+        let _e = span.enter();
+
+        self.encode_size_updates(dst);
+
+        let mut last_index = None;
+
+        for header in headers {
+            match header.reify() {
+                // The header has an associated name. In which case, try to
+                // index it in the table.
+                Ok(header) => {
+                    let index = self.table.index(header);
+                    self.encode_header(&index, dst);
+
+                    last_index = Some(index);
+                }
+                // The header does not have an associated name. This means that
+                // the name is the same as the previously yielded header. In
+                // which case, we skip table lookup and just use the same index
+                // as the previous entry.
+                Err(value) => {
+                    self.encode_header_without_name(
+                        last_index.as_ref().unwrap_or_else(|| {
+                            panic!("encoding header without name, but no previous index to use for name");
+                        }),
+                        &value,
+                        dst,
+                    );
+                }
+            }
+        }
+    }
+
+    fn encode_size_updates(&mut self, dst: &mut BytesMut) {
+        match self.size_update.take() {
+            Some(SizeUpdate::One(val)) => {
+                self.table.resize(val);
+                encode_size_update(val, dst);
+            }
+            Some(SizeUpdate::Two(min, max)) => {
+                self.table.resize(min);
+                self.table.resize(max);
+                encode_size_update(min, dst);
+                encode_size_update(max, dst);
+            }
+            None => {}
+        }
+    }
+
+    fn encode_header(&mut self, index: &Index, dst: &mut BytesMut) {
+        match *index {
+            Index::Indexed(idx, _) => {
+                encode_int(idx, 7, 0x80, dst);
+            }
+            Index::Name(idx, _) => {
+                let header = self.table.resolve(index);
+
+                encode_not_indexed(idx, header.value_slice(), header.is_sensitive(), dst);
+            }
+            Index::Inserted(_) => {
+                let header = self.table.resolve(index);
+
+                assert!(!header.is_sensitive());
+
+                dst.put_u8(0b0100_0000);
+
+                encode_str(header.name().as_slice(), dst);
+                encode_str(header.value_slice(), dst);
+            }
+            Index::InsertedValue(idx, _) => {
+                let header = self.table.resolve(index);
+
+                assert!(!header.is_sensitive());
+
+                encode_int(idx, 6, 0b0100_0000, dst);
+                encode_str(header.value_slice(), dst);
+            }
+            Index::NotIndexed(_) => {
+                let header = self.table.resolve(index);
+
+                encode_not_indexed2(
+                    header.name().as_slice(),
+                    header.value_slice(),
+                    header.is_sensitive(),
+                    dst,
+                );
+            }
+        }
+    }
+
+    fn encode_header_without_name(
+        &mut self,
+        last: &Index,
+        value: &HeaderValue,
+        dst: &mut BytesMut,
+    ) {
+        match *last {
+            Index::Indexed(..)
+            | Index::Name(..)
+            | Index::Inserted(..)
+            | Index::InsertedValue(..) => {
+                let idx = self.table.resolve_idx(last);
+
+                encode_not_indexed(idx, value.as_ref(), value.is_sensitive(), dst);
+            }
+            Index::NotIndexed(_) => {
+                let last = self.table.resolve(last);
+
+                encode_not_indexed2(
+                    last.name().as_slice(),
+                    value.as_ref(),
+                    value.is_sensitive(),
+                    dst,
+                );
+            }
+        }
+    }
+}
+
+impl Default for Encoder {
+    fn default() -> Encoder {
+        Encoder::new(4096, 0)
+    }
+}
+
+fn encode_size_update(val: usize, dst: &mut BytesMut) {
+    encode_int(val, 5, 0b0010_0000, dst)
+}
+
+fn encode_not_indexed(name: usize, value: &[u8], sensitive: bool, dst: &mut BytesMut) {
+    if sensitive {
+        encode_int(name, 4, 0b10000, dst);
+    } else {
+        encode_int(name, 4, 0, dst);
+    }
+
+    encode_str(value, dst);
+}
+
+fn encode_not_indexed2(name: &[u8], value: &[u8], sensitive: bool, dst: &mut BytesMut) {
+    if sensitive {
+        dst.put_u8(0b10000);
+    } else {
+        dst.put_u8(0);
+    }
+
+    encode_str(name, dst);
+    encode_str(value, dst);
+}
+
+use super::{header::BytesStr, huffman, Header};
+use crate::frame;
+
+use bytes::{Buf, Bytes, BytesMut};
+use http::header;
+use http::method::{self, Method};
+use http::status::{self, StatusCode};
+
+use std::cmp;
+use std::collections::VecDeque;
+use std::io::Cursor;
+use std::str::Utf8Error;
+
+/// Decodes headers using HPACK
+#[derive(Debug)]
+pub struct Decoder {
+    // Protocol indicated that the max table size will update
+    max_size_update: Option<usize>,
+    last_max_update: usize,
+    table: Table,
+    buffer: BytesMut,
+}
+
+/// Represents all errors that can be encountered while performing the decoding
+/// of an HPACK header set.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum DecoderError {
+    InvalidRepresentation,
+    InvalidIntegerPrefix,
+    InvalidTableIndex,
+    InvalidHuffmanCode,
+    InvalidUtf8,
+    InvalidStatusCode,
+    InvalidPseudoheader,
+    InvalidMaxDynamicSize,
+    IntegerOverflow,
+    NeedMore(NeedMore),
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum NeedMore {
+    UnexpectedEndOfStream,
+    IntegerUnderflow,
+    StringUnderflow,
+}
+
+enum Representation {
+    /// Indexed header field representation
+    ///
+    /// An indexed header field representation identifies an entry in either the
+    /// static table or the dynamic table (see Section 2.3).
+    ///
+    /// # Header encoding
+    ///
+    /// ```text
+    ///   0   1   2   3   4   5   6   7
+    /// +---+---+---+---+---+---+---+---+
+    /// | 1 |        Index (7+)         |
+    /// +---+---------------------------+
+    /// ```
+    Indexed,
+
+    /// Literal Header Field with Incremental Indexing
+    ///
+    /// A literal header field with incremental indexing representation results
+    /// in appending a header field to the decoded header list and inserting it
+    /// as a new entry into the dynamic table.
+    ///
+    /// # Header encoding
+    ///
+    /// ```text
+    ///   0   1   2   3   4   5   6   7
+    /// +---+---+---+---+---+---+---+---+
+    /// | 0 | 1 |      Index (6+)       |
+    /// +---+---+-----------------------+
+    /// | H |     Value Length (7+)     |
+    /// +---+---------------------------+
+    /// | Value String (Length octets)  |
+    /// +-------------------------------+
+    /// ```
+    LiteralWithIndexing,
+
+    /// Literal Header Field without Indexing
+    ///
+    /// A literal header field without indexing representation results in
+    /// appending a header field to the decoded header list without altering the
+    /// dynamic table.
+    ///
+    /// # Header encoding
+    ///
+    /// ```text
+    ///   0   1   2   3   4   5   6   7
+    /// +---+---+---+---+---+---+---+---+
+    /// | 0 | 0 | 0 | 0 |  Index (4+)   |
+    /// +---+---+-----------------------+
+    /// | H |     Value Length (7+)     |
+    /// +---+---------------------------+
+    /// | Value String (Length octets)  |
+    /// +-------------------------------+
+    /// ```
+    LiteralWithoutIndexing,
+
+    /// Literal Header Field Never Indexed
+    ///
+    /// A literal header field never-indexed representation results in appending
+    /// a header field to the decoded header list without altering the dynamic
+    /// table. Intermediaries MUST use the same representation for encoding this
+    /// header field.
+    ///
+    /// ```text
+    ///   0   1   2   3   4   5   6   7
+    /// +---+---+---+---+---+---+---+---+
+    /// | 0 | 0 | 0 | 1 |  Index (4+)   |
+    /// +---+---+-----------------------+
+    /// | H |     Value Length (7+)     |
+    /// +---+---------------------------+
+    /// | Value String (Length octets)  |
+    /// +-------------------------------+
+    /// ```
+    LiteralNeverIndexed,
+
+    /// Dynamic Table Size Update
+    ///
+    /// A dynamic table size update signals a change to the size of the dynamic
+    /// table.
+    ///
+    /// # Header encoding
+    ///
+    /// ```text
+    ///   0   1   2   3   4   5   6   7
+    /// +---+---+---+---+---+---+---+---+
+    /// | 0 | 0 | 1 |   Max size (5+)   |
+    /// +---+---------------------------+
+    /// ```
+    SizeUpdate,
+}
+
+#[derive(Debug)]
+struct Table {
+    entries: VecDeque<Header>,
+    size: usize,
+    max_size: usize,
+}
+
+struct StringMarker {
+    offset: usize,
+    len: usize,
+    string: Option<Bytes>,
+}
+
+// ===== impl Decoder =====
+
+impl Decoder {
+    /// Creates a new `Decoder` with all settings set to default values.
+    pub fn new(size: usize) -> Decoder {
+        Decoder {
+            max_size_update: None,
+            last_max_update: size,
+            table: Table::new(size),
+            buffer: BytesMut::with_capacity(4096),
+# Testing
+
+**TEST-1. Unit tests live in an inline `#[cfg(test)] mod tests`** at the bottom of the file they test, with `use super::*;`. memchr, jiff, and fd all follow this; jiff has test modules in 35 source files.
+
+**TEST-2. Integration tests live under `tests/`** and exercise only the public API or the built binary. Group them by feature area in separate files (ripgrep: `binary.rs`, `json.rs`, `multiline.rs`, `regression.rs`). Share helpers through a `tests/util.rs` or `tests/common/mod.rs` module, not by copying.
+
+**TEST-3. Regression tests reference the issue and cover the bug class.** A bug fix adds a test that fails without the fix, named after the issue or placed in a regression file with a link (ripgrep's `tests/regression.rs` holds over 100, named after issue numbers such as `r16`). Do not stop at the exact reported input: add the neighboring cases that the same root cause breaks (more elements, a different order, a combination with other inputs), because a second symptom of the same defect is common.
+
+**TEST-4. Test behavior, not implementation.** Assert observable results and properties. Do not write tests that restate a constant, duplicate the function's own logic to compute the expected value, or mirror its branches one to one.
+
+**TEST-5. Check invariants broadly, without new dependencies first.** When you can state a property (no panic on any input, round trips, equivalence with a naive implementation), the first tool is a plain test: enumerate every input up to a small length over a relevant alphabet, or run a seeded loop of random inputs against a naive reference. That catches most edge cases with no new crates. Reach for `quickcheck` or `proptest` only when the crate already depends on one, or when failures are hard to minimize by hand. memchr checks its SIMD routines against a naive byte loop this way.
+
+**TEST-6. Test names describe the scenario and outcome**: `parse_rejects_empty_unit`, not `test1` or `test_parse`.
+
+**TEST-7. Edge cases are explicit tests**: empty input, one element, maximum sizes, boundaries, non-UTF-8 paths and bytes, and every documented error and panic (`#[should_panic(expected = "...")]`).
+
+**TEST-8. Doc examples are tests.** `cargo test` runs them; keep them meaningful with assertions rather than bare calls.
+
+**TEST-9. Readable assertions.** One behavior per test. `assert_eq!(actual, expected)` with values a reader can verify. For large text output, use a helper that prints a readable diff (ripgrep's `eqnice!` macro), or snapshot testing (`insta`) for stable rendered output, as dua-cli does with `tests/snapshots`.
+
+**TEST-10. Test utilities are feature-gated** if a library exposes them to downstream crates (`feature = "test-util"`), never always-on public API.
+
+**TEST-11. Mockable I/O.** Code that touches the filesystem, clock, network, or environment takes those through a parameter or trait so tests run without real resources and in parallel. Use `tempfile` for tests that must touch disk.
+
+**TEST-12. Cover feature combinations.** Test with default features, with `--no-default-features`, and with `--all-features` (memchr's CI runs all three). For many features use `cargo hack --feature-powerset`.
+nightly-2026-10-01-aarch64-unknown-linux-gnu
+1.99.1-aarch64-unknown-linux-gnu (active, default)
+    miri
+12.211233333333332 minutes used of 45.0

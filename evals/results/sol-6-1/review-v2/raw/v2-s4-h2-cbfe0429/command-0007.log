@@ -1,0 +1,1104 @@
+4.265983333333334 minutes used of 15.0
+use super::{
+    store, Buffer, Codec, Config, Counts, Frame, Prioritize, Prioritized, Store, Stream, StreamId,
+    StreamIdOverflow, WindowSize,
+};
+use crate::codec::UserError;
+use crate::frame::{self, Reason};
+use crate::proto::{self, Error, Initiator};
+
+use bytes::Buf;
+use tokio::io::AsyncWrite;
+
+use std::cmp::Ordering;
+use std::io;
+use std::task::{Context, Poll, Waker};
+
+/// Manages state transitions related to outbound frames.
+#[derive(Debug)]
+pub(super) struct Send {
+    /// Stream identifier to use for next initialized stream.
+    next_stream_id: Result<StreamId, StreamIdOverflow>,
+
+    /// Any streams with a higher ID are ignored.
+    ///
+    /// This starts as MAX, but is lowered when a GOAWAY is received.
+    ///
+    /// > After sending a GOAWAY frame, the sender can discard frames for
+    /// > streams initiated by the receiver with identifiers higher than
+    /// > the identified last stream.
+    max_stream_id: StreamId,
+
+    /// Initial window size of locally initiated streams
+    init_window_sz: WindowSize,
+
+    /// Prioritization layer
+    prioritize: Prioritize,
+
+    is_push_enabled: bool,
+
+    /// If extended connect protocol is enabled.
+    is_extended_connect_protocol_enabled: bool,
+}
+
+/// A value to detect which public API has called `poll_reset`.
+#[derive(Debug)]
+pub(crate) enum PollReset {
+    AwaitingHeaders,
+    Streaming,
+}
+
+impl Send {
+    /// Create a new `Send`
+    pub fn new(config: &Config) -> Self {
+        Send {
+            init_window_sz: config.remote_init_window_sz,
+            max_stream_id: StreamId::MAX,
+            next_stream_id: Ok(config.local_next_stream_id),
+            prioritize: Prioritize::new(config),
+            is_push_enabled: true,
+            is_extended_connect_protocol_enabled: false,
+        }
+    }
+
+    /// Returns the initial send window size
+    pub fn init_window_sz(&self) -> WindowSize {
+        self.init_window_sz
+    }
+
+    pub fn open(&mut self) -> Result<StreamId, UserError> {
+        let stream_id = self.ensure_next_stream_id()?;
+        self.next_stream_id = stream_id.next_id();
+        Ok(stream_id)
+    }
+
+    pub fn reserve_local(&mut self) -> Result<StreamId, UserError> {
+        let stream_id = self.ensure_next_stream_id()?;
+        self.next_stream_id = stream_id.next_id();
+        Ok(stream_id)
+    }
+
+    fn check_headers(fields: &http::HeaderMap) -> Result<(), UserError> {
+        // 8.1.2.2. Connection-Specific Header Fields
+        if fields.contains_key(http::header::CONNECTION)
+            || fields.contains_key(http::header::TRANSFER_ENCODING)
+            || fields.contains_key(http::header::UPGRADE)
+            || fields.contains_key("keep-alive")
+            || fields.contains_key("proxy-connection")
+        {
+            tracing::debug!("illegal connection-specific headers found");
+            return Err(UserError::MalformedHeaders);
+        } else if let Some(te) = fields.get(http::header::TE) {
+            if te != "trailers" {
+                tracing::debug!("illegal connection-specific headers found");
+                return Err(UserError::MalformedHeaders);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn send_push_promise<B>(
+        &mut self,
+        frame: frame::PushPromise,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError> {
+        if !self.is_push_enabled {
+            return Err(UserError::PeerDisabledServerPush);
+        }
+
+        tracing::trace!(
+            "send_push_promise; frame={:?}; init_window={:?}",
+            frame,
+            self.init_window_sz
+        );
+
+        Self::check_headers(frame.fields())?;
+
+        // Queue the frame for sending
+        self.prioritize
+            .queue_frame(frame.into(), buffer, stream, task);
+
+        Ok(())
+    }
+
+    pub fn send_headers<B>(
+        &mut self,
+        frame: frame::Headers,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError> {
+        tracing::trace!(
+            "send_headers; frame={:?}; init_window={:?}",
+            frame,
+            self.init_window_sz
+        );
+
+        Self::check_headers(frame.fields())?;
+
+        let end_stream = frame.is_end_stream();
+
+        // Update the state
+        stream.state.send_open(end_stream)?;
+
+        let mut pending_open = false;
+        if counts.peer().is_local_init(frame.stream_id()) && !stream.is_pending_push {
+            self.prioritize.queue_open(stream);
+            pending_open = true;
+        }
+
+        // Queue the frame for sending
+        //
+        // This call expects that, since new streams are in the open queue, new
+        // streams won't be pushed on pending_send.
+        self.prioritize
+            .queue_frame(frame.into(), buffer, stream, task);
+
+        // Need to notify the connection when pushing onto pending_open since
+        // queue_frame only notifies for pending_send.
+        if pending_open {
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Send an explicit RST_STREAM frame
+    pub fn send_reset<B>(
+        &mut self,
+        reason: Reason,
+        initiator: Initiator,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) {
+        let is_reset = stream.state.is_reset();
+        let is_closed = stream.state.is_closed();
+        let is_empty = stream.pending_send.is_empty();
+        let stream_id = stream.id;
+
+        tracing::trace!(
+            "send_reset(..., reason={:?}, initiator={:?}, stream={:?}, ..., \
+             is_reset={:?}; is_closed={:?}; pending_send.is_empty={:?}; \
+             state={:?} \
+             ",
+            reason,
+            initiator,
+            stream_id,
+            is_reset,
+            is_closed,
+            is_empty,
+            stream.state
+        );
+
+        if is_reset {
+            // Don't double reset
+            tracing::trace!(
+                " -> not sending RST_STREAM ({:?} is already reset)",
+                stream_id
+            );
+            return;
+        }
+
+        // Transition the state to reset no matter what.
+        stream.set_reset(reason, initiator);
+
+        // If closed AND the send queue is flushed, then the stream cannot be
+        // reset explicitly, either. Implicit resets can still be queued.
+        if is_closed && is_empty {
+            tracing::trace!(
+                " -> not sending explicit RST_STREAM ({:?} was closed \
+                 and send queue was flushed)",
+                stream_id
+            );
+            return;
+        }
+
+        // Clear all pending outbound frames.
+        // Note that we don't call `self.recv_err` because we want to enqueue
+        // the reset frame before transitioning the stream inside
+        // `reclaim_all_capacity`.
+        self.prioritize.clear_queue(buffer, stream);
+
+        let frame = frame::Reset::new(stream.id, reason);
+
+        tracing::trace!("send_reset -- queueing; frame={:?}", frame);
+        self.prioritize
+            .queue_frame(frame.into(), buffer, stream, task);
+        self.prioritize.reclaim_all_capacity(stream, counts);
+    }
+
+    pub fn schedule_implicit_reset(
+        &mut self,
+        stream: &mut store::Ptr,
+        reason: Reason,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) {
+        if stream.state.is_closed() {
+            // Stream is already closed, nothing more to do
+            return;
+        }
+
+        stream.state.set_scheduled_reset(reason);
+
+        self.prioritize.reclaim_reserved_capacity(stream, counts);
+        self.prioritize.schedule_send(stream, task);
+    }
+
+    pub fn send_data<B>(
+        &mut self,
+        frame: frame::Data<B>,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError>
+    where
+        B: Buf,
+    {
+        self.prioritize
+            .send_data(frame, buffer, stream, counts, task)
+    }
+
+    pub fn send_trailers<B>(
+        &mut self,
+        match stream.state.ensure_reason(mode)? {
+            Some(reason) => Poll::Ready(Ok(reason)),
+            None => {
+                stream.wait_send(cx);
+                Poll::Pending
+            }
+        }
+    }
+
+    pub fn recv_connection_window_update(
+        &mut self,
+        frame: frame::WindowUpdate,
+        store: &mut Store,
+        counts: &mut Counts,
+    ) -> Result<(), Reason> {
+        self.prioritize
+            .recv_connection_window_update(frame.size_increment(), store, counts)
+    }
+
+    pub fn recv_stream_window_update<B>(
+        &mut self,
+        sz: WindowSize,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), Reason> {
+        if let Err(e) = self.prioritize.recv_stream_window_update(sz, stream) {
+            tracing::debug!("recv_stream_window_update !!; err={:?}", e);
+
+            self.send_reset(
+                Reason::FLOW_CONTROL_ERROR,
+                Initiator::Library,
+                buffer,
+                stream,
+                counts,
+                task,
+            );
+
+            return Err(e);
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn recv_go_away(&mut self, last_stream_id: StreamId) -> Result<(), Error> {
+        if last_stream_id > self.max_stream_id {
+            // The remote endpoint sent a `GOAWAY` frame indicating a stream
+            // that we never sent, or that we have already terminated on account
+            // of previous `GOAWAY` frame. In either case, that is illegal.
+            // (When sending multiple `GOAWAY`s, "Endpoints MUST NOT increase
+            // the value they send in the last stream identifier, since the
+            // peers might already have retried unprocessed requests on another
+            // connection.")
+            proto_err!(conn:
+                "recv_go_away: last_stream_id ({:?}) > max_stream_id ({:?})",
+                last_stream_id, self.max_stream_id,
+            );
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+        }
+
+        self.max_stream_id = last_stream_id;
+        Ok(())
+    }
+
+    pub fn handle_error<B>(
+        &mut self,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) {
+        // Clear all pending outbound frames
+        self.prioritize.clear_queue(buffer, stream);
+        self.prioritize.reclaim_all_capacity(stream, counts);
+    }
+
+    pub fn apply_remote_settings<B>(
+        &mut self,
+        settings: &frame::Settings,
+        buffer: &mut Buffer<Frame<B>>,
+        store: &mut Store,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), Error> {
+        if let Some(val) = settings.is_extended_connect_protocol_enabled() {
+            self.is_extended_connect_protocol_enabled = val;
+        }
+
+        // Applies an update to the remote endpoint's initial window size.
+        //
+        // Per RFC 7540 §6.9.2:
+        //
+        // In addition to changing the flow-control window for streams that are
+        // not yet active, a SETTINGS frame can alter the initial flow-control
+        // window size for streams with active flow-control windows (that is,
+        // streams in the "open" or "half-closed (remote)" state). When the
+        // value of SETTINGS_INITIAL_WINDOW_SIZE changes, a receiver MUST adjust
+        // the size of all stream flow-control windows that it maintains by the
+        // difference between the new value and the old value.
+        //
+        // A change to `SETTINGS_INITIAL_WINDOW_SIZE` can cause the available
+        // space in a flow-control window to become negative. A sender MUST
+        // track the negative flow-control window and MUST NOT send new
+        // flow-controlled frames until it receives WINDOW_UPDATE frames that
+        // cause the flow-control window to become positive.
+        if let Some(val) = settings.initial_window_size() {
+            let old_val = self.init_window_sz;
+            self.init_window_sz = val;
+
+            match val.cmp(&old_val) {
+                Ordering::Less => {
+                    // We must decrease the (remote) window on every open stream.
+                    let dec = old_val - val;
+                    tracing::trace!("decrementing all windows; dec={}", dec);
+
+                    let mut total_reclaimed = 0;
+                    store.try_for_each(|mut stream| {
+                        let stream = &mut *stream;
+
+                        if stream.state.is_send_closed() && stream.buffered_send_data == 0 {
+                            tracing::trace!(
+                                "skipping send-closed stream; id={:?}; flow={:?}",
+                                stream.id,
+                                stream.send_flow
+                            );
+
+                            return Ok(());
+                        }
+
+                        tracing::trace!(
+                            "decrementing stream window; id={:?}; decr={}; flow={:?}",
+                            stream.id,
+                            dec,
+                            stream.send_flow
+                        );
+
+                        // TODO: this decrement can underflow based on received frames!
+                        stream
+                            .send_flow
+                            .dec_send_window(dec)
+                            .map_err(proto::Error::library_go_away)?;
+
+                        // It's possible that decreasing the window causes
+                        // `window_size` (the stream-specific window) to fall below
+                        // `available` (the portion of the connection-level window
+                        // that we have allocated to the stream).
+                        // In this case, we should take that excess allocation away
+                        // and reassign it to other streams.
+                        let window_size = stream.send_flow.window_size();
+                        let available = stream.send_flow.available().as_size();
+                        let reclaimed = if available > window_size {
+                            // Drop down to `window_size`.
+                            let reclaim = available - window_size;
+                            stream
+                                .send_flow
+                                .claim_capacity(reclaim)
+                                .map_err(proto::Error::library_go_away)?;
+                            total_reclaimed += reclaim;
+                            reclaim
+                        } else {
+                            0
+                        };
+
+                        tracing::trace!(
+                            "decremented stream window; id={:?}; decr={}; reclaimed={}; flow={:?}",
+                            stream.id,
+                            dec,
+                            reclaimed,
+                            stream.send_flow
+                        );
+
+                        // TODO: Should this notify the producer when the capacity
+                        // of a stream is reduced? Maybe it should if the capacity
+                        // is reduced to zero, allowing the producer to stop work.
+
+                        Ok::<_, proto::Error>(())
+                    })?;
+
+                    self.prioritize
+                        .assign_connection_capacity(total_reclaimed, store, counts);
+                }
+                Ordering::Greater => {
+                    let inc = val - old_val;
+
+                    store.try_for_each(|mut stream| {
+                        self.recv_stream_window_update(inc, buffer, &mut stream, counts, task)
+                            .map_err(Error::library_go_away)
+                    })?;
+                }
+                Ordering::Equal => (),
+            }
+        }
+
+        if let Some(val) = settings.is_push_enabled() {
+            self.is_push_enabled = val
+        }
+
+        Ok(())
+    }
+
+    pub fn clear_queues(&mut self, store: &mut Store, counts: &mut Counts) {
+        self.prioritize.clear_pending_capacity(store, counts);
+        self.prioritize.clear_pending_send(store, counts);
+        self.prioritize.clear_pending_open(store, counts);
+    }
+
+    pub fn ensure_not_idle(&self, id: StreamId) -> Result<(), Reason> {
+        if let Ok(next) = self.next_stream_id {
+            if id >= next {
+                return Err(Reason::PROTOCOL_ERROR);
+            }
+        }
+        // if next_stream_id is overflowed, that's ok.
+
+        Ok(())
+    }
+
+    pub fn ensure_next_stream_id(&self) -> Result<StreamId, UserError> {
+        self.next_stream_id
+            .map_err(|_| UserError::OverflowedStreamId)
+    }
+
+    pub fn may_have_created_stream(&self, id: StreamId) -> bool {
+        if let Ok(next_id) = self.next_stream_id {
+            // Peer::is_local_init should have been called beforehand
+            debug_assert_eq!(id.is_server_initiated(), next_id.is_server_initiated(),);
+            id < next_id
+        } else {
+            true
+        }
+    }
+
+    pub(super) fn maybe_reset_next_stream_id(&mut self, id: StreamId) {
+        if let Ok(next_id) = self.next_stream_id {
+            // Peer::is_local_init should have been called beforehand
+            debug_assert_eq!(id.is_server_initiated(), next_id.is_server_initiated());
+            if id >= next_id {
+                self.next_stream_id = id.next_id();
+            }
+        }
+    }
+
+    pub(crate) fn is_extended_connect_protocol_enabled(&self) -> bool {
+        self.is_extended_connect_protocol_enabled
+    }
+}
+use super::*;
+use crate::codec::UserError;
+use crate::frame::{PushPromiseHeaderError, Reason, DEFAULT_INITIAL_WINDOW_SIZE};
+use crate::proto;
+
+use http::{HeaderMap, Request, Response};
+
+use std::cmp::Ordering;
+use std::io;
+use std::task::{Context, Poll, Waker};
+use std::time::Instant;
+
+#[derive(Debug)]
+pub(super) struct Recv {
+    /// Initial window size of remote initiated streams
+    init_window_sz: WindowSize,
+
+    /// Connection level flow control governing received data
+    flow: FlowControl,
+
+    /// Amount of connection window capacity currently used by outstanding streams.
+    in_flight_data: WindowSize,
+
+    /// The lowest stream ID that is still idle
+    next_stream_id: Result<StreamId, StreamIdOverflow>,
+
+    /// The stream ID of the last processed stream
+    last_processed_id: StreamId,
+
+    /// Any streams with a higher ID are ignored.
+    ///
+    /// This starts as MAX, but is lowered when a GOAWAY is received.
+    ///
+    /// > After sending a GOAWAY frame, the sender can discard frames for
+    /// > streams initiated by the receiver with identifiers higher than
+    /// > the identified last stream.
+    max_stream_id: StreamId,
+
+    /// Streams that have pending window updates
+    pending_window_updates: store::Queue<stream::NextWindowUpdate>,
+
+    /// New streams to be accepted
+    pending_accept: store::Queue<stream::NextAccept>,
+
+    /// Locally reset streams that should be reaped when they expire
+    pending_reset_expired: store::Queue<stream::NextResetExpire>,
+
+    /// How long locally reset streams should ignore received frames
+    reset_duration: Duration,
+
+    /// Holds frames that are waiting to be read
+    buffer: Buffer<Event>,
+
+    /// Refused StreamId, this represents a frame that must be sent out.
+    refused: Option<StreamId>,
+
+    /// If push promises are allowed to be received.
+    is_push_enabled: bool,
+
+    /// If extended connect protocol is enabled.
+    is_extended_connect_protocol_enabled: bool,
+}
+
+#[derive(Debug)]
+pub(super) enum Event {
+    Headers(peer::PollMessage),
+    Data(Bytes),
+    Trailers(HeaderMap),
+}
+
+#[derive(Debug)]
+pub(super) enum RecvHeaderBlockError<T> {
+    Oversize(T),
+    State(Error),
+}
+
+#[derive(Debug)]
+pub(crate) enum Open {
+    PushPromise,
+    Headers,
+}
+
+impl Recv {
+    pub fn new(peer: peer::Dyn, config: &Config) -> Self {
+        let next_stream_id = if peer.is_server() { 1 } else { 2 };
+
+        let mut flow = FlowControl::new();
+
+        // connections always have the default window size, regardless of
+        // settings
+        flow.inc_window(DEFAULT_INITIAL_WINDOW_SIZE)
+            .expect("invalid initial remote window size");
+        flow.assign_capacity(DEFAULT_INITIAL_WINDOW_SIZE).unwrap();
+
+        Recv {
+            init_window_sz: DEFAULT_INITIAL_WINDOW_SIZE,
+            flow,
+            in_flight_data: 0 as WindowSize,
+            next_stream_id: Ok(next_stream_id.into()),
+            pending_window_updates: store::Queue::new(),
+            last_processed_id: StreamId::ZERO,
+            max_stream_id: StreamId::MAX,
+            pending_accept: store::Queue::new(),
+            pending_reset_expired: store::Queue::new(),
+            reset_duration: config.local_reset_duration,
+            buffer: Buffer::new(),
+            refused: None,
+            is_push_enabled: config.local_push_enabled,
+            is_extended_connect_protocol_enabled: config.extended_connect_protocol_enabled,
+        }
+    }
+
+    /// Returns the initial receive window size
+    pub fn init_window_sz(&self) -> WindowSize {
+        self.init_window_sz
+    }
+
+    /// Returns the ID of the last processed stream
+    pub fn last_processed_id(&self) -> StreamId {
+        self.last_processed_id
+    }
+
+    /// Update state reflecting a new, remotely opened stream
+    ///
+    /// Returns the stream state if successful. `None` if refused
+    pub fn open(
+        &mut self,
+        id: StreamId,
+        mode: Open,
+        counts: &mut Counts,
+    ) -> Result<Option<StreamId>, Error> {
+        assert!(self.refused.is_none());
+
+        counts.peer().ensure_can_open(id, mode)?;
+
+        let next_id = self.next_stream_id()?;
+        if id < next_id {
+            proto_err!(conn: "id ({:?}) < next_id ({:?})", id, next_id);
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+        }
+
+        self.next_stream_id = id.next_id();
+
+        if !counts.can_inc_num_recv_streams() {
+            self.refused = Some(id);
+            return Ok(None);
+        }
+
+        Ok(Some(id))
+    }
+
+    /// Transition the stream state based on receiving headers
+    ///
+    /// The caller ensures that the frame represents headers and not trailers.
+    pub fn recv_headers(
+        &mut self,
+        frame: frame::Headers,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) -> Result<(), RecvHeaderBlockError<Option<frame::Headers>>> {
+        tracing::trace!("opening stream; init_window={}", self.init_window_sz);
+        let is_initial = stream.state.recv_open(&frame)?;
+
+        if is_initial {
+            // TODO: be smarter about this logic
+            if frame.stream_id() > self.last_processed_id {
+                self.last_processed_id = frame.stream_id();
+            }
+
+            // Increment the number of concurrent streams
+            counts.inc_num_recv_streams(stream);
+        }
+
+        if !stream.content_length.is_head() {
+            use super::stream::ContentLength;
+            use http::header;
+
+            if let Some(content_length) = frame.fields().get(header::CONTENT_LENGTH) {
+                let content_length = match frame::parse_u64(content_length.as_bytes()) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        proto_err!(stream: "could not parse content-length; stream={:?}", stream.id);
+                        return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+                    }
+                };
+
+                stream.content_length = ContentLength::Remaining(content_length);
+                // END_STREAM on headers frame with non-zero content-length is malformed.
+                // https://datatracker.ietf.org/doc/html/rfc9113#section-8.1.1
+                if frame.is_end_stream()
+                    && content_length > 0
+                    && frame
+                        .pseudo()
+                        .status
+                        .map_or(true, |status| status != 204 && status != 304)
+                {
+                    proto_err!(stream: "recv_headers with END_STREAM: content-length is not zero; stream={:?};", stream.id);
+                    return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+                }
+            }
+        }
+
+        if frame.is_over_size() {
+            // A frame is over size if the decoded header block was bigger than
+            // SETTINGS_MAX_HEADER_LIST_SIZE.
+            //
+            // > A server that receives a larger header block than it is willing
+            // > to handle can send an HTTP 431 (Request Header Fields Too
+            // > Large) status code [RFC6585]. A client can discard responses
+            // > that it cannot process.
+            //
+            // So, if peer is a server, we'll send a 431. In either case,
+            // an error is recorded, which will send a REFUSED_STREAM,
+            // since we don't want any of the data frames either.
+            tracing::debug!(
+                "stream error REQUEST_HEADER_FIELDS_TOO_LARGE -- \
+                 recv_headers: frame is over size; stream={:?}",
+                stream.id
+            );
+            return if counts.peer().is_server() && is_initial {
+                let mut res = frame::Headers::new(
+                    stream.id,
+                    frame::Pseudo::response(::http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE),
+                    HeaderMap::new(),
+                );
+                res.set_end_stream();
+                Err(RecvHeaderBlockError::Oversize(Some(res)))
+            } else {
+                Err(RecvHeaderBlockError::Oversize(None))
+            };
+        }
+
+        let stream_id = frame.stream_id();
+        let (pseudo, fields) = frame.into_parts();
+
+        if pseudo.protocol.is_some()
+            && counts.peer().is_server()
+            && !self.is_extended_connect_protocol_enabled
+        {
+            proto_err!(stream: "cannot use :protocol if extended connect protocol is disabled; stream={:?}", stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+        }
+
+        if pseudo.status.is_some() && counts.peer().is_server() {
+            proto_err!(stream: "cannot use :status header for requests; stream={:?}", stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+        }
+
+        if !pseudo.is_informational() {
+            let message = counts
+
+    pub fn recv_eof(&mut self, stream: &mut Stream) {
+        stream.state.recv_eof();
+        stream.notify_send();
+        stream.notify_recv();
+        stream.notify_push();
+    }
+
+    pub(super) fn clear_recv_buffer(&mut self, stream: &mut Stream) {
+        while stream.pending_recv.pop_front(&mut self.buffer).is_some() {
+            // drop it
+        }
+    }
+
+    /// Get the max ID of streams we can receive.
+    ///
+    /// This gets lowered if we send a GOAWAY frame.
+    pub fn max_stream_id(&self) -> StreamId {
+        self.max_stream_id
+    }
+
+    pub fn next_stream_id(&self) -> Result<StreamId, Error> {
+        if let Ok(id) = self.next_stream_id {
+            Ok(id)
+        } else {
+            Err(Error::library_go_away(Reason::PROTOCOL_ERROR))
+        }
+    }
+
+    pub fn may_have_created_stream(&self, id: StreamId) -> bool {
+        if let Ok(next_id) = self.next_stream_id {
+            // Peer::is_local_init should have been called beforehand
+            debug_assert_eq!(id.is_server_initiated(), next_id.is_server_initiated(),);
+            id < next_id
+        } else {
+            true
+        }
+    }
+
+    pub(super) fn maybe_reset_next_stream_id(&mut self, id: StreamId) {
+        if let Ok(next_id) = self.next_stream_id {
+            // !Peer::is_local_init should have been called beforehand
+            debug_assert_eq!(id.is_server_initiated(), next_id.is_server_initiated());
+            if id >= next_id {
+                self.next_stream_id = id.next_id();
+            }
+        }
+    }
+
+    /// Returns true if the remote peer can reserve a stream with the given ID.
+    pub fn ensure_can_reserve(&self) -> Result<(), Error> {
+        if !self.is_push_enabled {
+            proto_err!(conn: "recv_push_promise: push is disabled");
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+        }
+
+        Ok(())
+    }
+
+    /// Add a locally reset stream to queue to be eventually reaped.
+    pub fn enqueue_reset_expiration(&mut self, stream: &mut store::Ptr, counts: &mut Counts) {
+        if !stream.state.is_local_error() || stream.is_pending_reset_expiration() {
+            return;
+        }
+
+        if counts.can_inc_num_reset_streams() {
+            counts.inc_num_reset_streams();
+            tracing::trace!("enqueue_reset_expiration; added {:?}", stream.id);
+            self.pending_reset_expired.push(stream);
+        } else {
+            tracing::trace!(
+                "enqueue_reset_expiration; dropped {:?}, over max_concurrent_reset_streams",
+                stream.id
+            );
+        }
+    }
+
+    /// Send any pending refusals.
+    pub fn send_pending_refusal<T, B>(
+        &mut self,
+        cx: &mut Context,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        if let Some(stream_id) = self.refused {
+            ready!(dst.poll_ready(cx))?;
+
+            // Create the RST_STREAM frame
+            let frame = frame::Reset::new(stream_id, Reason::REFUSED_STREAM);
+
+            // Buffer the frame
+            dst.buffer(frame.into()).expect("invalid RST_STREAM frame");
+        }
+
+        self.refused = None;
+
+        Poll::Ready(Ok(()))
+    }
+
+    pub fn clear_expired_reset_streams(&mut self, store: &mut Store, counts: &mut Counts) {
+        if !self.pending_reset_expired.is_empty() {
+            let now = Instant::now();
+            let reset_duration = self.reset_duration;
+            while let Some(stream) = self.pending_reset_expired.pop_if(store, |stream| {
+                let reset_at = stream.reset_at.expect("reset_at must be set if in queue");
+                // rust-lang/rust#86470 tracks a bug in the standard library where `Instant`
+                // subtraction can panic (because, on some platforms, `Instant` isn't actually
+                // monotonic). We use a saturating operation to avoid this panic here.
+                now.saturating_duration_since(reset_at) > reset_duration
+            }) {
+                counts.transition_after(stream, true);
+            }
+        }
+    }
+
+    pub fn clear_queues(
+        &mut self,
+        clear_pending_accept: bool,
+        store: &mut Store,
+        counts: &mut Counts,
+    ) {
+        self.clear_stream_window_update_queue(store, counts);
+        self.clear_all_reset_streams(store, counts);
+
+        if clear_pending_accept {
+            self.clear_all_pending_accept(store, counts);
+        }
+    }
+
+    fn clear_stream_window_update_queue(&mut self, store: &mut Store, counts: &mut Counts) {
+        while let Some(stream) = self.pending_window_updates.pop(store) {
+            counts.transition(stream, |_, stream| {
+                tracing::trace!("clear_stream_window_update_queue; stream={:?}", stream.id);
+            })
+        }
+    }
+
+    /// Called on EOF
+    fn clear_all_reset_streams(&mut self, store: &mut Store, counts: &mut Counts) {
+        while let Some(stream) = self.pending_reset_expired.pop(store) {
+            counts.transition_after(stream, true);
+        }
+    }
+
+    fn clear_all_pending_accept(&mut self, store: &mut Store, counts: &mut Counts) {
+        while let Some(stream) = self.pending_accept.pop(store) {
+            counts.transition_after(stream, false);
+        }
+    }
+
+    pub fn poll_complete<T, B>(
+        &mut self,
+        cx: &mut Context,
+        store: &mut Store,
+        counts: &mut Counts,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        // Send any pending connection level window updates
+        ready!(self.send_connection_window_update(cx, dst))?;
+
+        // Send any pending stream level window updates
+        ready!(self.send_stream_window_updates(cx, store, counts, dst))?;
+
+        Poll::Ready(Ok(()))
+    }
+
+    /// Send connection level window update
+    fn send_connection_window_update<T, B>(
+        &mut self,
+        cx: &mut Context,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        if let Some(incr) = self.flow.unclaimed_capacity() {
+            let frame = frame::WindowUpdate::new(StreamId::zero(), incr);
+
+            // Ensure the codec has capacity
+            ready!(dst.poll_ready(cx))?;
+
+            // Buffer the WINDOW_UPDATE frame
+            dst.buffer(frame.into())
+                .expect("invalid WINDOW_UPDATE frame");
+
+            // Update flow control
+            self.flow
+                .inc_window(incr)
+                .expect("unexpected flow control state");
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
+    /// Send stream level window update
+    pub fn send_stream_window_updates<T, B>(
+        &mut self,
+        cx: &mut Context,
+        store: &mut Store,
+        counts: &mut Counts,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        loop {
+            // Ensure the codec has capacity
+            ready!(dst.poll_ready(cx))?;
+
+            // Get the next stream
+            let stream = match self.pending_window_updates.pop(store) {
+                Some(stream) => stream,
+                None => return Poll::Ready(Ok(())),
+            };
+
+            counts.transition(stream, |_, stream| {
+                tracing::trace!("pending_window_updates -- pop; stream={:?}", stream.id);
+                debug_assert!(!stream.is_pending_window_update);
+
+                if !stream.state.is_recv_streaming() {
+                    // No need to send window updates on the stream if the stream is
+                    // no longer receiving data.
+                    //
+                    // TODO: is this correct? We could possibly send a window
+                    // update on a ReservedRemote stream if we already know
+                    // we want to stream the data faster...
+                    return;
+                }
+
+                // TODO: de-dup
+                if let Some(incr) = stream.recv_flow.unclaimed_capacity() {
+                    // Create the WINDOW_UPDATE frame
+                    let frame = frame::WindowUpdate::new(stream.id, incr);
+
+                    // Buffer it
+                    dst.buffer(frame.into())
+                        .expect("invalid WINDOW_UPDATE frame");
+
+                    // Update flow control
+                    stream
+                        .recv_flow
+                        .inc_window(incr)
+                        .expect("unexpected flow control state");
+                }
+            })
+        }
+    }
+
+    pub fn next_incoming(&mut self, store: &mut Store) -> Option<store::Key> {
+        self.pending_accept.pop(store).map(|ptr| ptr.key())
+    }
+
+    pub fn poll_data(
+        &mut self,
+        cx: &Context,
+        stream: &mut Stream,
+    ) -> Poll<Option<Result<Bytes, proto::Error>>> {
+        match stream.pending_recv.pop_front(&mut self.buffer) {
+            Some(Event::Data(payload)) => Poll::Ready(Some(Ok(payload))),
+            Some(event) => {
+                // Frame is trailer
+                stream.pending_recv.push_front(&mut self.buffer, event);
+
+                // Notify the recv task. This is done just in case
+                // `poll_trailers` was called.
+                //
+                // It is very likely that `notify_recv` will just be a no-op (as
+                // the task will be None), so this isn't really much of a
+                // performance concern. It also means we don't have to track
+                // state to see if `poll_trailers` was called before `poll_data`
+                // returned `None`.
+                stream.notify_recv();
+
+                // No more data frames
+                Poll::Ready(None)
+            }
+            None => self.schedule_recv(cx, stream),
+        }
+    }
+
+    pub fn poll_trailers(
+        &mut self,
+        cx: &Context,
+        stream: &mut Stream,
+    ) -> Poll<Option<Result<HeaderMap, proto::Error>>> {
+        match stream.pending_recv.pop_front(&mut self.buffer) {
+            Some(Event::Trailers(trailers)) => Poll::Ready(Some(Ok(trailers))),
+            Some(event) => {
+                // Frame is not trailers.. not ready to poll trailers yet.
+                stream.pending_recv.push_front(&mut self.buffer, event);
+
+                Poll::Pending
+            }
+            None => self.schedule_recv(cx, stream),
+        }
+    }
+
+    fn schedule_recv<T>(
+        &mut self,
+        cx: &Context,
+        stream: &mut Stream,
+    ) -> Poll<Option<Result<T, proto::Error>>> {
+        if stream.state.ensure_recv_open()? {
+            // Request to get notified once more frames arrive
+            stream.recv_task = Some(cx.waker().clone());
+            Poll::Pending
+        } else {
+            // No more frames will be received
+            Poll::Ready(None)
+        }
+    }
+}
+
+// ===== impl Open =====
+
+impl Open {
+    pub fn is_push_promise(&self) -> bool {
+        matches!(*self, Self::PushPromise)
+    }
+}
+
+// ===== impl RecvHeaderBlockError =====
+
+impl<T> From<Error> for RecvHeaderBlockError<T> {
+    fn from(err: Error) -> Self {
+        RecvHeaderBlockError::State(err)
+    }
+}

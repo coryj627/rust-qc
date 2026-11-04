@@ -1,0 +1,1118 @@
+use std::any::TypeId;
+use std::cell::Cell;
+use std::marker::PhantomData;
+use std::os::raw::c_int;
+use std::ptr;
+
+use rustc_hash::FxHashMap;
+
+use super::UserDataStorage;
+use crate::error::{Error, Result};
+use crate::types::CallbackPtr;
+use crate::util::{get_userdata, rawget_field, rawset_field, take_userdata};
+
+// This is a trick to check if a type is `Sync` or not.
+// It uses leaked specialization feature from stdlib.
+struct IsSync<'a, T> {
+    is_sync: &'a Cell<bool>,
+    _marker: PhantomData<T>,
+}
+
+impl<T> Clone for IsSync<'_, T> {
+    fn clone(&self) -> Self {
+        self.is_sync.set(false);
+        IsSync {
+            is_sync: self.is_sync,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T: Sync> Copy for IsSync<'_, T> {}
+
+pub(crate) fn is_sync<T>() -> bool {
+    let is_sync = Cell::new(true);
+    let _ = [IsSync::<T> {
+        is_sync: &is_sync,
+        _marker: PhantomData,
+    }]
+    .clone();
+    is_sync.get()
+}
+
+// Userdata type hints,  used to match types of wrapped userdata
+#[derive(Clone, Copy)]
+pub(crate) struct TypeIdHints {
+    t: TypeId,
+
+    #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+    rc: TypeId,
+    #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+    rc_refcell: TypeId,
+
+    #[cfg(feature = "userdata-wrappers")]
+    arc: TypeId,
+    #[cfg(feature = "userdata-wrappers")]
+    arc_mutex: TypeId,
+    #[cfg(feature = "userdata-wrappers")]
+    arc_rwlock: TypeId,
+    #[cfg(feature = "userdata-wrappers")]
+    arc_pl_mutex: TypeId,
+    #[cfg(feature = "userdata-wrappers")]
+    arc_pl_rwlock: TypeId,
+}
+
+impl TypeIdHints {
+    pub(crate) fn new<T: 'static>() -> Self {
+        Self {
+            t: TypeId::of::<T>(),
+
+            #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+            rc: TypeId::of::<std::rc::Rc<T>>(),
+            #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+            rc_refcell: TypeId::of::<std::rc::Rc<std::cell::RefCell<T>>>(),
+
+            #[cfg(feature = "userdata-wrappers")]
+            arc: TypeId::of::<std::sync::Arc<T>>(),
+            #[cfg(feature = "userdata-wrappers")]
+            arc_mutex: TypeId::of::<std::sync::Arc<std::sync::Mutex<T>>>(),
+            #[cfg(feature = "userdata-wrappers")]
+            arc_rwlock: TypeId::of::<std::sync::Arc<std::sync::RwLock<T>>>(),
+            #[cfg(feature = "userdata-wrappers")]
+            arc_pl_mutex: TypeId::of::<std::sync::Arc<parking_lot::Mutex<T>>>(),
+            #[cfg(feature = "userdata-wrappers")]
+            arc_pl_rwlock: TypeId::of::<std::sync::Arc<parking_lot::RwLock<T>>>(),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn type_id(&self) -> TypeId {
+        self.t
+    }
+}
+
+pub(crate) unsafe fn borrow_userdata_scoped<T, R>(
+    state: *mut ffi::lua_State,
+    idx: c_int,
+    type_id: Option<TypeId>,
+    type_hints: TypeIdHints,
+    f: impl FnOnce(&T) -> R,
+) -> Result<R> {
+    match type_id {
+        Some(type_id) if type_id == type_hints.t => {
+            let ud = get_userdata::<UserDataStorage<T>>(state, idx);
+            (*ud).try_borrow_scoped(|ud| f(ud))
+        }
+
+        #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+        Some(type_id) if type_id == type_hints.rc => {
+            let ud = get_userdata::<UserDataStorage<std::rc::Rc<T>>>(state, idx);
+            (*ud).try_borrow_scoped(|ud| f(ud))
+        }
+        #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+        Some(type_id) if type_id == type_hints.rc_refcell => {
+            let ud = get_userdata::<UserDataStorage<std::rc::Rc<std::cell::RefCell<T>>>>(state, idx);
+            (*ud).try_borrow_scoped(|ud| {
+                let ud = ud.try_borrow().map_err(|_| Error::UserDataBorrowError)?;
+                Ok(f(&ud))
+            })?
+        }
+
+        #[cfg(feature = "userdata-wrappers")]
+        Some(type_id) if type_id == type_hints.arc => {
+            let ud = get_userdata::<UserDataStorage<std::sync::Arc<T>>>(state, idx);
+            (*ud).try_borrow_scoped(|ud| f(ud))
+        }
+        #[cfg(feature = "userdata-wrappers")]
+        Some(type_id) if type_id == type_hints.arc_mutex => {
+            let ud = get_userdata::<UserDataStorage<std::sync::Arc<std::sync::Mutex<T>>>>(state, idx);
+            (*ud).try_borrow_scoped(|ud| {
+                let ud = ud.try_lock().map_err(|_| Error::UserDataBorrowError)?;
+                Ok(f(&ud))
+            })?
+        }
+        #[cfg(feature = "userdata-wrappers")]
+        Some(type_id) if type_id == type_hints.arc_rwlock => {
+            let ud = get_userdata::<UserDataStorage<std::sync::Arc<std::sync::RwLock<T>>>>(state, idx);
+            (*ud).try_borrow_scoped(|ud| {
+                let ud = ud.try_read().map_err(|_| Error::UserDataBorrowError)?;
+                Ok(f(&ud))
+            })?
+        }
+        #[cfg(feature = "userdata-wrappers")]
+        Some(type_id) if type_id == type_hints.arc_pl_mutex => {
+            let ud = get_userdata::<UserDataStorage<std::sync::Arc<parking_lot::Mutex<T>>>>(state, idx);
+            (*ud).try_borrow_scoped(|ud| {
+                let ud = ud.try_lock().ok_or(Error::UserDataBorrowError)?;
+                Ok(f(&ud))
+            })?
+        }
+        #[cfg(feature = "userdata-wrappers")]
+        Some(type_id) if type_id == type_hints.arc_pl_rwlock => {
+            let ud = get_userdata::<UserDataStorage<std::sync::Arc<parking_lot::RwLock<T>>>>(state, idx);
+            (*ud).try_borrow_scoped(|ud| {
+                let ud = ud.try_read().ok_or(Error::UserDataBorrowError)?;
+                Ok(f(&ud))
+            })?
+        }
+        _ => Err(Error::UserDataTypeMismatch),
+    }
+}
+
+pub(crate) unsafe fn borrow_userdata_scoped_mut<T, R>(
+    state: *mut ffi::lua_State,
+    idx: c_int,
+    type_id: Option<TypeId>,
+    type_hints: TypeIdHints,
+    f: impl FnOnce(&mut T) -> R,
+) -> Result<R> {
+    match type_id {
+        Some(type_id) if type_id == type_hints.t => {
+            let ud = get_userdata::<UserDataStorage<T>>(state, idx);
+            (*ud).try_borrow_scoped_mut(|ud| f(ud))
+        }
+
+        #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+        Some(type_id) if type_id == type_hints.rc => {
+            let ud = get_userdata::<UserDataStorage<std::rc::Rc<T>>>(state, idx);
+            (*ud).try_borrow_scoped_mut(|ud| match std::rc::Rc::get_mut(ud) {
+                Some(ud) => Ok(f(ud)),
+                None => Err(Error::UserDataBorrowMutError),
+use std::any::{type_name, TypeId};
+use std::ops::{Deref, DerefMut};
+use std::os::raw::c_int;
+use std::{fmt, mem};
+
+use crate::error::{Error, Result};
+use crate::state::{Lua, RawLua};
+use crate::traits::FromLua;
+use crate::userdata::AnyUserData;
+use crate::util::get_userdata;
+use crate::value::Value;
+
+use super::cell::{UserDataStorage, UserDataVariant};
+use super::lock::{LockGuard, RawLock, UserDataLock};
+use super::util::is_sync;
+
+#[cfg(feature = "userdata-wrappers")]
+use {
+    parking_lot::{
+        Mutex as MutexPL, MutexGuard as MutexGuardPL, RwLock as RwLockPL,
+        RwLockReadGuard as RwLockReadGuardPL, RwLockWriteGuard as RwLockWriteGuardPL,
+    },
+    std::sync::Arc,
+};
+#[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+use {
+    std::cell::{Ref, RefCell, RefMut},
+    std::rc::Rc,
+};
+
+/// A wrapper type for a userdata value that provides read access.
+///
+/// It implements [`FromLua`] and can be used to receive a typed userdata from Lua.
+pub struct UserDataRef<T: 'static> {
+    // It's important to drop the guard first, as it refers to the `inner` data.
+    _guard: LockGuard<'static, RawLock>,
+    inner: UserDataRefInner<T>,
+}
+
+impl<T> Deref for UserDataRef<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.inner
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for UserDataRef<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<T: fmt::Display> fmt::Display for UserDataRef<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<T> TryFrom<UserDataVariant<T>> for UserDataRef<T> {
+    type Error = Error;
+
+    #[inline]
+    fn try_from(variant: UserDataVariant<T>) -> Result<Self> {
+        let guard = if cfg!(not(feature = "send")) || is_sync::<T>() {
+            variant.raw_lock().try_lock_shared_guarded()
+        } else {
+            variant.raw_lock().try_lock_exclusive_guarded()
+        };
+        let guard = guard.map_err(|_| Error::UserDataBorrowError)?;
+        let guard = unsafe { mem::transmute::<LockGuard<_>, LockGuard<'static, _>>(guard) };
+        Ok(UserDataRef::from_parts(UserDataRefInner::Default(variant), guard))
+    }
+}
+
+impl<T: 'static> FromLua for UserDataRef<T> {
+    fn from_lua(value: Value, _: &Lua) -> Result<Self> {
+        try_value_to_userdata::<T>(value)?.borrow()
+    }
+
+    #[inline]
+    unsafe fn from_stack(idx: c_int, lua: &RawLua) -> Result<Self> {
+        Self::borrow_from_stack(lua, lua.state(), idx)
+    }
+}
+
+impl<T: 'static> UserDataRef<T> {
+    #[inline(always)]
+    fn from_parts(inner: UserDataRefInner<T>, guard: LockGuard<'static, RawLock>) -> Self {
+        Self { _guard: guard, inner }
+    }
+
+    #[cfg(feature = "userdata-wrappers")]
+    fn remap<U>(
+        self,
+        f: impl FnOnce(UserDataVariant<T>) -> Result<UserDataRefInner<U>>,
+    ) -> Result<UserDataRef<U>> {
+        match &self.inner {
+            UserDataRefInner::Default(variant) => {
+                let inner = f(variant.clone())?;
+                Ok(UserDataRef::from_parts(inner, self._guard))
+            }
+            _ => Err(Error::UserDataTypeMismatch),
+        }
+    }
+
+    pub(crate) unsafe fn borrow_from_stack(
+        lua: &RawLua,
+        state: *mut ffi::lua_State,
+        idx: c_int,
+    ) -> Result<Self> {
+        let type_id = lua.get_userdata_type_id::<T>(state, idx)?;
+        match type_id {
+            Some(type_id) if type_id == TypeId::of::<T>() => {
+                let ud = get_userdata::<UserDataStorage<T>>(state, idx);
+                (*ud).try_borrow_owned()
+            }
+
+            #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+            Some(type_id) if type_id == TypeId::of::<Rc<T>>() => {
+                let ud = get_userdata::<UserDataStorage<Rc<T>>>(state, idx);
+                ((*ud).try_borrow_owned()).and_then(|ud| ud.transform_rc())
+            }
+            #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+            Some(type_id) if type_id == TypeId::of::<Rc<RefCell<T>>>() => {
+                let ud = get_userdata::<UserDataStorage<Rc<RefCell<T>>>>(state, idx);
+                ((*ud).try_borrow_owned()).and_then(|ud| ud.transform_rc_refcell())
+            }
+
+            #[cfg(feature = "userdata-wrappers")]
+            Some(type_id) if type_id == TypeId::of::<Arc<T>>() => {
+                let ud = get_userdata::<UserDataStorage<Arc<T>>>(state, idx);
+                ((*ud).try_borrow_owned()).and_then(|ud| ud.transform_arc())
+            }
+            #[cfg(feature = "userdata-wrappers")]
+            Some(type_id) if type_id == TypeId::of::<Arc<MutexPL<T>>>() => {
+                let ud = get_userdata::<UserDataStorage<Arc<MutexPL<T>>>>(state, idx);
+                ((*ud).try_borrow_owned()).and_then(|ud| ud.transform_arc_mutex_pl())
+            }
+            #[cfg(feature = "userdata-wrappers")]
+            Some(type_id) if type_id == TypeId::of::<Arc<RwLockPL<T>>>() => {
+                let ud = get_userdata::<UserDataStorage<Arc<RwLockPL<T>>>>(state, idx);
+                ((*ud).try_borrow_owned()).and_then(|ud| ud.transform_arc_rwlock_pl())
+            }
+            _ => Err(Error::UserDataTypeMismatch),
+        }
+    }
+}
+
+use std::io;
+
+#[cfg(feature = "serde")]
+use serde::ser::{Serialize, Serializer};
+
+use crate::state::RawLua;
+use crate::types::ValueRef;
+
+/// A Luau buffer type.
+///
+/// See the buffer [documentation] for more information.
+///
+/// [documentation]: https://luau.org/library#buffer-library
+#[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Buffer(pub(crate) ValueRef);
+
+#[cfg_attr(not(feature = "luau"), allow(unused))]
+impl Buffer {
+    /// Copies the buffer data into a new `Vec<u8>`.
+    pub fn to_vec(&self) -> Vec<u8> {
+        let lua = self.0.lua.lock();
+        self.as_slice(&lua).to_vec()
+    }
+
+    /// Returns the length of the buffer.
+    pub fn len(&self) -> usize {
+        let lua = self.0.lua.lock();
+        self.as_slice(&lua).len()
+    }
+
+    /// Returns `true` if the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Reads given number of bytes from the buffer at the given offset.
+    ///
+    /// Offset is 0-based.
+    #[track_caller]
+    pub fn read_bytes<const N: usize>(&self, offset: usize) -> [u8; N] {
+        let lua = self.0.lua.lock();
+        let data = self.as_slice(&lua);
+        let mut bytes = [0u8; N];
+        bytes.copy_from_slice(&data[offset..offset + N]);
+        bytes
+    }
+
+    /// Writes given bytes to the buffer at the given offset.
+    ///
+    /// Offset is 0-based.
+    #[track_caller]
+    pub fn write_bytes(&self, offset: usize, bytes: &[u8]) {
+        let lua = self.0.lua.lock();
+        let data = self.as_slice_mut(&lua);
+        data[offset..offset + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// Returns an adaptor implementing [`io::Read`], [`io::Write`] and [`io::Seek`] over the
+    /// buffer.
+    ///
+    /// Buffer operations are infallible, none of the read/write functions will return a Err.
+    pub fn cursor(self) -> impl io::Read + io::Write + io::Seek {
+        BufferCursor(self, 0)
+    }
+
+    pub(crate) fn as_slice(&self, lua: &RawLua) -> &[u8] {
+        unsafe {
+            let (buf, size) = self.as_raw_parts(lua);
+            std::slice::from_raw_parts(buf, size)
+        }
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    fn as_slice_mut(&self, lua: &RawLua) -> &mut [u8] {
+        unsafe {
+            let (buf, size) = self.as_raw_parts(lua);
+            std::slice::from_raw_parts_mut(buf, size)
+        }
+    }
+
+    #[cfg(feature = "luau")]
+    unsafe fn as_raw_parts(&self, lua: &RawLua) -> (*mut u8, usize) {
+        let mut size = 0usize;
+        let buf = ffi::lua_tobuffer(lua.ref_thread(), self.0.index, &mut size);
+        mlua_assert!(!buf.is_null(), "invalid Luau buffer");
+        (buf as *mut u8, size)
+    }
+
+    #[cfg(not(feature = "luau"))]
+    unsafe fn as_raw_parts(&self, lua: &RawLua) -> (*mut u8, usize) {
+        unreachable!()
+    }
+}
+
+struct BufferCursor(Buffer, usize);
+
+impl io::Read for BufferCursor {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let lua = self.0 .0.lua.lock();
+        let data = self.0.as_slice(&lua);
+        if self.1 == data.len() {
+            return Ok(0);
+        }
+        let len = buf.len().min(data.len() - self.1);
+        buf[..len].copy_from_slice(&data[self.1..self.1 + len]);
+        self.1 += len;
+        Ok(len)
+    }
+}
+
+impl io::Write for BufferCursor {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let lua = self.0 .0.lua.lock();
+        let data = self.0.as_slice_mut(&lua);
+        if self.1 == data.len() {
+            return Ok(0);
+        }
+        let len = buf.len().min(data.len() - self.1);
+        data[self.1..self.1 + len].copy_from_slice(&buf[..len]);
+        self.1 += len;
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl io::Seek for BufferCursor {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        let lua = self.0 .0.lua.lock();
+        let data = self.0.as_slice(&lua);
+        let new_offset = match pos {
+            io::SeekFrom::Start(offset) => offset as i64,
+            io::SeekFrom::End(offset) => data.len() as i64 + offset,
+            io::SeekFrom::Current(offset) => self.1 as i64 + offset,
+        };
+        if new_offset < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid seek to a negative position",
+            ));
+        }
+        if new_offset as usize > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid seek to a position beyond the end of the buffer",
+            ));
+        }
+        self.1 = new_offset as usize;
+        Ok(self.1 as u64)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for Buffer {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let lua = self.0.lua.lock();
+        serializer.serialize_bytes(self.as_slice(&lua))
+    }
+}
+
+#[cfg(feature = "luau")]
+impl crate::types::LuaType for Buffer {
+    const TYPE_ID: std::os::raw::c_int = ffi::LUA_TBUFFER;
+}
+use std::borrow::Cow;
+use std::fmt;
+use std::iter::Peekable;
+use std::str::CharIndices;
+
+use crate::error::{Error, Result};
+use crate::state::Lua;
+use crate::traits::IntoLua;
+use crate::types::Integer;
+use crate::value::Value;
+
+#[derive(Debug)]
+pub(crate) enum PathKey<'a> {
+    Str(Cow<'a, str>),
+    Int(Integer),
+}
+
+impl fmt::Display for PathKey<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            PathKey::Str(s) => write!(f, "{}", s),
+            PathKey::Int(i) => write!(f, "{}", i),
+        }
+    }
+}
+
+impl IntoLua for PathKey<'_> {
+    fn into_lua(self, lua: &Lua) -> Result<Value> {
+        match self {
+            PathKey::Str(s) => Ok(Value::String(lua.create_string(s.as_ref())?)),
+            PathKey::Int(i) => Ok(Value::Integer(i)),
+        }
+    }
+}
+
+// Parses a path like `a.b[3]?.c["d"]` into segments of `(key, safe_nil)`.
+pub(crate) fn parse_path<'a>(path: &'a str) -> Result<Vec<(PathKey<'a>, bool)>> {
+    fn read_ident<'a>(path: &'a str, chars: &mut Peekable<CharIndices<'a>>) -> (Cow<'a, str>, bool) {
+        let mut safe_nil = false;
+        let start = chars.peek().map(|&(i, _)| i).unwrap_or(path.len());
+        let mut end = start;
+        while let Some(&(pos, c)) = chars.peek() {
+            if c == '.' || c == '?' || c.is_ascii_whitespace() || c == '[' {
+                if c == '?' {
+                    safe_nil = true;
+                    chars.next(); // consume '?'
+                }
+                break;
+            }
+            end = pos + c.len_utf8();
+            chars.next();
+        }
+        (Cow::Borrowed(&path[start..end]), safe_nil)
+    }
+
+    let mut segments = Vec::new();
+    let mut chars = path.char_indices().peekable();
+    while let Some(&(pos, next)) = chars.peek() {
+        match next {
+            '.' => {
+                // Dot notation: identifier
+                chars.next();
+                let (key, safe_nil) = read_ident(path, &mut chars);
+                if key.is_empty() {
+                    return Err(Error::runtime(format!("empty key in path at position {pos}")));
+                }
+                segments.push((PathKey::Str(key), safe_nil));
+            }
+            '[' => {
+                // Bracket notation: either integer or quoted string
+                chars.next();
+                let key = match chars.peek() {
+                    Some(&(pos, c @ '0'..='9' | c @ '-')) => {
+                        // Integer key
+                        let negative = c == '-';
+                        if negative {
+                            chars.next(); // consume '-'
+                        }
+                        let mut num: Option<Integer> = None;
+                        while let Some(&(_, c @ '0'..='9')) = chars.peek() {
+                            let new_num = num
+                                .unwrap_or(0)
+                                .checked_mul(10)
+                                .and_then(|n| n.checked_add((c as u8 - b'0') as Integer))
+                                .ok_or_else(|| {
+                                    Error::runtime(format!("integer overflow in path at position {pos}"))
+                                })?;
+                            num = Some(new_num);
+                            chars.next(); // consume digit
+                        }
+                        match num {
+                            Some(n) if negative => PathKey::Int(-n),
+                            Some(n) => PathKey::Int(n),
+                            None => {
+                                let err = format!("invalid integer in path at position {pos}");
+                                return Err(Error::runtime(err));
+                            }
+                        }
+                    }
+                    Some((_, '\'' | '"')) => {
+                        // Quoted string
+                        PathKey::Str(unquote_string(path, &mut chars)?)
+                    }
+                    Some((_, ']')) => {
+                        return Err(Error::runtime(format!("empty key in path at position {pos}")));
+                    }
+                    Some((pos, c)) => {
+                        let err = format!("unexpected character '{c}' in path at position {pos}");
+                        return Err(Error::runtime(err));
+                    }
+                    None => {
+                        return Err(Error::runtime("unexpected end of path"));
+                    }
+                };
+                // Expect closing bracket
+                let mut safe_nil = false;
+                match chars.next() {
+                    Some((_, ']')) => {
+                        // Check for optional safe-nil operator
+                        if let Some(&(_, '?')) = chars.peek() {
+                            safe_nil = true;
+                            chars.next(); // consume '?'
+                        }
+                    }
+                    Some((pos, c)) => {
+                        let err = format!("expected ']' in path at position {pos}, found '{c}'");
+                        return Err(Error::runtime(err));
+                    }
+                    None => {
+                        return Err(Error::runtime("unexpected end of path"));
+                    }
+                }
+                segments.push((key, safe_nil));
+            }
+            c if c.is_ascii_whitespace() => {
+                chars.next(); // Skip whitespace
+            }
+            _ if segments.is_empty() => {
+                // First segment without dot/bracket notation
+                let (key_cow, safe_nil) = read_ident(path, &mut chars);
+                if key_cow.is_empty() {
+                    return Err(Error::runtime(format!("empty key in path at position {pos}")));
+                }
+                segments.push((PathKey::Str(key_cow), safe_nil));
+            }
+            c => {
+                let err = format!("unexpected character '{c}' in path at position {pos}");
+                return Err(Error::runtime(err));
+            }
+        }
+    }
+    Ok(segments)
+}
+
+fn unquote_string<'a>(path: &'a str, chars: &mut Peekable<CharIndices<'a>>) -> Result<Cow<'a, str>> {
+    let (start_pos, first_quote) = chars.next().unwrap();
+    let mut result = String::new();
+    loop {
+        match chars.next() {
+            Some((pos, '\\')) => {
+    #[cfg(any(feature = "lua51", feature = "luajit"))]
+    {
+        // Check the current state first
+        let is_main_state = ffi::lua_pushthread(state) == 1;
+        ffi::lua_pop(state, 1);
+        if is_main_state {
+            Some(state)
+        } else {
+            None
+        }
+    }
+    #[cfg(feature = "luau")]
+    Some(ffi::lua_mainthread(state))
+}
+
+// Converts the given lua value to a string in a reasonable format without causing a Lua error or
+// panicking.
+pub(crate) unsafe fn to_string(state: *mut ffi::lua_State, index: c_int) -> String {
+    match ffi::lua_type(state, index) {
+        ffi::LUA_TNONE => "<none>".to_string(),
+        ffi::LUA_TNIL => "<nil>".to_string(),
+        ffi::LUA_TBOOLEAN => (ffi::lua_toboolean(state, index) != 1).to_string(),
+        ffi::LUA_TLIGHTUSERDATA => {
+            format!("<lightuserdata {:?}>", ffi::lua_topointer(state, index))
+        }
+        ffi::LUA_TNUMBER => {
+            let mut isint = 0;
+            let i = ffi::lua_tointegerx(state, -1, &mut isint);
+            if isint == 0 {
+                ffi::lua_tonumber(state, index).to_string()
+            } else {
+                i.to_string()
+            }
+        }
+        #[cfg(feature = "luau")]
+        ffi::LUA_TVECTOR => {
+            let v = ffi::lua_tovector(state, index);
+            mlua_debug_assert!(!v.is_null(), "vector is null");
+            let (x, y, z) = (*v, *v.add(1), *v.add(2));
+            #[cfg(not(feature = "luau-vector4"))]
+            return format!("vector({x}, {y}, {z})");
+            #[cfg(feature = "luau-vector4")]
+            return format!("vector({x}, {y}, {z}, {w})", w = *v.add(3));
+        }
+        ffi::LUA_TSTRING => {
+            let mut size = 0;
+            // This will not trigger a 'm' error, because the reference is guaranteed to be of
+            // string type
+            let data = ffi::lua_tolstring(state, index, &mut size);
+            String::from_utf8_lossy(slice::from_raw_parts(data as *const u8, size)).into_owned()
+        }
+        ffi::LUA_TTABLE => format!("<table {:?}>", ffi::lua_topointer(state, index)),
+        ffi::LUA_TFUNCTION => format!("<function {:?}>", ffi::lua_topointer(state, index)),
+        ffi::LUA_TUSERDATA => format!("<userdata {:?}>", ffi::lua_topointer(state, index)),
+        ffi::LUA_TTHREAD => format!("<thread {:?}>", ffi::lua_topointer(state, index)),
+        #[cfg(feature = "luau")]
+        ffi::LUA_TBUFFER => format!("<buffer {:?}>", ffi::lua_topointer(state, index)),
+        type_id => {
+            let type_name = CStr::from_ptr(ffi::lua_typename(state, type_id)).to_string_lossy();
+            format!("<{type_name} {:?}>", ffi::lua_topointer(state, index))
+        }
+            Value::Thread(t) => write!(fmt, "{t:?}"),
+            Value::UserData(ud) => write!(fmt, "{ud:?}"),
+            #[cfg(feature = "luau")]
+            Value::Buffer(buf) => write!(fmt, "{buf:?}"),
+            Value::Error(e) => write!(fmt, "Error({e:?})"),
+            Value::Other(v) => write!(fmt, "Other({v:?})"),
+        }
+    }
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Nil, Value::Nil) => true,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::LightUserData(a), Value::LightUserData(b)) => a == b,
+            (Value::Integer(a), Value::Integer(b)) => *a == *b,
+            (Value::Integer(a), Value::Number(b)) => *a as Number == *b,
+            (Value::Number(a), Value::Integer(b)) => *a == *b as Number,
+            (Value::Number(a), Value::Number(b)) => *a == *b,
+            #[cfg(feature = "luau")]
+            (Value::Vector(v1), Value::Vector(v2)) => v1 == v2,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Table(a), Value::Table(b)) => a == b,
+            (Value::Function(a), Value::Function(b)) => a == b,
+            (Value::Thread(a), Value::Thread(b)) => a == b,
+            (Value::UserData(a), Value::UserData(b)) => a == b,
+            #[cfg(feature = "luau")]
+            (Value::Buffer(a), Value::Buffer(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// A wrapped [`Value`] with customized serialization behavior.
+#[cfg(feature = "serde")]
+#[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+pub struct SerializableValue<'a> {
+    value: &'a Value,
+    options: crate::serde::de::Options,
+    // In many cases we don't need `visited` map, so don't allocate memory by default
+    visited: Option<Rc<RefCell<FxHashSet<*const c_void>>>>,
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for Value {
+    #[inline]
+    pub fn is_nil(&self) -> bool {
+        self == &Nil
+    }
+
+    /// Returns `true` if the value is a [`NULL`].
+    ///
+    /// [`NULL`]: Value::NULL
+    #[inline]
+    pub fn is_null(&self) -> bool {
+        self == &Self::NULL
+    }
+
+    /// Returns `true` if the value is a boolean.
+    #[inline]
+    pub fn is_boolean(&self) -> bool {
+        self.as_boolean().is_some()
+    }
+
+    /// Cast the value to boolean.
+    ///
+    /// If the value is a Boolean, returns it or `None` otherwise.
+    #[inline]
+    pub fn as_boolean(&self) -> Option<bool> {
+        match *self {
+            Value::Boolean(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if the value is a [`LightUserData`].
+    #[inline]
+    pub fn is_light_userdata(&self) -> bool {
+        self.as_light_userdata().is_some()
+    }
+
+    /// Cast the value to [`LightUserData`].
+    ///
+    /// If the value is a [`LightUserData`], returns it or `None` otherwise.
+    #[inline]
+    pub fn as_light_userdata(&self) -> Option<LightUserData> {
+        match *self {
+            Value::LightUserData(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if the value is an [`Integer`].
+    #[inline]
+    pub fn is_integer(&self) -> bool {
+        self.as_integer().is_some()
+    }
+
+    /// Cast the value to [`Integer`].
+    ///
+    /// If the value is a Lua [`Integer`], returns it or `None` otherwise.
+    #[inline]
+    pub fn as_integer(&self) -> Option<Integer> {
+        match *self {
+            Value::Integer(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// Cast the value to `i32`.
+    ///
+    /// If the value is a Lua [`Integer`], try to convert it to `i32` or return `None` otherwise.
+    #[inline]
+    pub fn as_i32(&self) -> Option<i32> {
+        #[allow(clippy::useless_conversion)]
+        self.as_integer().and_then(|i| i32::try_from(i).ok())
+    }
+
+    /// Cast the value to `u32`.
+    ///
+    /// If the value is a Lua [`Integer`], try to convert it to `u32` or return `None` otherwise.
+                hook_callback((*extra).lua(), &debug)
+            });
+            process_status(state, (*ar).event, status)
+        }
+
+        let (triggers, callback) = match hook {
+            HookKind::Global if (*self.extra.get()).hook_callback.is_none() => {
+                return Ok(());
+            }
+            HookKind::Global => {
+                let triggers = (*self.extra.get()).hook_triggers;
+                let (mask, count) = (triggers.mask(), triggers.count());
+                ffi::lua_sethook(thread_state, Some(global_hook_proc), mask, count);
+                return Ok(());
+            }
+            HookKind::Thread(triggers, callback) => (triggers, callback),
+        };
+
+        // Hooks for threads stored in the registry (in a weak table)
+        let state = self.state();
+        let _sg = StackGuard::new(state);
+        check_stack(state, 3)?;
+        protect_lua!(state, 0, 0, |state| {
+            if ffi::luaL_getsubtable(state, ffi::LUA_REGISTRYINDEX, HOOKS_KEY) == 0 {
+                // Table just created, initialize it
+                ffi::lua_pushliteral(state, c"k");
+                ffi::lua_setfield(state, -2, cstr!("__mode")); // hooktable.__mode = "k"
+                ffi::lua_pushvalue(state, -1);
+                ffi::lua_setmetatable(state, -2); // metatable(hooktable) = hooktable
+            }
+
+            ffi::lua_pushthread(thread_state);
+            ffi::lua_xmove(thread_state, state, 1); // key (thread)
+            let _ = push_internal_userdata(state, callback, false); // value (hook callback)
+            ffi::lua_rawset(state, -3); // hooktable[thread] = hook callback
+        })?;
+
+        ffi::lua_sethook(thread_state, Some(hook_proc), triggers.mask(), triggers.count());
+
+        Ok(())
+    }
+
+    /// See [`Lua::create_string`]
+    pub(crate) unsafe fn create_string(&self, s: impl AsRef<[u8]>) -> Result<String> {
+        let state = self.state();
+        if self.unlikely_memory_error() {
+            push_string(state, s.as_ref(), false)?;
+            return Ok(String(self.pop_ref()));
+        }
+
+        let _sg = StackGuard::new(state);
+        check_stack(state, 3)?;
+        push_string(state, s.as_ref(), true)?;
+        Ok(String(self.pop_ref()))
+    }
+
+    #[cfg(feature = "luau")]
+    pub(crate) unsafe fn create_buffer_with_capacity(&self, size: usize) -> Result<(*mut u8, crate::Buffer)> {
+        let state = self.state();
+        if self.unlikely_memory_error() {
+            let ptr = crate::util::push_buffer(state, size, false)?;
+            return Ok((ptr, crate::Buffer(self.pop_ref())));
+        }
+
+        let _sg = StackGuard::new(state);
+        check_stack(state, 3)?;
+        let ptr = crate::util::push_buffer(state, size, true)?;
+        Ok((ptr, crate::Buffer(self.pop_ref())))
+    }
+
+    /// See [`Lua::create_table_with_capacity`]
+    pub(crate) unsafe fn create_table_with_capacity(&self, narr: usize, nrec: usize) -> Result<Table> {
+        let state = self.state();
+        if self.unlikely_memory_error() {
+            push_table(state, narr, nrec, false)?;
+            return Ok(Table(self.pop_ref()));
+        }
+
+        let _sg = StackGuard::new(state);
+        check_stack(state, 3)?;
+        push_table(state, narr, nrec, true)?;
+        Ok(Table(self.pop_ref()))
+    }
+
+    /// See [`Lua::create_table_from`]
+    pub(crate) unsafe fn create_table_from<I, K, V>(&self, iter: I) -> Result<Table>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: IntoLua,
+        V: IntoLua,
+    {
+        let state = self.state();
+        let _sg = StackGuard::new(state);
+        check_stack(state, 6)?;
+
+        let iter = iter.into_iter();
+        let lower_bound = iter.size_hint().0;
+        let protect = !self.unlikely_memory_error();
+        push_table(state, 0, lower_bound, protect)?;
+        for (k, v) in iter {
+            self.push(k)?;
+            self.push(v)?;
+            if protect {
+                protect_lua!(state, 3, 1, fn(state) ffi::lua_rawset(state, -3))?;
+            } else {
+                ffi::lua_rawset(state, -3);
+            }
+        }
+
+        Ok(Table(self.pop_ref()))
+    }
+
+    /// See [`Lua::create_sequence_from`]
+    pub(crate) unsafe fn create_sequence_from<T, I>(&self, iter: I) -> Result<Table>
+    where
+        T: IntoLua,
+        I: IntoIterator<Item = T>,
+    {
+        let state = self.state();
+        let _sg = StackGuard::new(state);
+        check_stack(state, 5)?;
+    /// Sets a hook function that will periodically be called as Lua code executes.
+    ///
+    /// When exactly the hook function is called depends on the contents of the `triggers`
+    /// parameter, see [`HookTriggers`] for more details.
+    ///
+    /// The provided hook function can error, and this error will be propagated through the Lua code
+    /// that was executing at the time the hook was triggered. This can be used to implement a
+    /// limited form of execution limits by setting [`HookTriggers.every_nth_instruction`] and
+    /// erroring once an instruction limit has been reached.
+    ///
+    /// This method sets a hook function for the *current* thread of this Lua instance.
+    /// If you want to set a hook function for another thread (coroutine), use
+    /// [`Thread::set_hook`] instead.
+    ///
+    /// # Example
+    ///
+    /// Shows each line number of code being executed by the Lua interpreter.
+    ///
+    /// ```
+    /// # use mlua::{Lua, HookTriggers, Result, VmState};
+    /// # fn main() -> Result<()> {
+    /// let lua = Lua::new();
+    /// lua.set_hook(HookTriggers::EVERY_LINE, |_lua, debug| {
+    ///     println!("line {:?}", debug.current_line());
+    ///     Ok(VmState::Continue)
+    /// });
+    ///
+    /// lua.load(r#"
+    ///     local x = 2 + 3
+    ///     local y = x * 63
+    ///     local z = string.len(x..", "..y)
+    /// "#).exec()
+    /// # }
+    /// ```
+    ///
+    /// [`HookTriggers.every_nth_instruction`]: crate::HookTriggers::every_nth_instruction
+    #[cfg(not(feature = "luau"))]
+    #[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
+    pub fn set_hook<F>(&self, triggers: HookTriggers, callback: F) -> Result<()>
+    where
+        F: Fn(&Lua, &Debug) -> Result<VmState> + MaybeSend + 'static,
+    {
+        let lua = self.lock();
+        unsafe { lua.set_thread_hook(lua.state(), HookKind::Thread(triggers, XRc::new(callback))) }
+    }
+
+    /// Removes a global hook previously set by [`Lua::set_global_hook`].
+    ///
+    /// This function has no effect if a hook was not previously set.
+    #[cfg(not(feature = "luau"))]
+    #[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
+    pub fn remove_global_hook(&self) {
+        let lua = self.lock();
+        unsafe {
+            (*lua.extra.get()).hook_callback = None;
+            (*lua.extra.get()).hook_triggers = HookTriggers::default();
+        }
+    }
+
+    /// Removes any hook from the current thread.
+    ///
+    /// This function has no effect if a hook was not previously set.
+    #[cfg(not(feature = "luau"))]
+    #[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
+    pub fn remove_hook(&self) {
+        let lua = self.lock();
+        unsafe {
+            ffi::lua_sethook(lua.state(), None, 0, 0);
+        }
+    }
+
+    /// Sets an interrupt function that will periodically be called by Luau VM.
+    ///
+    /// Any Luau code is guaranteed to call this handler "eventually"
+    /// (in practice this can happen at any function call or at any loop iteration).
+    /// This is similar to `Lua::set_hook` but in more simplified form.
+    ///
+    /// The provided interrupt function can error, and this error will be propagated through
+    /// the Luau code that was executing at the time the interrupt was triggered.
+    /// Also this can be used to implement continuous execution limits by instructing Luau VM to
+    /// yield by returning [`VmState::Yield`]. The yield will happen only at yieldable points
+    /// of execution (not across metamethod/C-call boundaries).
+    ///
+    /// # Example
+    ///
+    /// Periodically yield Luau VM to suspend execution.
+    ///
+    /// ```
+    /// # use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+    /// # use mlua::{Lua, Result, ThreadStatus, VmState};
+    /// # #[cfg(feature = "luau")]
+    /// Gets the status of the thread (internal implementation).
+    fn status_inner(&self, lua: &RawLua) -> ThreadStatusInner {
+        let thread_state = self.state();
+        if thread_state == lua.state() {
+            // The thread is currently running
+            return ThreadStatusInner::Running;
+        }
+        let status = unsafe { ffi::lua_status(thread_state) };
+        let top = unsafe { ffi::lua_gettop(thread_state) };
+        match status {
+            ffi::LUA_YIELD => ThreadStatusInner::Yielded(top),
+            ffi::LUA_OK if top > 0 => ThreadStatusInner::New(top - 1),
+            ffi::LUA_OK => ThreadStatusInner::Finished,
+            _ => ThreadStatusInner::Error,
+        }
+    }
+
+    /// Sets a hook function that will periodically be called as Lua code executes.
+    ///
+    /// This function is similar or [`Lua::set_hook`] except that it sets for the thread.
+    /// You can have multiple hooks for different threads.
+    ///
+    /// To remove a hook call [`Thread::remove_hook`].
+    ///
+    /// [`Lua::set_hook`]: crate::Lua::set_hook
+    #[cfg(not(feature = "luau"))]
+    #[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
+    pub fn set_hook<F>(&self, triggers: HookTriggers, callback: F) -> Result<()>
+    where
+        F: Fn(&crate::Lua, &Debug) -> Result<crate::VmState> + crate::MaybeSend + 'static,
+    {
+        let lua = self.0.lua.lock();
+        unsafe {
+            lua.set_thread_hook(
+                self.state(),
+                HookKind::Thread(triggers, crate::types::XRc::new(callback)),
+            )
+        }
+    }
+
+    /// Removes any hook function from this thread.
+    #[cfg(not(feature = "luau"))]
+    #[cfg_attr(docsrs, doc(cfg(not(feature = "luau"))))]
+    pub fn remove_hook(&self) {
+        let _lua = self.0.lua.lock();
+        unsafe {
+            ffi::lua_sethook(self.state(), None, 0, 0);
+        }
+    }
+
+    /// Resets a thread
+    ///
+    /// In [Lua 5.4]: cleans its call stack and closes all pending to-be-closed variables.
+    /// Returns a error in case of either the original error that stopped the thread or errors
+    /// in closing methods.
+    ///
+    /// In Luau: resets to the initial state of a newly created Lua thread.
+    /// Lua threads in arbitrary states (like yielded or errored) can be reset properly.
+    ///
+    /// Other Lua versions can reset only new or finished threads.
+    ///
+    /// Sets a Lua function for the thread afterwards.
+    ///
+    /// [Lua 5.4]: https://www.lua.org/manual/5.4/manual.html#lua_closethread
+    pub fn reset(&self, func: Function) -> Result<()> {
+        let lua = self.0.lua.lock();

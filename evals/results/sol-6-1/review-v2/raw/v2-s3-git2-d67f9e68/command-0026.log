@@ -1,0 +1,901 @@
+use libc::{c_int, c_uint, c_void, size_t};
+use std::marker;
+use std::path::Path;
+use std::ptr;
+use std::slice;
+use std::str;
+
+use crate::odb::{write_pack_progress_cb, OdbPackwriterCb};
+use crate::util::Binding;
+use crate::IntoCString;
+use crate::{panic, raw, Buf, Error, Oid, Repository, Revwalk};
+
+#[derive(PartialEq, Eq, Clone, Debug, Copy)]
+/// Stages that are reported by the `PackBuilder` progress callback.
+pub enum PackBuilderStage {
+    /// Adding objects to the pack
+    AddingObjects,
+    /// Deltafication of the pack
+    Deltafication,
+}
+
+pub type ProgressCb<'a> = dyn FnMut(PackBuilderStage, u32, u32) -> bool + 'a;
+pub type ForEachCb<'a> = dyn FnMut(&[u8]) -> bool + 'a;
+
+/// A builder for creating a packfile
+pub struct PackBuilder<'repo> {
+    raw: *mut raw::git_packbuilder,
+    _progress: Option<Box<Box<ProgressCb<'repo>>>>,
+    _marker: marker::PhantomData<&'repo Repository>,
+}
+
+impl<'repo> PackBuilder<'repo> {
+    /// Insert a single object. For an optimal pack it's mandatory to insert
+    /// objects in recency order, commits followed by trees and blobs.
+    pub fn insert_object(&mut self, id: Oid, name: Option<&str>) -> Result<(), Error> {
+        let name = crate::opt_cstr(name)?;
+        unsafe {
+            try_call!(raw::git_packbuilder_insert(self.raw, id.raw(), name));
+        }
+        Ok(())
+    }
+
+    /// Insert a root tree object. This will add the tree as well as all
+    /// referenced trees and blobs.
+    pub fn insert_tree(&mut self, id: Oid) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_packbuilder_insert_tree(self.raw, id.raw()));
+        }
+        Ok(())
+    }
+
+    /// Insert a commit object. This will add a commit as well as the completed
+    /// referenced tree.
+    pub fn insert_commit(&mut self, id: Oid) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_packbuilder_insert_commit(self.raw, id.raw()));
+        }
+        Ok(())
+    }
+
+    /// Insert objects as given by the walk. Those commits and all objects they
+    /// reference will be inserted into the packbuilder.
+    pub fn insert_walk(&mut self, walk: &mut Revwalk<'_>) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_packbuilder_insert_walk(self.raw, walk.raw()));
+        }
+        Ok(())
+    }
+
+    /// Recursively insert an object and its referenced objects. Insert the
+    /// object as well as any object it references.
+    pub fn insert_recursive(&mut self, id: Oid, name: Option<&str>) -> Result<(), Error> {
+        let name = crate::opt_cstr(name)?;
+        unsafe {
+            try_call!(raw::git_packbuilder_insert_recur(self.raw, id.raw(), name));
+        }
+        Ok(())
+    }
+
+    /// Write the contents of the packfile to an in-memory buffer. The contents
+    /// of the buffer will become a valid packfile, even though there will be
+    /// no attached index.
+    pub fn write_buf(&mut self, buf: &mut Buf) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_packbuilder_write_buf(buf.raw(), self.raw));
+        }
+        Ok(())
+    }
+
+    /// Write the new pack and corresponding index file to path.
+    /// To set a progress callback, use `set_progress_callback` before calling this method.
+    pub fn write(&mut self, path: &Path, mode: u32) -> Result<(), Error> {
+        let path = path.into_c_string()?;
+        let progress_cb: raw::git_indexer_progress_cb = Some(write_pack_progress_cb);
+        let progress_payload = Box::new(OdbPackwriterCb { cb: None });
+        let progress_payload_ptr = Box::into_raw(progress_payload);
+
+        unsafe {
+            try_call!(raw::git_packbuilder_write(
+                self.raw,
+                path,
+                mode,
+                progress_cb,
+                progress_payload_ptr as *mut _
+            ));
+        }
+        Ok(())
+    }
+
+    /// Create the new pack and pass each object to the callback.
+    pub fn foreach<F>(&mut self, mut cb: F) -> Result<(), Error>
+    where
+        F: FnMut(&[u8]) -> bool,
+    {
+        let mut cb = &mut cb as &mut ForEachCb<'_>;
+        let ptr = &mut cb as *mut _;
+        let foreach: raw::git_packbuilder_foreach_cb = Some(foreach_c);
+        unsafe {
+            try_call!(raw::git_packbuilder_foreach(
+                self.raw,
+                foreach,
+                ptr as *mut _
+            ));
+        }
+        Ok(())
+    }
+
+    /// `progress` will be called with progress information during pack
+    /// building. Be aware that this is called inline with pack building
+    /// operations, so performance may be affected.
+    ///
+    /// There can only be one progress callback attached, this will replace any
+    /// existing one. See `unset_progress_callback` to remove the current
+    /// progress callback without attaching a new one.
+    pub fn set_progress_callback<F>(&mut self, progress: F) -> Result<(), Error>
+    where
+        F: FnMut(PackBuilderStage, u32, u32) -> bool + 'repo,
+    {
+        let mut progress = Box::new(Box::new(progress) as Box<ProgressCb<'_>>);
+        let ptr = &mut *progress as *mut _;
+        let progress_c: raw::git_packbuilder_progress = Some(progress_c);
+        unsafe {
+            try_call!(raw::git_packbuilder_set_callbacks(
+                self.raw,
+                progress_c,
+                ptr as *mut _
+            ));
+        }
+        self._progress = Some(progress);
+        Ok(())
+    }
+
+    /// Remove the current progress callback.  See `set_progress_callback` to
+    /// set the progress callback.
+    pub fn unset_progress_callback(&mut self) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_packbuilder_set_callbacks(
+                self.raw,
+                None,
+                ptr::null_mut()
+            ));
+            self._progress = None;
+        }
+        Ok(())
+    }
+
+    /// Set the number of threads to be used.
+    ///
+    /// Returns the number of threads to be used.
+    pub fn set_threads(&mut self, threads: u32) -> u32 {
+        unsafe { raw::git_packbuilder_set_threads(self.raw, threads) }
+    }
+
+    /// Get the total number of objects the packbuilder will write out.
+    pub fn object_count(&self) -> usize {
+        unsafe { raw::git_packbuilder_object_count(self.raw) }
+    }
+
+    /// Get the number of objects the packbuilder has already written out.
+    pub fn written(&self) -> usize {
+        unsafe { raw::git_packbuilder_written(self.raw) }
+    }
+
+    /// Get the packfile's hash. A packfile's name is derived from the sorted
+    /// hashing of all object names. This is only correct after the packfile
+    /// has been written.
+    #[deprecated = "use `name()` to retrieve the filename"]
+    #[allow(deprecated)]
+    pub fn hash(&self) -> Option<Oid> {
+        if self.object_count() == 0 {
+            unsafe { Some(Binding::from_raw(raw::git_packbuilder_hash(self.raw))) }
+        } else {
+            None
+        }
+    }
+
+    /// Get the unique name for the resulting packfile.
+    ///
+    /// The packfile's name is derived from the packfile's content. This is only
+    /// correct after the packfile has been written.
+    ///
+    /// Returns `None` if the packfile has not been written or if the name is
+    /// not valid utf-8.
+    pub fn name(&self) -> Option<&str> {
+        self.name_bytes().and_then(|s| str::from_utf8(s).ok())
+    }
+
+    /// Get the unique name for the resulting packfile, in bytes.
+    ///
+    /// The packfile's name is derived from the packfile's content. This is only
+    /// correct after the packfile has been written.
+    pub fn name_bytes(&self) -> Option<&[u8]> {
+        unsafe { crate::opt_bytes(self, raw::git_packbuilder_name(self.raw)) }
+    }
+}
+
+impl<'repo> Binding for PackBuilder<'repo> {
+    type Raw = *mut raw::git_packbuilder;
+    unsafe fn from_raw(ptr: *mut raw::git_packbuilder) -> PackBuilder<'repo> {
+        PackBuilder {
+            raw: ptr,
+            _progress: None,
+            _marker: marker::PhantomData,
+        }
+    }
+    fn raw(&self) -> *mut raw::git_packbuilder {
+        self.raw
+    }
+}
+
+impl<'repo> Drop for PackBuilder<'repo> {
+    fn drop(&mut self) {
+        unsafe {
+            raw::git_packbuilder_set_callbacks(self.raw, None, ptr::null_mut());
+            raw::git_packbuilder_free(self.raw);
+        }
+    }
+}
+
+impl Binding for PackBuilderStage {
+    type Raw = raw::git_packbuilder_stage_t;
+    unsafe fn from_raw(raw: raw::git_packbuilder_stage_t) -> PackBuilderStage {
+        match raw {
+            raw::GIT_PACKBUILDER_ADDING_OBJECTS => PackBuilderStage::AddingObjects,
+            raw::GIT_PACKBUILDER_DELTAFICATION => PackBuilderStage::Deltafication,
+            _ => panic!("Unknown git diff binary kind"),
+        }
+    }
+    fn raw(&self) -> raw::git_packbuilder_stage_t {
+        match *self {
+            PackBuilderStage::AddingObjects => raw::GIT_PACKBUILDER_ADDING_OBJECTS,
+            PackBuilderStage::Deltafication => raw::GIT_PACKBUILDER_DELTAFICATION,
+        }
+    }
+}
+
+extern "C" fn foreach_c(buf: *const c_void, size: size_t, data: *mut c_void) -> c_int {
+    unsafe {
+        let buf = slice::from_raw_parts(buf as *const u8, size as usize);
+
+        let r = panic::wrap(|| {
+            let data = data as *mut &mut ForEachCb<'_>;
+            (*data)(buf)
+        });
+        if r == Some(true) {
+            0
+        } else {
+            -1
+        }
+    }
+}
+
+extern "C" fn progress_c(
+    stage: raw::git_packbuilder_stage_t,
+    current: c_uint,
+    total: c_uint,
+    data: *mut c_void,
+) -> c_int {
+    unsafe {
+        let stage = Binding::from_raw(stage);
+
+        let r = panic::wrap(|| {
+            let data = data as *mut Box<ProgressCb<'_>>;
+            (*data)(stage, current, total)
+        });
+        if r == Some(true) {
+            0
+        } else {
+            -1
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Buf, Oid};
+
+    // hash of a packfile constructed without any objects in it
+    const EMPTY_PACKFILE_OID: &str = "029d08823bd8a8eab510ad6ac75c823cfd3ed31e";
+
+use std::marker;
+use std::mem;
+use std::os::raw::c_int;
+use std::path::Path;
+use std::ptr;
+use std::str;
+
+use crate::util::{self, Binding};
+use crate::{build::CheckoutBuilder, SubmoduleIgnore, SubmoduleUpdate};
+use crate::{raw, Error, FetchOptions, Oid, Repository};
+
+/// A structure to represent a git [submodule][1]
+///
+/// [1]: http://git-scm.com/book/en/Git-Tools-Submodules
+pub struct Submodule<'repo> {
+    raw: *mut raw::git_submodule,
+    _marker: marker::PhantomData<&'repo Repository>,
+}
+
+impl<'repo> Submodule<'repo> {
+    /// Get the submodule's branch.
+    ///
+    /// Returns `None` if the branch is not valid utf-8 or if the branch is not
+    /// yet available.
+    pub fn branch(&self) -> Option<&str> {
+        self.branch_bytes().and_then(|s| str::from_utf8(s).ok())
+    }
+
+    /// Get the branch for the submodule.
+    ///
+    /// Returns `None` if the branch is not yet available.
+    pub fn branch_bytes(&self) -> Option<&[u8]> {
+        unsafe { crate::opt_bytes(self, raw::git_submodule_branch(self.raw)) }
+    }
+
+    /// Perform the clone step for a newly created submodule.
+    ///
+    /// This performs the necessary `git_clone` to setup a newly-created submodule.
+    pub fn clone(
+        &mut self,
+        opts: Option<&mut SubmoduleUpdateOptions<'_>>,
+    ) -> Result<Repository, Error> {
+        unsafe {
+            let raw_opts = opts.map(|o| o.raw());
+            let mut raw_repo = ptr::null_mut();
+            try_call!(raw::git_submodule_clone(
+                &mut raw_repo,
+                self.raw,
+                raw_opts.as_ref()
+            ));
+            Ok(Binding::from_raw(raw_repo))
+        }
+    }
+
+    /// Get the submodule's URL.
+    ///
+    /// Returns `None` if the URL is not valid utf-8 or if the URL isn't present
+    pub fn url(&self) -> Option<&str> {
+        self.opt_url_bytes().and_then(|b| str::from_utf8(b).ok())
+    }
+
+    /// Get the URL for the submodule.
+    #[doc(hidden)]
+    #[deprecated(note = "renamed to `opt_url_bytes`")]
+    pub fn url_bytes(&self) -> &[u8] {
+        self.opt_url_bytes().unwrap()
+    }
+
+    /// Get the URL for the submodule.
+    ///
+    /// Returns `None` if the URL isn't present
+    // TODO: delete this method and fix the signature of `url_bytes` on next
+    // major version bump
+    pub fn opt_url_bytes(&self) -> Option<&[u8]> {
+        unsafe { crate::opt_bytes(self, raw::git_submodule_url(self.raw)) }
+    }
+
+    /// Get the submodule's name.
+    ///
+    /// Returns `None` if the name is not valid utf-8
+    pub fn name(&self) -> Option<&str> {
+        str::from_utf8(self.name_bytes()).ok()
+    }
+
+    /// Get the name for the submodule.
+    pub fn name_bytes(&self) -> &[u8] {
+        unsafe { crate::opt_bytes(self, raw::git_submodule_name(self.raw)).unwrap() }
+    }
+
+    /// Get the path for the submodule.
+    pub fn path(&self) -> &Path {
+        util::bytes2path(unsafe {
+            crate::opt_bytes(self, raw::git_submodule_path(self.raw)).unwrap()
+        })
+    }
+
+    /// Get the OID for the submodule in the current HEAD tree.
+    pub fn head_id(&self) -> Option<Oid> {
+        unsafe { Binding::from_raw_opt(raw::git_submodule_head_id(self.raw)) }
+    }
+
+    /// Get the OID for the submodule in the index.
+    pub fn index_id(&self) -> Option<Oid> {
+        unsafe { Binding::from_raw_opt(raw::git_submodule_index_id(self.raw)) }
+    }
+
+    /// Get the OID for the submodule in the current working directory.
+    ///
+    /// This returns the OID that corresponds to looking up 'HEAD' in the
+    /// checked out submodule. If there are pending changes in the index or
+    /// anything else, this won't notice that.
+    pub fn workdir_id(&self) -> Option<Oid> {
+        unsafe { Binding::from_raw_opt(raw::git_submodule_wd_id(self.raw)) }
+    }
+
+    /// Get the ignore rule that will be used for the submodule.
+    pub fn ignore_rule(&self) -> SubmoduleIgnore {
+        SubmoduleIgnore::from_raw(unsafe { raw::git_submodule_ignore(self.raw) })
+    }
+
+    /// Get the update rule that will be used for the submodule.
+    pub fn update_strategy(&self) -> SubmoduleUpdate {
+        SubmoduleUpdate::from_raw(unsafe { raw::git_submodule_update_strategy(self.raw) })
+    }
+
+    /// Copy submodule info into ".git/config" file.
+    ///
+    /// Just like "git submodule init", this copies information about the
+    /// submodule into ".git/config". You can use the accessor functions above
+    /// to alter the in-memory git_submodule object and control what is written
+    /// to the config, overriding what is in .gitmodules.
+    ///
+    /// By default, existing entries will not be overwritten, but passing `true`
+    /// for `overwrite` forces them to be updated.
+    pub fn init(&mut self, overwrite: bool) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_submodule_init(self.raw, overwrite));
+        }
+        Ok(())
+    }
+
+    /// Set up the subrepository for a submodule in preparation for clone.
+    ///
+    /// This function can be called to init and set up a submodule repository
+    /// from a submodule in preparation to clone it from its remote.
+
+    /// use_gitlink: Should the workdir contain a gitlink to the repo in
+    /// .git/modules vs. repo directly in workdir.
+    pub fn repo_init(&mut self, use_gitlink: bool) -> Result<Repository, Error> {
+        unsafe {
+            let mut raw_repo = ptr::null_mut();
+            try_call!(raw::git_submodule_repo_init(
+                &mut raw_repo,
+                self.raw,
+                use_gitlink
+            ));
+            Ok(Binding::from_raw(raw_repo))
+        }
+    }
+
+    /// Open the repository for a submodule.
+    ///
+    /// This will only work if the submodule is checked out into the working
+    /// directory.
+    pub fn open(&self) -> Result<Repository, Error> {
+        let mut raw = ptr::null_mut();
+        unsafe {
+            try_call!(raw::git_submodule_open(&mut raw, self.raw));
+            Ok(Binding::from_raw(raw))
+        }
+    }
+
+    /// Reread submodule info from config, index, and HEAD.
+    ///
+    /// Call this to reread cached submodule information for this submodule if
+    /// you have reason to believe that it has changed.
+    ///
+    /// If `force` is `true`, then data will be reloaded even if it doesn't seem
+    /// out of date
+    pub fn reload(&mut self, force: bool) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_submodule_reload(self.raw, force));
+        }
+        Ok(())
+    }
+
+    /// Copy submodule remote info into submodule repo.
+    ///
+    /// This copies the information about the submodules URL into the checked
+    /// out submodule config, acting like "git submodule sync". This is useful
+    /// if you have altered the URL for the submodule (or it has been altered
+    /// by a fetch of upstream changes) and you need to update your local repo.
+    pub fn sync(&mut self) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_submodule_sync(self.raw));
+        }
+        Ok(())
+    }
+
+    /// Add current submodule HEAD commit to index of superproject.
+    ///
+    /// If `write_index` is true, then the index file will be immediately
+    /// written. Otherwise you must explicitly call `write()` on an `Index`
+    /// later on.
+    pub fn add_to_index(&mut self, write_index: bool) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_submodule_add_to_index(self.raw, write_index));
+        }
+        Ok(())
+    }
+
+    /// Resolve the setup of a new git submodule.
+    ///
+    /// This should be called on a submodule once you have called add setup and
+    /// done the clone of the submodule. This adds the .gitmodules file and the
+    /// newly cloned submodule to the index to be ready to be committed (but
+    /// doesn't actually do the commit).
+    pub fn add_finalize(&mut self) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_submodule_add_finalize(self.raw));
+        }
+        Ok(())
+    }
+
+    /// Update submodule.
+    ///
+    /// This will clone a missing submodule and check out the subrepository to
+    /// the commit specified in the index of the containing repository. If
+    /// the submodule repository doesn't contain the target commit, then the
+    /// submodule is fetched using the fetch options supplied in `opts`.
+    ///
+    /// `init` indicates if the submodule should be initialized first if it has
+    /// not been initialized yet.
+    pub fn update(
+        &mut self,
+        init: bool,
+        opts: Option<&mut SubmoduleUpdateOptions<'_>>,
+    ) -> Result<(), Error> {
+        unsafe {
+            let mut raw_opts = opts.map(|o| o.raw());
+            try_call!(raw::git_submodule_update(
+                self.raw,
+                init as c_int,
+                raw_opts.as_mut().map_or(ptr::null_mut(), |o| o)
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<'repo> Binding for Submodule<'repo> {
+    type Raw = *mut raw::git_submodule;
+    unsafe fn from_raw(raw: *mut raw::git_submodule) -> Submodule<'repo> {
+        Submodule {
+            raw,
+            _marker: marker::PhantomData,
+        }
+    }
+    fn raw(&self) -> *mut raw::git_submodule {
+        self.raw
+    }
+}
+
+impl<'repo> Drop for Submodule<'repo> {
+    fn drop(&mut self) {
+        unsafe { raw::git_submodule_free(self.raw) }
+    }
+}
+
+/// Options to update a submodule.
+pub struct SubmoduleUpdateOptions<'cb> {
+    checkout_builder: CheckoutBuilder<'cb>,
+    fetch_opts: FetchOptions<'cb>,
+    allow_fetch: bool,
+}
+
+impl<'cb> SubmoduleUpdateOptions<'cb> {
+    /// Return default options.
+    pub fn new() -> Self {
+        SubmoduleUpdateOptions {
+            checkout_builder: CheckoutBuilder::new(),
+            fetch_opts: FetchOptions::new(),
+            allow_fetch: true,
+        }
+    }
+
+    unsafe fn raw(&mut self) -> raw::git_submodule_update_options {
+        let mut checkout_opts: raw::git_checkout_options = mem::zeroed();
+        let init_res =
+            raw::git_checkout_init_options(&mut checkout_opts, raw::GIT_CHECKOUT_OPTIONS_VERSION);
+        assert_eq!(0, init_res);
+        self.checkout_builder.configure(&mut checkout_opts);
+        let opts = raw::git_submodule_update_options {
+            version: raw::GIT_SUBMODULE_UPDATE_OPTIONS_VERSION,
+            checkout_opts,
+            fetch_opts: self.fetch_opts.raw(),
+            allow_fetch: self.allow_fetch as c_int,
+        };
+        opts
+    }
+
+    /// Set checkout options.
+    pub fn checkout(&mut self, opts: CheckoutBuilder<'cb>) -> &mut Self {
+        self.checkout_builder = opts;
+        self
+    }
+
+    /// Set fetch options and allow fetching.
+    pub fn fetch(&mut self, opts: FetchOptions<'cb>) -> &mut Self {
+        self.fetch_opts = opts;
+use std::mem;
+
+use crate::build::CheckoutBuilder;
+use crate::merge::MergeOptions;
+use crate::raw;
+use std::ptr;
+
+/// Options to specify when cherry picking
+pub struct CherrypickOptions<'cb> {
+    mainline: u32,
+    checkout_builder: Option<CheckoutBuilder<'cb>>,
+    merge_opts: Option<MergeOptions>,
+}
+
+impl<'cb> CherrypickOptions<'cb> {
+    /// Creates a default set of cherrypick options
+    pub fn new() -> CherrypickOptions<'cb> {
+        CherrypickOptions {
+            mainline: 0,
+            checkout_builder: None,
+            merge_opts: None,
+        }
+    }
+
+    /// Set the mainline value
+    ///
+    /// For merge commits, the "mainline" is treated as the parent.
+    pub fn mainline(&mut self, mainline: u32) -> &mut Self {
+        self.mainline = mainline;
+        self
+    }
+
+    /// Set the checkout builder
+    pub fn checkout_builder(&mut self, cb: CheckoutBuilder<'cb>) -> &mut Self {
+        self.checkout_builder = Some(cb);
+        self
+    }
+
+    /// Set the merge options
+    pub fn merge_opts(&mut self, merge_opts: MergeOptions) -> &mut Self {
+        self.merge_opts = Some(merge_opts);
+        self
+    }
+
+    /// Obtain the raw struct
+    pub fn raw(&mut self) -> raw::git_cherrypick_options {
+        unsafe {
+            let mut checkout_opts: raw::git_checkout_options = mem::zeroed();
+            raw::git_checkout_init_options(&mut checkout_opts, raw::GIT_CHECKOUT_OPTIONS_VERSION);
+            if let Some(ref mut cb) = self.checkout_builder {
+                cb.configure(&mut checkout_opts);
+            }
+
+            let mut merge_opts: raw::git_merge_options = mem::zeroed();
+            raw::git_merge_init_options(&mut merge_opts, raw::GIT_MERGE_OPTIONS_VERSION);
+            if let Some(ref opts) = self.merge_opts {
+                ptr::copy(opts.raw(), &mut merge_opts, 1);
+            }
+
+            let mut cherrypick_opts: raw::git_cherrypick_options = mem::zeroed();
+            raw::git_cherrypick_init_options(
+                &mut cherrypick_opts,
+                raw::GIT_CHERRYPICK_OPTIONS_VERSION,
+            );
+            cherrypick_opts.mainline = self.mainline;
+            cherrypick_opts.checkout_opts = checkout_opts;
+            cherrypick_opts.merge_opts = merge_opts;
+
+            cherrypick_opts
+        }
+    }
+}
+use std::mem;
+
+use crate::build::CheckoutBuilder;
+use crate::merge::MergeOptions;
+use crate::raw;
+use std::ptr;
+
+/// Options to specify when reverting
+pub struct RevertOptions<'cb> {
+    mainline: u32,
+    checkout_builder: Option<CheckoutBuilder<'cb>>,
+    merge_opts: Option<MergeOptions>,
+}
+
+impl<'cb> RevertOptions<'cb> {
+    /// Creates a default set of revert options
+    pub fn new() -> RevertOptions<'cb> {
+        RevertOptions {
+            mainline: 0,
+            checkout_builder: None,
+            merge_opts: None,
+        }
+    }
+
+    /// Set the mainline value
+    ///
+    /// For merge commits, the "mainline" is treated as the parent.
+    pub fn mainline(&mut self, mainline: u32) -> &mut Self {
+        self.mainline = mainline;
+        self
+    }
+
+    /// Set the checkout builder
+    pub fn checkout_builder(&mut self, cb: CheckoutBuilder<'cb>) -> &mut Self {
+        self.checkout_builder = Some(cb);
+        self
+    }
+
+    /// Set the merge options
+    pub fn merge_opts(&mut self, merge_opts: MergeOptions) -> &mut Self {
+        self.merge_opts = Some(merge_opts);
+        self
+    }
+
+    /// Obtain the raw struct
+    pub fn raw(&mut self) -> raw::git_revert_options {
+        unsafe {
+            let mut checkout_opts: raw::git_checkout_options = mem::zeroed();
+            raw::git_checkout_init_options(&mut checkout_opts, raw::GIT_CHECKOUT_OPTIONS_VERSION);
+            if let Some(ref mut cb) = self.checkout_builder {
+                cb.configure(&mut checkout_opts);
+            }
+
+            let mut merge_opts: raw::git_merge_options = mem::zeroed();
+            raw::git_merge_init_options(&mut merge_opts, raw::GIT_MERGE_OPTIONS_VERSION);
+            if let Some(ref opts) = self.merge_opts {
+                ptr::copy(opts.raw(), &mut merge_opts, 1);
+            }
+
+            let mut revert_opts: raw::git_revert_options = mem::zeroed();
+            raw::git_revert_options_init(&mut revert_opts, raw::GIT_REVERT_OPTIONS_VERSION);
+            revert_opts.mainline = self.mainline;
+            revert_opts.checkout_opts = checkout_opts;
+            revert_opts.merge_opts = merge_opts;
+
+            revert_opts
+        }
+    }
+}
+use libc::c_int;
+use std::env::JoinPathsError;
+use std::error;
+use std::ffi::{CStr, CString, NulError};
+use std::fmt;
+use std::str;
+
+use crate::{raw, ErrorClass, ErrorCode};
+
+/// A structure to represent errors coming out of libgit2.
+#[derive(Debug, PartialEq)]
+pub struct Error {
+    code: c_int,
+    klass: c_int,
+    message: Box<str>,
+}
+
+impl Error {
+    /// Creates a new error.
+    ///
+    /// This is mainly intended for implementers of custom transports or
+    /// database backends, where it is desirable to propagate an [`Error`]
+    /// through `libgit2`.
+    pub fn new<S: AsRef<str>>(code: ErrorCode, class: ErrorClass, message: S) -> Self {
+        let mut err = Error::from_str(message.as_ref());
+        err.set_code(code);
+        err.set_class(class);
+        err
+    }
+
+    /// Returns the last error that happened with the code specified by `code`.
+    ///
+    /// The `code` argument typically comes from the return value of a function
+    /// call. This code will later be returned from the `code` function.
+    pub fn last_error(code: c_int) -> Error {
+        crate::init();
+        unsafe {
+            // Note that whenever libgit2 returns an error any negative value
+            // indicates that an error happened. Auxiliary information is
+            // *usually* in `git_error_last` but unfortunately that's not always
+            // the case. Sometimes a negative error code is returned from
+            // libgit2 *without* calling `git_error_set` internally to configure
+            // the error.
+            //
+            // To handle this case and hopefully provide better error messages
+            // on our end we unconditionally call `git_error_clear` when we're done
+            // with an error. This is an attempt to clear it as aggressively as
+            // possible when we can to ensure that error information from one
+            // api invocation doesn't leak over to the next api invocation.
+            //
+            // Additionally if `git_error_last` returns null then we returned a
+            // canned error out.
+            let ptr = raw::git_error_last();
+            let err = if ptr.is_null() {
+                let mut error = Error::from_str("an unknown git error occurred");
+                error.code = code;
+                error
+            } else {
+                Error::from_raw(code, ptr)
+            };
+            raw::git_error_clear();
+            err
+        }
+    }
+
+    unsafe fn from_raw(code: c_int, ptr: *const raw::git_error) -> Error {
+        let message = CStr::from_ptr((*ptr).message as *const _).to_bytes();
+        let message = String::from_utf8_lossy(message).into_owned().into();
+        Error {
+            code,
+            klass: (*ptr).klass,
+            message,
+        }
+    }
+
+    /// Creates a new error from the given string as the error.
+    ///
+    /// The error returned will have the code `GIT_ERROR` and the class
+    /// `GIT_ERROR_NONE`.
+    pub fn from_str(s: &str) -> Error {
+        Error {
+            code: raw::GIT_ERROR as c_int,
+            klass: raw::GIT_ERROR_NONE as c_int,
+            message: s.into(),
+        }
+    }
+
+    /// Return the error code associated with this error.
+    ///
+    /// An error code is intended to be programmatically actionable most of the
+    /// time. For example the code `GIT_EAGAIN` indicates that an error could be
+    /// fixed by trying again, while the code `GIT_ERROR` is more bland and
+    /// doesn't convey anything in particular.
+    pub fn code(&self) -> ErrorCode {
+        match self.raw_code() {
+            raw::GIT_OK => super::ErrorCode::GenericError,
+            raw::GIT_ERROR => super::ErrorCode::GenericError,
+            raw::GIT_ENOTFOUND => super::ErrorCode::NotFound,
+            raw::GIT_EEXISTS => super::ErrorCode::Exists,
+            raw::GIT_EAMBIGUOUS => super::ErrorCode::Ambiguous,
+            raw::GIT_EBUFS => super::ErrorCode::BufSize,
+            raw::GIT_EUSER => super::ErrorCode::User,
+            raw::GIT_EBAREREPO => super::ErrorCode::BareRepo,
+            raw::GIT_EUNBORNBRANCH => super::ErrorCode::UnbornBranch,
+            raw::GIT_EUNMERGED => super::ErrorCode::Unmerged,
+            raw::GIT_ENONFASTFORWARD => super::ErrorCode::NotFastForward,
+            raw::GIT_EINVALIDSPEC => super::ErrorCode::InvalidSpec,
+            raw::GIT_ECONFLICT => super::ErrorCode::Conflict,
+            raw::GIT_ELOCKED => super::ErrorCode::Locked,
+            raw::GIT_EMODIFIED => super::ErrorCode::Modified,
+            raw::GIT_PASSTHROUGH => super::ErrorCode::GenericError,
+            raw::GIT_ITEROVER => super::ErrorCode::GenericError,
+            raw::GIT_EAUTH => super::ErrorCode::Auth,
+            raw::GIT_ECERTIFICATE => super::ErrorCode::Certificate,
+            raw::GIT_EAPPLIED => super::ErrorCode::Applied,
+            raw::GIT_EPEEL => super::ErrorCode::Peel,
+            raw::GIT_EEOF => super::ErrorCode::Eof,
+            raw::GIT_EINVALID => super::ErrorCode::Invalid,
+            raw::GIT_EUNCOMMITTED => super::ErrorCode::Uncommitted,
+            raw::GIT_EDIRECTORY => super::ErrorCode::Directory,
+            raw::GIT_EMERGECONFLICT => super::ErrorCode::MergeConflict,
+            raw::GIT_EMISMATCH => super::ErrorCode::HashsumMismatch,
+            raw::GIT_EINDEXDIRTY => super::ErrorCode::IndexDirty,
+            raw::GIT_EAPPLYFAIL => super::ErrorCode::ApplyFail,
+            raw::GIT_EOWNER => super::ErrorCode::Owner,
+            raw::GIT_TIMEOUT => super::ErrorCode::Timeout,
+            _ => super::ErrorCode::GenericError,
+        }
+    }
+
+    /// Modify the error code associated with this error.
+    ///
+    /// This is mainly intended to be used by implementers of custom transports
+    /// or database backends, and should be used with care.
+    pub fn set_code(&mut self, code: ErrorCode) {
+        self.code = match code {
+            ErrorCode::GenericError => raw::GIT_ERROR,
+            ErrorCode::NotFound => raw::GIT_ENOTFOUND,
+            ErrorCode::Exists => raw::GIT_EEXISTS,
+            ErrorCode::Ambiguous => raw::GIT_EAMBIGUOUS,
+            ErrorCode::BufSize => raw::GIT_EBUFS,
+            ErrorCode::User => raw::GIT_EUSER,
+            ErrorCode::BareRepo => raw::GIT_EBAREREPO,
+            ErrorCode::UnbornBranch => raw::GIT_EUNBORNBRANCH,
+            ErrorCode::Unmerged => raw::GIT_EUNMERGED,
+            ErrorCode::NotFastForward => raw::GIT_ENONFASTFORWARD,
+            ErrorCode::InvalidSpec => raw::GIT_EINVALIDSPEC,
+            ErrorCode::Conflict => raw::GIT_ECONFLICT,
+            ErrorCode::Locked => raw::GIT_ELOCKED,
+            ErrorCode::Modified => raw::GIT_EMODIFIED,

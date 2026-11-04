@@ -1,0 +1,746 @@
+    fn do_get_with_hash<Q, R, I>(
+        &self,
+        key: &Q,
+        hash: u64,
+        read_recorder: R,
+        mut ignore_if: Option<&mut I>,
+        need_key: bool,
+    ) -> Option<Entry<K, V>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+        R: Fn(ReadOp<K, V>, Instant),
+        I: FnMut(&V) -> bool,
+    {
+        if self.is_map_disabled() {
+            return None;
+        }
+
+        let mut now = self.current_time();
+
+        let maybe_entry = self
+            .inner
+            .get_key_value_and_then(key, hash, move |k, entry| {
+                if let Some(ignore_if) = &mut ignore_if {
+                    if ignore_if(&entry.value) {
+                        // Ignore the entry.
+                        return None;
+                    }
+                }
+
+                let i = &self.inner;
+                let (ttl, tti, va) = (&i.time_to_live(), &i.time_to_idle(), &i.valid_after());
+
+                if is_expired_by_per_entry_ttl(entry.entry_info(), now)
+                    || is_expired_entry_wo(ttl, va, entry, now)
+                    || is_expired_entry_ao(tti, va, entry, now)
+                    || i.is_invalidated_entry(k, entry)
+                {
+                    // Expired or invalidated entry.
+                    None
+                } else {
+                    // Valid entry.
+                    let maybe_key = if need_key { Some(Arc::clone(k)) } else { None };
+                    Some((maybe_key, MiniArc::clone(entry)))
+                }
+            });
+
+        if let Some((maybe_key, entry)) = maybe_entry {
+            let mut is_expiry_modified = false;
+
+            // Call the user supplied `expire_after_read` method if any.
+            if let Some(expiry) = &self.inner.expiration_policy.expiry() {
+                let lm = entry.last_modified().expect("Last modified is not set");
+                // Check if the `last_modified` of entry is earlier than or equals to
+                // `now`. If not, update the `now` to `last_modified`. This is needed
+                // because there is a small chance that other threads have inserted
+                // the entry _after_ we obtained `now`.
+                now = now.max(lm);
+
+                // Convert `last_modified` from `moka::common::time::Instant` to
+                // `std::time::Instant`.
+                let lm = self.inner.clock().to_std_instant(lm);
+
+                // Call the user supplied `expire_after_read` method.
+                //
+                // We will put the return value (`is_expiry_modified: bool`) to a
+                // `ReadOp` so that `apply_reads` method can determine whether or not
+                // to reschedule the timer for the entry.
+                //
+                // NOTE: It is not guaranteed that the `ReadOp` is passed to
+                // `apply_reads`. Here are the corner cases that the `ReadOp` will
+                // not be passed to `apply_reads`:
+                //
+                // - If the bounded `read_op_ch` channel is full, the `ReadOp` will
+                //   be discarded.
+                // - If we were called by `get_with_hash_without_recording` method,
+                //   the `ReadOp` will not be recorded at all.
+                //
+                // These cases are okay because when the timer wheel tries to expire
+                // the entry, it will check if the entry is actually expired. If not,
+                // the timer wheel will reschedule the expiration timer for the
+                // entry.
+                is_expiry_modified = Self::expire_after_read_or_update(
+                    |k, v, t, d| expiry.expire_after_read(k, v, t, d, lm),
+                    &entry.entry_info().key_hash().key,
+                    &entry,
+                    self.inner.expiration_policy.time_to_live(),
+                    self.inner.expiration_policy.time_to_idle(),
+                    now,
+                    self.inner.clock(),
+                );
+            }
+
+            entry.set_last_accessed(now);
+
+            let v = entry.value.clone();
+            let op = ReadOp::Hit {
+                value_entry: entry,
+                is_expiry_modified,
+            };
+            read_recorder(op, now);
+            Some(Entry::new(maybe_key, v, false, false))
+        } else {
+            read_recorder(ReadOp::Miss(hash), now);
+            None
+        }
+    }
+
+    pub(crate) fn get_key_with_hash<Q>(&self, key: &Q, hash: u64) -> Option<Arc<K>>
+    pub(crate) fn do_insert_with_hash(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        value: V,
+    ) -> (WriteOp<K, V>, Instant) {
+        let weight = self.inner.weigh(&key, &value);
+        let op_cnt1 = Rc::new(AtomicU8::new(0));
+        let op_cnt2 = Rc::clone(&op_cnt1);
+        let mut op1 = None;
+        let mut op2 = None;
+
+        // Lock the key for update if blocking removal notification is enabled.
+        let kl = self.maybe_key_lock(&key);
+        let _klg = &kl.as_ref().map(|kl| kl.lock());
+
+        let ts = self.current_time();
+
+        // TODO: Instead using Arc<AtomicU8> to check if the actual operation was
+        // insert or update, check the return value of insert_with_or_modify. If it
+        // is_some, the value was updated, otherwise the value was inserted.
+
+        // Since the cache (cht::SegmentedHashMap) employs optimistic locking
+        // strategy, insert_with_or_modify() may get an insert/modify operation
+        // conflicted with other concurrent hash table operations. In that case, it
+        // has to retry the insertion or modification, so on_insert and/or on_modify
+        // closures can be executed more than once. In order to identify the last
+        // call of these closures, we use a shared counter (op_cnt{1,2}) here to
+        // record a serial number on a WriteOp, and consider the WriteOp with the
+        // largest serial number is the one made by the last call of the closures.
+        self.inner.cache.insert_with_or_modify(
+            Arc::clone(&key),
+            hash,
+            // on_insert
+            || {
+                let (entry, gen) = self.new_value_entry(&key, hash, value.clone(), ts, weight);
+                let ins_op = WriteOp::new_upsert(&key, hash, &entry, gen, 0, weight);
+                let cnt = op_cnt1.fetch_add(1, Ordering::Relaxed);
+                op1 = Some((cnt, ins_op));
+                entry
+            },
+            // on_modify
+            |_k, old_entry| {
+                let old_weight = old_entry.policy_weight();
+
+                // Create this OldEntryInfo _before_ creating a new ValueEntry, so
+                // that the OldEntryInfo can preserve the old EntryInfo's
+                // last_accessed and last_modified timestamps.
+                let old_info = OldEntryInfo::new(old_entry);
+                let (entry, gen) = self.new_value_entry_from(value.clone(), ts, weight, old_entry);
+                let upd_op = WriteOp::new_upsert(&key, hash, &entry, gen, old_weight, weight);
+                let cnt = op_cnt2.fetch_add(1, Ordering::Relaxed);
+                op2 = Some((cnt, old_info, upd_op));
+                entry
+            },
+        );
+
+        match (op1, op2) {
+            (Some((_cnt, ins_op)), None) => self.do_post_insert_steps(ts, &key, ins_op),
+            (Some((cnt1, ins_op)), Some((cnt2, ..))) if cnt1 > cnt2 => {
+                self.do_post_insert_steps(ts, &key, ins_op)
+            }
+            (_, Some((_cnt, old_info, upd_op))) => {
+                self.do_post_update_steps(ts, key, old_info, upd_op)
+            }
+            (None, None) => unreachable!(),
+        }
+    }
+
+    fn do_post_insert_steps(
+        &self,
+        ts: Instant,
+        key: &Arc<K>,
+        ins_op: WriteOp<K, V>,
+    ) -> (WriteOp<K, V>, Instant) {
+        if let (Some(expiry), WriteOp::Upsert { value_entry, .. }) =
+            (&self.inner.expiration_policy.expiry(), &ins_op)
+        {
+            Self::expire_after_create(expiry, key, value_entry, ts, self.inner.clock());
+        }
+        (ins_op, ts)
+    }
+
+    fn do_post_update_steps(
+== rustdoc
+   Compiling syn v3.0.9
+    Checking smallvec v1.16.4
+    Checking parking_lot_core v0.9.12
+   Compiling moka v0.12.11 (/work/crate)
+    Checking futures-core v0.3.34
+    Checking parking_lot v0.12.5
+    Checking log v0.4.35
+   Compiling futures-macro v0.3.34
+    Checking futures-util v0.3.34
+ Documenting moka v0.12.11 (/work/crate)
+error: unresolved link to `try_append_value_async.rs`
+   --> src/sync/entry_selector.rs:201:15
+    |
+201 |     /// See [`try_append_value_async.rs`] in the `examples` directory.
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `try_append_value_async.rs` in scope
+    |
+    = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+    = note: `-D rustdoc::broken-intra-doc-links` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(rustdoc::broken_intra_doc_links)]`
+
+error: unresolved link to `try_append_value_async.rs`
+   --> src/sync/entry_selector.rs:743:15
+    |
+743 |     /// See [`try_append_value_async.rs`] in the `examples` directory.
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^ no item named `try_append_value_async.rs` in scope
+    |
+    = help: to escape `[` and `]` characters, add '\' before them like `\[` or `\]`
+
+error: unresolved link to `ptr::eq`
+  --> src/common/concurrent/arc.rs:83:27
+   |
+83 |     /// vein similar to [`ptr::eq`].
+   |                           ^^^^^^^ no item named `ptr` in scope
+
+error: this URL is not a hyperlink
+  --> src/common/concurrent/arc.rs:99:9
+   |
+99 |     /// https://github.com/Manishearth/triomphe/pull/84
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: bare URLs are not automatically turned into clickable links
+   = note: `-D rustdoc::bare-urls` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(rustdoc::bare_urls)]`
+help: use an automatic link instead
+   |
+99 |     /// <https://github.com/Manishearth/triomphe/pull/84>
+   |         +                                               +
+
+error: could not document `moka`
+
+== tests
+   Compiling quanta v0.12.6
+   Compiling moka v0.12.11 (/work/crate)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.29s
+     Running unittests src/lib.rs (/target/debug/deps/moka-88826ce651c46e2a)
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+use crate::notification::{EvictionListener, RemovalCause};
+
+pub(crate) struct RemovalNotifier<K, V> {
+    listener: EvictionListener<K, V>,
+    is_enabled: AtomicBool,
+    #[cfg(feature = "logging")]
+    cache_name: Option<String>,
+}
+
+impl<K, V> RemovalNotifier<K, V> {
+    pub(crate) fn new(listener: EvictionListener<K, V>, _cache_name: Option<String>) -> Self {
+        Self {
+            listener,
+            is_enabled: AtomicBool::new(true),
+            #[cfg(feature = "logging")]
+            cache_name: _cache_name,
+        }
+    }
+
+    pub(crate) fn notify(&self, key: Arc<K>, value: V, cause: RemovalCause) {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        if !self.is_enabled.load(Ordering::Acquire) {
+            return;
+        }
+
+        let listener_clo = || (self.listener)(key, value, cause);
+
+        // Safety: It is safe to assert unwind safety here because we will not
+        // call the listener again if it has been panicked.
+        let result = catch_unwind(AssertUnwindSafe(listener_clo));
+        if let Err(_payload) = result {
+            self.is_enabled.store(false, Ordering::Release);
+            #[cfg(feature = "logging")]
+            log_panic(&*_payload, self.cache_name.as_deref());
+        }
+    }
+}
+
+#[cfg(feature = "logging")]
+fn log_panic(payload: &(dyn std::any::Any + Send + 'static), cache_name: Option<&str>) {
+    // Try to downcast the payload into &str or String.
+    //
+    // NOTE: Clippy will complain if we use `if let Some(_)` here.
+    // https://rust-lang.github.io/rust-clippy/master/index.html#manual_map
+    let message: Option<std::borrow::Cow<'_, str>> =
+        (payload.downcast_ref::<&str>().map(|s| (*s).into()))
+            .or_else(|| payload.downcast_ref::<String>().map(Into::into));
+
+    let cn = cache_name
+        .map(|name| format!("[{name}] "))
+        .unwrap_or_default();
+
+    if let Some(m) = message {
+        log::error!("{cn}Disabled the eviction listener because it panicked at '{m}'");
+    } else {
+        log::error!("{cn}Disabled the eviction listener because it panicked");
+    }
+}
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+use futures_util::FutureExt;
+
+use crate::notification::{AsyncEvictionListener, RemovalCause};
+
+pub(crate) struct RemovalNotifier<K, V> {
+    listener: AsyncEvictionListener<K, V>,
+    is_enabled: AtomicBool,
+    #[cfg(feature = "logging")]
+    cache_name: Option<String>,
+}
+
+impl<K, V> RemovalNotifier<K, V> {
+    pub(crate) fn new(listener: AsyncEvictionListener<K, V>, _cache_name: Option<String>) -> Self {
+        Self {
+            listener,
+            is_enabled: AtomicBool::new(true),
+            #[cfg(feature = "logging")]
+            cache_name: _cache_name,
+        }
+    }
+
+    pub(crate) async fn notify(&self, key: Arc<K>, value: V, cause: RemovalCause) {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        if !self.is_enabled.load(Ordering::Acquire) {
+            return;
+        }
+
+        // This macro unwraps the result of the catch_unwind call if it is Ok. And
+        // disable the notifier and do early return if the listener panicked.
+        macro_rules! try_or_disable {
+            ($match_expr:expr) => {
+                match $match_expr {
+                    Ok(v) => v,
+                    Err(_payload) => {
+                        self.is_enabled.store(false, Ordering::Release);
+                        #[cfg(feature = "logging")]
+                        log_panic(&*_payload, self.cache_name.as_deref());
+                        return;
+                    }
+                }
+            };
+        }
+
+        let listener_clo = || (self.listener)(key, value, cause);
+
+        // Safety: It is safe to assert unwind safety here because we will not
+        // call the listener again if it has been panicked.
+        let fut = try_or_disable!(catch_unwind(AssertUnwindSafe(listener_clo)));
+        try_or_disable!(AssertUnwindSafe(fut).catch_unwind().await);
+    }
+}
+
+#[cfg(feature = "logging")]
+fn log_panic(payload: &(dyn std::any::Any + Send + 'static), cache_name: Option<&str>) {
+    // Try to downcast the payload into &str or String.
+    //
+    // NOTE: Clippy will complain if we use `if let Some(_)` here.
+    // https://rust-lang.github.io/rust-clippy/master/index.html#manual_map
+    let message: Option<std::borrow::Cow<'_, str>> =
+        (payload.downcast_ref::<&str>().map(|s| (*s).into()))
+            .or_else(|| payload.downcast_ref::<String>().map(Into::into));
+
+    let cn = cache_name
+        .map(|name| format!("[{name}] "))
+        .unwrap_or_default();
+
+    if let Some(m) = message {
+        log::error!("{cn}Disabled the eviction listener because it panicked at '{m}'");
+    } else {
+        log::error!("{cn}Disabled the eviction listener because it panicked");
+    }
+}
+use super::{base_cache::Inner, PredicateId, PredicateIdStr};
+use crate::{
+    common::{
+        concurrent::{arc::MiniArc, AccessTime, KvEntry, ValueEntry},
+        time::Instant,
+    },
+    notification::RemovalCause,
+    PredicateError,
+};
+
+use parking_lot::{Mutex, MutexGuard};
+use std::{
+    hash::{BuildHasher, Hash},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
+use uuid::Uuid;
+
+pub(crate) type PredicateFun<K, V> = Arc<dyn Fn(&K, &V) -> bool + Send + Sync + 'static>;
+
+const PREDICATE_MAP_NUM_SEGMENTS: usize = 16;
+
+pub(crate) struct KeyDateLite<K> {
+    key: Arc<K>,
+    hash: u64,
+    timestamp: Instant,
+}
+
+impl<K> Clone for KeyDateLite<K> {
+    fn clone(&self) -> Self {
+        Self {
+            key: Arc::clone(&self.key),
+            hash: self.hash,
+            timestamp: self.timestamp,
+        }
+    }
+}
+
+impl<K> KeyDateLite<K> {
+    pub(crate) fn new(key: &Arc<K>, hash: u64, timestamp: Instant) -> Self {
+        Self {
+            key: Arc::clone(key),
+            hash,
+            timestamp,
+        }
+    }
+}
+
+pub(crate) struct Invalidator<K, V, S> {
+    predicates: crate::cht::SegmentedHashMap<PredicateId, Predicate<K, V>, S>,
+    is_empty: AtomicBool,
+    scan_context: Arc<ScanContext<K, V>>,
+}
+
+//
+// Crate public methods.
+//
+impl<K, V, S> Invalidator<K, V, S> {
+    pub(crate) fn new(hasher: S) -> Self
+    where
+        S: BuildHasher,
+    {
+        const CAPACITY: usize = 0;
+        let predicates = crate::cht::SegmentedHashMap::with_num_segments_capacity_and_hasher(
+            PREDICATE_MAP_NUM_SEGMENTS,
+            CAPACITY,
+            hasher,
+        );
+        Self {
+            predicates,
+            is_empty: AtomicBool::new(true),
+            scan_context: Arc::new(ScanContext::default()),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.is_empty.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn remove_predicates_registered_before(&self, ts: Instant)
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher,
+    {
+        let pred_map = &self.predicates;
+
+        let removing_ids = pred_map
+            .iter()
+            .filter(|(_, pred)| pred.registered_at <= ts)
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+
+        for id in removing_ids {
+            let hash = pred_map.hash(&id);
+            pred_map.remove(hash, |k| k == &id);
+        }
+
+        if pred_map.is_empty() {
+            self.is_empty.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn register_predicate(
+        &self,
+        predicate: PredicateFun<K, V>,
+        registered_at: Instant,
+    ) -> Result<PredicateId, PredicateError>
+    where
+        K: Hash + Eq,
+        S: BuildHasher,
+    {
+        const MAX_RETRY: usize = 1_000;
+        let mut tries = 0;
+        let preds = &self.predicates;
+
+        while tries < MAX_RETRY {
+            let id = Uuid::new_v4().as_hyphenated().to_string();
+
+            let hash = preds.hash(&id);
+            if preds.contains_key(hash, |k| k == &id) {
+                tries += 1;
+
+                continue; // Retry
+            }
+            let pred = Predicate::new(&id, predicate, registered_at);
+            preds.insert_entry_and(id.clone(), hash, pred, |_, _| ());
+            self.is_empty.store(false, Ordering::Release);
+
+            return Ok(id);
+        }
+
+        // Since we are using 128-bit UUID for the ID and we do retries for MAX_RETRY
+        // times, this panic should extremely unlikely occur (unless there is a bug in
+        // UUID generation).
+        panic!("Cannot assign a new PredicateId to a predicate");
+    }
+
+    // This method will be called by the get method of Cache.
+    #[inline]
+    pub(crate) fn apply_predicates(&self, key: &Arc<K>, entry: &MiniArc<ValueEntry<K, V>>) -> bool
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher,
+    {
+        if self.is_empty() {
+            false
+        } else if let Some(ts) = entry.last_modified() {
+            Self::do_apply_predicates(
+                self.predicates.iter().map(|(_, v)| v),
+                key,
+                &entry.value,
+                ts,
+            )
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn scan_and_invalidate(
+        &self,
+        cache: &Inner<K, V, S>,
+        candidates: Vec<KeyDateLite<K>>,
+        is_truncated: bool,
+    ) -> (Vec<KvEntry<K, V>>, bool)
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher,
+    {
+        let mut predicates = self.scan_context.predicates.lock();
+        if predicates.is_empty() {
+            *predicates = self.predicates.iter().map(|(_k, v)| v).collect();
+        }
+
+        let mut invalidated = Vec::default();
+        let mut newest_timestamp = None;
+
+        for candidate in &candidates {
+            let key = &candidate.key;
+            let hash = candidate.hash;
+            let ts = candidate.timestamp;
+            if self.apply(&predicates, cache, key, hash, ts) {
+                if let Some(entry) = Self::invalidate(cache, key, hash, ts) {
+                    invalidated.push(KvEntry {
+                        key: Arc::clone(key),
+                        entry,
+                    });
+                }
+            }
+            newest_timestamp = Some(ts);
+        }
+
+        self.remove_finished_predicates(predicates, is_truncated, newest_timestamp);
+
+        (invalidated, self.predicates.is_empty())
+    }
+}
+
+//
+// Private methods.
+//
+impl<K, V, S> Invalidator<K, V, S>
+where
+    K: Hash + Eq,
+    S: BuildHasher,
+{
+    #[inline]
+    fn do_apply_predicates<I>(predicates: I, key: &K, value: &V, ts: Instant) -> bool
+    where
+        I: Iterator<Item = Predicate<K, V>>,
+    {
+        for predicate in predicates {
+            if predicate.is_applicable(ts) && predicate.apply(key, value) {
+                return true;
+            }
+        }
+impl<K, V, S> SegmentedCache<K, V, S> {
+    fn is_waiter_map_empty(&self) -> bool {
+        self.inner.segments.iter().all(Cache::is_waiter_map_empty)
+    }
+}
+
+#[cfg(test)]
+impl<K, V, S> SegmentedCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn invalidation_predicate_count(&self) -> usize {
+        self.inner
+            .segments
+            .iter()
+            .map(|seg| seg.invalidation_predicate_count())
+            .sum()
+    }
+
+    fn reconfigure_for_testing(&mut self) {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("There are other strong reference to self.inner Arc");
+
+        for segment in inner.segments.iter_mut() {
+            segment.reconfigure_for_testing();
+        }
+    }
+
+    fn key_locks_map_is_empty(&self) -> bool {
+        self.inner
+            .segments
+            .iter()
+            .all(|seg| seg.key_locks_map_is_empty())
+    }
+}
+
+struct Inner<K, V, S> {
+    desired_capacity: Option<u64>,
+    segments: Box<[Cache<K, V, S>]>,
+    build_hasher: S,
+    segment_shift: u32,
+}
+
+impl<K, V, S> Inner<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is 0.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        name: Option<String>,
+        max_capacity: Option<u64>,
+        initial_capacity: Option<usize>,
+        num_segments: usize,
+        build_hasher: S,
+        weigher: Option<Weigher<K, V>>,
+        eviction_policy: EvictionPolicy,
+        eviction_listener: Option<EvictionListener<K, V>>,
+        expiration_policy: ExpirationPolicy<K, V>,
+        housekeeper_config: HousekeeperConfig,
+        invalidator_enabled: bool,
+        clock: Clock,
+    ) -> Self {
+        assert!(num_segments > 0);
+
+        let actual_num_segments = num_segments.next_power_of_two();
+        let segment_shift = 64 - actual_num_segments.trailing_zeros();
+        let seg_max_capacity =
+            max_capacity.map(|n| (n as f64 / actual_num_segments as f64).ceil() as u64);
+        let seg_init_capacity =
+            initial_capacity.map(|cap| (cap as f64 / actual_num_segments as f64).ceil() as usize);
+        // NOTE: We cannot initialize the segments as `vec![cache; actual_num_segments]`
+        // because Cache::clone() does not clone its inner but shares the same inner.
+        let segments = (0..actual_num_segments)
+            .map(|_| {
+                Cache::with_everything(
+                    name.clone(),
+                    seg_max_capacity,
+                    seg_init_capacity,
+                    build_hasher.clone(),
+                    weigher.clone(),
+                    eviction_policy.clone(),
+                    eviction_listener.clone(),
+                    expiration_policy.clone(),
+                    housekeeper_config.clone(),
+                    invalidator_enabled,
+                    clock.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        Self {
+            desired_capacity: max_capacity,
+            segments: segments.into_boxed_slice(),
+            build_hasher,
+            segment_shift,
+        }
+    }
+
+    #[inline]
+    fn hash<Q>(&self, key: &Q) -> u64
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        let mut hasher = self.build_hasher.build_hasher();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[inline]
+    fn select(&self, hash: u64) -> &Cache<K, V, S> {
+        let index = self.segment_index_from_hash(hash);
+        &self.segments[index]
+    }
+
+    #[inline]
+    fn segment_index_from_hash(&self, hash: u64) -> usize {
+        if self.segment_shift == 64 {
+            0
+        } else {
+            (hash >> self.segment_shift) as usize
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SegmentedCache;
+    use crate::notification::RemovalCause;
+    use parking_lot::Mutex;

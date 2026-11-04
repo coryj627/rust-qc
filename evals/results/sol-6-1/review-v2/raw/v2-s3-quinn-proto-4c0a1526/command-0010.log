@@ -1,0 +1,377 @@
+audit_exit=0
+Counter({'unwrap_used': 83, 'missing_assert_message': 43, 'missing_errors_doc': 37, 'missing_panics_doc': 11, 'map_err_ignore': 5, 'undocumented_unsafe_blocks': 4, 'derivable_impls': 1, 'manual_filter': 1, 'wildcard_imports': 1})
+lines 2146
+
+    pub(super) fn new(endpoint_config: Arc<EndpointConfig>, server_config: ServerConfig) -> Self {
+        let server = Endpoint::new(
+            endpoint_config.clone(),
+            Some(Arc::new(server_config)),
+            true,
+            None,
+        );
+        let client = Endpoint::new(endpoint_config, None, true, None);
+
+        Self::new_from_endpoint(client, server)
+    }
+
+    pub(super) fn new_from_endpoint(client: Endpoint, server: Endpoint) -> Self {
+        let server_addr = SocketAddr::new(
+            Ipv6Addr::LOCALHOST.into(),
+            SERVER_PORTS.lock().unwrap().next().unwrap(),
+        );
+        let client_addr = SocketAddr::new(
+            Ipv6Addr::LOCALHOST.into(),
+            CLIENT_PORTS.lock().unwrap().next().unwrap(),
+        );
+        let now = Instant::now();
+        Self {
+            server: TestEndpoint::new(server, server_addr),
+            client: TestEndpoint::new(client, client_addr),
+            epoch: now,
+            time: now,
+            mtu: DEFAULT_MTU,
+            latency: Duration::ZERO,
+            spins: 0,
+            last_spin: false,
+            congestion_experienced: false,
+        }
+    }
+
+    /// Returns whether the connection is not idle
+    pub(super) fn step(&mut self) -> bool {
+        self.drive_client();
+        self.drive_server();
+        if self.client.is_idle() && self.server.is_idle() {
+            return false;
+        }
+
+        let client_t = self.client.next_wakeup();
+        let server_t = self.server.next_wakeup();
+        match min_opt(client_t, server_t) {
+            Some(t) if Some(t) == client_t => {
+                if t != self.time {
+                    self.time = self.time.max(t);
+                    trace!("advancing to {:?} for client", self.time - self.epoch);
+                }
+                true
+            }
+            Some(t) if Some(t) == server_t => {
+                if t != self.time {
+                    self.time = self.time.max(t);
+                    trace!("advancing to {:?} for server", self.time - self.epoch);
+                }
+                true
+            }
+            Some(_) => unreachable!(),
+            None => false,
+        }
+    }
+
+    /// Advance time until both connections are idle
+    pub(super) fn drive(&mut self) {
+        while self.step() {}
+    }
+
+    /// Advance time until both connections are idle, or after 100 steps have been executed
+    ///
+    /// Returns true if the amount of steps exceeds the bounds, because the connections never became
+    /// idle
+    pub(super) fn drive_bounded(&mut self) -> bool {
+        for _ in 0..100 {
+            if !self.step() {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    pub(super) fn drive_client(&mut self) {
+        let span = info_span!("client");
+        let _guard = span.enter();
+        self.client.drive(self.time, self.server.addr);
+        for (packet, buffer) in self.client.outbound.drain(..) {
+            let packet_size = packet_size(&packet, &buffer);
+            if packet_size > self.mtu {
+                info!(packet_size, "dropping packet (max size exceeded)");
+                continue;
+            }
+            if buffer[0] & packet::LONG_HEADER_FORM == 0 {
+                let spin = buffer[0] & packet::SPIN_BIT != 0;
+                self.spins += (spin == self.last_spin) as u64;
+                self.last_spin = spin;
+            }
+            if let Some(ref socket) = self.client.socket {
+                socket.send_to(&buffer, packet.destination).unwrap();
+            }
+            if self.server.addr == packet.destination {
+                let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced);
+                self.server.inbound.push_back((
+                    self.time + self.latency,
+                    ecn,
+                    buffer.as_ref().into(),
+                ));
+            }
+        }
+    }
+
+    pub(super) fn drive_server(&mut self) {
+        let span = info_span!("server");
+        let _guard = span.enter();
+        self.server.drive(self.time, self.client.addr);
+        for (packet, buffer) in self.server.outbound.drain(..) {
+            let packet_size = packet_size(&packet, &buffer);
+            if packet_size > self.mtu {
+                info!(packet_size, "dropping packet (max size exceeded)");
+                continue;
+            }
+            if let Some(ref socket) = self.server.socket {
+                socket.send_to(&buffer, packet.destination).unwrap();
+            }
+            if self.client.addr == packet.destination {
+                let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced);
+                self.client.inbound.push_back((
+                    self.time + self.latency,
+                    ecn,
+                    buffer.as_ref().into(),
+                ));
+            }
+        }
+    }
+
+    pub(super) fn connect(&mut self) -> (ConnectionHandle, ConnectionHandle) {
+        self.connect_with(client_config())
+    }
+
+    pub(super) fn connect_with(
+        &mut self,
+        config: ClientConfig,
+    ) -> (ConnectionHandle, ConnectionHandle) {
+        info!("connecting");
+        let client_ch = self.begin_connect(config);
+        self.drive();
+        let server_ch = self.server.assert_accept();
+        self.finish_connect(client_ch, server_ch);
+        (client_ch, server_ch)
+    }
+
+    /// Just start connecting the client
+    pub(super) fn begin_connect(&mut self, config: ClientConfig) -> ConnectionHandle {
+        let span = info_span!("client");
+        let _guard = span.enter();
+        let (client_ch, client_conn) = self
+            .client
+            .connect(self.time, config, self.server.addr, "localhost")
+            .unwrap();
+        self.client.connections.insert(client_ch, client_conn);
+        client_ch
+    }
+
+    fn finish_connect(&mut self, client_ch: ConnectionHandle, server_ch: ConnectionHandle) {
+        assert_matches!(
+            self.client_conn_mut(client_ch).poll(),
+            Some(Event::HandshakeDataReady)
+        );
+        assert_matches!(
+            self.client_conn_mut(client_ch).poll(),
+            Some(Event::Connected)
+        );
+        assert_matches!(
+            self.server_conn_mut(server_ch).poll(),
+            Some(Event::HandshakeDataReady)
+        );
+        assert_matches!(
+            self.server_conn_mut(server_ch).poll(),
+            Some(Event::Connected)
+        );
+    }
+
+    pub(super) fn client_conn_mut(&mut self, ch: ConnectionHandle) -> &mut Connection {
+use std::{
+    convert::TryInto,
+    mem,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{Arc, Mutex},
+};
+
+use assert_matches::assert_matches;
+#[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
+use aws_lc_rs::hmac;
+use bytes::{Bytes, BytesMut};
+use hex_literal::hex;
+use rand::RngCore;
+#[cfg(feature = "ring")]
+use ring::hmac;
+#[cfg(all(feature = "rustls-aws-lc-rs", not(feature = "rustls-ring")))]
+use rustls::crypto::aws_lc_rs::default_provider;
+#[cfg(feature = "rustls-ring")]
+use rustls::crypto::ring::default_provider;
+use rustls::{
+    AlertDescription, RootCertStore,
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    server::WebPkiClientVerifier,
+};
+use tracing::info;
+
+use super::*;
+use crate::{
+    Duration, Instant,
+    cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
+    crypto::rustls::QuicServerConfig,
+    frame::FrameStruct,
+    transport_parameters::TransportParameters,
+};
+mod util;
+use util::*;
+
+mod token;
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasm_bindgen_test::wasm_bindgen_test as test;
+
+// Enable this if you want to run these tests in the browser.
+// Unfortunately it's either-or: Enable this and you can run in the browser, disable to run in nodejs.
+// #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+// wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+#[test]
+fn version_negotiate_server() {
+    let _guard = subscribe();
+    let client_addr = "[::2]:7890".parse().unwrap();
+    let mut server = Endpoint::new(
+        Default::default(),
+        Some(Arc::new(server_config())),
+        true,
+        None,
+    );
+    let now = Instant::now();
+    let mut buf = Vec::with_capacity(server.config().get_max_udp_payload_size() as usize);
+    let event = server.handle(
+        now,
+        client_addr,
+        None,
+        None,
+        // Long-header packet with reserved version number
+        hex!("80 0a1a2a3a 04 00000000 04 00000000 00")[..].into(),
+        &mut buf,
+    );
+    let Some(DatagramEvent::Response(Transmit { .. })) = event else {
+        panic!("expected a response");
+    };
+
+    assert_ne!(buf[0] & 0x80, 0);
+    assert_eq!(&buf[1..15], hex!("00000000 04 00000000 04 00000000"));
+    assert!(buf[15..].chunks(4).any(|x| {
+        DEFAULT_SUPPORTED_VERSIONS.contains(&u32::from_be_bytes(x.try_into().unwrap()))
+    }));
+}
+
+#[test]
+fn version_negotiate_client() {
+    let _guard = subscribe();
+    let server_addr = "[::2]:7890".parse().unwrap();
+    // Configure client to use empty CIDs so we can easily hardcode a server version negotiation
+    // packet
+    let cid_generator_factory: fn() -> Box<dyn ConnectionIdGenerator> =
+        || Box::new(RandomConnectionIdGenerator::new(0));
+    let mut client = Endpoint::new(
+        Arc::new(EndpointConfig {
+            connection_id_generator_factory: Arc::new(cid_generator_factory),
+            ..Default::default()
+        }),
+        None,
+        true,
+        None,
+    );
+    let (_, mut client_ch) = client
+        .connect(Instant::now(), client_config(), server_addr, "localhost")
+        .unwrap();
+    let now = Instant::now();
+    let mut buf = Vec::with_capacity(client.config().get_max_udp_payload_size() as usize);
+    let opt_event = client.handle(
+        now,
+        server_addr,
+        None,
+        None,
+        // Version negotiation packet for reserved version, with empty DCID
+        hex!(
+            "80 00000000 00 04 00000000
+             0a1a2a3a"
+1790:    // No datagrams frames received in the handshake.
+1792:    assert_eq!(server_stats.frame_rx.datagram, 0);
+1797:    info!("Sending an ack-eliciting datagram");
+1809:    // Still no datagrams frames received by the server.
+1811:    assert_eq!(server_stats.frame_rx.datagram, 0);
+1813:    // Now we can send another batch of datagrams, so the PTO can send them instead of
+1816:    info!("Sending datagram batch");
+1818:        pair.client_datagrams(client_ch)
+1823:    // If this succeeds the datagrams are received by the server and the client did not
+1827:    // Finally the server should have received some datagrams.
+1829:    assert_eq!(server_stats.frame_rx.datagram, DGRAM_NUM);
+1832:// Respect max_datagrams when TLP happens
+1834:fn tail_loss_respect_max_datagrams() {
+1850:    info!("Sending an ack-eliciting datagram");
+1862:    // start sending datagram batches but the first should be a TLP
+1863:    info!("Sending datagram batch");
+1865:        pair.client_datagrams(client_ch)
+1872:    // Finally checking the number of sent udp datagrams match the number of iops
+1874:    assert_eq!(client_stats.udp_tx.ios, client_stats.udp_tx.datagrams);
+1878:fn datagram_send_recv() {
+1883:    assert_matches!(pair.client_datagrams(client_ch).max_size(), Some(x) if x > 0);
+1886:    pair.client_datagrams(client_ch)
+1894:    assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA);
+1895:    assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+1899:fn datagram_recv_buffer_overflow() {
+1904:            datagram_receive_buffer_size: Some(WINDOW),
+1913:        pair.client_conn_mut(client_ch).datagrams().max_size(),
+1920:    pair.client_datagrams(client_ch)
+1923:    pair.client_datagrams(client_ch)
+1926:    pair.client_datagrams(client_ch)
+1934:    assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA2);
+1935:    assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA3);
+1936:    assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+1938:    pair.client_datagrams(client_ch)
+1942:    assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA1);
+1943:    assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+1947:fn datagram_unsupported() {
+1951:            datagram_receive_buffer_size: None,
+1959:    assert_matches!(pair.client_datagrams(client_ch).max_size(), None);
+1961:    match pair.client_datagrams(client_ch).send(Bytes::new(), true) {
+3059:        pair.client_datagrams(client_ch)
+3063:        assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), MSG);
+3147:    // datagram batches
+3159:fn datagram_gso() {
+3167:    // Send 10 datagrams above half the MTU, which fits inside a `tests::util::MAX_DATAGRAMS`
+3168:    // datagram batch
+3173:        pair.client_datagrams(client_ch)
+3196:    // Send three application datagrams such that each is large to be combined with another in a
+3197:    // single MTU, and the second datagram would require an unreasonably large amount of padding to
+3202:        pair.client_datagrams(client_ch)
+3211:            pair.server_datagrams(server_ch)
+3213:                .expect("datagram lost")
+3220:/// Verify that UDP datagrams are padded to MTU if specified in the transport config.
+3243:    // Send two datagrams significantly smaller than MTU, but large enough to require two UDP datagrams.
+3246:    pair.client_datagrams(client_ch)
+3249:    pair.client_datagrams(client_ch)
+3266:    // Check that both datagrams ended up in the same GSO batch
+3271:        pair.server_datagrams(server_ch)
+3273:            .expect("datagram lost")
+3278:        pair.server_datagrams(server_ch)
+3280:            .expect("datagram lost")
+3286:/// Verify that a large application datagram is sent successfully when an ACK frame too large to fit
+3287:/// alongside it is also queued, in exactly 2 UDP datagrams.
+3289:fn large_datagram_with_acks() {
+3303:    let max_size = pair.client_datagrams(client_ch).max_size().unwrap();
+3305:    pair.client_datagrams(client_ch)
+3308:    let initial_datagrams = pair.client_conn_mut(client_ch).stats().udp_tx.datagrams;
+3310:    let final_datagrams = pair.client_conn_mut(client_ch).stats().udp_tx.datagrams;
+3311:    assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), msg);
+3312:    assert_eq!(final_datagrams - initial_datagrams, 2);
+3316:/// outgoing application datagrams too large to coexist in the same packet with it.
+3318:fn voluntary_ack_with_large_datagrams() {
+3324:    let initial_datagrams = pair.client_conn_mut(client_ch).stats().udp_tx.datagrams;
+3329:        let max_size = pair.client_datagrams(client_ch).max_size().unwrap();
+3330:        pair.client_datagrams(client_ch)
+3335:    let final_datagrams = pair.client_conn_mut(client_ch).stats().udp_tx.datagrams;
+3337:    // datagram, which is reasonable behavior but makes this test ineffective.
+3339:        final_datagrams - initial_datagrams,

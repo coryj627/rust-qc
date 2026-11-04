@@ -1,0 +1,260 @@
+The review found 18 findings: 5 Blocker, 10 Major and 3 Minor. The original default-feature suite passes with the requested lint cap, but targeted regression tests expose panics, incorrect results and invalid serialized JSON. `/work/crate` was left unchanged.
+
+## Blocker
+
+### 1. NEON stores assume alignment that `Vec<u32>` does not guarantee
+
+Location: [src/impls/neon/stage1.rs:207](/work/crate/src/impls/neon/stage1.rs:207), store at line 226.
+
+The SIMD store requires 16-byte alignment. The implementation chooses `ptr::write` based on the element offset being divisible by four, although the allocation itself only guarantees four-byte alignment.
+
+Executed evidence: the existing `value::tape::array::test::get_nested` test fails under Miri with “alignment 4, but alignment 16 is required.” This affects ordinary parsing on aarch64.
+
+Fix: use an unaligned store or guarantee the allocation’s alignment.
+
+### 2. Nested tape accessors truncate containers and can panic
+
+Location: [src/value/tape/trait_impls.rs:425](/work/crate/src/value/tape/trait_impls.rs:425); also lines 454, 487 and 519.
+
+The returned slice must include the container header and every descendant node. These accessors use the descendant count without adding the header.
+
+Executed evidence:
+
+- `{"a":[1,2]}`: `get_array("a")` iterates only `1`.
+- `{"o":{"a":1,"b":2}}`: `get_object("o")` iterates only `"a"`.
+- Empty and nested arrays panic during iteration.
+
+Callers can silently lose data or panic on valid JSON. Source inspection confirms the same mistake in both `try_get_*` variants; lazy accessors delegate to them.
+
+Fix: include the header, preferably through a shared container-slicing helper.
+
+### 3. Numeric deserialization panics after EOF
+
+Location: [src/serde.rs:255](/work/crate/src/serde.rs:255); unchecked access at [src/lib.rs:875](/work/crate/src/lib.rs:875).
+
+A safe deserializer returning `Result` should return an error when exhausted. Deserializing `u64` twice from a public `Deserializer` containing `1` instead panics on the second call.
+
+Executed evidence: `serde_values::exhausted_numeric_deserializer_returns_error`. Source inspection shows analogous unchecked reads throughout the numeric helpers, with `get_unchecked` used in release builds. Release execution of this case was not attempted.
+
+Fix: use the checked node-reading operation in Serde entry points.
+
+### 4. `128bit` and `approx-number-parsing` cannot build together
+
+Location: [src/macros.rs:1252](/work/crate/src/macros.rs:1252); use at [src/numberparse/approx.rs:339](/work/crate/src/numberparse/approx.rs:339).
+
+Both features should compose. The required macro is gated on nonexistent feature `i128`, so enabling the actual `128bit` feature leaves it undefined.
+
+Executed evidence: the isolated feature combination fails with “cannot find macro `static_cast_i128`.” Nightly `--all-features` also fails for this reason.
+
+Fix: correct both macro gates to `128bit` and add a combination build check.
+
+### 5. The `big-int-as-float` regression test does not compile
+
+Location: [src/numberparse/correct.rs:584](/work/crate/src/numberparse/correct.rs:584).
+
+Enabling this documented feature should allow its tests to run. The test compares `OwnedValue` directly with `StaticNode`, which has no applicable `PartialEq` implementation.
+
+Executed evidence: `cargo test --locked --features big-int-as-float`, with the lint cap, fails with E0277. This blocks feature validation, rather than downstream library compilation.
+
+Fix: compare matching value types. Also choose an input exceeding the active integer range: the current number fits in `u128` when `128bit` is enabled.
+
+## Major
+
+### 6. Pretty serialization emits invalid JSON for tuple enum variants
+
+Location: [src/serde/se/pp.rs:236](/work/crate/src/serde/se/pp.rs:236).
+
+Tuple variants need both the array and enclosing object closed. The implementation writes only `}` for nonempty variants and omits the outer closing delimiter for empty variants.
+
+Executed evidence: pretty serialization of `Pair(1,2)` produces `{"Pair":[1,2}` after removing whitespace; `Empty()` also produces incomplete JSON. Nested tests additionally show indentation state leaking into the parent.
+
+Callers receive successful serialization results that JSON readers reject.
+
+Fix: close both containers and restore both indentation levels; test empty, nonempty and nested variants.
+
+### 7. Empty containers with unknown lengths are left open
+
+Location: [src/serde/se.rs:96](/work/crate/src/serde/se.rs:96), [src/serde/se/pp.rs:521](/work/crate/src/serde/se/pp.rs:521).
+
+An empty sequence or map must serialize completely even when its length was initially unknown. `first` currently conflates “no elements written” with “closing delimiter already written.”
+
+Executed evidence:
+
+- An empty sequence using `serialize_seq(None)` returns `"["`.
+- Pretty serialization of an empty struct containing a flattened map returns `"{"`.
+
+Both calls return `Ok`, so callers can write unusable output without noticing.
+
+Fix: track whether the container was already closed, independently of whether elements were written.
+
+### 8. Tuple deserialization can consume a sibling’s value incorrectly
+
+Location: [src/serde/de.rs:254](/work/crate/src/serde/de.rs:254); sequence visitor at line 240.
+
+Tuple lengths and container boundaries must be enforced. The requested tuple length is ignored, and successful visitors are not checked for unconsumed elements.
+
+Executed evidence: deserializing `[[1,2],3]` as `((u8,),u8)` returns `Ok(((1,),2))`; `serde_json` rejects it. The actual sibling value `3` disappears.
+
+Fix: validate tuple lengths and container consumption before returning from visitors. Apply the check to tuple structs, variants and other container entry points too.
+
+### 9. Large exponents wrap into unrelated finite values
+
+Location: [src/numberparse/correct.rs:186](/work/crate/src/numberparse/correct.rs:186).
+
+The exponent must retain its mathematical meaning. Casting the accumulated `i64` exponent to `i32` wraps it.
+
+Executed evidence:
+
+- `1e4294967296` returns `1.0`, instead of an overflow error.
+- `1e-4294967296` returns `1.0`, instead of underflowing to zero.
+- Neighboring exponents return `10.0` and `0.1`.
+
+Callers receive silently incorrect numbers.
+
+Fix: check the conversion or use the slow parser when the exponent exceeds the fast path’s range.
+
+### 10. Slow number paths accept invalid suffixes
+
+Location: [src/numberparse/correct.rs:171](/work/crate/src/numberparse/correct.rs:171), large-integer return at line 239.
+
+Every number path must validate its terminator. Large integers and an early floating-point fallback bypass that validation.
+
+Executed evidence: all these invalid inputs are accepted:
+
+- `1234567890123456789x`
+- `[1234567890123456789x]`
+- `12345678901234567890.0x`
+
+The suffix is silently discarded, contradicting the parsing APIs’ invalid-JSON error contract.
+
+Fix: validate the terminator before selecting any conversion path.
+
+### 11. Invalid surrogate sequences silently change string contents
+
+Location: [src/stringparse.rs:57](/work/crate/src/stringparse.rs:57), particularly lines 61 and 77.
+
+Invalid surrogate sequences should produce an error. Missing low surrogates return a zero sentinel that becomes a NUL character; the second code unit also lacks an upper-bound check.
+
+Executed evidence:
+
+- `"\ud800"` becomes `"\0"`.
+- `"\ud800x"` becomes `"\0x"`.
+- `"\ud800\ue000"` becomes U+10400.
+
+`serde_json` rejects these cases. Callers receive changed text instead of a parsing error.
+
+Fix: return an error for incomplete pairs and require the second code unit to lie in `LOW_SURROGATES`.
+
+### 12. Consuming DOM conversion rejects integer map keys
+
+Location: [src/serde/value/owned/de.rs:189](/work/crate/src/serde/value/owned/de.rs:189), [src/serde/value/borrowed/de.rs:202](/work/crate/src/serde/value/borrowed/de.rs:202).
+
+Maps with integer keys should round-trip through the Serde DOM conversion APIs. Consuming conversion deserializes keys as ordinary string values, bypassing the integer-aware key deserializer.
+
+Executed evidence: a `BTreeMap<u32,String>` successfully converts into either DOM, but consuming conversion back fails with “string `"42"`, expected u32.” Both reference conversion variants succeed.
+
+Fix: reuse `MapKeyDeserializer` for consuming object access.
+
+### 13. Borrowed DOM deserialization unnecessarily requires borrowed keys
+
+Location: [src/serde/value/borrowed/de.rs:483](/work/crate/src/serde/value/borrowed/de.rs:483).
+
+`BorrowedValue` supports owned strings, so its Serde implementation should accept keys that cannot be borrowed. Requesting every key as `&str` prevents this.
+
+Executed evidence: deserializing an owned `serde_json::Value` object fails, as does `serde_json::from_str::<BorrowedValue>` for an escaped key such as `"a\"b"`.
+
+Ordinary Serde interoperability therefore depends unexpectedly on how keys are supplied.
+
+Fix: deserialize keys with an owned-string fallback, while preserving borrowing where available.
+
+### 14. Tape scalar access omits 128-bit forwarding
+
+Location: [src/value/tape/trait_impls.rs:48](/work/crate/src/value/tape/trait_impls.rs:48).
+
+With `128bit`, successfully parsed integers should remain accessible through the scalar API. The tape implementation omits `as_i128` and `as_u128`, inheriting defaults that cannot recover large values.
+
+Executed evidence: parsing `18446744073709551616` produces type `U128`, but `as_u128()` returns `None`.
+
+Existing tape conversion tests alias `StaticNode` as `Value` at [src/value/tape.rs:197](/work/crate/src/value/tape.rs:197), so they miss this delegation defect.
+
+Fix: forward the 128-bit methods and test actual tape values, including object getters and lazy values.
+
+### 15. Lazy equality changes after a no-op mutable borrow
+
+Location: [src/value/lazy.rs:43](/work/crate/src/value/lazy.rs:43).
+
+Equivalent lazy JSON values should compare by content. Derived `PartialEq` instead distinguishes the tape and materialized variants.
+
+Executed evidence: clone a lazy `{"a":1}`, call `as_object_mut()` on one copy without changing it, then compare them. Their converted contents remain equal, but the lazy values compare unequal.
+
+Callers performing change detection can observe a change caused solely by storage conversion.
+
+Fix: implement content equality across representations and add a no-op upgrade regression test.
+
+## Minor
+
+### 16. Lint configuration fails on the installed newer compiler
+
+Location: [src/lib.rs:1](/work/crate/src/lib.rs:1); imports at line 47, `numberparse/correct.rs:12` and `stage2.rs:3`.
+
+Strict default Clippy fails on Rust 1.99.1 because denied warnings include newly reported unused imports and `manual_is_multiple_of`. This is toolchain drift relative to the project’s Rust 1.88 CI, rather than evidence that its original toolchain fails.
+
+The default-feature advisory pass also reports unreasoned `allow` attributes at 69 distinct locations.
+
+Fix: resolve compatibility warnings and give maintained lint overrides explicit reasons.
+
+### 17. Unsafe preconditions are poorly documented locally
+
+Location: [src/lib.rs:817](/work/crate/src/lib.rs:817), [src/impls/neon/stage1.rs:188](/work/crate/src/impls/neon/stage1.rs:188).
+
+The default-feature advisory pass identifies unsafe blocks at 124 distinct reported locations without recognized safety comments, plus two unsafe implementations. Some locations have explanatory prose, so these counts are hygiene results, not additional demonstrated correctness defects.
+
+Missing local alignment, initialization and aliasing requirements make changes to these routines difficult to verify.
+
+Fix: document the actual preconditions beside the raw operations, especially buffer construction and SIMD stores.
+
+### 18. Public buffer and container types lack `Debug`
+
+Location: [src/lib.rs:90](/work/crate/src/lib.rs:90), [src/value/tape/array.rs:6](/work/crate/src/value/tape/array.rs:6), [src/value/lazy/object.rs:10](/work/crate/src/value/lazy/object.rs:10).
+
+The advisory pass identifies 13 public types without `Debug`, including `Buffers`, container views and iterators. This prevents ordinary diagnostic formatting of public API results.
+
+Fix: derive or implement useful `Debug` representations.
+
+## Verification
+
+Commands ran on aarch64 Linux with Rust 1.99.1 and installed `nightly-2026-10-01`. `RUSTUP_AUTO_INSTALL=0` was retained; subsequent builds used offline mode.
+
+From `/work/crate`:
+
+- `RUSTFLAGS="--cap-lints warn" cargo test --locked` — passed: 464 tests, 3 ignored.
+- `RUSTFLAGS="--cap-lints warn" cargo test --locked --no-default-features` — passed: 349 tests, 2 ignored.
+- `RUSTFLAGS="--cap-lints warn" cargo test --locked --features approx-number-parsing` — passed: 456 tests, 3 ignored.
+- `RUSTFLAGS="--cap-lints warn" cargo test --locked --features "128bit known-key beef arraybackend ordered-float value-no-dup-keys"` — passed: 493 tests, 4 ignored.
+- `cargo fmt --all --check` — passed.
+- `cargo clippy --locked --workspace --all-targets -- -D warnings` — failed on the compiler/lint drift described above.
+- `RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps --document-private-items` — passed.
+- `RUSTFLAGS="--cap-lints warn" cargo check --locked --features "128bit approx-number-parsing"` — failed: missing macro.
+- `RUSTFLAGS="--cap-lints warn" cargo +nightly-2026-10-01 check --locked --all-features` — failed: missing macro.
+- `RUSTFLAGS="--cap-lints warn" cargo test --locked --features big-int-as-float` — failed: E0277.
+
+Skill checks:
+
+- `bash /work/skill/scripts/check.sh --audit /work/crate` — formatting passed; all-feature Clippy, rustdoc and tests failed. Besides the macro defect, stable rejects the documented nightly-only `hints` feature.
+- `RUSTFLAGS="--cap-lints warn" bash /work/skill/scripts/check.sh --audit --features "" /work/crate` — formatting, capped Clippy, rustdoc and tests passed; advisory findings are summarized above.
+- `python3 -I /work/skill/scripts/audit_scan.py /work/crate` — executed; heuristic candidates added no further confirmed findings.
+
+Scratch regression commands from `/work/tmp/review`:
+
+- `RUSTFLAGS="--cap-lints warn" cargo test --no-fail-fast -- --nocapture` — 11 passed, 15 failed; evidence in `/work/tmp/regressions-final.log`.
+- `RUSTFLAGS="--cap-lints warn" cargo test --features int128 --test tape_access tape_preserves_128_bit_scalar_access -- --nocapture` — failed as reported.
+- `RUSTFLAGS="--cap-lints warn" cargo test --test ordinary --features dedup -- --nocapture` — four passed, covering duplicate keys, buffer reuse, larger inputs and nested round trips. Additional passing probes covered 50,000 finite float round trips and Unicode across SIMD boundaries.
+
+Miri:
+
+- In `/work/tmp/miri-crate`, `cargo +nightly-2026-10-01 miri test --locked --lib value::tape::array::test::get_nested` — failed on alignment.
+- A second scratch copy temporarily used unaligned NEON stores to continue checking the existing escaped-object test. `CARGO_TARGET_DIR=/target/miri-after-alignment cargo +nightly-2026-10-01 miri test --locked --lib tests::test_tape_object_escaped` failed under Stacked Borrows; adding `MIRIFLAGS="-Zmiri-tree-borrows"` passed. This model-dependent observation is unresolved and is not counted as another confirmed defect.
+
+All review edits were confined to scratch space: the regression harness, removal of `#![deny(warnings)]` in Miri copies, and the temporary unaligned-store workaround in the second copy.
+
+Finding count: **18 — 5 Blocker, 10 Major, 3 Minor**. Coverage limits: execution covered the NEON host backend; other architectures, MSRV 1.88, the full Miri suite and exhaustive feature combinations were not validated. No security assessment or dedicated security testing was performed. Last clock reading: **15.15595 minutes used of 45.0**.

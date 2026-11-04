@@ -1,0 +1,556 @@
+   167 src/buffer.rs
+   802 src/chunk.rs
+  1204 src/conversion.rs
+   387 src/debug.rs
+   570 src/error.rs
+   691 src/function.rs
+   277 src/lib.rs
+   116 src/macros.rs
+   164 src/memory.rs
+   478 src/multi.rs
+    41 src/prelude.rs
+   329 src/scope.rs
+  2327 src/state.rs
+   126 src/stdlib.rs
+   434 src/string.rs
+  1255 src/table.rs
+   666 src/thread.rs
+   347 src/traits.rs
+   159 src/types.rs
+  1114 src/userdata.rs
+   777 src/value.rs
+    91 src/vector.rs
+   778 src/serde/de.rs
+   248 src/serde/mod.rs
+   576 src/serde/ser.rs
+ 14124 total
+use std::collections::HashSet;
+use std::fmt;
+use std::marker::PhantomData;
+use std::os::raw::{c_int, c_void};
+use std::string::String as StdString;
+
+use crate::error::{Error, Result};
+use crate::function::Function;
+use crate::state::{LuaGuard, RawLua, WeakLua};
+use crate::traits::{FromLua, FromLuaMulti, IntoLua, IntoLuaMulti, ObjectLike};
+use crate::types::{Integer, LuaType, ValueRef};
+use crate::util::{assert_stack, check_stack, get_metatable_ptr, StackGuard};
+use crate::value::{Nil, Value};
+
+#[cfg(feature = "async")]
+use crate::function::AsyncCallFuture;
+
+#[cfg(feature = "serde")]
+use {
+    rustc_hash::FxHashSet,
+    serde::ser::{Serialize, SerializeMap, SerializeSeq, Serializer},
+    std::{cell::RefCell, rc::Rc, result::Result as StdResult},
+};
+
+/// Handle to an internal Lua table.
+#[derive(Clone, PartialEq)]
+pub struct Table(pub(crate) ValueRef);
+
+impl Table {
+    /// Sets a key-value pair in the table.
+    ///
+    /// If the value is `nil`, this will effectively remove the pair.
+    ///
+    /// This might invoke the `__newindex` metamethod. Use the [`raw_set`] method if that is not
+    /// desired.
+    ///
+    /// # Examples
+    ///
+    /// Export a value as a global to make it usable from Lua:
+    ///
+    /// ```
+    /// # use mlua::{Lua, Result};
+    /// # fn main() -> Result<()> {
+    /// # let lua = Lua::new();
+    /// let globals = lua.globals();
+    ///
+    /// globals.set("assertions", cfg!(debug_assertions))?;
+    ///
+    /// lua.load(r#"
+    ///     if assertions == true then
+    ///         -- ...
+    ///     elseif assertions == false then
+    ///         -- ...
+    ///     else
+    ///         error("assertions neither on nor off?")
+    ///     end
+    /// "#).exec()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`raw_set`]: Table::raw_set
+    pub fn set(&self, key: impl IntoLua, value: impl IntoLua) -> Result<()> {
+        // Fast track (skip protected call)
+        if !self.has_metatable() {
+            return self.raw_set(key, value);
+        }
+
+        self.set_protected(key, value)
+    }
+
+    pub(crate) fn set_protected(&self, key: impl IntoLua, value: impl IntoLua) -> Result<()> {
+        let lua = self.0.lua.lock();
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            check_stack(state, 5)?;
+
+            lua.push_ref(&self.0);
+            key.push_into_stack(&lua)?;
+            value.push_into_stack(&lua)?;
+            protect_lua!(state, 3, 0, fn(state) ffi::lua_settable(state, -3))
+        }
+    }
+
+    /// Gets the value associated to `key` from the table.
+    ///
+    /// If no value is associated to `key`, returns the `nil` value.
+    ///
+    /// This might invoke the `__index` metamethod. Use the [`raw_get`] method if that is not
+    /// desired.
+    ///
+    /// # Examples
+    ///
+    /// Query the version of the Lua interpreter:
+    ///
+    /// ```
+    /// # use mlua::{Lua, Result};
+    /// # fn main() -> Result<()> {
+    /// # let lua = Lua::new();
+    /// let globals = lua.globals();
+    ///
+    /// let version: String = globals.get("_VERSION")?;
+    /// println!("Lua version: {}", version);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`raw_get`]: Table::raw_get
+    pub fn get<V: FromLua>(&self, key: impl IntoLua) -> Result<V> {
+        // Fast track (skip protected call)
+        if !self.has_metatable() {
+            return self.raw_get(key);
+        }
+
+        self.get_protected(key)
+    }
+
+    pub(crate) fn get_protected<V: FromLua>(&self, key: impl IntoLua) -> Result<V> {
+        let lua = self.0.lua.lock();
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            check_stack(state, 4)?;
+
+            lua.push_ref(&self.0);
+            key.push_into_stack(&lua)?;
+            protect_lua!(state, 2, 1, fn(state) ffi::lua_gettable(state, -2))?;
+
+            V::from_stack(-1, &lua)
+        }
+    }
+
+    /// Checks whether the table contains a non-nil value for `key`.
+    ///
+    /// This might invoke the `__index` metamethod.
+    pub fn contains_key(&self, key: impl IntoLua) -> Result<bool> {
+        Ok(self.get::<Value>(key)? != Value::Nil)
+    }
+
+    /// Appends a value to the back of the table.
+    ///
+    /// This might invoke the `__len` and `__newindex` metamethods.
+    pub fn push(&self, value: impl IntoLua) -> Result<()> {
+        // Fast track (skip protected call)
+        if !self.has_metatable() {
+            return self.raw_push(value);
+        }
+
+        let lua = self.0.lua.lock();
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            check_stack(state, 4)?;
+
+            lua.push_ref(&self.0);
+            value.push_into_stack(&lua)?;
+            protect_lua!(state, 2, 0, fn(state) {
+                let len = ffi::luaL_len(state, -2) as Integer;
+                ffi::lua_seti(state, -2, len + 1);
+            })?
+        }
+        Ok(())
+    }
+
+    /// Removes the last element from the table and returns it.
+    ///
+    /// This might invoke the `__len` and `__newindex` metamethods.
+    pub fn pop<V: FromLua>(&self) -> Result<V> {
+        // Fast track (skip protected call)
+        if !self.has_metatable() {
+            return self.raw_pop();
+        }
+
+        let lua = self.0.lua.lock();
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            check_stack(state, 4)?;
+
+            lua.push_ref(&self.0);
+            protect_lua!(state, 1, 1, fn(state) {
+                let len = ffi::luaL_len(state, -1) as Integer;
+                ffi::lua_geti(state, -1, len);
+                ffi::lua_pushnil(state);
+                ffi::lua_seti(state, -3, len);
+            })?;
+            V::from_stack(-1, &lua)
+        }
+    }
+
+    /// Compares two tables for equality.
+    ///
+    /// Tables are compared by reference first.
+    /// If they are not primitively equals, then mlua will try to invoke the `__eq` metamethod.
+    /// mlua will check `self` first for the metamethod, then `other` if not found.
+    ///
+    /// # Examples
+    ///
+    /// Compare two tables using `__eq` metamethod:
+    ///
+    /// ```
+    /// # use mlua::{Lua, Result, Table};
+    /// # fn main() -> Result<()> {
+    /// # let lua = Lua::new();
+    /// let table1 = lua.create_table()?;
+    /// table1.set(1, "value")?;
+    ///
+    /// let table2 = lua.create_table()?;
+    /// table2.set(2, "value")?;
+    ///
+    /// let always_equals_mt = lua.create_table()?;
+    /// always_equals_mt.set("__eq", lua.create_function(|_, (_t1, _t2): (Table, Table)| Ok(true))?)?;
+    /// table2.set_metatable(Some(always_equals_mt))?;
+    ///
+    /// assert!(table1.equals(&table1.clone())?);
+    /// assert!(table1.equals(&table2)?);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn equals(&self, other: &Self) -> Result<bool> {
+        if self == other {
+            return Ok(true);
+        }
+
+        // Compare using `__eq` metamethod if exists
+        // First, check the self for the metamethod.
+        // If self does not define it, then check the other table.
+        if let Some(mt) = self.metatable() {
+            if mt.contains_key("__eq")? {
+                return mt.get::<Function>("__eq")?.call((self, other));
+            }
+        }
+        if let Some(mt) = other.metatable() {
+            if mt.contains_key("__eq")? {
+                return mt.get::<Function>("__eq")?.call((self, other));
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Sets a key-value pair without invoking metamethods.
+    pub fn raw_set(&self, key: impl IntoLua, value: impl IntoLua) -> Result<()> {
+        let lua = self.0.lua.lock();
+        let state = lua.state();
+        unsafe {
+            #[cfg(feature = "luau")]
+            self.check_readonly_write(&lua)?;
+
+            let _sg = StackGuard::new(state);
+            check_stack(state, 5)?;
+
+            lua.push_ref(&self.0);
+            key.push_into_stack(&lua)?;
+            value.push_into_stack(&lua)?;
+
+            if lua.unlikely_memory_error() {
+                ffi::lua_rawset(state, -3);
+                ffi::lua_pop(state, 1);
+                Ok(())
+            } else {
+                protect_lua!(state, 3, 0, fn(state) ffi::lua_rawset(state, -3))
+            }
+        }
+    }
+
+    /// Gets the value associated to `key` without invoking metamethods.
+    pub fn raw_get<V: FromLua>(&self, key: impl IntoLua) -> Result<V> {
+        let lua = self.0.lua.lock();
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            check_stack(state, 3)?;
+
+            lua.push_ref(&self.0);
+            key.push_into_stack(&lua)?;
+            ffi::lua_rawget(state, -2);
+
+            V::from_stack(-1, &lua)
+use mlua::{Error, Lua, ObjectLike, Result, Table, Value};
+
+#[test]
+fn test_globals_set_get() -> Result<()> {
+    let lua = Lua::new();
+
+    let globals = lua.globals();
+    globals.set("foo", "bar")?;
+    globals.set("baz", "baf")?;
+    assert_eq!(globals.get::<String>("foo")?, "bar");
+    assert_eq!(globals.get::<String>("baz")?, "baf");
+
+    lua.load(r#"assert(foo == "bar")"#).exec().unwrap();
+
+    Ok(())
+}
+
+#[test]
+fn test_table() -> Result<()> {
+    let lua = Lua::new();
+
+    let globals = lua.globals();
+
+    lua.load(
+        r#"
+        table1 = {1, 2, 3, 4, 5}
+        table2 = {}
+        table3 = {1, 2, nil, 4, 5}
+    "#,
+    )
+    .exec()?;
+
+    let table1 = globals.get::<Table>("table1")?;
+    assert_eq!(table1.len()?, 5);
+    assert!(!table1.is_empty());
+    assert_eq!(
+        table1.pairs().collect::<Result<Vec<(i64, i64)>>>()?,
+        vec![(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]
+    );
+    assert_eq!(
+        table1.sequence_values().collect::<Result<Vec<i64>>>()?,
+        vec![1, 2, 3, 4, 5]
+    );
+    assert_eq!(table1, [1, 2, 3, 4, 5]);
+    assert_eq!(table1, [1, 2, 3, 4, 5].as_slice());
+
+    let table2 = globals.get::<Table>("table2")?;
+    assert_eq!(table2.len()?, 0);
+    assert!(table2.is_empty());
+    assert_eq!(table2.pairs().collect::<Result<Vec<(i64, i64)>>>()?, vec![]);
+    assert_eq!(table2, [0; 0]);
+
+    let table3 = globals.get::<Table>("table3")?;
+    // sequence_values should only iterate until the first border
+    assert_eq!(table3, [1, 2]);
+    assert_eq!(
+        table3.sequence_values().collect::<Result<Vec<i64>>>()?,
+        vec![1, 2]
+    );
+
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "linux")] // Linux allow overcommiting the memory (relevant for CI)
+fn test_table_with_large_capacity() {
+    let lua = Lua::new();
+
+    let t = lua.create_table_with_capacity(1 << 26, 1 << 26);
+    assert!(t.is_ok());
+}
+
+#[test]
+fn test_table_push_pop() -> Result<()> {
+    let lua = Lua::new();
+
+    // Test raw access
+    let table1 = lua.create_sequence_from([123])?;
+    table1.raw_push(321)?;
+    assert_eq!(table1, [123, 321]);
+    assert_eq!(table1.raw_pop::<i64>()?, 321);
+    assert_eq!(table1.raw_pop::<i64>()?, 123);
+    assert_eq!(table1.raw_pop::<Value>()?, Value::Nil); // An extra pop should do nothing
+    assert_eq!(table1.raw_len(), 0);
+    assert_eq!(table1, [0; 0]);
+
+    // Test access through metamethods
+    let table2 = lua
+        .load(
+            r#"
+        local proxy_table = {234}
+        table2 = setmetatable({}, {
+            __len = function() return #proxy_table end,
+            __index = proxy_table,
+            __newindex = proxy_table,
+        })
+        return table2
+    "#,
+        )
+        .eval::<Table>()?;
+    table2.push(345)?;
+    assert_eq!(table2.len()?, 2);
+    assert_eq!(
+        table2.sequence_values::<i64>().collect::<Result<Vec<_>>>()?,
+        vec![]
+    );
+    assert_eq!(table2.pop::<i64>()?, 345);
+    assert_eq!(table2.pop::<i64>()?, 234);
+    assert_eq!(table2.pop::<Value>()?, Value::Nil);
+    assert_eq!(table2.len()?, 0);
+
+    Ok(())
+}
+
+#[test]
+fn test_table_insert_remove() -> Result<()> {
+    let lua = Lua::new();
+
+    let globals = lua.globals();
+
+    globals.set("table4", [1, 2, 3, 4, 5])?;
+    let table4 = globals.get::<Table>("table4")?;
+    assert_eq!(
+        table4.pairs().collect::<Result<Vec<(i64, i64)>>>()?,
+        vec![(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]
+    );
+    table4.raw_insert(4, 35)?;
+    table4.raw_insert(7, 7)?;
+    assert_eq!(
+        table4.pairs().collect::<Result<Vec<(i64, i64)>>>()?,
+        vec![(1, 1), (2, 2), (3, 3), (4, 35), (5, 4), (6, 5), (7, 7)]
+    );
+    table4.raw_remove(1)?;
+    assert_eq!(
+        table4.pairs().collect::<Result<Vec<(i64, i64)>>>()?,
+        vec![(1, 2), (2, 3), (3, 35), (4, 4), (5, 5), (6, 7)]
+    );
+
+    // Wrong index, tables are 1-indexed
+    assert!(table4.raw_insert(0, "123").is_err());
+
+    Ok(())
+}
+
+#[test]
+fn test_table_clear() -> Result<()> {
+    let lua = Lua::new();
+
+    let t = lua.create_table()?;
+
+    // Check readonly error
+    #[cfg(feature = "luau")]
+    {
+        t.set_readonly(true);
+        assert!(matches!(
+            t.clear(),
+            Err(Error::RuntimeError(err)) if err.contains("attempt to modify a readonly table")
+        ));
+        t.set_readonly(false);
+    }
+
+    // Set array and hash parts
+    t.push("abc")?;
+    t.push("bcd")?;
+    t.set("a", "1")?;
+    t.set("b", "2")?;
+    t.clear()?;
+    assert_eq!(t.len()?, 0);
+    assert_eq!(t.pairs::<Value, Value>().count(), 0);
+
+    // Test table with metamethods
+    let t2 = lua
+        .load(
+            r#"
+        setmetatable({1, 2, 3, a = "1"}, {
+            __index = function() error("index error") end,
+            __newindex = function() error("newindex error") end,
+            __len = function() error("len error") end,
+            __pairs = function() error("pairs error") end,
+        })
+    "#,
+        )
+        .eval::<Table>()?;
+    assert_eq!(t2.raw_len(), 3);
+    assert!(!t2.is_empty());
+    t2.clear()?;
+    assert_eq!(t2.raw_len(), 0);
+    assert!(t2.is_empty());
+    assert_eq!(t2.raw_get::<Value>("a")?, Value::Nil);
+    assert_ne!(t2.metatable(), None);
+
+    Ok(())
+}
+
+#[test]
+fn test_table_sequence_from() -> Result<()> {
+    let lua = Lua::new();
+
+    let get_table = lua.create_function(|_, t: Table| Ok(t))?;
+
+    assert_eq!(get_table.call::<Table>(vec![1, 2, 3])?, [1, 2, 3]);
+    assert_eq!(get_table.call::<Table>([4, 5, 6])?, [4, 5, 6]);
+    assert_eq!(get_table.call::<Table>([7, 8, 9].as_slice())?, [7, 8, 9]);
+
+    Ok(())
+}
+
+#[test]
+fn test_table_pairs() -> Result<()> {
+    let lua = Lua::new();
+
+    let table = lua
+        .load(
+            r#"
+    {
+        foo = "bar",
+        baz = "baf",
+        [123] = 456,
+        [789] = 101112,
+        5,
+    }
+    "#,
+        )
+        .eval::<Table>()?;
+
+    for (i, kv) in table.pairs::<String, Value>().enumerate() {
+        let (k, _v) = kv.unwrap();
+        match i {
+            // Try to add a new key
+            0 => table.set("new_key", "new_value")?,
+            // Try to delete the 2nd key
+            1 => {
+                table.set(k, Value::Nil)?;
+                lua.gc_collect()?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_table_for_each() -> Result<()> {
+    let lua = Lua::new();
+
+    let table = lua
+        .load(
+            r#"
+    {

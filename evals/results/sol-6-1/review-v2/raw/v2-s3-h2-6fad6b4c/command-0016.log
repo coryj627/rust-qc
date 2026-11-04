@@ -1,0 +1,641 @@
+async fn request_over_max_concurrent_streams_errors() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv
+            .assert_client_handshake_with_settings(
+                frames::settings()
+                    // super tiny server
+                    .max_concurrent_streams(1),
+            )
+            .await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("POST", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+        srv.recv_frame(frames::headers(3).request("POST", "https://example.com/"))
+            .await;
+        srv.send_frame(frames::headers(3).response(200)).await;
+        srv.recv_frame(frames::data(3, "hello").eos()).await;
+        srv.send_frame(frames::data(3, "").eos()).await;
+        srv.recv_frame(frames::headers(5).request("POST", "https://example.com/"))
+            .await;
+        srv.send_frame(frames::headers(5).response(200)).await;
+        srv.recv_frame(frames::data(5, "hello").eos()).await;
+        srv.send_frame(frames::data(5, "").eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.expect("handshake");
+        // we send a simple req here just to drive the connection so we can
+        // receive the server settings.
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+        // first request is allowed
+        let (response, _) = client.send_request(request, true).unwrap();
+        h2.drive(response).await.unwrap();
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+
+        // first request is allowed
+        let (resp1, mut stream1) = client.send_request(request, false).unwrap();
+        // as long as we let the connection internals tick
+        client = h2.drive(client.ready()).await.unwrap();
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+
+        // second request is put into pending_open
+        let (resp2, mut stream2) = client.send_request(request, false).unwrap();
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // third stream is over max concurrent
+        assert!(!client.poll_ready(&mut cx).is_ready());
+
+        let err = client.send_request(request, true).unwrap_err();
+        assert_eq!(err.to_string(), "user error: rejected");
+
+        stream1
+            .send_data("hello".into(), true)
+            .expect("req send_data");
+
+        h2.drive(async move {
+            resp1.await.expect("req");
+            stream2
+                .send_data("hello".into(), true)
+                .expect("req2 send_data");
+        })
+        .await;
+        join(async move { h2.await.unwrap() }, async move {
+            resp2.await.unwrap()
+        })
+        .await;
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn drop_pending_open() {
+    // This test checks that a stream queued for pending open behaves correctly when its
+    // client drops.
+    use tokio::sync::oneshot;
+    h2_support::trace_init!();
+
+    let (io, mut srv) = mock::new();
+    let (init_tx, init_rx) = oneshot::channel();
+    let (trigger_go_away_tx, trigger_go_away_rx) = oneshot::channel();
+    let (sent_go_away_tx, sent_go_away_rx) = oneshot::channel();
+    let (drop_tx, drop_rx) = oneshot::channel();
+
+    let mut settings = frame::Settings::default();
+    settings.set_max_concurrent_streams(Some(2));
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake_with_settings(settings).await;
+        // This is the ACK
+        assert_default_settings!(settings);
+        init_tx.send(()).unwrap();
+        srv.recv_frame(frames::headers(1).request("GET", "https://www.example.com/"))
+            .await;
+        srv.recv_frame(
+            frames::headers(3)
+                .request("GET", "https://www.example.com/")
+                .eos(),
+        )
+        .await;
+        trigger_go_away_rx.await.unwrap();
+        srv.send_frame(frames::go_away(3)).await;
+        sent_go_away_tx.send(()).unwrap();
+        drop_rx.await.unwrap();
+        srv.send_frame(frames::headers(3).response(200).eos()).await;
+        srv.recv_frame(frames::data(1, vec![]).eos()).await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+    };
+
+    fn request() -> Request<()> {
+        Request::builder()
+            .uri("https://www.example.com/")
+            .body(())
+            .unwrap()
+    }
+
+    let client = async move {
+        let (mut client, conn) = client::Builder::new()
+            .max_concurrent_reset_streams(0)
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+        let f = async move {
+            init_rx.await.expect("init_rx");
+            // Fill up the concurrent stream limit.
+            poll_fn(|cx| client.poll_ready(cx)).await.unwrap();
+            let mut response1 = client.send_request(request(), false).unwrap();
+            poll_fn(|cx| client.poll_ready(cx)).await.unwrap();
+            let response2 = client.send_request(request(), true).unwrap();
+            poll_fn(|cx| client.poll_ready(cx)).await.unwrap();
+            let response3 = client.send_request(request(), true).unwrap();
+
+            // Trigger a GOAWAY frame to invalidate our third request.
+            trigger_go_away_tx.send(()).unwrap();
+            sent_go_away_rx.await.expect("sent_go_away_rx");
+            // Now drop all the references to that stream.
+            drop(response3);
+            drop(client);
+            drop_tx.send(()).unwrap();
+
+            // Complete the second request, freeing up a stream.
+            response2.0.await.expect("resp2");
+            response1.1.send_data(Default::default(), true).unwrap();
+            response1.0.await.expect("resp1")
+        };
+
+        join(
+            async move {
+                conn.await.expect("h2");
+            },
+            f,
+        )
+        .await;
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn malformed_response_headers_dont_unlink_stream() {
+    // This test checks that receiving malformed headers frame on a stream with
+    // no remaining references correctly resets the stream, without prematurely
+    // unlinking it.
+    use tokio::sync::oneshot;
+    h2_support::trace_init!();
+
+    let (io, mut srv) = mock::new();
+    let (drop_tx, drop_rx) = oneshot::channel();
+    let (queued_tx, queued_rx) = oneshot::channel();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+
+        srv.recv_frame(frames::headers(1).request("GET", "http://example.com/"))
+            .await;
+        srv.recv_frame(frames::headers(3).request("GET", "http://example.com/"))
+            .await;
+        srv.recv_frame(frames::headers(5).request("GET", "http://example.com/"))
+            .await;
+        drop_tx.send(()).unwrap();
+        queued_rx.await.unwrap();
+        srv.send_bytes(&[
+            // 2 byte frame
+            0, 0, 2, // type: HEADERS
+            1, // flags: END_STREAM | END_HEADERS
+            5, // stream identifier: 3
+            0, 0, 0, 3, // data - invalid (pseudo not at end of block)
+            144,
+            135, // Per the spec, this frame should cause a stream error of type
+                 // PROTOCOL_ERROR.
+        ])
+        .await;
+    };
+
+    fn request() -> Request<()> {
+        Request::builder()
+            .uri("http://example.com/")
+            .body(())
+            .unwrap()
+    }
+
+    let client = async move {
+        let (mut client, conn) = client::Builder::new()
+            .handshake::<_, Bytes>(io)
+            .await
+use futures::{FutureExt, TryFuture};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
+
+/// Future extension helpers that are useful for tests
+pub trait TestFuture: Future {
+    /// Drive `other` by polling `self`.
+    ///
+    /// `self` must not resolve before `other` does.
+    fn drive<T>(&mut self, other: T) -> Drive<'_, Self, T>
+    where
+        T: Future,
+        Self: Future + Sized,
+    {
+        Drive {
+            driver: self,
+            future: other.wakened(),
+        }
+    }
+
+    fn wakened(self) -> Wakened<Self>
+    where
+        Self: Sized,
+    {
+        Wakened {
+            future: Box::pin(self),
+            woken: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
+
+/// Wraps futures::future::join to ensure that the futures are only polled if they are woken.
+pub fn join<Fut1, Fut2>(
+    future1: Fut1,
+    future2: Fut2,
+) -> futures::future::Join<Wakened<Fut1>, Wakened<Fut2>>
+where
+    Fut1: Future,
+    Fut2: Future,
+{
+    futures::future::join(future1.wakened(), future2.wakened())
+}
+
+/// Wraps futures::future::join3 to ensure that the futures are only polled if they are woken.
+pub fn join3<Fut1, Fut2, Fut3>(
+    future1: Fut1,
+    future2: Fut2,
+    future3: Fut3,
+) -> futures::future::Join3<Wakened<Fut1>, Wakened<Fut2>, Wakened<Fut3>>
+where
+    Fut1: Future,
+    Fut2: Future,
+    Fut3: Future,
+{
+    futures::future::join3(future1.wakened(), future2.wakened(), future3.wakened())
+}
+
+/// Wraps futures::future::join4 to ensure that the futures are only polled if they are woken.
+pub fn join4<Fut1, Fut2, Fut3, Fut4>(
+    future1: Fut1,
+    future2: Fut2,
+    future3: Fut3,
+    future4: Fut4,
+) -> futures::future::Join4<Wakened<Fut1>, Wakened<Fut2>, Wakened<Fut3>, Wakened<Fut4>>
+where
+    Fut1: Future,
+    Fut2: Future,
+    Fut3: Future,
+    Fut4: Future,
+{
+    futures::future::join4(
+        future1.wakened(),
+        future2.wakened(),
+        future3.wakened(),
+        future4.wakened(),
+    )
+}
+
+/// Wraps futures::future::try_join to ensure that the futures are only polled if they are woken.
+pub fn try_join<Fut1, Fut2>(
+    future1: Fut1,
+    future2: Fut2,
+) -> futures::future::TryJoin<Wakened<Fut1>, Wakened<Fut2>>
+where
+    Fut1: futures::future::TryFuture + Future,
+    Fut2: Future,
+    Wakened<Fut1>: futures::future::TryFuture,
+    Wakened<Fut2>: futures::future::TryFuture<Error = <Wakened<Fut1> as TryFuture>::Error>,
+{
+    futures::future::try_join(future1.wakened(), future2.wakened())
+}
+
+/// Wraps futures::future::select to ensure that the futures are only polled if they are woken.
+pub fn select<A, B>(future1: A, future2: B) -> futures::future::Select<Wakened<A>, Wakened<B>>
+where
+    A: Future + Unpin,
+    B: Future + Unpin,
+{
+    futures::future::select(future1.wakened(), future2.wakened())
+}
+
+/// Wraps futures::future::join_all to ensure that the futures are only polled if they are woken.
+pub fn join_all<I>(iter: I) -> futures::future::JoinAll<Wakened<I::Item>>
+where
+    I: IntoIterator,
+    I::Item: Future,
+{
+    futures::future::join_all(iter.into_iter().map(|f| f.wakened()))
+}
+
+/// A future that only polls the inner future if it has been woken (after the initial poll).
+pub struct Wakened<T> {
+    future: Pin<Box<T>>,
+    woken: Arc<AtomicBool>,
+}
+
+/// A future that only polls the inner future if it has been woken (after the initial poll).
+impl<T> Future for Wakened<T>
+where
+    T: Future,
+{
+    type Output = T::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if !this.woken.load(std::sync::atomic::Ordering::SeqCst) {
+            return Poll::Pending;
+        }
+        this.woken.store(false, std::sync::atomic::Ordering::SeqCst);
+        let my_waker = IfWokenWaker {
+            inner: cx.waker().clone(),
+            wakened: this.woken.clone(),
+        };
+        let my_waker = Arc::new(my_waker).into();
+        let mut cx = Context::from_waker(&my_waker);
+        this.future.as_mut().poll(&mut cx)
+    }
+}
+
+impl Wake for IfWokenWaker {
+    fn wake(self: Arc<Self>) {
+        self.wakened
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.wake_by_ref();
+    }
+}
+
+struct IfWokenWaker {
+    inner: Waker,
+    wakened: Arc<AtomicBool>,
+}
+
+impl<T: Future> TestFuture for T {}
+
+// ===== Drive ======
+
+/// Drive a future to completion while also polling the driver
+///
+/// This is useful for H2 futures that also require the connection to be polled.
+pub struct Drive<'a, T, U> {
+    driver: &'a mut T,
+    future: Wakened<U>,
+}
+
+impl<'a, T, U> Future for Drive<'a, T, U>
+where
+    T: Future + Unpin,
+    U: Future,
+{
+    type Output = U::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut looped = false;
+        loop {
+            match self.future.poll_unpin(cx) {
+                Poll::Ready(val) => return Poll::Ready(val),
+                Poll::Pending => {}
+            }
+
+            match self.driver.poll_unpin(cx) {
+                Poll::Ready(_) => {
+                    if looped {
+                        // Try polling the future one last time
+                        panic!("driver resolved before future")
+                    } else {
+                        looped = true;
+                        continue;
+                    }
+                }
+                Poll::Pending => {}
+            }
+
+            return Poll::Pending;
+        }
+    }
+}
+    /// capacity will be 0, i.e. there is no requested capacity for the stream.
+    ///
+    /// If `reserve_capacity` is called with a lower value than the amount of
+    /// capacity **currently** assigned to the stream, this capacity will be
+    /// returned to the connection to be re-assigned to other streams.
+    ///
+    /// Also, the amount of capacity that is reserved gets decremented as data
+    /// is sent. For example:
+    ///
+    /// ```rust
+    /// # use h2::*;
+    /// # async fn doc(mut send_stream: SendStream<&'static [u8]>) {
+    /// send_stream.reserve_capacity(100);
+    ///
+    /// send_stream.send_data(b"hello", false).unwrap();
+    /// // At this point, the total amount of requested capacity is 95 bytes.
+    ///
+    /// // Calling `reserve_capacity` with `100` again essentially requests an
+    /// // additional 5 bytes.
+    /// send_stream.reserve_capacity(100);
+    /// # }
+    /// ```
+    ///
+    /// See [Flow control](struct.SendStream.html#flow-control) for an overview
+    /// of how send flow control works.
+    pub fn reserve_capacity(&mut self, capacity: usize) {
+        // TODO: Check for overflow
+        self.inner.reserve_capacity(capacity as WindowSize)
+    }
+
+    /// Returns the stream's current send capacity.
+    ///
+    /// This allows the caller to check the current amount of available capacity
+    /// before sending data.
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity() as usize
+    }
+
+    /// Requests to be notified when the stream's capacity increases.
+    ///
+    /// Before calling this, capacity should be requested with
+    /// `reserve_capacity`. Once capacity is requested, the connection will
+    /// assign capacity to the stream **as it becomes available**. There is no
+    /// guarantee as to when and in what increments capacity gets assigned to
+    /// the stream.
+    ///
+    /// To get notified when the available capacity increases, the caller calls
+    /// `poll_capacity`, which returns `Ready(Some(n))` when `n` has been
+    /// increased by the connection. Note that `n` here represents the **total**
+    /// amount of assigned capacity at that point in time. It is also possible
+    /// that `n` is lower than the previous call if, since then, the caller has
+    /// sent data.
+    pub fn poll_capacity(&mut self, cx: &mut Context) -> Poll<Option<Result<usize, crate::Error>>> {
+        self.inner
+            .poll_capacity(cx)
+            .map_ok(|w| w as usize)
+            .map_err(Into::into)
+    }
+
+1247-
+1248-    /// Called by a client to see if the current stream is pending open
+1249-    pub fn is_pending_open(&self) -> bool {
+1250-        let mut me = self.opaque.inner.lock().unwrap();
+1251-        me.store.resolve(self.opaque.key).is_pending_open
+1252-    }
+1253-
+1254-    /// Request capacity to send data
+1255:    pub fn reserve_capacity(&mut self, capacity: WindowSize) {
+1256-        let mut me = self.opaque.inner.lock().unwrap();
+1257-        let me = &mut *me;
+1258-
+1259-        let mut stream = me.store.resolve(self.opaque.key);
+1260-
+1261-        me.actions
+1262-            .send
+1263-            .reserve_capacity(capacity, &mut stream, &mut me.counts)
+1264-    }
+1265-
+1266-    /// Returns the stream's current send capacity.
+1267-    pub fn capacity(&self) -> WindowSize {
+1268-        let mut me = self.opaque.inner.lock().unwrap();
+1269-        let me = &mut *me;
+1270-
+1271-        let mut stream = me.store.resolve(self.opaque.key);
+1272-
+1273-        me.actions.send.capacity(&mut stream)
+1274-    }
+1275-
+1276-    /// Request to be notified when the stream's capacity increases
+1277-    pub fn poll_capacity(&mut self, cx: &Context) -> Poll<Option<Result<WindowSize, UserError>>> {
+1278-        let mut me = self.opaque.inner.lock().unwrap();
+1279-        let me = &mut *me;
+1280-
+1281-        let mut stream = me.store.resolve(self.opaque.key);
+1282-
+1283-        me.actions.send.poll_capacity(cx, &mut stream)
+// Re-export H2 crate
+pub use h2;
+
+pub use h2::client;
+pub use h2::ext::Protocol;
+pub use h2::frame::StreamId;
+pub use h2::server;
+pub use h2::*;
+
+// Re-export mock
+pub use super::mock::{self, idle_ms};
+
+// Re-export frames helpers
+pub use super::frames;
+
+// Re-export utility mod
+pub use super::util;
+
+// Re-export some type defines
+pub use super::{Codec, SendFrame};
+
+// Re-export macros
+pub use super::{
+    assert_closed, assert_data, assert_default_settings, assert_go_away, assert_headers,
+    assert_ping, assert_settings, poll_err, poll_frame, raw_codec,
+};
+
+pub use super::assert::assert_frame_eq;
+
+// Re-export useful crates
+pub use tokio_test::io as mock_io;
+pub use {bytes, futures, http, tokio::io as tokio_io, tracing, tracing_subscriber};
+
+// Re-export primary future types
+pub use futures::{Future, Sink, Stream};
+
+// And our Future extensions
+pub use super::future_ext::{join, join3, join4, join_all, select, try_join, TestFuture};
+
+// Our client_ext helpers
+pub use super::client_ext::SendRequestExt;
+
+// Re-export HTTP types
+pub use http::{uri, HeaderMap, Method, Request, Response, StatusCode, Version};
+
+pub use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+pub use tokio::io::{AsyncRead, AsyncWrite};
+
+pub use std::thread;
+pub use std::time::Duration;
+
+pub static MAGIC_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+// ===== Everything under here shouldn't be used =====
+// TODO: work on deleting this code
+
+use futures::future;
+pub use futures::future::poll_fn;
+use futures::future::Either::*;
+use std::pin::Pin;
+
+pub trait MockH2 {
+    fn handshake(&mut self) -> &mut Self;
+
+    fn handshake_read_settings(&mut self, settings: &[u8]) -> &mut Self;
+}
+
+impl MockH2 for tokio_test::io::Builder {
+    fn handshake(&mut self) -> &mut Self {
+        self.handshake_read_settings(frames::SETTINGS)
+    }
+
+    fn handshake_read_settings(&mut self, settings: &[u8]) -> &mut Self {
+        self.write(MAGIC_PREFACE)
+            // Settings frame
+            .write(frames::SETTINGS)
+            .read(settings)
+            .read(frames::SETTINGS_ACK)
+    }
+}
+
+pub trait ClientExt {
+    fn run<'a, F: Future + Unpin + 'a>(
+        &'a mut self,
+        f: F,
+    ) -> Pin<Box<dyn Future<Output = F::Output> + 'a>>;
+}
+
+impl<T, B> ClientExt for client::Connection<T, B>
+where
+    T: AsyncRead + AsyncWrite + Unpin + 'static,
+    B: Buf,
+{
+    fn run<'a, F: Future + Unpin + 'a>(
+        &'a mut self,
+        f: F,
+    ) -> Pin<Box<dyn Future<Output = F::Output> + 'a>> {
+        let res = future::select(self, f);
+        Box::pin(async {
+test result: ok. 42 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.11s
+test result: ok. 10 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.08s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 33 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.83s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 204.18s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 36 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.26s
+test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s

@@ -1,0 +1,840 @@
+use {super::*, serde::Serialize};
+
+type Scopes<'src, 'run> = BTreeMap<
+  Modulepath,
+  (
+    &'run Justfile<'src>,
+    &'run Scope<'src, 'run>,
+    &'run BTreeMap<String, String>,
+  ),
+>;
+
+#[derive(Debug, PartialEq, Serialize)]
+pub(crate) struct Justfile<'src> {
+  pub(crate) aliases: Table<'src, Alias<'src>>,
+  pub(crate) assignments: Table<'src, Assignment<'src>>,
+  #[serde(rename = "first", serialize_with = "keyed::serialize_option")]
+  pub(crate) default: Option<Arc<Recipe<'src>>>,
+  pub(crate) doc: Option<String>,
+  #[serde(skip)]
+  pub(crate) functions: Table<'src, FunctionDefinition<'src>>,
+  pub(crate) groups: Vec<StringLiteral<'src>>,
+  #[serde(skip)]
+  pub(crate) loaded: Vec<PathBuf>,
+  pub(crate) module_path: Modulepath,
+  pub(crate) modules: Table<'src, Self>,
+  #[serde(skip)]
+  pub(crate) name: Option<Name<'src>>,
+  #[serde(skip)]
+  pub(crate) private: bool,
+  pub(crate) recipes: Table<'src, Arc<Recipe<'src>>>,
+  pub(crate) settings: Settings,
+  pub(crate) source: PathBuf,
+  pub(crate) unexports: HashSet<String>,
+  #[serde(skip)]
+  pub(crate) unstable_features: BTreeSet<UnstableFeature>,
+  pub(crate) warnings: Vec<Warning>,
+  #[serde(skip)]
+  pub(crate) working_directory: PathBuf,
+}
+
+impl<'src> Justfile<'src> {
+  fn find_suggestion(
+    input: &str,
+    candidates: impl Iterator<Item = Suggestion<'src>>,
+  ) -> Option<Suggestion<'src>> {
+    candidates
+      .map(|suggestion| (edit_distance(input, suggestion.name), suggestion))
+      .filter(|(distance, _suggestion)| *distance < 3)
+      .min_by_key(|(distance, _suggestion)| *distance)
+      .map(|(_distance, suggestion)| suggestion)
+  }
+
+  pub(crate) fn suggest_recipe(&self, input: &str) -> Option<Suggestion<'src>> {
+    Self::find_suggestion(
+      input,
+      self
+        .recipes
+        .values()
+        .filter(|recipe| recipe.is_public())
+        .map(|recipe| Suggestion {
+          name: recipe.name(),
+          target: None,
+        })
+        .chain(
+          self
+            .aliases
+            .values()
+            .filter(|alias| alias.is_public())
+            .map(|alias| Suggestion {
+              name: alias.name.lexeme(),
+              target: Some(alias.target.name.lexeme()),
+            }),
+        ),
+    )
+  }
+
+  pub(crate) fn suggest_submodule(&self, input: &str) -> Option<Suggestion<'src>> {
+    Self::find_suggestion(
+      input,
+      self
+        .modules
+        .keys()
+        .map(|name| Suggestion { name, target: None }),
+    )
+  }
+
+  pub(crate) fn suggest_variable_or_submodule(&self, input: &str) -> Option<Suggestion<'src>> {
+    Self::find_suggestion(
+      input,
+      self
+        .assignments
+        .keys()
+        .chain(self.modules.keys())
+        .map(|name| Suggestion { name, target: None }),
+    )
+  }
+
+  fn evaluate_scopes<'run>(
+    &'run self,
+    config: &'run Config,
+    dotenv_arena: &'run Arena<BTreeMap<String, String>>,
+    overrides: &'run HashMap<Number, String>,
+    parent_dotenv: Option<&'run BTreeMap<String, String>>,
+    root: &'run Scope<'src, 'run>,
+    scope_arena: &'run Arena<Scope<'src, 'run>>,
+    scopes: &mut Scopes<'src, 'run>,
+    search: &'run Search,
+    variable_references: Option<&HashSet<Number>>,
+  ) -> RunResult<'src> {
+    let dotenv = if config.load_dotenv {
+      let working_directory = if self.is_submodule() {
+        &self.working_directory
+      } else {
+        &search.working_directory
+      };
+      load_dotenv(config, &self.settings, working_directory)?
+    } else {
+      BTreeMap::new()
+    };
+
+    let dotenv = if let Some(parent_dotenv) = parent_dotenv {
+      parent_dotenv
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .chain(dotenv)
+        .collect()
+    } else {
+      dotenv
+    };
+
+    let dotenv = dotenv_arena.alloc(dotenv);
+
+    let scope = Evaluator::evaluate_assignments(
+      config,
+      dotenv,
+      self,
+      overrides,
+      root,
+      search,
+      variable_references,
+    )?;
+
+    let scope = scope_arena.alloc(scope);
+    scopes.insert(self.module_path.clone(), (self, scope, dotenv));
+
+    for module in self.modules.values() {
+      module.evaluate_scopes(
+        config,
+        dotenv_arena,
+        overrides,
+        Some(dotenv),
+        scope,
+        scope_arena,
+        scopes,
+        search,
+        variable_references,
+      )?;
+    }
+
+    Ok(())
+  }
+
+  pub(crate) fn run(
+    &self,
+    config: &Config,
+    search: &Search,
+    arguments: &[String],
+    overrides: &HashMap<Number, String>,
+  ) -> RunResult<'src> {
+    let root = Scope::root();
+    let dotenv_arena = Arena::new();
+    let scope_arena = Arena::new();
+    let mut scopes = BTreeMap::new();
+
+    match &config.subcommand {
+      Subcommand::Choose { .. } | Subcommand::Run { .. } => {
+        let arguments = arguments.iter().map(String::as_str).collect::<Vec<&str>>();
+
+        let invocations = InvocationParser::parse_invocations(self, &arguments)?;
+
+        if config.one && invocations.len() > 1 {
+          return Err(Error::ExcessInvocations {
+            invocations: invocations.len(),
+          });
+        }
+
+        let variable_references = if self.settings.lazy {
+          let mut variable_references = HashSet::new();
+
+          let mut stack = Vec::new();
+
+          for invocation in &invocations {
+            stack.push(invocation.recipe);
+          }
+
+          while let Some(recipe) = stack.pop() {
+            variable_references.extend(&recipe.variable_references);
+            for dependency in &recipe.dependencies {
+              stack.push(&dependency.recipe);
+            }
+          }
+
+          Some(variable_references)
+        } else {
+          None
+        };
+
+        self.evaluate_scopes(
+          config,
+          &dotenv_arena,
+          overrides,
+          None,
+          &root,
+          &scope_arena,
+          &mut scopes,
+          search,
+          variable_references.as_ref(),
+        )?;
+
+        let ran = Ran::default();
+        for invocation in invocations {
+          Self::run_recipe(
+            &invocation.arguments,
+            config,
+            false,
+            &ran,
+            invocation.recipe,
+            &scopes,
+            search,
+          )?;
+        }
+
+        Ok(())
+      }
+      Subcommand::Command {
+        binary, arguments, ..
+      } => {
+        let mut command = if config.shell_command {
+          let mut command = self.settings.shell_command(config);
+          command.arg(binary);
+          command
+        } else {
+          Command::resolve(binary)
+        };
+
+        command
+          .args(arguments)
+          .current_dir(&search.working_directory);
+
+        self.evaluate_scopes(
+          config,
+          &dotenv_arena,
+          overrides,
+          None,
+          &root,
+          &scope_arena,
+          &mut scopes,
+          search,
+          Some(HashSet::new()).as_ref(),
+        )?;
+
+        let (_module, scope, dotenv) = scopes.get(&self.module_path).unwrap();
+        let scope = scope.child();
+
+        command.export(&self.settings, dotenv, &scope, &self.unexports);
+
+        let (result, caught) = command.status_guard();
+
+        let status = result.map_err(|io_error| Error::CommandInvoke {
+          binary: binary.clone(),
+          arguments: arguments.clone(),
+          io_error,
+        })?;
+
+        if !status.success() {
+          return Err(Error::CommandStatus {
+            binary: binary.clone(),
+            arguments: arguments.clone(),
+            status,
+          });
+        }
+
+        if let Some(signal) = caught {
+          return Err(Error::Interrupted { signal });
+        }
+
+        Ok(())
+      }
+      Subcommand::Evaluate { format, path } => {
+        let (module, variable, variable_references) = self.evaluation_target(path)?;
+
+        self.evaluate_scopes(
+          config,
+          &dotenv_arena,
+          overrides,
+          None,
+          &root,
+          &scope_arena,
+          &mut scopes,
+          search,
+          Some(&variable_references),
+        )?;
+
+        let scope = scopes.get(&module.module_path).unwrap().1;
+
+        if let Some(variable) = variable {
+          print!("{}", scope.value(variable).unwrap());
+        } else {
+          let width = scope.names().fold(0, |max, name| name.len().max(max));
+
+          for binding in scope.bindings() {
+            if !binding.private {
+              match format {
+                EvaluateFormat::Just => {
+                  println!("{0:1$} := \"{2}\"", binding.name, width, binding.value);
+                }
+                EvaluateFormat::Shell => {
+                  if binding.export || module.settings.export {
+                    print!("export ");
+                  }
+                  print!("{}=\"", binding.name.lexeme().replace('-', "_"));
+                  for c in binding.value.chars() {
+                    if matches!(c, '!' | '"' | '$' | '\\' | '`') {
+                      print!("\\");
+                    }
+                    print!("{c}");
+                  }
+                  println!("\"");
+                }
+              }
+            }
+          }
+        }
+
+        Ok(())
+      }
+      _ => unreachable!(),
+    }
+  }
+
+  pub(crate) fn evaluation_target<'a>(
+    &'a self,
+    path: &'a Modulepath,
+  ) -> RunResult<'src, (&'a Justfile<'a>, Option<&'a str>, HashSet<Number>)> {
+    let mut current = self;
+
+    let mut variable = None;
+
+    for (i, component) in path.components.iter().enumerate() {
+      let last = i + 1 == path.components.len();
+use super::*;
+
+pub(crate) struct Evaluator<'src: 'run, 'run> {
+  assignments: Option<&'run Table<'src, Assignment<'src>>>,
+  context: Option<ExecutionContext<'src, 'run>>,
+  env: BTreeMap<String, String>,
+  is_dependency: bool,
+  non_const_assignments: Table<'src, Name<'src>>,
+  overrides: &'run HashMap<Number, String>,
+  scope: Scope<'src, 'run>,
+}
+
+impl<'src, 'run> Evaluator<'src, 'run> {
+  fn context(
+    &self,
+    const_error: ConstError<'src>,
+  ) -> Result<&ExecutionContext<'src, 'run>, ConstError<'src>> {
+    self.context.as_ref().ok_or(const_error)
+  }
+
+  pub(crate) fn evaluate_settings(
+    assignments: &'run Table<'src, Assignment<'src>>,
+    overrides: &'run HashMap<Number, String>,
+    scope: &'run Scope<'src, 'run>,
+    sets: Table<'src, Set<'src>>,
+  ) -> RunResult<'src, Settings> {
+    let mut evaluator = Self {
+      assignments: Some(assignments),
+      context: None,
+      env: BTreeMap::new(),
+      is_dependency: false,
+      non_const_assignments: Table::new(),
+      overrides,
+      scope: scope.child(),
+    };
+
+    for assignment in assignments.values() {
+      match evaluator.evaluate_assignment(assignment) {
+        Err(Error::Const { .. }) => evaluator.non_const_assignments.insert(assignment.name),
+        Err(err) => return Err(err),
+        Ok(_) => {}
+      }
+    }
+
+    evaluator.evaluate_sets(sets)
+  }
+
+  fn evaluate_sets(&mut self, sets: Table<'src, Set<'src>>) -> RunResult<'src, Settings> {
+    let mut settings = Settings::default();
+
+    for (_name, set) in sets {
+      match set.value {
+        Setting::AllowDuplicateRecipes(value) => {
+          settings.allow_duplicate_recipes = value;
+        }
+        Setting::AllowDuplicateVariables(value) => {
+          settings.allow_duplicate_variables = value;
+        }
+        Setting::DotenvFilename(value) => {
+          settings.dotenv_filename = Some(self.evaluate_expression(&value)?);
+        }
+        Setting::DotenvLoad(value) => {
+          settings.dotenv_load = value;
+        }
+        Setting::DotenvPath(value) => {
+          settings.dotenv_path = Some(self.evaluate_expression(&value)?.into());
+        }
+        Setting::DotenvOverride(value) => {
+          settings.dotenv_override = value;
+        }
+        Setting::DotenvRequired(value) => {
+          settings.dotenv_required = value;
+        }
+        Setting::Export(value) => {
+          settings.export = value;
+        }
+        Setting::Fallback(value) => {
+          settings.fallback = value;
+        }
+        Setting::Guards(guards) => {
+          settings.guards = guards;
+        }
+        Setting::IgnoreComments(value) => {
+          settings.ignore_comments = value;
+        }
+        Setting::Lazy(value) => {
+          settings.lazy = value;
+        }
+        Setting::NoExitMessage(value) => {
+          settings.no_exit_message = value;
+        }
+        Setting::PositionalArguments(value) => {
+          settings.positional_arguments = value;
+        }
+        Setting::Quiet(value) => {
+          settings.quiet = value;
+        }
+        Setting::ScriptInterpreter(value) => {
+          settings.script_interpreter = Some(self.evaluate_interpreter(&value)?);
+        }
+        Setting::Shell(value) => {
+          settings.shell = Some(self.evaluate_interpreter(&value)?);
+        }
+        Setting::Unstable(value) => {
+          settings.unstable = value;
+        }
+        Setting::WindowsPowerShell(value) => {
+          settings.windows_powershell = value;
+        }
+        Setting::WindowsShell(value) => {
+          settings.windows_shell = Some(self.evaluate_interpreter(&value)?);
+        }
+        Setting::Tempdir(value) => {
+          settings.tempdir = Some(self.evaluate_expression(&value)?);
+        }
+        Setting::WorkingDirectory(value) => {
+          settings.working_directory = Some(self.evaluate_expression(&value)?.into());
+        }
+      }
+    }
+
+    Ok(settings)
+  }
+
+  pub(crate) fn evaluate_interpreter(
+    &mut self,
+    interpreter: &Interpreter<Expression<'src>>,
+  ) -> RunResult<'src, Interpreter<String>> {
+    Ok(Interpreter {
+      command: self.evaluate_expression(&interpreter.command)?,
+      arguments: interpreter
+        .arguments
+        .iter()
+        .map(|argument| self.evaluate_expression(argument))
+        .collect::<RunResult<Vec<String>>>()?,
+    })
+  }
+
+  pub(crate) fn evaluate_assignments(
+    config: &'run Config,
+    dotenv: &'run BTreeMap<String, String>,
+    module: &'run Justfile<'src>,
+    overrides: &'run HashMap<Number, String>,
+    parent: &'run Scope<'src, 'run>,
+    search: &'run Search,
+    variable_references: Option<&HashSet<Number>>,
+  ) -> RunResult<'src, Scope<'src, 'run>>
+  where
+    'src: 'run,
+  {
+    let context = ExecutionContext {
+      config,
+      dotenv,
+      module,
+      search,
+    };
+
+    let mut evaluator = Self {
+      assignments: Some(&module.assignments),
+      context: Some(context),
+      env: BTreeMap::new(),
+      is_dependency: false,
+      non_const_assignments: Table::new(),
+      overrides,
+      scope: parent.child(),
+    };
+
+    for assignment in module.assignments.values() {
+      if assignment.eager
+        || assignment.export
+        || module.settings.export
+        || variable_references
+          .is_none_or(|variable_references| variable_references.contains(&assignment.number))
+      {
+        evaluator.evaluate_assignment(assignment)?;
+      }
+    }
+
+    Ok(evaluator.scope)
+  }
+
+  fn evaluate_assignment(&mut self, assignment: &Assignment<'src>) -> RunResult<'src, &str> {
+    let name = assignment.name.lexeme();
+
+    if !self.scope.bound(name) {
+      let value = if let Some(value) = self.overrides.get(&assignment.number) {
+        value.clone()
+      } else {
+        self.evaluate_expression(&assignment.value)?
+      };
+
+      self.scope.bind(Binding {
+        eager: assignment.eager,
+        export: assignment.export
+          || self
+            .context
+            .is_some_and(|context| context.module.settings.export),
+        file_depth: 0,
+        name: assignment.name,
+        number: assignment.number,
+        prelude: false,
+        private: assignment.private,
+        value,
+      });
+    }
+
+    Ok(self.scope.value(name).unwrap())
+  }
+
+  fn function_context(&self, name: Name<'src>) -> RunResult<'src, function::Context> {
+    Ok(function::Context {
+      execution_context: self.context(ConstError::FunctionCall(name))?,
+      is_dependency: self.is_dependency,
+      name,
+      scope: &self.scope,
+    })
+  }
+
+  fn evaluate_defined_function(
+    &mut self,
+    function: &FunctionDefinition<'src>,
+    arguments: &[Expression<'src>],
+  ) -> RunResult<'src, String> {
+    let context = *self.context.as_ref().unwrap();
+
+    let mut scope = Scope::root();
+    for ((name, number), argument) in function.parameters.iter().copied().zip(arguments) {
+      let value = self.evaluate_expression(argument)?;
+      scope.bind(Binding {
+        eager: false,
+        export: false,
+        file_depth: 0,
+        name,
+        number,
+        prelude: false,
+        private: false,
+        value: value.clone(),
+      });
+    }
+
+    let overrides = HashMap::new();
+    let mut evaluator = Evaluator {
+      assignments: Some(&context.module.assignments),
+      context: Some(context),
+      env: BTreeMap::new(),
+      is_dependency: false,
+      non_const_assignments: Table::new(),
+      overrides: &overrides,
+      scope,
+    };
+
+    evaluator.evaluate_expression(&function.body)
+  }
+
+  fn evaluate_builtin_function(
+    &mut self,
+    name: Name<'src>,
+    function: Function,
+    arguments: &[Expression<'src>],
+  ) -> RunResult<'src, String> {
+    match function {
+      Function::Nullary(f) => f(self.function_context(name).unwrap()),
+      Function::Unary(f) => {
+        let a = self.evaluate_expression(&arguments[0])?;
+        f(self.function_context(name).unwrap(), &a)
+      }
+      Function::UnaryOpt(f) => {
+        let a = self.evaluate_expression(&arguments[0])?;
+        let b = if arguments.len() > 1 {
+          Some(self.evaluate_expression(&arguments[1])?)
+        } else {
+          None
+        };
+        f(self.function_context(name).unwrap(), &a, b.as_deref())
+      }
+      Function::UnaryPlus(f) => {
+        let a = self.evaluate_expression(&arguments[0])?;
+        let mut rest = Vec::new();
+        for arg in &arguments[1..] {
+          rest.push(self.evaluate_expression(arg)?);
+        }
+        f(self.function_context(name).unwrap(), &a, &rest)
+      }
+      Function::Binary(f) => {
+        let a = self.evaluate_expression(&arguments[0])?;
+        let b = self.evaluate_expression(&arguments[1])?;
+        f(self.function_context(name).unwrap(), &a, &b)
+      }
+      Function::BinaryPlus(f) => {
+        let a = self.evaluate_expression(&arguments[0])?;
+        let b = self.evaluate_expression(&arguments[1])?;
+        let mut rest = Vec::new();
+        for arg in &arguments[2..] {
+          rest.push(self.evaluate_expression(arg)?);
+        }
+        f(self.function_context(name).unwrap(), &a, &b, &rest)
+      }
+      Function::Ternary(f) => {
+        let a = self.evaluate_expression(&arguments[0])?;
+        let b = self.evaluate_expression(&arguments[1])?;
+        let c = self.evaluate_expression(&arguments[2])?;
+        f(self.function_context(name).unwrap(), &a, &b, &c)
+      }
+    }
+    .map_err(|message| Error::FunctionCall {
+      function: name,
+      message,
+    })
+  }
+
+  pub(crate) fn evaluate_expression(
+    &mut self,
+    expression: &Expression<'src>,
+  ) -> RunResult<'src, String> {
+    match expression {
+      Expression::And { lhs, rhs } => {
+        let lhs = self.evaluate_expression(lhs)?;
+        if lhs.is_empty() {
+          return Ok(String::new());
+        }
+        self.evaluate_expression(rhs)
+      }
+      Expression::Assert {
+        condition,
+        error,
+        name,
+      } => {
+        if self.evaluate_condition(condition)? {
+          Ok(String::new())
+        } else {
+          Err(Error::Assert {
+            message: self.evaluate_expression(error)?,
+            name: *name,
+          })
+        }
+      }
+      Expression::Backtick { contents, token } => {
+        let context = self.context(ConstError::Backtick(*token))?;
+
+        if context.config.dry_run {
+          return Ok(format!("`{contents}`"));
+        }
+
+        Self::run_command(context, &self.env, &self.scope, contents, None).map_err(|output_error| {
+          Error::Backtick {
+            token: *token,
+            output_error,
+          }
+        })
+      }
+use super::*;
+
+pub(crate) fn load_dotenv(
+  config: &Config,
+  settings: &Settings,
+  working_directory: &Path,
+) -> RunResult<'static, BTreeMap<String, String>> {
+  let dotenv_filename = config
+    .dotenv_filename
+    .as_ref()
+    .or(settings.dotenv_filename.as_ref());
+
+  let dotenv_path = config
+    .dotenv_path
+    .as_ref()
+    .or(settings.dotenv_path.as_ref());
+
+  if !settings.dotenv_load
+    && !settings.dotenv_override
+    && !settings.dotenv_required
+    && dotenv_filename.is_none()
+    && dotenv_path.is_none()
+  {
+    return Ok(BTreeMap::new());
+  }
+
+  if let Some(path) = dotenv_path {
+    let path = working_directory.join(path);
+    if let Some(map) = load_from_file(&path, settings)? {
+      return Ok(map);
+    }
+  }
+
+  let filename = dotenv_filename.map_or(".env", |s| s.as_str());
+
+  for directory in working_directory.ancestors() {
+    let path = directory.join(filename);
+    if let Some(map) = load_from_file(&path, settings)? {
+      return Ok(map);
+    }
+  }
+
+  if settings.dotenv_required {
+    Err(Error::DotenvRequired)
+  } else {
+    Ok(BTreeMap::new())
+  }
+}
+
+fn load_from_file(
+  path: &Path,
+  settings: &Settings,
+) -> RunResult<'static, Option<BTreeMap<String, String>>> {
+  if path.is_dir() {
+    return Ok(None);
+  }
+
+  let file = match File::open(path) {
+    Ok(file) => file,
+    Err(source) => {
+      if source.kind() == io::ErrorKind::NotFound {
+        return Ok(None);
+      }
+      return Err(Error::FilesystemIo {
+        path: path.into(),
+        source,
+      });
+    }
+  };
+
+  let mut dotenv = BTreeMap::new();
+
+  for result in dotenvy::from_read_iter(file) {
+    let (key, value) = result.map_err(|dotenv_error| Error::Dotenv {
+      dotenv_error,
+      path: path.into(),
+    })?;
+
+    if settings.dotenv_override || env::var_os(&key).is_none() {
+      dotenv.insert(key, value);
+    }
+  }
+
+  Ok(Some(dotenv))
+}
+use super::*;
+
+#[derive(Copy, Clone)]
+pub(crate) struct ExecutionContext<'src: 'run, 'run> {
+  pub(crate) config: &'run Config,
+  pub(crate) dotenv: &'run BTreeMap<String, String>,
+  pub(crate) module: &'run Justfile<'src>,
+  pub(crate) search: &'run Search,
+}
+
+impl<'src: 'run, 'run> ExecutionContext<'src, 'run> {
+  pub(crate) fn tempdir<D>(&self, recipe: &Recipe<'src, D>) -> RunResult<'src, TempDir> {
+    let mut tempdir_builder = tempfile::Builder::new();
+
+    tempdir_builder.prefix("just-");
+
+    if let Some(tempdir) = &self.config.tempdir {
+      tempdir_builder.tempdir_in(self.search.working_directory.join(tempdir))
+    } else {
+      match &self.module.settings.tempdir {
+        Some(tempdir) => tempdir_builder.tempdir_in(self.search.working_directory.join(tempdir)),
+        None => {
+          if let Some(runtime_dir) = dirs::runtime_dir() {
+            let path = runtime_dir.join("just");
+            fs::create_dir_all(&path).map_err(|io_error| Error::RuntimeDirIo {
+              io_error,
+              path: path.clone(),
+            })?;
+            tempdir_builder.tempdir_in(path)
+          } else {
+            tempdir_builder.tempdir()
+          }
+        }
+      }
+    }
+    .map_err(|error| Error::TempdirIo {
+      recipe: recipe.name(),
+      io_error: error,
+    })
+  }
+
+  pub(crate) fn working_directory(&self) -> PathBuf {
+    let base = if self.module.is_submodule() {
+      &self.module.working_directory
+    } else {
+      &self.search.working_directory
+    };
+
+    if let Some(setting) = &self.module.settings.working_directory {
+      base.join(setting)
+    } else {
+      base.into()
+    }
+  }
+}

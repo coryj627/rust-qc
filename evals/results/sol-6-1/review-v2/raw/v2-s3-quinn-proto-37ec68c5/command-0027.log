@@ -1,0 +1,1057 @@
+    pub(super) handle_incoming: Box<dyn FnMut(&Incoming) -> IncomingConnectionBehavior>,
+    pub(super) waiting_incoming: Vec<Incoming>,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub(super) enum IncomingConnectionBehavior {
+    Accept,
+    Reject,
+    Retry,
+    Wait,
+}
+
+pub(super) fn validate_incoming(incoming: &Incoming) -> IncomingConnectionBehavior {
+    if incoming.remote_address_validated() {
+        IncomingConnectionBehavior::Accept
+    } else {
+        IncomingConnectionBehavior::Retry
+    }
+}
+
+impl TestEndpoint {
+    fn new(endpoint: Endpoint, addr: SocketAddr) -> Self {
+        let socket = if env::var_os("SSLKEYLOGFILE").is_some() {
+            let socket = UdpSocket::bind(addr).expect("failed to bind UDP socket");
+            socket
+                .set_read_timeout(Some(Duration::from_millis(10)))
+                .unwrap();
+            Some(socket)
+        } else {
+            None
+        };
+        Self {
+            endpoint,
+            addr,
+            socket,
+            timeout: None,
+            outbound: VecDeque::new(),
+            delayed: VecDeque::new(),
+            inbound: VecDeque::new(),
+            accepted: None,
+            connections: HashMap::default(),
+            conn_events: HashMap::default(),
+            captured_packets: Vec::new(),
+            capture_inbound_packets: false,
+            handle_incoming: Box::new(|_| IncomingConnectionBehavior::Accept),
+            waiting_incoming: Vec::new(),
+        }
+    }
+
+    pub(super) fn drive(&mut self, now: Instant, remote: SocketAddr) {
+        self.drive_incoming(now, remote);
+        self.drive_outgoing(now);
+    }
+
+    pub(super) fn drive_incoming(&mut self, now: Instant, remote: SocketAddr) {
+        if let Some(ref socket) = self.socket {
+            loop {
+                let mut buf = [0; 8192];
+                if socket.recv_from(&mut buf).is_err() {
+                    break;
+                }
+            }
+        }
+        let buffer_size = self.endpoint.config().get_max_udp_payload_size() as usize;
+        let mut buf = Vec::with_capacity(buffer_size);
+
+        while self.inbound.front().is_some_and(|x| x.0 <= now) {
+            let (recv_time, ecn, packet) = self.inbound.pop_front().unwrap();
+            if let Some(event) = self
+                .endpoint
+                .handle(recv_time, remote, None, ecn, packet, &mut buf)
+            {
+                match event {
+                    DatagramEvent::NewConnection(incoming) => {
+                        match (self.handle_incoming)(&incoming) {
+                            IncomingConnectionBehavior::Accept => {
+                                let _ = self.try_accept(incoming, now);
+                            }
+                            IncomingConnectionBehavior::Reject => {
+                                self.reject(incoming);
+                            }
+                            IncomingConnectionBehavior::Retry => {
+                                self.retry(incoming);
+                            }
+                            IncomingConnectionBehavior::Wait => {
+                                self.waiting_incoming.push(incoming);
+                            }
+                        }
+                    }
+                    DatagramEvent::ConnectionEvent(ch, event) => {
+                        if self.capture_inbound_packets {
+                            let packet = self.connections[&ch].decode_packet(&event);
+                            self.captured_packets.extend(packet);
+                        }
+
+                        self.conn_events.entry(ch).or_default().push_back(event);
+                    }
+                    DatagramEvent::Response(transmit) => {
+                        let size = transmit.size;
+                        self.outbound.extend(split_transmit(transmit, &buf[..size]));
+                        buf.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn drive_outgoing(&mut self, now: Instant) {
+        let buffer_size = self.endpoint.config().get_max_udp_payload_size() as usize;
+        let mut buf = Vec::with_capacity(buffer_size);
+
+        loop {
+            let mut endpoint_events: Vec<(ConnectionHandle, EndpointEvent)> = vec![];
+            for (ch, conn) in self.connections.iter_mut() {
+                if self.timeout.is_some_and(|x| x <= now) {
+                    self.timeout = None;
+                    conn.handle_timeout(now);
+                }
+
+                for (_, mut events) in self.conn_events.drain() {
+                    for event in events.drain(..) {
+                        conn.handle_event(event);
+                    }
+                }
+
+                while let Some(event) = conn.poll_endpoint_events() {
+                    endpoint_events.push((*ch, event));
+                }
+                while let Some(transmit) = conn.poll_transmit(now, MAX_DATAGRAMS, &mut buf) {
+                    let size = transmit.size;
+                    self.outbound.extend(split_transmit(transmit, &buf[..size]));
+                    buf.clear();
+                }
+                self.timeout = conn.poll_timeout();
+            }
+
+            if endpoint_events.is_empty() {
+                break;
+            }
+
+            for (ch, event) in endpoint_events {
+                if let Some(event) = self.handle_event(ch, event) {
+                    if let Some(conn) = self.connections.get_mut(&ch) {
+                        conn.handle_event(event);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn next_wakeup(&self) -> Option<Instant> {
+        let next_inbound = self.inbound.front().map(|x| x.0);
+        min_opt(self.timeout, next_inbound)
+    }
+
+    fn is_idle(&self) -> bool {
+        self.connections.values().all(|x| x.is_idle())
+    }
+
+    pub(super) fn delay_outbound(&mut self) {
+        assert!(self.delayed.is_empty());
+        mem::swap(&mut self.delayed, &mut self.outbound);
+    }
+
+    pub(super) fn finish_delay(&mut self) {
+        self.outbound.extend(self.delayed.drain(..));
+    }
+
+    pub(super) fn try_accept(
+        &mut self,
+        incoming: Incoming,
+        now: Instant,
+    ) -> Result<ConnectionHandle, ConnectionError> {
+        let mut buf = Vec::new();
+        match self.endpoint.accept(incoming, now, &mut buf, None) {
+            Ok((ch, conn)) => {
+                self.connections.insert(ch, conn);
+                self.accepted = Some(Ok(ch));
+                Ok(ch)
+            }
+            Err(error) => {
+                if let Some(transmit) = error.response {
+                    let size = transmit.size;
+                    self.outbound.extend(split_transmit(transmit, &buf[..size]));
+                }
+                self.accepted = Some(Err(error.cause.clone()));
+                Err(error.cause)
+            }
+        }
+    }
+
+    pub(super) fn retry(&mut self, incoming: Incoming) {
+        let mut buf = Vec::new();
+        let transmit = self.endpoint.retry(incoming, &mut buf).unwrap();
+        let size = transmit.size;
+        self.outbound.extend(split_transmit(transmit, &buf[..size]));
+    }
+
+    pub(super) fn reject(&mut self, incoming: Incoming) {
+        let mut buf = Vec::new();
+        let transmit = self.endpoint.refuse(incoming, &mut buf);
+        let size = transmit.size;
+        self.outbound.extend(split_transmit(transmit, &buf[..size]));
+    }
+
+    pub(super) fn assert_accept(&mut self) -> ConnectionHandle {
+        self.accepted
+            .take()
+            .expect("server didn't try connecting")
+            .expect("server experienced error connecting")
+    }
+
+    pub(super) fn assert_accept_error(&mut self) -> ConnectionError {
+        self.accepted
+            .take()
+            .expect("server didn't try connecting")
+            .expect_err("server did unexpectedly connect without error")
+    }
+
+    pub(super) fn assert_no_accept(&self) {
+        assert!(self.accepted.is_none(), "server did unexpectedly connect")
+    }
+}
+
+impl ::std::ops::Deref for TestEndpoint {
+    type Target = Endpoint;
+    fn deref(&self) -> &Endpoint {
+        &self.endpoint
+    }
+}
+
+impl ::std::ops::DerefMut for TestEndpoint {
+    fn deref_mut(&mut self) -> &mut Endpoint {
+        &mut self.endpoint
+    }
+}
+
+pub(super) fn subscribe() -> tracing::subscriber::DefaultGuard {
+    let builder = tracing_subscriber::FmtSubscriber::builder()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(|| TestWriter);
+    // tracing uses std::time to trace time, which panics in wasm.
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    let builder = builder.without_time();
+    tracing::subscriber::set_default(builder.finish())
+}
+
+struct TestWriter;
+
+impl Write for TestWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        print!(
+            "{}",
+            str::from_utf8(buf).expect("tried to log invalid UTF-8")
+        );
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().flush()
+    }
+}
+
+pub(super) fn server_config() -> ServerConfig {
+    let mut config = ServerConfig::with_crypto(Arc::new(server_crypto()));
+    if !cfg!(feature = "bloom") {
+        config
+            .validation_token
+            .sent(2)
+            .log(Arc::new(SimpleTokenLog::default()));
+    }
+    config
+}
+
+pub(super) fn server_config_with_cert(
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+) -> ServerConfig {
+    let mut config = ServerConfig::with_crypto(Arc::new(server_crypto_with_cert(cert, key)));
+    config
+        .validation_token
+        .sent(2)
+        .log(Arc::new(SimpleTokenLog::default()));
+    config
+}
+
+pub(super) fn server_crypto() -> QuicServerConfig {
+    server_crypto_inner(None, None)
+}
+
+pub(super) fn server_crypto_with_alpn(alpn: Vec<Vec<u8>>) -> QuicServerConfig {
+    server_crypto_inner(None, Some(alpn))
+}
+
+pub(super) fn server_crypto_with_cert(
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
+) -> QuicServerConfig {
+    server_crypto_inner(Some((cert, key)), None)
+}
+
+fn server_crypto_inner(
+    identity: Option<(CertificateDer<'static>, PrivateKeyDer<'static>)>,
+    alpn: Option<Vec<Vec<u8>>>,
+) -> QuicServerConfig {
+    let (cert, key) = identity.unwrap_or_else(|| {
+        (
+            CERTIFIED_KEY.cert.der().clone(),
+            PrivateKeyDer::Pkcs8(CERTIFIED_KEY.signing_key.serialize_der().into()),
+        )
+    });
+
+        .connections
+        .get_mut(&server_ch)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.connect();
+}
+
+#[test]
+fn keep_alive() {
+    let _guard = subscribe();
+    const IDLE_TIMEOUT: u64 = 10;
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            keep_alive_interval: Some(Duration::from_millis(IDLE_TIMEOUT / 2)),
+            max_idle_timeout: Some(VarInt(IDLE_TIMEOUT)),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect();
+    // Run a good while longer than the idle timeout
+    let end = pair.time + Duration::from_millis(20 * IDLE_TIMEOUT);
+    while pair.time < end {
+        if !pair.step() {
+            if let Some(time) = min_opt(pair.client.next_wakeup(), pair.server.next_wakeup()) {
+                pair.time = time;
+            }
+        }
+        assert!(!pair.client_conn_mut(client_ch).is_closed());
+        assert!(!pair.server_conn_mut(server_ch).is_closed());
+    }
+}
+
+#[test]
+fn cid_rotation() {
+    let _guard = subscribe();
+    const CID_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let cid_generator_factory: fn() -> Box<dyn ConnectionIdGenerator> =
+        || Box::new(*RandomConnectionIdGenerator::new(8).set_lifetime(CID_TIMEOUT));
+
+    // Only test cid rotation on server side to have a clear output trace
+    let server = Endpoint::new(
+        Arc::new(EndpointConfig {
+            connection_id_generator_factory: Arc::new(cid_generator_factory),
+            ..EndpointConfig::default()
+        }),
+        Some(Arc::new(server_config())),
+        true,
+        None,
+    );
+    let client = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+
+    let mut pair = Pair::new_from_endpoint(client, server);
+    let (_, server_ch) = pair.connect();
+
+    let mut round: u64 = 1;
+    let mut stop = pair.time;
+    let end = pair.time + 5 * CID_TIMEOUT;
+
+    use crate::LOC_CID_COUNT;
+    use crate::cid_queue::CidQueue;
+    let mut active_cid_num = CidQueue::LEN as u64 + 1;
+    active_cid_num = active_cid_num.min(LOC_CID_COUNT);
+    let mut left_bound = 0;
+    let mut right_bound = active_cid_num - 1;
+
+    while pair.time < end {
+        stop += CID_TIMEOUT;
+        // Run a while until PushNewCID timer fires
+        while pair.time < stop {
+            if !pair.step() {
+                if let Some(time) = min_opt(pair.client.next_wakeup(), pair.server.next_wakeup()) {
+                    pair.time = time;
+                }
+            }
+        }
+        info!(
+            "Checking active cid sequence range before {:?} seconds",
+            round * CID_TIMEOUT.as_secs()
+        );
+        let _bound = (left_bound, right_bound);
+        assert_matches!(
+            pair.server_conn_mut(server_ch).active_local_cid_seq(),
+            _bound
+        );
+        round += 1;
+        left_bound += active_cid_num;
+        right_bound += active_cid_num;
+        pair.drive_server();
+    }
+}
+
+#[test]
+fn cid_retirement() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+
+    // Server retires current active remote CIDs
+    pair.server_conn_mut(server_ch)
+        .rotate_local_cid(1, Instant::now());
+    pair.drive();
+    // Any unexpected behavior may trigger TransportError::CONNECTION_ID_LIMIT_ERROR
+    assert!(!pair.client_conn_mut(client_ch).is_closed());
+    assert!(!pair.server_conn_mut(server_ch).is_closed());
+    assert_matches!(pair.client_conn_mut(client_ch).active_rem_cid_seq(), 1);
+
+    use crate::LOC_CID_COUNT;
+    use crate::cid_queue::CidQueue;
+    let mut active_cid_num = CidQueue::LEN as u64;
+    active_cid_num = active_cid_num.min(LOC_CID_COUNT);
+
+    let next_retire_prior_to = active_cid_num + 1;
+    pair.client_conn_mut(client_ch).ping();
+    // Server retires all valid remote CIDs
+    pair.server_conn_mut(server_ch)
+        .rotate_local_cid(next_retire_prior_to, Instant::now());
+    pair.drive();
+    assert!(!pair.client_conn_mut(client_ch).is_closed());
+    assert!(!pair.server_conn_mut(server_ch).is_closed());
+
+    assert_eq!(
+        pair.client_conn_mut(client_ch).active_rem_cid_seq(),
+        next_retire_prior_to,
+    );
+}
+
+#[test]
+fn finish_stream_flow_control_reordered() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+fn stream_flow_control() {
+    test_flow_control(
+        TransportConfig {
+            stream_receive_window: 2000u32.into(),
+            ..TransportConfig::default()
+        },
+        2000,
+    );
+}
+
+#[test]
+fn conn_flow_control() {
+    test_flow_control(
+        TransportConfig {
+            receive_window: 2000u32.into(),
+            ..TransportConfig::default()
+        },
+        2000,
+    );
+}
+
+#[test]
+fn stop_opens_bidi() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    assert_eq!(pair.client_streams(client_ch).send_streams(), 0);
+    let s = pair.client_streams(client_ch).open(Dir::Bi).unwrap();
+    assert_eq!(pair.client_streams(client_ch).send_streams(), 1);
+    const ERROR: VarInt = VarInt(42);
+    pair.client
+        .connections
+        .get_mut(&server_ch)
+        .unwrap()
+        .recv_stream(s)
+        .stop(ERROR)
+        .unwrap();
+    pair.drive();
+
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Stream(StreamEvent::Opened { dir: Dir::Bi }))
+    );
+    assert_eq!(pair.server_conn_mut(client_ch).streams().send_streams(), 0);
+    assert_matches!(pair.server_streams(server_ch).accept(Dir::Bi), Some(stream) if stream == s);
+    assert_eq!(pair.server_conn_mut(client_ch).streams().send_streams(), 1);
+
+    let mut recv = pair.server_recv(server_ch, s);
+    let mut chunks = recv.read(false).unwrap();
+    assert_matches!(chunks.next(usize::MAX), Err(ReadError::Blocked));
+    let _ = chunks.finalize();
+
+    assert_matches!(
+        pair.server_send(server_ch, s).write(b"foo"),
+        Err(WriteError::Stopped(ERROR))
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Stream(StreamEvent::Stopped {
+            id: _,
+            error_code: ERROR
+        }))
+    );
+    assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
+}
+
+#[test]
+fn implicit_open() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    let s1 = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let s2 = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s2).write(b"hello").unwrap();
+    pair.drive();
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Stream(StreamEvent::Opened { dir: Dir::Uni }))
+    );
+    assert_eq!(pair.server_streams(server_ch).accept(Dir::Uni), Some(s1));
+    assert_eq!(pair.server_streams(server_ch).accept(Dir::Uni), Some(s2));
+    assert_eq!(pair.server_streams(server_ch).accept(Dir::Uni), None);
+}
+
+#[test]
+fn zero_length_cid() {
+    let _guard = subscribe();
+    let cid_generator_factory: fn() -> Box<dyn ConnectionIdGenerator> =
+        || Box::new(RandomConnectionIdGenerator::new(0));
+    let mut pair = Pair::new(
+        Arc::new(EndpointConfig {
+            connection_id_generator_factory: Arc::new(cid_generator_factory),
+            ..EndpointConfig::default()
+        }),
+        server_config(),
+    );
+    let (client_ch, server_ch) = pair.connect();
+    // Ensure we can reconnect after a previous connection is cleaned up
+    info!("closing");
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(42), Bytes::new());
+    pair.drive();
+    pair.server
+        .connections
+//! Maintain the state of local connection IDs
+use std::collections::VecDeque;
+
+use rustc_hash::FxHashSet;
+use tracing::{debug, trace};
+
+use crate::{Duration, Instant, TransportError, shared::IssuedCid};
+
+/// Local connection ID management
+pub(super) struct CidState {
+    /// Timestamp when issued cids should be retired
+    retire_timestamp: VecDeque<CidTimestamp>,
+    /// Number of local connection IDs that have been issued in NEW_CONNECTION_ID frames.
+    issued: u64,
+    /// Sequence numbers of local connection IDs not yet retired by the peer
+    active_seq: FxHashSet<u64>,
+    /// Sequence number the peer has already retired all CIDs below at our request via `retire_prior_to`
+    prev_retire_seq: u64,
+    /// Sequence number to set in retire_prior_to field in NEW_CONNECTION_ID frame
+    retire_seq: u64,
+    /// cid length used to decode short packet
+    cid_len: usize,
+    //// cid lifetime
+    cid_lifetime: Option<Duration>,
+}
+
+impl CidState {
+    pub(crate) fn new(
+        cid_len: usize,
+        cid_lifetime: Option<Duration>,
+        now: Instant,
+        issued: u64,
+    ) -> Self {
+        let mut active_seq = FxHashSet::default();
+        // Add sequence number of CIDs used in handshaking into tracking set
+        for seq in 0..issued {
+            active_seq.insert(seq);
+        }
+        let mut this = Self {
+            retire_timestamp: VecDeque::new(),
+            issued,
+            active_seq,
+            prev_retire_seq: 0,
+            retire_seq: 0,
+            cid_len,
+            cid_lifetime,
+        };
+        // Track lifetime of CIDs used in handshaking
+        for seq in 0..issued {
+            this.track_lifetime(seq, now);
+        }
+        this
+    }
+
+    /// Find the next timestamp when previously issued CID should be retired
+    pub(crate) fn next_timeout(&mut self) -> Option<Instant> {
+        self.retire_timestamp.front().map(|nc| {
+            trace!("CID {} will expire at {:?}", nc.sequence, nc.timestamp);
+            nc.timestamp
+        })
+    }
+
+    /// Track the lifetime of issued cids in `retire_timestamp`
+    fn track_lifetime(&mut self, new_cid_seq: u64, now: Instant) {
+        let lifetime = match self.cid_lifetime {
+            Some(lifetime) => lifetime,
+            None => return,
+        };
+
+        let expire_timestamp = now.checked_add(lifetime);
+        let expire_at = match expire_timestamp {
+            Some(expire_at) => expire_at,
+            None => return,
+        };
+
+        let last_record = self.retire_timestamp.back_mut();
+        if let Some(last) = last_record {
+            // Compare the timestamp with the last inserted record
+            // Combine into a single batch if timestamp of current cid is same as the last record
+            if expire_at == last.timestamp {
+                debug_assert!(new_cid_seq > last.sequence);
+                last.sequence = new_cid_seq;
+                return;
+            }
+        }
+
+        self.retire_timestamp.push_back(CidTimestamp {
+            sequence: new_cid_seq,
+            timestamp: expire_at,
+        });
+    }
+
+    /// Update local CID state when previously issued CID is retired
+    ///
+    /// Return whether a new CID needs to be pushed that notifies remote peer to respond `RETIRE_CONNECTION_ID`
+    pub(crate) fn on_cid_timeout(&mut self) -> bool {
+        // Whether the peer hasn't retired all the CIDs we asked it to yet
+        let unretired_ids_found =
+            (self.prev_retire_seq..self.retire_seq).any(|seq| self.active_seq.contains(&seq));
+
+        let current_retire_prior_to = self.retire_seq;
+        let next_retire_sequence = self
+            .retire_timestamp
+            .pop_front()
+            .map(|seq| seq.sequence + 1);
+
+        // According to RFC:
+        // Endpoints SHOULD NOT issue updates of the Retire Prior To field
+        // before receiving RETIRE_CONNECTION_ID frames that retire all
+        // connection IDs indicated by the previous Retire Prior To value.
+        // https://tools.ietf.org/html/draft-ietf-quic-transport-29#section-5.1.2
+        if !unretired_ids_found {
+            // All Cids are retired, `prev_retire_cid_seq` can be assigned to `retire_cid_seq`
+            self.prev_retire_seq = self.retire_seq;
+            // Advance `retire_seq` if next cid that needs to be retired exists
+            if let Some(next_retire_prior_to) = next_retire_sequence {
+                self.retire_seq = next_retire_prior_to;
+            }
+        }
+
+        // Check if retirement of all CIDs that reach their lifetime is still needed
+        // According to RFC:
+        // An endpoint MUST NOT
+        // provide more connection IDs than the peer's limit.  An endpoint MAY
+        // send connection IDs that temporarily exceed a peer's limit if the
+        // NEW_CONNECTION_ID frame also requires the retirement of any excess,
+        // by including a sufficiently large value in the Retire Prior To field.
+        //
+        // If yes (return true), a new CID must be pushed with updated `retire_prior_to` field to remote peer.
+        // If no (return false), it means CIDs that reach the end of lifetime have been retired already. Do not push a new CID in order to avoid violating above RFC.
+        (current_retire_prior_to..self.retire_seq).any(|seq| self.active_seq.contains(&seq))
+    }
+
+    /// Update cid state when `NewIdentifiers` event is received
+    pub(crate) fn new_cids(&mut self, ids: &[IssuedCid], now: Instant) {
+        // `ids` could be `None` once active_connection_id_limit is set to 1 by peer
+        let last_cid = match ids.last() {
+            Some(cid) => cid,
+            None => return,
+        };
+        self.issued += ids.len() as u64;
+        // Record the timestamp of CID with the largest seq number
+        let sequence = last_cid.sequence;
+        ids.iter().for_each(|frame| {
+            self.active_seq.insert(frame.sequence);
+        });
+        self.track_lifetime(sequence, now);
+    }
+
+    /// Update CidState for receipt of a `RETIRE_CONNECTION_ID` frame
+    ///
+    /// Returns whether a new CID can be issued, or an error if the frame was illegal.
+    pub(crate) fn on_cid_retirement(
+        &mut self,
+        sequence: u64,
+        limit: u64,
+    ) -> Result<bool, TransportError> {
+        if self.cid_len == 0 {
+            return Err(TransportError::PROTOCOL_VIOLATION(
+                "RETIRE_CONNECTION_ID when CIDs aren't in use",
+            ));
+        }
+        if sequence > self.issued {
+            debug!(
+                sequence,
+                "got RETIRE_CONNECTION_ID for unissued sequence number"
+            );
+            return Err(TransportError::PROTOCOL_VIOLATION(
+                "RETIRE_CONNECTION_ID for unissued sequence number",
+            ));
+        }
+        self.active_seq.remove(&sequence);
+        // Consider a scenario where peer A has active remote cid 0,1,2.
+        // Peer B first send a NEW_CONNECTION_ID with cid 3 and retire_prior_to set to 1.
+        // Peer A processes this NEW_CONNECTION_ID frame; update remote cid to 1,2,3
+        // and meanwhile send a RETIRE_CONNECTION_ID to retire cid 0 to peer B.
+        // If peer B doesn't check the cid limit here and send a new cid again, peer A will then face CONNECTION_ID_LIMIT_ERROR
+        Ok(limit > self.active_seq.len() as u64)
+    }
+
+    /// Length of local Connection IDs
+    pub(crate) fn cid_len(&self) -> usize {
+        self.cid_len
+    }
+
+    /// The value for `retire_prior_to` field in `NEW_CONNECTION_ID` frame
+    pub(crate) fn retire_prior_to(&self) -> u64 {
+        self.retire_seq
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_seq(&self) -> (u64, u64) {
+        let mut min = u64::MAX;
+        let mut max = u64::MIN;
+        for n in self.active_seq.iter() {
+            if n < &min {
+                min = *n;
+            }
+            if n > &max {
+                max = *n;
+use std::ops::Range;
+
+use crate::{ConnectionId, ResetToken, frame::NewConnectionId};
+
+/// DataType stored in CidQueue buffer
+type CidData = (ConnectionId, Option<ResetToken>);
+
+/// Sliding window of active Connection IDs
+///
+/// May contain gaps due to packet loss or reordering
+#[derive(Debug)]
+pub(crate) struct CidQueue {
+    /// Ring buffer indexed by `self.cursor`
+    buffer: [Option<CidData>; Self::LEN],
+    /// Index at which circular buffer addressing is based
+    cursor: usize,
+    /// Sequence number of `self.buffer[cursor]`
+    ///
+    /// The sequence number of the active CID; must be the smallest among CIDs in `buffer`.
+    offset: u64,
+}
+
+impl CidQueue {
+    pub(crate) fn new(cid: ConnectionId) -> Self {
+        let mut buffer = [None; Self::LEN];
+        buffer[0] = Some((cid, None));
+        Self {
+            buffer,
+            cursor: 0,
+            offset: 0,
+        }
+    }
+
+    /// Handle a `NEW_CONNECTION_ID` frame
+    ///
+    /// Returns a non-empty range of retired sequence numbers and the reset token of the new active
+    /// CID iff any CIDs were retired.
+    pub(crate) fn insert(
+        &mut self,
+        cid: NewConnectionId,
+    ) -> Result<Option<(Range<u64>, ResetToken)>, InsertError> {
+        // Position of new CID wrt. the current active CID
+        let index = match cid.sequence.checked_sub(self.offset) {
+            None => return Err(InsertError::Retired),
+            Some(x) => x,
+        };
+
+        let retired_count = cid.retire_prior_to.saturating_sub(self.offset);
+        if index >= Self::LEN as u64 + retired_count {
+            return Err(InsertError::ExceedsLimit);
+        }
+
+        // Discard retired CIDs, if any
+        for i in 0..(retired_count.min(Self::LEN as u64) as usize) {
+            self.buffer[(self.cursor + i) % Self::LEN] = None;
+        }
+
+        // Record the new CID
+        let index = ((self.cursor as u64 + index) % Self::LEN as u64) as usize;
+        self.buffer[index] = Some((cid.id, Some(cid.reset_token)));
+
+        if retired_count == 0 {
+            return Ok(None);
+        }
+
+        // The active CID was retired. Find the first known CID with sequence number of at least
+        // retire_prior_to, and inform the caller that all prior CIDs have been retired, and of
+        // the new CID's reset token.
+        self.cursor = ((self.cursor as u64 + retired_count) % Self::LEN as u64) as usize;
+        let (i, (_, token)) = self
+            .iter()
+            .next()
+            .expect("it is impossible to retire a CID without supplying a new one");
+        self.cursor = (self.cursor + i) % Self::LEN;
+        let orig_offset = self.offset;
+        self.offset = cid.retire_prior_to + i as u64;
+        // We don't immediately retire CIDs in the range (orig_offset +
+        // Self::LEN)..self.offset. These are CIDs that we haven't yet received from a
+        // NEW_CONNECTION_ID frame, since having previously received them would violate the
+        // connection ID limit we specified based on Self::LEN. If we do receive a such a frame
+        // in the future, e.g. due to reordering, we'll retire it then. This ensures we can't be
+        // made to buffer an arbitrarily large number of RETIRE_CONNECTION_ID frames.
+        Ok(Some((
+            orig_offset..self.offset.min(orig_offset + Self::LEN as u64),
+            token.expect("non-initial CID missing reset token"),
+        )))
+    }
+
+    /// Switch to next active CID if possible, return
+    /// 1) the corresponding ResetToken and 2) a non-empty range preceding it to retire
+    pub(crate) fn next(&mut self) -> Option<(ResetToken, Range<u64>)> {
+        let (i, cid_data) = self.iter().nth(1)?;
+        self.buffer[self.cursor] = None;
+
+        let orig_offset = self.offset;
+        self.offset += i as u64;
+        self.cursor = (self.cursor + i) % Self::LEN;
+        Some((cid_data.1.unwrap(), orig_offset..self.offset))
+    }
+
+    /// Iterate CIDs in CidQueue that are not `None`, including the active CID
+    fn iter(&self) -> impl Iterator<Item = (usize, CidData)> + '_ {
+        (0..Self::LEN).filter_map(move |step| {
+            let index = (self.cursor + step) % Self::LEN;
+            self.buffer[index].map(|cid_data| (step, cid_data))
+        })
+    }
+
+    /// Replace the initial CID
+    pub(crate) fn update_initial_cid(&mut self, cid: ConnectionId) {
+        debug_assert_eq!(self.offset, 0);
+        self.buffer[self.cursor] = Some((cid, None));
+    }
+
+    /// Return active remote CID itself
+    pub(crate) fn active(&self) -> ConnectionId {
+        self.buffer[self.cursor].unwrap().0
+    }
+
+    /// Return the sequence number of active remote CID
+    pub(crate) fn active_seq(&self) -> u64 {
+        self.offset
+    }
+
+    pub(crate) const LEN: usize = 5;
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum InsertError {
+    /// CID was already retired
+    Retired,
+    /// Sequence number violates the leading edge of the window
+    ExceedsLimit,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cid(sequence: u64, retire_prior_to: u64) -> NewConnectionId {
+        NewConnectionId {
+            sequence,
+            id: ConnectionId::new(&[0xAB; 8]),
+            reset_token: ResetToken::from([0xCD; crate::RESET_TOKEN_SIZE]),
+            retire_prior_to,
+        }
+    }
+
+    fn initial_cid() -> ConnectionId {
+        ConnectionId::new(&[0xFF; 8])
+    }
+
+    #[test]
+    fn next_dense() {
+        let mut q = CidQueue::new(initial_cid());
+        assert!(q.next().is_none());
+        assert!(q.next().is_none());
+
+        for i in 1..CidQueue::LEN as u64 {
+            q.insert(cid(i, 0)).unwrap();
+        }
+        for i in 1..CidQueue::LEN as u64 {
+            let (_, retire) = q.next().unwrap();
+            assert_eq!(q.active_seq(), i);
+            assert_eq!(retire.end - retire.start, 1);
+        }
+        assert!(q.next().is_none());
+    }
+    #[test]
+    fn next_sparse() {
+        let mut q = CidQueue::new(initial_cid());
+        let seqs = (1..CidQueue::LEN as u64).filter(|x| x % 2 == 0);
+        for i in seqs.clone() {
+            q.insert(cid(i, 0)).unwrap();
+        }
+        for i in seqs {
+            let (_, retire) = q.next().unwrap();
+            dbg!(&retire);
+            assert_eq!(q.active_seq(), i);
+            assert_eq!(retire, (q.active_seq().saturating_sub(2))..q.active_seq());
+        }
+        assert!(q.next().is_none());
+    }
+
+    #[test]
+    fn wrap() {
+        let mut q = CidQueue::new(initial_cid());
+
+        for i in 1..CidQueue::LEN as u64 {
+            q.insert(cid(i, 0)).unwrap();
+        }
+        for _ in 1..(CidQueue::LEN as u64 - 1) {
+            q.next().unwrap();
+        }
+        for i in CidQueue::LEN as u64..(CidQueue::LEN as u64 + 3) {
+            q.insert(cid(i, 0)).unwrap();
+        }
+        for i in (CidQueue::LEN as u64 - 1)..(CidQueue::LEN as u64 + 3) {
+            q.next().unwrap();
+            assert_eq!(q.active_seq(), i);
+        }
+        assert!(q.next().is_none());
+    }
+
+    #[test]
+    fn retire_dense() {
+        let mut q = CidQueue::new(initial_cid());
+
+        for i in 1..CidQueue::LEN as u64 {
+            q.insert(cid(i, 0)).unwrap();
+        }
+        assert_eq!(q.active_seq(), 0);
+
+        assert_eq!(q.insert(cid(4, 2)).unwrap().unwrap().0, 0..2);
+        assert_eq!(q.active_seq(), 2);
+        assert_eq!(q.insert(cid(4, 2)), Ok(None));
+
+        for i in 2..(CidQueue::LEN as u64 - 1) {
+            let _ = q.next().unwrap();
+            assert_eq!(q.active_seq(), i + 1);
+            assert_eq!(q.insert(cid(i + 1, i + 1)), Ok(None));
+        }
+
+        assert!(q.next().is_none());
+    }
+
+    #[test]
+    fn retire_sparse() {
+        // Retiring CID 0 when CID 1 is not known should retire CID 1 as we move to CID 2
+        let mut q = CidQueue::new(initial_cid());
+        q.insert(cid(2, 0)).unwrap();
+        assert_eq!(q.insert(cid(3, 1)).unwrap().unwrap().0, 0..2,);
+        assert_eq!(q.active_seq(), 2);
+    }
+
+    #[test]
+    fn retire_many() {
+        let mut q = CidQueue::new(initial_cid());
+        q.insert(cid(2, 0)).unwrap();
+        assert_eq!(
+            q.insert(cid(1_000_000, 1_000_000)).unwrap().unwrap().0,
+            0..CidQueue::LEN as u64,
+        );
+        assert_eq!(q.active_seq(), 1_000_000);
+    }
+
+    #[test]
+    fn insert_limit() {
+        let mut q = CidQueue::new(initial_cid());
+        assert_eq!(q.insert(cid(CidQueue::LEN as u64 - 1, 0)), Ok(None));
+        assert_eq!(
+            q.insert(cid(CidQueue::LEN as u64, 0)),
+            Err(InsertError::ExceedsLimit)
+        );
+    }
+
+    #[test]
+    fn insert_duplicate() {
+        let mut q = CidQueue::new(initial_cid());
+        q.insert(cid(0, 0)).unwrap();
+        q.insert(cid(0, 0)).unwrap();
+    }
+
+    #[test]
+    fn insert_retired() {
+        let mut q = CidQueue::new(initial_cid());
+        assert_eq!(
+            q.insert(cid(0, 0)),
+            Ok(None),
+            "reinserting active CID succeeds"
+        );
+        assert!(q.next().is_none(), "active CID isn't requeued");
+        q.insert(cid(1, 0)).unwrap();
+        q.next().unwrap();
+        assert_eq!(
+            q.insert(cid(0, 0)),
+            Err(InsertError::Retired),
+            "previous active CID is already retired"
+        );
+    }
+
+    #[test]
+    fn retire_then_insert_next() {
+        let mut q = CidQueue::new(initial_cid());
+        for i in 1..CidQueue::LEN as u64 {
+            q.insert(cid(i, 0)).unwrap();
+        }
+        q.next().unwrap();
+        q.insert(cid(CidQueue::LEN as u64, 0)).unwrap();
+        assert_eq!(
+            q.insert(cid(CidQueue::LEN as u64 + 1, 0)),
+            Err(InsertError::ExceedsLimit)
+        );
+    }
+
+    #[test]
+    fn always_valid() {
+        let mut q = CidQueue::new(initial_cid());
+        assert!(q.next().is_none());
+        assert_eq!(q.active(), initial_cid());
+        assert_eq!(q.active_seq(), 0);
+    }
+}

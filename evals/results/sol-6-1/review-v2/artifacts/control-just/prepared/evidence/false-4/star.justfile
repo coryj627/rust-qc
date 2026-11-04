@@ -1,0 +1,2 @@
+@gather *items:
+  printf '<%s>\n' '{{items}}'

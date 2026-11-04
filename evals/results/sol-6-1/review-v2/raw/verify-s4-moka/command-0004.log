@@ -1,0 +1,540 @@
+            read_op_ch: r_snd,
+            write_op_ch: w_snd,
+            housekeeper: Some(Arc::new(Housekeeper::new(
+                is_eviction_listener_enabled,
+                housekeeper_config,
+                fast_now,
+            ))),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn hash<Q>(&self, key: &Q) -> u64
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        self.inner.hash(key)
+    }
+
+    pub(crate) fn contains_key_with_hash<Q>(&self, key: &Q, hash: u64) -> bool
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        // TODO: Maybe we can just call ScanningGet::scanning_get.
+        self.inner
+            .get_key_value_and(key, hash, |k, entry| {
+                let i = &self.inner;
+                let (ttl, tti, va) = (&i.time_to_live(), &i.time_to_idle(), &i.valid_after());
+                let now = self.current_time();
+
+                !is_expired_by_per_entry_ttl(entry.entry_info(), now)
+                    && !is_expired_entry_wo(ttl, va, entry, now)
+                    && !is_expired_entry_ao(tti, va, entry, now)
+                    && !i.is_invalidated_entry(k, entry)
+            })
+            .unwrap_or_default() // `false` is the default for `bool` type.
+    }
+
+    pub(crate) fn get_with_hash<Q>(&self, key: &Q, hash: u64, need_key: bool) -> Option<Entry<K, V>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        // Define a closure to record a read op.
+        let record = |op, now| {
+            self.record_read_op(op, now)
+                .expect("Failed to record a get op");
+        };
+        let ignore_if = None as Option<&mut fn(&V) -> bool>;
+        self.do_get_with_hash(key, hash, record, ignore_if, need_key)
+    }
+
+    pub(crate) fn get_with_hash_and_ignore_if<Q, I>(
+        &self,
+        key: &Q,
+        hash: u64,
+        ignore_if: Option<&mut I>,
+        need_key: bool,
+    ) -> Option<Entry<K, V>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+        I: FnMut(&V) -> bool,
+    {
+        // Define a closure to record a read op.
+        let record = |op, now| {
+            self.record_read_op(op, now)
+                .expect("Failed to record a get op");
+        };
+        self.do_get_with_hash(key, hash, record, ignore_if, need_key)
+    }
+
+    pub(crate) fn get_with_hash_without_recording<Q, I>(
+        &self,
+        key: &Q,
+        hash: u64,
+        ignore_if: Option<&mut I>,
+    ) -> Option<V>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+        I: FnMut(&V) -> bool,
+    {
+        // Define a closure that skips to record a read op.
+        let record = |_op, _now| {};
+        self.do_get_with_hash(key, hash, record, ignore_if, false)
+            .map(Entry::into_value)
+    }
+
+    fn do_get_with_hash<Q, R, I>(
+        &self,
+        key: &Q,
+        hash: u64,
+        read_recorder: R,
+        mut ignore_if: Option<&mut I>,
+        need_key: bool,
+    ) -> Option<Entry<K, V>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+        R: Fn(ReadOp<K, V>, Instant),
+        I: FnMut(&V) -> bool,
+    {
+        if self.is_map_disabled() {
+            return None;
+        }
+
+        let mut now = self.current_time();
+
+        let maybe_entry = self
+            .inner
+            .get_key_value_and_then(key, hash, move |k, entry| {
+                if let Some(ignore_if) = &mut ignore_if {
+                    if ignore_if(&entry.value) {
+                        // Ignore the entry.
+                        return None;
+                    }
+                }
+
+                let i = &self.inner;
+                let (ttl, tti, va) = (&i.time_to_live(), &i.time_to_idle(), &i.valid_after());
+
+                if is_expired_by_per_entry_ttl(entry.entry_info(), now)
+                    || is_expired_entry_wo(ttl, va, entry, now)
+                    || is_expired_entry_ao(tti, va, entry, now)
+                    || i.is_invalidated_entry(k, entry)
+                {
+                    // Expired or invalidated entry.
+                    None
+                } else {
+                    // Valid entry.
+                    let maybe_key = if need_key { Some(Arc::clone(k)) } else { None };
+                    Some((maybe_key, MiniArc::clone(entry)))
+                }
+            });
+
+        if let Some((maybe_key, entry)) = maybe_entry {
+            let mut is_expiry_modified = false;
+
+            // Call the user supplied `expire_after_read` method if any.
+            if let Some(expiry) = &self.inner.expiration_policy.expiry() {
+                let lm = entry.last_modified().expect("Last modified is not set");
+                // Check if the `last_modified` of entry is earlier than or equals to
+                // `now`. If not, update the `now` to `last_modified`. This is needed
+                // because there is a small chance that other threads have inserted
+                // the entry _after_ we obtained `now`.
+                now = now.max(lm);
+
+                // Convert `last_modified` from `moka::common::time::Instant` to
+                // `std::time::Instant`.
+                let lm = self.inner.clock().to_std_instant(lm);
+
+                // Call the user supplied `expire_after_read` method.
+                //
+                // We will put the return value (`is_expiry_modified: bool`) to a
+                // `ReadOp` so that `apply_reads` method can determine whether or not
+                // to reschedule the timer for the entry.
+                //
+                // NOTE: It is not guaranteed that the `ReadOp` is passed to
+                // `apply_reads`. Here are the corner cases that the `ReadOp` will
+                // not be passed to `apply_reads`:
+                //
+                // - If the bounded `read_op_ch` channel is full, the `ReadOp` will
+                //   be discarded.
+                // - If we were called by `get_with_hash_without_recording` method,
+                //   the `ReadOp` will not be recorded at all.
+                //
+                // These cases are okay because when the timer wheel tries to expire
+                // the entry, it will check if the entry is actually expired. If not,
+                // the timer wheel will reschedule the expiration timer for the
+                // entry.
+                is_expiry_modified = Self::expire_after_read_or_update(
+                    |k, v, t, d| expiry.expire_after_read(k, v, t, d, lm),
+                    &entry.entry_info().key_hash().key,
+                    &entry,
+                    self.inner.expiration_policy.time_to_live(),
+                    self.inner.expiration_policy.time_to_idle(),
+                    now,
+                    self.inner.clock(),
+                );
+            }
+
+            entry.set_last_accessed(now);
+
+            let v = entry.value.clone();
+            let op = ReadOp::Hit {
+                value_entry: entry,
+                is_expiry_modified,
+            };
+            read_recorder(op, now);
+            Some(Entry::new(maybe_key, v, false, false))
+        } else {
+            read_recorder(ReadOp::Miss(hash), now);
+            None
+        }
+    }
+
+    pub(crate) fn get_key_with_hash<Q>(&self, key: &Q, hash: u64) -> Option<Arc<K>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        self.inner
+            .get_key_value_and(key, hash, |k, _entry| Arc::clone(k))
+    }
+
+    #[inline]
+    pub(crate) fn remove_entry<Q>(&self, key: &Q, hash: u64) -> Option<KvEntry<K, V>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        self.inner.remove_entry(key, hash)
+    }
+
+    #[inline]
+    pub(crate) fn apply_reads_writes_if_needed(
+        inner: &impl InnerSync,
+        ch: &Sender<WriteOp<K, V>>,
+        now: Instant,
+        housekeeper: Option<&HouseKeeperArc>,
+    ) {
+        let w_len = ch.len();
+
+        if let Some(hk) = housekeeper {
+            if Self::should_apply_writes(hk, w_len, now) {
+                hk.try_run_pending_tasks(inner);
+            }
+        }
+    }
+
+    pub(crate) fn invalidate_all(&self) {
+        let now = self.current_time();
+        self.inner.set_valid_after(now);
+    }
+
+    pub(crate) fn invalidate_entries_if(
+        &self,
+        predicate: PredicateFun<K, V>,
+    ) -> Result<PredicateId, PredicateError> {
+        let now = self.current_time();
+        self.inner.register_invalidation_predicate(predicate, now)
+    }
+}
+
+//
+// Iterator support
+//
+impl<K, V, S> ScanningGet<K, V> for BaseCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn num_cht_segments(&self) -> usize {
+        self.inner.num_cht_segments()
+    }
+
+    fn scanning_get(&self, key: &Arc<K>) -> Option<V> {
+        let hash = self.hash(&**key);
+        self.inner.get_key_value_and_then(&**key, hash, |k, entry| {
+            let i = &self.inner;
+            let (ttl, tti, va) = (&i.time_to_live(), &i.time_to_idle(), &i.valid_after());
+            let now = self.current_time();
+
+            if is_expired_by_per_entry_ttl(entry.entry_info(), now)
+                || is_expired_entry_wo(ttl, va, entry, now)
+                || is_expired_entry_ao(tti, va, entry, now)
+                || i.is_invalidated_entry(k, entry)
+            {
+                // Expired or invalidated entry.
+                None
+            } else {
+                // Valid entry.
+                Some(entry.value.clone())
+            }
+        })
+    }
+
+    fn keys(&self, cht_segment: usize) -> Option<Vec<Arc<K>>> {
+        self.inner.keys(cht_segment)
+    }
+}
+
+//
+// private methods
+//
+impl<K, V, S> BaseCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    #[inline]
+    fn record_read_op(
+        &self,
+        op: ReadOp<K, V>,
+        now: Instant,
+    ) -> Result<(), TrySendError<ReadOp<K, V>>> {
+        self.apply_reads_if_needed(&self.inner, now);
+        let ch = &self.read_op_ch;
+        match ch.try_send(op) {
+            // Discard the ReadOp when the channel is full.
+            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+            Err(e @ TrySendError::Disconnected(_)) => Err(e),
+        }
+    }
+
+    ) {
+        let duration =
+            expiry.expire_after_create(key, &value_entry.value, clock.to_std_instant(ts));
+        let expiration_time = duration.map(|duration| ts.saturating_add(duration));
+        value_entry
+            .entry_info()
+            .set_expiration_time(expiration_time);
+    }
+
+    fn expire_after_read_or_update(
+        expiry: impl FnOnce(&K, &V, StdInstant, Option<Duration>) -> Option<Duration>,
+        key: &K,
+        value_entry: &ValueEntry<K, V>,
+        ttl: Option<Duration>,
+        tti: Option<Duration>,
+        ts: Instant,
+        clock: &Clock,
+    ) -> bool {
+        let current_time = clock.to_std_instant(ts);
+        let ei = &value_entry.entry_info();
+
+        let exp_time = IntoIterator::into_iter([
+            ei.expiration_time(),
+            ttl.and_then(|dur| ei.last_modified().map(|ts| ts.saturating_add(dur))),
+            tti.and_then(|dur| ei.last_accessed().map(|ts| ts.saturating_add(dur))),
+        ])
+        .flatten()
+        .min();
+
+        let current_duration = exp_time.and_then(|time| {
+            let std_time = clock.to_std_instant(time);
+            std_time.checked_duration_since(current_time)
+        });
+
+        let duration = expiry(key, &value_entry.value, current_time, current_duration);
+
+        if duration != current_duration {
+            let expiration_time = duration.map(|duration| ts.saturating_add(duration));
+            value_entry
+                .entry_info()
+                .set_expiration_time(expiration_time);
+            // The `expiration_time` has changed from `None` to `Some` or vice versa.
+            true
+        } else {
+            false
+        }
+    }
+}
+
+//
+// for testing
+//
+#[cfg(test)]
+impl<K, V, S> BaseCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+            None | Some(0) => false,
+            Some(max_cap) => {
+                if self.frequency_sketch_enabled.load(Ordering::Acquire) {
+                    false // The frequency sketch is already enabled.
+                } else {
+                    counters.weighted_size >= max_cap / 2
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn enable_frequency_sketch(&self, counters: &EvictionCounters) {
+        if let Some(max_cap) = self.max_capacity {
+            let c = counters;
+            let cap = if self.weigher.is_none() {
+                max_cap
+            } else {
+                (c.entry_count as f64 * (c.weighted_size as f64 / max_cap as f64)) as u64
+            };
+            self.do_enable_frequency_sketch(cap);
+        }
+    }
+
+    #[cfg(test)]
+    fn enable_frequency_sketch_for_testing(&self) {
+        if let Some(max_cap) = self.max_capacity {
+            self.do_enable_frequency_sketch(max_cap);
+        }
+    }
+
+    #[inline]
+    fn do_enable_frequency_sketch(&self, cache_capacity: u64) {
+        let skt_capacity = common::sketch_capacity(cache_capacity);
+        self.frequency_sketch.write().ensure_capacity(skt_capacity);
+        self.frequency_sketch_enabled.store(true, Ordering::Release);
+    }
+
+    fn apply_reads(&self, deqs: &mut Deques<K>, timer_wheel: &mut TimerWheel<K>, count: usize) {
+        use ReadOp::{Hit, Miss};
+        let mut freq = self.frequency_sketch.write();
+        let ch = &self.read_op_ch;
+        for _ in 0..count {
+            match ch.try_recv() {
+                Ok(Hit {
+                    value_entry,
+                    is_expiry_modified,
+                }) => {
+                    let kh = value_entry.entry_info().key_hash();
+                    freq.increment(kh.hash);
+                    if is_expiry_modified {
+                        self.update_timer_wheel(&value_entry, timer_wheel);
+                    }
+                    deqs.move_to_back_ao(&value_entry);
+                }
+                Ok(Miss(hash)) => freq.increment(hash),
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn apply_writes(
+        &self,
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        count: usize,
+        eviction_state: &mut EvictionState<'_, K, V>,
+    ) where
+        V: Clone,
+    {
+        use WriteOp::{Remove, Upsert};
+        let freq = self.frequency_sketch.read();
+        let ch = &self.write_op_ch;
+
+        for _ in 0..count {
+            match ch.try_recv() {
+                Ok(Upsert {
+                    key_hash: kh,
+                    value_entry: entry,
+                    entry_gen: gen,
+                    old_weight,
+                    new_weight,
+                }) => self.handle_upsert(
+                    kh,
+                    entry,
+                    gen,
+                    old_weight,
+                    new_weight,
+                    deqs,
+                    timer_wheel,
+                    &freq,
+                    eviction_state,
+                ),
+                Ok(Remove {
+                    kv_entry: KvEntry { key: _key, entry },
+                    entry_gen: gen,
+                }) => {
+                    Self::handle_remove(
+                        deqs,
+                        timer_wheel,
+                        entry,
+    /// the cache, the key will be cloned to create new entry in the cache.
+    pub fn try_get_with_by_ref<F, E, Q>(&self, key: &Q, init: F) -> Result<V, Arc<E>>
+    where
+        F: FnOnce() -> Result<V, E>,
+        E: Send + Sync + 'static,
+        Q: Equivalent<K> + ToOwned<Owned = K> + Hash + ?Sized,
+    {
+        let hash = self.base.hash(key);
+        self.get_or_try_insert_with_hash_by_ref_and_fun(key, hash, init, false)
+            .map(Entry::into_value)
+    }
+
+    pub(crate) fn get_or_try_insert_with_hash_and_fun<F, E>(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        init: F,
+        need_key: bool,
+    ) -> Result<Entry<K, V>, Arc<E>>
+    where
+        F: FnOnce() -> Result<V, E>,
+        E: Send + Sync + 'static,
+    {
+        if let Some(entry) = self.get_with_hash(&*key, hash, need_key) {
+            return Ok(entry);
+        }
+
+        self.try_insert_with_hash_and_fun(key, hash, init, need_key)
+    }
+
+    pub(crate) fn get_or_try_insert_with_hash_by_ref_and_fun<F, Q, E>(
+        &self,
+        key: &Q,
+        hash: u64,
+        init: F,
+        need_key: bool,
+    ) -> Result<Entry<K, V>, Arc<E>>
+    where
+        F: FnOnce() -> Result<V, E>,
+        E: Send + Sync + 'static,
+        Q: Equivalent<K> + ToOwned<Owned = K> + Hash + ?Sized,
+    {
+        if let Some(entry) = self.get_with_hash(key, hash, false) {
+            return Ok(entry);
+        }
+
+        let key = Arc::new(key.to_owned());
+        self.try_insert_with_hash_and_fun(key, hash, init, need_key)
+    }
+
+    pub(crate) fn try_insert_with_hash_and_fun<F, E>(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        init: F,
+        need_key: bool,
+    ) -> Result<Entry<K, V>, Arc<E>>
+    where
+        F: FnOnce() -> Result<V, E>,
+        E: Send + Sync + 'static,
+    {
+        let get = || {
+            let ignore_if = None as Option<&mut fn(&V) -> bool>;
+            self.base
+                .get_with_hash_without_recording(&*key, hash, ignore_if)
+        };
+        let insert = |v| self.insert_with_hash(key.clone(), hash, v);
+
+        let k = if need_key {
+            Some(Arc::clone(&key))
+        } else {
+            None
+        };
+
+        let type_id = ValueInitializer::<K, V, S>::type_id_for_try_get_with::<E>();
+        let post_init = ValueInitializer::<K, V, S>::post_init_for_try_get_with;
+
+        match self
+            .value_initializer
+            .try_init_or_read(&key, type_id, get, init, insert, post_init)
+        {
+sed: can't read src/entry.rs: No such file or directory

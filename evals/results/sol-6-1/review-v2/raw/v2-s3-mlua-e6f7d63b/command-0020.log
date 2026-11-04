@@ -1,0 +1,988 @@
+#![cfg(feature = "send")]
+
+use std::cell::UnsafeCell;
+use std::marker::PhantomData;
+use std::string::String as StdString;
+
+use mlua::{AnyUserData, Error, Lua, ObjectLike, Result, UserData, UserDataMethods, UserDataRef};
+use static_assertions::{assert_impl_all, assert_not_impl_all};
+
+#[test]
+fn test_userdata_multithread_access_send_only() -> Result<()> {
+    let lua = Lua::new();
+
+    // This type is `Send` but not `Sync`.
+    struct MyUserData(StdString, PhantomData<UnsafeCell<()>>);
+    assert_impl_all!(MyUserData: Send);
+    assert_not_impl_all!(MyUserData: Sync);
+
+    impl UserData for MyUserData {
+        fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+            methods.add_method("method", |lua, this, ()| {
+                let ud = lua.globals().get::<AnyUserData>("ud")?;
+                assert_eq!(ud.call_method::<String>("method2", ())?, "method2");
+                Ok(this.0.clone())
+            });
+
+            methods.add_method("method2", |_, _, ()| Ok("method2"));
+        }
+    }
+
+    lua.globals()
+        .set("ud", MyUserData("hello".to_string(), PhantomData))?;
+
+    // We acquired the exclusive reference.
+    let ud = lua.globals().get::<UserDataRef<MyUserData>>("ud")?;
+
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let res = lua.globals().get::<UserDataRef<MyUserData>>("ud");
+            assert!(matches!(res, Err(Error::UserDataBorrowError)));
+        });
+    });
+
+    drop(ud);
+    lua.load("ud:method()").exec().unwrap();
+
+    Ok(())
+}
+
+#[test]
+fn test_userdata_multithread_access_sync() -> Result<()> {
+    let lua = Lua::new();
+
+    // This type is `Send` and `Sync`.
+    struct MyUserData(StdString);
+    assert_impl_all!(MyUserData: Send, Sync);
+
+    impl UserData for MyUserData {
+        fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+            methods.add_method("method", |lua, this, ()| {
+                let ud = lua.globals().get::<AnyUserData>("ud")?;
+                assert!(ud.call_method::<()>("method2", ()).is_ok());
+                Ok(this.0.clone())
+            });
+
+            methods.add_method("method2", |_, _, ()| Ok(()));
+        }
+    }
+
+    lua.globals().set("ud", MyUserData("hello".to_string()))?;
+
+    // We acquired the shared reference.
+    let _ud = lua.globals().get::<UserDataRef<MyUserData>>("ud")?;
+
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            // Getting another shared reference for `Sync` type is allowed.
+            let _ = lua.globals().get::<UserDataRef<MyUserData>>("ud").unwrap();
+        });
+    });
+
+    lua.load("ud:method()").exec().unwrap();
+
+    Ok(())
+}
+pub(crate) trait UserDataLock {
+    const INIT: Self;
+
+    fn is_locked(&self) -> bool;
+    fn try_lock_shared(&self) -> bool;
+    fn try_lock_exclusive(&self) -> bool;
+
+    unsafe fn unlock_shared(&self);
+    unsafe fn unlock_exclusive(&self);
+
+    fn try_lock_shared_guarded(&self) -> Result<LockGuard<'_, Self>, ()> {
+        if self.try_lock_shared() {
+            Ok(LockGuard {
+                lock: self,
+                exclusive: false,
+            })
+        } else {
+            Err(())
+        }
+    }
+
+    fn try_lock_exclusive_guarded(&self) -> Result<LockGuard<'_, Self>, ()> {
+        if self.try_lock_exclusive() {
+            Ok(LockGuard {
+                lock: self,
+                exclusive: true,
+            })
+        } else {
+            Err(())
+        }
+    }
+}
+
+pub(crate) struct LockGuard<'a, L: UserDataLock + ?Sized> {
+    lock: &'a L,
+    exclusive: bool,
+}
+
+impl<L: UserDataLock + ?Sized> Drop for LockGuard<'_, L> {
+    fn drop(&mut self) {
+        unsafe {
+            if self.exclusive {
+                self.lock.unlock_exclusive();
+            } else {
+                self.lock.unlock_shared();
+            }
+        }
+    }
+}
+
+pub(crate) use lock_impl::RawLock;
+
+#[cfg(not(feature = "send"))]
+#[cfg(not(tarpaulin_include))]
+mod lock_impl {
+    use std::cell::Cell;
+
+    // Positive values represent the number of read references.
+    // Negative values represent the number of write references (only one allowed).
+    pub(crate) type RawLock = Cell<isize>;
+
+    const UNUSED: isize = 0;
+
+    impl super::UserDataLock for RawLock {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const INIT: Self = Cell::new(UNUSED);
+
+        #[inline(always)]
+        fn is_locked(&self) -> bool {
+            self.get() != UNUSED
+        }
+
+        #[inline(always)]
+        fn try_lock_shared(&self) -> bool {
+            let flag = self.get().wrapping_add(1);
+            if flag <= UNUSED {
+                return false;
+            }
+            self.set(flag);
+            true
+        }
+
+        #[inline(always)]
+        fn try_lock_exclusive(&self) -> bool {
+            let flag = self.get();
+            if flag != UNUSED {
+                return false;
+            }
+            self.set(UNUSED - 1);
+            true
+        }
+
+        #[inline(always)]
+        unsafe fn unlock_shared(&self) {
+            let flag = self.get();
+            debug_assert!(flag > UNUSED);
+            self.set(flag - 1);
+        }
+
+        #[inline(always)]
+        unsafe fn unlock_exclusive(&self) {
+            let flag = self.get();
+            debug_assert!(flag < UNUSED);
+            self.set(flag + 1);
+        }
+    }
+}
+
+#[cfg(feature = "send")]
+mod lock_impl {
+    use parking_lot::lock_api::RawRwLock;
+
+    pub(crate) type RawLock = parking_lot::RawRwLock;
+
+    impl super::UserDataLock for RawLock {
+        #[allow(clippy::declare_interior_mutable_const)]
+        const INIT: Self = <Self as parking_lot::lock_api::RawRwLock>::INIT;
+
+        #[inline(always)]
+        fn is_locked(&self) -> bool {
+            RawRwLock::is_locked(self)
+        }
+
+        #[inline(always)]
+        fn try_lock_shared(&self) -> bool {
+            RawRwLock::try_lock_shared(self)
+        }
+
+        #[inline(always)]
+        fn try_lock_exclusive(&self) -> bool {
+            RawRwLock::try_lock_exclusive(self)
+        }
+
+        #[inline(always)]
+        unsafe fn unlock_shared(&self) {
+            RawRwLock::unlock_shared(self)
+        }
+
+        #[inline(always)]
+        unsafe fn unlock_exclusive(&self) {
+            RawRwLock::unlock_exclusive(self)
+        }
+    }
+}
+use std::cell::{RefCell, UnsafeCell};
+
+#[cfg(feature = "serde")]
+use serde::ser::{Serialize, Serializer};
+
+use crate::error::{Error, Result};
+use crate::types::XRc;
+
+use super::lock::{RawLock, UserDataLock};
+use super::r#ref::{UserDataRef, UserDataRefMut};
+
+#[cfg(all(feature = "serde", not(feature = "send")))]
+type DynSerialize = dyn erased_serde::Serialize;
+
+#[cfg(all(feature = "serde", feature = "send"))]
+type DynSerialize = dyn erased_serde::Serialize + Send;
+
+pub(crate) enum UserDataStorage<T> {
+    Owned(UserDataVariant<T>),
+    Scoped(ScopedUserDataVariant<T>),
+}
+
+// A enum for storing userdata values.
+// It's stored inside a Lua VM and protected by the outer `ReentrantMutex`.
+pub(crate) enum UserDataVariant<T> {
+    Default(XRc<UserDataCell<T>>),
+    #[cfg(feature = "serde")]
+    Serializable(XRc<UserDataCell<Box<DynSerialize>>>, bool), // bool is `is_sync`
+}
+
+impl<T> Clone for UserDataVariant<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        match self {
+            Self::Default(inner) => Self::Default(XRc::clone(inner)),
+            #[cfg(feature = "serde")]
+            Self::Serializable(inner, is_sync) => Self::Serializable(XRc::clone(inner), *is_sync),
+        }
+    }
+}
+
+impl<T> UserDataVariant<T> {
+    #[inline(always)]
+    pub(super) fn try_borrow_scoped<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R> {
+        // We don't need to check for `T: Sync` because when this method is used (internally),
+        // Lua mutex is already locked.
+        // If non-`Sync` userdata is already borrowed by another thread (via `UserDataRef`), it will be
+        // exclusively locked.
+        let _guard = (self.raw_lock().try_lock_shared_guarded()).map_err(|_| Error::UserDataBorrowError)?;
+        Ok(f(unsafe { &*self.as_ptr() }))
+    }
+
+    // Mutably borrows the wrapped value in-place.
+    #[inline(always)]
+    fn try_borrow_scoped_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> Result<R> {
+        let _guard =
+            (self.raw_lock().try_lock_exclusive_guarded()).map_err(|_| Error::UserDataBorrowMutError)?;
+        Ok(f(unsafe { &mut *self.as_ptr() }))
+    }
+
+    // Immutably borrows the wrapped value and returns an owned reference.
+    #[inline(always)]
+    fn try_borrow_owned(&self) -> Result<UserDataRef<T>> {
+        UserDataRef::try_from(self.clone())
+    }
+
+    // Mutably borrows the wrapped value and returns an owned reference.
+    #[inline(always)]
+    fn try_borrow_owned_mut(&self) -> Result<UserDataRefMut<T>> {
+        UserDataRefMut::try_from(self.clone())
+    }
+
+    // Returns the wrapped value.
+    //
+    // This method checks that we have exclusive access to the value.
+    fn into_inner(self) -> Result<T> {
+        if !self.raw_lock().try_lock_exclusive() {
+            return Err(Error::UserDataBorrowMutError);
+        }
+        Ok(match self {
+            Self::Default(inner) => XRc::into_inner(inner).unwrap().value.into_inner(),
+            #[cfg(feature = "serde")]
+            Self::Serializable(inner, _) => unsafe {
+                let raw = Box::into_raw(XRc::into_inner(inner).unwrap().value.into_inner());
+                *Box::from_raw(raw as *mut T)
+            },
+        })
+    }
+
+    #[inline(always)]
+    fn strong_count(&self) -> usize {
+        match self {
+            Self::Default(inner) => XRc::strong_count(inner),
+            #[cfg(feature = "serde")]
+            Self::Serializable(inner, _) => XRc::strong_count(inner),
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn raw_lock(&self) -> &RawLock {
+        match self {
+            Self::Default(inner) => &inner.raw_lock,
+            #[cfg(feature = "serde")]
+            Self::Serializable(inner, _) => &inner.raw_lock,
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn as_ptr(&self) -> *mut T {
+        match self {
+            Self::Default(inner) => inner.value.get(),
+            #[cfg(feature = "serde")]
+            Self::Serializable(inner, _) => unsafe { &mut **(inner.value.get() as *mut Box<T>) },
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for UserDataStorage<()> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Owned(variant @ UserDataVariant::Serializable(inner, is_sync)) => unsafe {
+                #[cfg(feature = "send")]
+                if *is_sync {
+                    let _guard = (variant.raw_lock().try_lock_shared_guarded())
+                        .map_err(|_| serde::ser::Error::custom(Error::UserDataBorrowError))?;
+                    (*inner.value.get()).serialize(serializer)
+                } else {
+                    let _guard = (variant.raw_lock().try_lock_exclusive_guarded())
+                        .map_err(|_| serde::ser::Error::custom(Error::UserDataBorrowError))?;
+                    (*inner.value.get()).serialize(serializer)
+                }
+                #[cfg(not(feature = "send"))]
+                {
+                    let _ = is_sync;
+                    let _guard = (variant.raw_lock().try_lock_shared_guarded())
+                        .map_err(|_| serde::ser::Error::custom(Error::UserDataBorrowError))?;
+                    (*inner.value.get()).serialize(serializer)
+                }
+            },
+            _ => Err(serde::ser::Error::custom("cannot serialize <userdata>")),
+        }
+    }
+}
+
+/// A type that provides interior mutability for a userdata value (thread-safe).
+pub(crate) struct UserDataCell<T> {
+    raw_lock: RawLock,
+    value: UnsafeCell<T>,
+}
+
+#[cfg(feature = "send")]
+unsafe impl<T: Send> Send for UserDataCell<T> {}
+#[cfg(feature = "send")]
+unsafe impl<T: Send> Sync for UserDataCell<T> {}
+
+impl<T> UserDataCell<T> {
+    #[inline(always)]
+    fn new(value: T) -> Self {
+        UserDataCell {
+            raw_lock: RawLock::INIT,
+            value: UnsafeCell::new(value),
+        }
+    }
+}
+
+pub(crate) enum ScopedUserDataVariant<T> {
+    Ref(*const T),
+    RefMut(RefCell<*mut T>),
+    Boxed(RefCell<*mut T>),
+}
+
+impl<T> Drop for ScopedUserDataVariant<T> {
+    #[inline]
+    fn drop(&mut self) {
+        if let Self::Boxed(value) = self {
+            if let Ok(value) = value.try_borrow_mut() {
+                unsafe { drop(Box::from_raw(*value)) };
+            }
+        }
+    }
+}
+
+impl<T: 'static> UserDataStorage<T> {
+    #[inline(always)]
+    pub(crate) fn new(data: T) -> Self {
+        Self::Owned(UserDataVariant::Default(XRc::new(UserDataCell::new(data))))
+    }
+
+    #[inline(always)]
+    pub(crate) fn new_ref(data: &T) -> Self {
+        Self::Scoped(ScopedUserDataVariant::Ref(data))
+    }
+
+    #[inline(always)]
+    pub(crate) fn new_ref_mut(data: &mut T) -> Self {
+        Self::Scoped(ScopedUserDataVariant::RefMut(RefCell::new(data)))
+    }
+
+    #[cfg(feature = "serde")]
+    #[inline(always)]
+    pub(crate) fn new_ser(data: T) -> Self
+    where
+        T: Serialize + crate::types::MaybeSend,
+    {
+        let data = Box::new(data) as Box<DynSerialize>;
+        let is_sync = super::util::is_sync::<T>();
+        let variant = UserDataVariant::Serializable(XRc::new(UserDataCell::new(data)), is_sync);
+        Self::Owned(variant)
+    }
+
+    #[cfg(feature = "serde")]
+    #[inline(always)]
+    pub(crate) fn is_serializable(&self) -> bool {
+        matches!(self, Self::Owned(UserDataVariant::Serializable(..)))
+    }
+
+    // Immutably borrows the wrapped value and returns an owned reference.
+    #[inline(always)]
+    pub(crate) fn try_borrow_owned(&self) -> Result<UserDataRef<T>> {
+        match self {
+            Self::Owned(data) => data.try_borrow_owned(),
+            Self::Scoped(_) => Err(Error::UserDataTypeMismatch),
+        }
+    }
+
+    // Mutably borrows the wrapped value and returns an owned reference.
+    #[inline(always)]
+    pub(crate) fn try_borrow_owned_mut(&self) -> Result<UserDataRefMut<T>> {
+        match self {
+            Self::Owned(data) => data.try_borrow_owned_mut(),
+            Self::Scoped(_) => Err(Error::UserDataTypeMismatch),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn into_inner(self) -> Result<T> {
+        match self {
+            Self::Owned(data) => data.into_inner(),
+            Self::Scoped(_) => Err(Error::UserDataTypeMismatch),
+        }
+    }
+}
+
+impl<T> UserDataStorage<T> {
+    #[inline(always)]
+    pub(crate) fn new_scoped(data: T) -> Self {
+        let data = Box::into_raw(Box::new(data));
+        Self::Scoped(ScopedUserDataVariant::Boxed(RefCell::new(data)))
+    }
+
+    /// Returns `true` if it's safe to destroy the container.
+    ///
+    /// It's safe to destroy the container if the reference count is greater than 1 or the lock is
+    /// not acquired.
+    #[inline(always)]
+    pub(crate) fn is_safe_to_destroy(&self) -> bool {
+        match self {
+            Self::Owned(variant) => variant.strong_count() > 1 || !variant.raw_lock().is_locked(),
+            Self::Scoped(_) => false,
+        }
+    }
+
+    /// Returns `true` if the container has exclusive access to the value.
+    #[inline(always)]
+    pub(crate) fn has_exclusive_access(&self) -> bool {
+        match self {
+            Self::Owned(variant) => !variant.raw_lock().is_locked(),
+            Self::Scoped(_) => false,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn try_borrow_scoped<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R> {
+        match self {
+            Self::Owned(data) => data.try_borrow_scoped(f),
+            Self::Scoped(ScopedUserDataVariant::Ref(value)) => Ok(f(unsafe { &**value })),
+            Self::Scoped(ScopedUserDataVariant::RefMut(value) | ScopedUserDataVariant::Boxed(value)) => {
+                let t = value.try_borrow().map_err(|_| Error::UserDataBorrowError)?;
+                Ok(f(unsafe { &**t }))
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn try_borrow_scoped_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> Result<R> {
+        match self {
+            Self::Owned(data) => data.try_borrow_scoped_mut(f),
+            Self::Scoped(ScopedUserDataVariant::Ref(_)) => Err(Error::UserDataBorrowMutError),
+            Self::Scoped(ScopedUserDataVariant::RefMut(value) | ScopedUserDataVariant::Boxed(value)) => {
+                let mut t = value
+                    .try_borrow_mut()
+                    .map_err(|_| Error::UserDataBorrowMutError)?;
+                Ok(f(unsafe { &mut **t }))
+            }
+        }
+    }
+}
+use std::any::{type_name, TypeId};
+use std::ops::{Deref, DerefMut};
+use std::os::raw::c_int;
+use std::{fmt, mem};
+
+use crate::error::{Error, Result};
+use crate::state::{Lua, RawLua};
+use crate::traits::FromLua;
+use crate::userdata::AnyUserData;
+use crate::util::get_userdata;
+use crate::value::Value;
+
+use super::cell::{UserDataStorage, UserDataVariant};
+use super::lock::{LockGuard, RawLock, UserDataLock};
+use super::util::is_sync;
+
+#[cfg(feature = "userdata-wrappers")]
+use {
+    parking_lot::{
+        Mutex as MutexPL, MutexGuard as MutexGuardPL, RwLock as RwLockPL,
+        RwLockReadGuard as RwLockReadGuardPL, RwLockWriteGuard as RwLockWriteGuardPL,
+    },
+    std::sync::Arc,
+};
+#[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+use {
+    std::cell::{Ref, RefCell, RefMut},
+    std::rc::Rc,
+};
+
+/// A wrapper type for a userdata value that provides read access.
+///
+/// It implements [`FromLua`] and can be used to receive a typed userdata from Lua.
+pub struct UserDataRef<T: 'static> {
+    // It's important to drop the guard first, as it refers to the `inner` data.
+    _guard: LockGuard<'static, RawLock>,
+    inner: UserDataRefInner<T>,
+}
+
+impl<T> Deref for UserDataRef<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.inner
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for UserDataRef<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<T: fmt::Display> fmt::Display for UserDataRef<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<T> TryFrom<UserDataVariant<T>> for UserDataRef<T> {
+    type Error = Error;
+
+    #[inline]
+    fn try_from(variant: UserDataVariant<T>) -> Result<Self> {
+        let guard = if cfg!(not(feature = "send")) || is_sync::<T>() {
+            variant.raw_lock().try_lock_shared_guarded()
+        } else {
+            variant.raw_lock().try_lock_exclusive_guarded()
+        };
+        let guard = guard.map_err(|_| Error::UserDataBorrowError)?;
+        let guard = unsafe { mem::transmute::<LockGuard<_>, LockGuard<'static, _>>(guard) };
+        Ok(UserDataRef::from_parts(UserDataRefInner::Default(variant), guard))
+    }
+}
+
+impl<T: 'static> FromLua for UserDataRef<T> {
+    fn from_lua(value: Value, _: &Lua) -> Result<Self> {
+        try_value_to_userdata::<T>(value)?.borrow()
+    }
+
+    #[inline]
+    unsafe fn from_stack(idx: c_int, lua: &RawLua) -> Result<Self> {
+        Self::borrow_from_stack(lua, lua.state(), idx)
+    }
+}
+
+impl<T: 'static> UserDataRef<T> {
+    #[inline(always)]
+    fn from_parts(inner: UserDataRefInner<T>, guard: LockGuard<'static, RawLock>) -> Self {
+        Self { _guard: guard, inner }
+    }
+
+    #[cfg(feature = "userdata-wrappers")]
+    fn remap<U>(
+        self,
+        f: impl FnOnce(UserDataVariant<T>) -> Result<UserDataRefInner<U>>,
+    ) -> Result<UserDataRef<U>> {
+        match &self.inner {
+            UserDataRefInner::Default(variant) => {
+                let inner = f(variant.clone())?;
+                Ok(UserDataRef::from_parts(inner, self._guard))
+            }
+            _ => Err(Error::UserDataTypeMismatch),
+        }
+    }
+
+    pub(crate) unsafe fn borrow_from_stack(
+        lua: &RawLua,
+        state: *mut ffi::lua_State,
+        idx: c_int,
+    ) -> Result<Self> {
+        let type_id = lua.get_userdata_type_id::<T>(state, idx)?;
+        match type_id {
+            Some(type_id) if type_id == TypeId::of::<T>() => {
+                let ud = get_userdata::<UserDataStorage<T>>(state, idx);
+                (*ud).try_borrow_owned()
+            }
+
+            #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+            Some(type_id) if type_id == TypeId::of::<Rc<T>>() => {
+                let ud = get_userdata::<UserDataStorage<Rc<T>>>(state, idx);
+                ((*ud).try_borrow_owned()).and_then(|ud| ud.transform_rc())
+            }
+            #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+            Some(type_id) if type_id == TypeId::of::<Rc<RefCell<T>>>() => {
+                let ud = get_userdata::<UserDataStorage<Rc<RefCell<T>>>>(state, idx);
+                ((*ud).try_borrow_owned()).and_then(|ud| ud.transform_rc_refcell())
+            }
+
+            #[cfg(feature = "userdata-wrappers")]
+            Some(type_id) if type_id == TypeId::of::<Arc<T>>() => {
+                let ud = get_userdata::<UserDataStorage<Arc<T>>>(state, idx);
+                ((*ud).try_borrow_owned()).and_then(|ud| ud.transform_arc())
+            }
+            #[cfg(feature = "userdata-wrappers")]
+            Some(type_id) if type_id == TypeId::of::<Arc<MutexPL<T>>>() => {
+                let ud = get_userdata::<UserDataStorage<Arc<MutexPL<T>>>>(state, idx);
+                ((*ud).try_borrow_owned()).and_then(|ud| ud.transform_arc_mutex_pl())
+            }
+            #[cfg(feature = "userdata-wrappers")]
+            Some(type_id) if type_id == TypeId::of::<Arc<RwLockPL<T>>>() => {
+                let ud = get_userdata::<UserDataStorage<Arc<RwLockPL<T>>>>(state, idx);
+                ((*ud).try_borrow_owned()).and_then(|ud| ud.transform_arc_rwlock_pl())
+            }
+            _ => Err(Error::UserDataTypeMismatch),
+        }
+    }
+}
+
+#[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+impl<T> UserDataRef<Rc<T>> {
+    fn transform_rc(self) -> Result<UserDataRef<T>> {
+        self.remap(|variant| Ok(UserDataRefInner::Rc(variant)))
+    }
+}
+
+#[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+impl<T> UserDataRef<Rc<RefCell<T>>> {
+    fn transform_rc_refcell(self) -> Result<UserDataRef<T>> {
+        self.remap(|variant| unsafe {
+            let obj = &*variant.as_ptr();
+            let r#ref = obj.try_borrow().map_err(|_| Error::UserDataBorrowError)?;
+            let borrow = std::mem::transmute::<Ref<T>, Ref<'static, T>>(r#ref);
+            Ok(UserDataRefInner::RcRefCell(borrow, variant))
+        })
+    }
+}
+
+#[cfg(feature = "userdata-wrappers")]
+impl<T> UserDataRef<Arc<T>> {
+    fn transform_arc(self) -> Result<UserDataRef<T>> {
+        self.remap(|variant| Ok(UserDataRefInner::Arc(variant)))
+    }
+}
+
+#[cfg(feature = "userdata-wrappers")]
+impl<T> UserDataRef<Arc<MutexPL<T>>> {
+    fn transform_arc_mutex_pl(self) -> Result<UserDataRef<T>> {
+        self.remap(|variant| unsafe {
+            let obj = &*variant.as_ptr();
+            let guard = obj.try_lock().ok_or(Error::UserDataBorrowError)?;
+            let borrow = std::mem::transmute::<MutexGuardPL<T>, MutexGuardPL<'static, T>>(guard);
+            Ok(UserDataRefInner::ArcMutexPL(borrow, variant))
+        })
+    }
+}
+
+#[cfg(feature = "userdata-wrappers")]
+impl<T> UserDataRef<Arc<RwLockPL<T>>> {
+    fn transform_arc_rwlock_pl(self) -> Result<UserDataRef<T>> {
+        self.remap(|variant| unsafe {
+            let obj = &*variant.as_ptr();
+            let guard = obj.try_read().ok_or(Error::UserDataBorrowError)?;
+            let borrow = std::mem::transmute::<RwLockReadGuardPL<T>, RwLockReadGuardPL<'static, T>>(guard);
+            Ok(UserDataRefInner::ArcRwLockPL(borrow, variant))
+        })
+    }
+}
+
+#[allow(unused)]
+enum UserDataRefInner<T: 'static> {
+    Default(UserDataVariant<T>),
+
+    #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+    Rc(UserDataVariant<Rc<T>>),
+    #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+    RcRefCell(Ref<'static, T>, UserDataVariant<Rc<RefCell<T>>>),
+
+    #[cfg(feature = "userdata-wrappers")]
+    Arc(UserDataVariant<Arc<T>>),
+    #[cfg(feature = "userdata-wrappers")]
+    ArcMutexPL(MutexGuardPL<'static, T>, UserDataVariant<Arc<MutexPL<T>>>),
+    #[cfg(feature = "userdata-wrappers")]
+    ArcRwLockPL(RwLockReadGuardPL<'static, T>, UserDataVariant<Arc<RwLockPL<T>>>),
+}
+
+impl<T> Deref for UserDataRefInner<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        match self {
+            Self::Default(inner) => unsafe { &*inner.as_ptr() },
+
+            #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+            Self::Rc(inner) => unsafe { &*Rc::as_ptr(&*inner.as_ptr()) },
+            #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+            Self::RcRefCell(x, ..) => x,
+
+            #[cfg(feature = "userdata-wrappers")]
+            Self::Arc(inner) => unsafe { &*Arc::as_ptr(&*inner.as_ptr()) },
+            #[cfg(feature = "userdata-wrappers")]
+            Self::ArcMutexPL(x, ..) => x,
+            #[cfg(feature = "userdata-wrappers")]
+            Self::ArcRwLockPL(x, ..) => x,
+        }
+    }
+}
+
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::ffi::CStr;
+use std::io::Result as IoResult;
+use std::ops::{Deref, DerefMut};
+use std::os::raw::{c_char, c_int, c_void};
+use std::path::{Component, Path, PathBuf};
+use std::result::Result as StdResult;
+use std::{env, fmt, fs, mem, ptr};
+
+use crate::error::{Error, Result};
+use crate::function::Function;
+use crate::state::{callback_error_ext, Lua};
+use crate::table::Table;
+use crate::types::MaybeSend;
+
+/// An error that can occur during navigation in the Luau `require-by-string` system.
+#[cfg(any(feature = "luau", doc))]
+#[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+#[derive(Debug, Clone)]
+pub enum NavigateError {
+    Ambiguous,
+    NotFound,
+    Other(Error),
+}
+
+#[cfg(feature = "luau")]
+trait IntoNavigateResult {
+    fn into_nav_result(self) -> Result<ffi::luarequire_NavigateResult>;
+}
+
+#[cfg(feature = "luau")]
+impl IntoNavigateResult for StdResult<(), NavigateError> {
+    fn into_nav_result(self) -> Result<ffi::luarequire_NavigateResult> {
+        match self {
+            Ok(()) => Ok(ffi::luarequire_NavigateResult::Success),
+            Err(NavigateError::Ambiguous) => Ok(ffi::luarequire_NavigateResult::Ambiguous),
+            Err(NavigateError::NotFound) => Ok(ffi::luarequire_NavigateResult::NotFound),
+            Err(NavigateError::Other(err)) => Err(err),
+        }
+    }
+}
+
+impl From<Error> for NavigateError {
+    fn from(err: Error) -> Self {
+        NavigateError::Other(err)
+    }
+}
+
+#[cfg(feature = "luau")]
+type WriteResult = ffi::luarequire_WriteResult;
+
+/// A trait for handling modules loading and navigation in the Luau `require-by-string` system.
+#[cfg(any(feature = "luau", doc))]
+#[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+pub trait Require {
+    /// Returns `true` if "require" is permitted for the given chunk name.
+    fn is_require_allowed(&self, chunk_name: &str) -> bool;
+
+    /// Resets the internal state to point at the requirer module.
+    fn reset(&mut self, chunk_name: &str) -> StdResult<(), NavigateError>;
+
+    /// Resets the internal state to point at an aliased module.
+    ///
+    /// This function received an exact path from a configuration file.
+    /// It's only called when an alias's path cannot be resolved relative to its
+    /// configuration file.
+    fn jump_to_alias(&mut self, path: &str) -> StdResult<(), NavigateError>;
+
+    // Navigate to parent directory
+    fn to_parent(&mut self) -> StdResult<(), NavigateError>;
+
+    /// Navigate to the given child directory.
+    fn to_child(&mut self, name: &str) -> StdResult<(), NavigateError>;
+
+    /// Returns whether the context is currently pointing at a module
+    fn has_module(&self) -> bool;
+
+    /// Provides a cache key representing the current module.
+    ///
+    /// This function is only called if `has_module` returns true.
+    fn cache_key(&self) -> String;
+
+    /// Returns whether a configuration is present in the current context.
+    fn has_config(&self) -> bool;
+
+    /// Returns the contents of the configuration file in the current context.
+    ///
+    /// This function is only called if `has_config` returns true.
+    fn config(&self) -> IoResult<Vec<u8>>;
+
+    /// Returns a loader function for the current module, that when called, loads the module
+    /// and returns the result.
+    ///
+    /// Loader can be sync or async.
+    /// This function is only called if `has_module` returns true.
+    fn loader(&self, lua: &Lua) -> Result<Function>;
+}
+
+impl fmt::Debug for dyn Require {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<dyn Require>")
+    }
+}
+
+/// The standard implementation of Luau `require-by-string` navigation.
+#[derive(Default, Debug)]
+pub struct TextRequirer {
+    /// An absolute path to the current Luau module (not mapped to a physical file)
+    abs_path: PathBuf,
+    /// A relative path to the current Luau module (not mapped to a physical file)
+    rel_path: PathBuf,
+    /// A physical path to the current Luau module, which is a file or a directory with an
+    /// `init.lua(u)` file
+    resolved_path: Option<PathBuf>,
+}
+
+impl TextRequirer {
+    /// The prefix used for chunk names in the require system.
+    /// Only chunk names starting with this prefix are allowed to be used in `require`.
+    const CHUNK_PREFIX: &str = "@";
+
+    /// The file extensions that are considered valid for Luau modules.
+    const FILE_EXTENSIONS: &[&str] = &["luau", "lua"];
+
+    /// Creates a new `TextRequirer` instance.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn normalize_chunk_name(chunk_name: &str) -> &str {
+        if let Some((path, line)) = chunk_name.rsplit_once(':') {
+            if line.parse::<u32>().is_ok() {
+                return path;
+            }
+        }
+        chunk_name
+    }
+
+    // Normalizes the path by removing unnecessary components
+    fn normalize_path(path: &Path) -> PathBuf {
+        let mut components = VecDeque::new();
+
+        for comp in path.components() {
+            match comp {
+                Component::Prefix(..) | Component::RootDir => {
+                    components.push_back(comp);
+                }
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if matches!(components.back(), None | Some(Component::ParentDir)) {
+                        components.push_back(Component::ParentDir);
+                    } else if matches!(components.back(), Some(Component::Normal(..))) {
+                        components.pop_back();
+                    }
+                }
+                Component::Normal(..) => components.push_back(comp),
+            }
+        }
+
+        if matches!(components.front(), None | Some(Component::Normal(..))) {
+            components.push_front(Component::CurDir);
+        }
+
+        // Join the components back together
+        components.into_iter().collect()
+    }
+
+    /// Resolve a Luau module path to a physical file or directory.
+    ///
+    /// Empty directories without init files are considered valid as "intermediate" directories.
+    fn resolve_module(path: &Path) -> StdResult<Option<PathBuf>, NavigateError> {
+        let mut found_path = None;
+
+        if path.components().next_back() != Some(Component::Normal("init".as_ref())) {
+            let current_ext = (path.extension().and_then(|s| s.to_str()))
+                .map(|s| format!("{s}."))
+                .unwrap_or_default();
+            for ext in Self::FILE_EXTENSIONS {
+                let candidate = path.with_extension(format!("{current_ext}{ext}"));
+                if candidate.is_file() && found_path.replace(candidate).is_some() {
+                    return Err(NavigateError::Ambiguous);
+                }
+            }
+        }
+        if path.is_dir() {
+            for component in Self::FILE_EXTENSIONS.iter().map(|ext| format!("init.{ext}")) {
+                let candidate = path.join(component);
+                if candidate.is_file() && found_path.replace(candidate).is_some() {
+                    return Err(NavigateError::Ambiguous);
+                }
+            }
+
+            if found_path.is_none() {
+                // Directories without init files are considered valid "intermediate" path
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(found_path.ok_or(NavigateError::NotFound)?))
+    }
+}
+
+impl Require for TextRequirer {
+    fn is_require_allowed(&self, chunk_name: &str) -> bool {
+        chunk_name.starts_with(Self::CHUNK_PREFIX)
+    }
+
+    fn reset(&mut self, chunk_name: &str) -> StdResult<(), NavigateError> {
+        if !chunk_name.starts_with(Self::CHUNK_PREFIX) {
+            return Err(NavigateError::NotFound);
+        }
+        let chunk_name = Self::normalize_chunk_name(&chunk_name[1..]);
+        let chunk_path = Self::normalize_path(chunk_name.as_ref());
+
+        if chunk_path.extension() == Some("rs".as_ref()) {
+            // Special case for Rust source files, reset to the current directory
+            let chunk_filename = chunk_path.file_name().unwrap();
+            let cwd = env::current_dir().map_err(|_| NavigateError::NotFound)?;
+            self.abs_path = Self::normalize_path(&cwd.join(chunk_filename));
+3.9051166666666663 minutes used of 45.0

@@ -1,0 +1,639 @@
+     89 src/cht/iter.rs
+     10 src/cht/map.rs
+   1797 src/cht/segment.rs
+    114 src/cht/test_util.rs
+    919 src/cht/map/bucket.rs
+    357 src/cht/map/bucket_array_ref.rs
+     16 src/common/builder_utils.rs
+    386 src/common/concurrent.rs
+    783 src/common/deque.rs
+     92 src/common/entry.rs
+     31 src/common/error.rs
+    401 src/common/frequency_sketch.rs
+    149 src/common/iter.rs
+     81 src/common/test_utils.rs
+     10 src/common/time.rs
+    802 src/common/timer_wheel.rs
+    331 src/common/concurrent/arc.rs
+     23 src/common/concurrent/constants.rs
+    131 src/common/concurrent/debug_counters.rs
+    206 src/common/concurrent/deques.rs
+    236 src/common/concurrent/entry_info.rs
+    140 src/common/concurrent/housekeeper.rs
+   3294 src/sync/base_cache.rs
+    618 src/sync/builder.rs
+   5132 src/sync/cache.rs
+   1097 src/sync/entry_selector.rs
+    385 src/sync/invalidator.rs
+     94 src/sync/key_lock.rs
+   2005 src/sync/segment.rs
+    390 src/sync/value_initializer.rs
+   3535 src/future/base_cache.rs
+    489 src/future/builder.rs
+   5761 src/future/cache.rs
+   1318 src/future/entry_selector.rs
+    215 src/future/housekeeper.rs
+    391 src/future/invalidator.rs
+     94 src/future/key_lock.rs
+     78 src/future/notifier.rs
+    667 src/future/value_initializer.rs
+  32667 total
+//! Segmented lock-free hash tables.
+//!
+//! Segmented hash tables divide their entries between a number of smaller
+//! logical hash tables, or segments. Each segment is entirely independent from
+//! the others, and entries are never relocated across segment boundaries.
+//!
+//! In the context of this crate, a segment refers specifically to an array of
+//! bucket pointers. The number of segments in a hash table is rounded up to the
+//! nearest power of two; this is so that selecting the segment for a key is no
+//! more than a right shift to select the most significant bits of a hashed key.
+//!
+//! Each segment is entirely independent from the others, all operations can be
+//! performed concurrently by multiple threads. Should a set of threads be
+//! operating on disjoint sets of segments, the only synchronization between
+//! them will be destructive interference as they access and update the bucket
+//! array pointer and length for each segment.
+//!
+//! Compared to the unsegmented hash tables in this crate, the segmented hash
+//! tables have higher concurrent write throughput for disjoint sets of keys.
+//! However, the segmented hash tables have slightly lower read and
+//! single-threaded write throughput. This is because the segmenting structure
+//! adds another layer of indirection between the hash table and its buckets.
+//!
+//! The idea for segmenting hash tables was inspired by the
+//! [`ConcurrentHashMap`] from OpenJDK 7, which consists of a number of
+//! separately-locked segments. OpenJDK 8 introduced a striped concurrent hash
+//! map that stripes a set of bucket locks across the set of buckets using the
+//! least significant bits of hashed keys.
+//!
+//! [`ConcurrentHashMap`]: https://github.com/openjdk-mirror/jdk7u-jdk/blob/master/src/share/classes/java/util/concurrent/ConcurrentHashMap.java
+
+use crate::cht::map::{
+    bucket::{self, BucketArray},
+    bucket_array_ref::BucketArrayRef,
+    DefaultHashBuilder,
+};
+
+use super::iter::{Iter, ScanningGet};
+
+use std::{
+    hash::{BuildHasher, Hash},
+    ptr,
+    sync::atomic::{self, AtomicUsize, Ordering},
+};
+
+use crossbeam_epoch::Atomic;
+use equivalent::Equivalent;
+
+/// A lock-free hash map implemented with segmented bucket pointer arrays, open
+/// addressing, and linear probing.
+///
+/// By default, `Cache` uses a hashing algorithm selected to provide resistance
+/// against HashDoS attacks.
+///
+/// The default hashing algorithm is the one used by `std::collections::HashMap`,
+/// which is currently SipHash 1-3.
+///
+/// While its performance is very competitive for medium sized keys, other hashing
+/// algorithms will outperform it for small keys such as integers as well as large
+/// keys such as long strings. However those algorithms will typically not protect
+/// against attacks such as HashDoS.
+///
+/// The hashing algorithm can be replaced on a per-`HashMap` basis using the
+/// [`default`], [`with_hasher`], [`with_capacity_and_hasher`],
+/// [`with_num_segments_and_hasher`], and
+/// [`with_num_segments_capacity_and_hasher`] methods. Many alternative
+/// algorithms are available on crates.io, such as the [`AHash`] crate.
+///
+/// The number of segments can be specified on a per-`HashMap` basis using the
+/// [`with_num_segments`], [`with_num_segments_and_capacity`],
+/// [`with_num_segments_and_hasher`], and
+/// [`with_num_segments_capacity_and_hasher`] methods. By default, the
+/// `num-cpus` feature is enabled and [`new`], [`with_capacity`],
+/// [`with_hasher`], and [`with_capacity_and_hasher`] will create maps with
+/// twice as many segments as the system has CPUs.
+///
+/// It is required that the keys implement the [`Eq`] and [`Hash`] traits,
+/// although this can frequently be achieved by using
+/// `#[derive(PartialEq, Eq, Hash)]`. If you implement these yourself, it is
+/// important that the following property holds:
+///
+/// ```text
+/// k1 == k2 -> hash(k1) == hash(k2)
+/// ```
+///
+/// In other words, if two keys are equal, their hashes must be equal.
+///
+/// It is a logic error for a key to be modified in such a way that the key's
+/// hash, as determined by the [`Hash`] trait, or its equality, as determined by
+/// the [`Eq`] trait, changes while it is in the map. This is normally only
+/// possible through [`Cell`], [`RefCell`], global state, I/O, or unsafe code.
+///
+/// [`AHash`]: https://crates.io/crates/ahash
+/// [`default`]: #method.default
+/// [`with_hasher`]: #method.with_hasher
+/// [`with_capacity`]: #method.with_capacity
+/// [`with_capacity_and_hasher`]: #method.with_capacity_and_hasher
+/// [`with_num_segments_and_hasher`]: #method.with_num_segments_and_hasher
+/// [`with_num_segments_capacity_and_hasher`]: #method.with_num_segments_capacity_and_hasher
+/// [`with_num_segments`]: #method.with_num_segments
+/// [`with_num_segments_and_capacity`]: #method.with_num_segments_and_capacity
+/// [`new`]: #method.new
+/// [`Eq`]: https://doc.rust-lang.org/std/cmp/trait.Eq.html
+/// [`Hash`]: https://doc.rust-lang.org/std/hash/trait.Hash.html
+/// [`Cell`]: https://doc.rust-lang.org/std/cell/struct.Ref.html
+/// [`RefCell`]: https://doc.rust-lang.org/std/cell/struct.RefCell.html
+pub(crate) struct HashMap<K, V, S = DefaultHashBuilder> {
+    segments: Box<[Segment<K, V>]>,
+    build_hasher: S,
+    len: AtomicUsize,
+    segment_shift: u32,
+}
+
+#[cfg(test)]
+impl<K, V> HashMap<K, V, DefaultHashBuilder> {
+    /// Creates an empty `HashMap` with the specified capacity.
+    ///
+    /// The hash map will be able to hold at least `capacity` elements without
+    /// reallocating any bucket pointer arrays. If `capacity` is 0, the hash map
+    /// will not allocate any bucket pointer arrays. However, it will always
+    /// allocate memory for segment pointers and lengths.
+    ///
+    /// The `HashMap` will be created with at least twice as many segments as
+    /// the system has CPUs.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_num_segments_capacity_and_hasher(
+            default_num_segments(),
+            capacity,
+            DefaultHashBuilder::default(),
+        )
+    }
+}
+
+impl<K, V, S> HashMap<K, V, S> {
+    /// Creates an empty `HashMap` with the specified number of segments, using
+    /// `build_hasher` to hash the keys.
+    ///
+    /// The hash map is initially created with a capacity of 0, so it will not
+    /// allocate bucket pointer arrays until it is first inserted into. However,
+    /// it will always allocate memory for segment pointers and lengths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is 0.
+    pub(crate) fn with_num_segments_and_hasher(num_segments: usize, build_hasher: S) -> Self {
+        Self::with_num_segments_capacity_and_hasher(num_segments, 0, build_hasher)
+    }
+
+    /// Creates an empty `HashMap` with the specified number of segments and
+    /// capacity, using `build_hasher` to hash the keys.
+    ///
+    /// The hash map will be able to hold at least `capacity` elements without
+    /// reallocating any bucket pointer arrays. If `capacity` is 0, the hash map
+    /// will not allocate any bucket pointer arrays. However, it will always
+    /// allocate memory for segment pointers and lengths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is 0.
+    pub(crate) fn with_num_segments_capacity_and_hasher(
+        num_segments: usize,
+        capacity: usize,
+        build_hasher: S,
+    ) -> Self {
+        assert!(num_segments > 0);
+
+        let actual_num_segments = num_segments.next_power_of_two();
+        let segment_shift = 64 - actual_num_segments.trailing_zeros();
+
+        let mut segments = Vec::with_capacity(actual_num_segments);
+
+        if capacity == 0 {
+            unsafe {
+                ptr::write_bytes(segments.as_mut_ptr(), 0, actual_num_segments);
+                segments.set_len(actual_num_segments);
+            }
+        } else {
+            let actual_capacity = (capacity * 2 / actual_num_segments).next_power_of_two();
+
+            for _ in 0..actual_num_segments {
+                segments.push(Segment {
+                    bucket_array: Atomic::new(BucketArray::with_length(0, actual_capacity)),
+                    len: AtomicUsize::new(0),
+                });
+            }
+        }
+
+        let segments = segments.into_boxed_slice();
+
+        Self {
+            segments,
+            build_hasher,
+            len: AtomicUsize::new(0),
+            segment_shift,
+        }
+    }
+
+    pub(crate) fn actual_num_segments(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Returns the number of elements in the map.
+    ///
+    /// # Safety
+    ///
+    /// This method on its own is safe, but other threads can add or remove
+    /// elements at any time.
+    pub(crate) fn len(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
+    }
+
+    /// Returns `true` if the map contains no elements.
+    ///
+    /// # Safety
+    ///
+    /// This method on its own is safe, but other threads can add or remove
+    /// elements at any time.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the number of elements the map can hold without reallocating any
+    /// bucket pointer arrays.
+    ///
+    /// Note that all mutating operations except removal will result in a bucket
+    /// being allocated or reallocated.
+    ///
+    /// # Safety
+    ///
+    /// This method on its own is safe, but other threads can increase the
+    /// capacity of each segment at any time by adding elements.
+    #[cfg(any(test, feature = "unstable-debug-counters"))]
+    pub(crate) fn capacity(&self) -> usize {
+        let guard = &crossbeam_epoch::pin();
+
+        self.segments
+            .iter()
+            .map(|s| s.bucket_array.load_consume(guard))
+            .map(|p| unsafe { p.as_ref() })
+            .map(|a| a.map_or(0, BucketArray::capacity))
+            .sum::<usize>()
+    }
+
+    #[cfg(test)]
+    /// Returns the number of segments in the map.
+    pub(crate) fn num_segments(&self) -> usize {
+        self.segments.len()
+    }
+}
+
+use std::hash::Hash;
+
+pub(crate) trait ScanningGet<K, V>
+where
+    K: Clone,
+    V: Clone,
+{
+    /// Returns a _clone_ of the value corresponding to the key.
+    fn scanning_get(&self, key: &K) -> Option<V>;
+
+    /// Returns a vec of keys in a specified segment of the concurrent hash table.
+    fn keys(&self, cht_segment: usize) -> Option<Vec<K>>;
+}
+
+pub(crate) struct Iter<'i, K, V> {
+    keys: Option<Vec<K>>,
+    map: &'i dyn ScanningGet<K, V>,
+    num_segments: usize,
+    seg_index: usize,
+    is_done: bool,
+}
+
+impl<'i, K, V> Iter<'i, K, V> {
+    pub(crate) fn with_single_cache_segment(
+        map: &'i dyn ScanningGet<K, V>,
+        num_segments: usize,
+    ) -> Self {
+        Self {
+            keys: None,
+            map,
+            num_segments,
+            seg_index: 0,
+            is_done: false,
+        }
+    }
+}
+
+impl<K, V> Iterator for Iter<'_, K, V>
+where
+    K: Eq + Hash + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.is_done {
+            return None;
+        }
+
+        while let Some(key) = self.next_key() {
+            if let Some(v) = self.map.scanning_get(&key) {
+                return Some((key, v));
+            }
+        }
+
+        self.is_done = true;
+        None
+    }
+}
+
+impl<K, V> Iter<'_, K, V>
+where
+    K: Eq + Hash + Clone + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    fn next_key(&mut self) -> Option<K> {
+        while let Some(keys) = self.current_keys() {
+            if let key @ Some(_) = keys.pop() {
+                return key;
+            }
+        }
+        None
+    }
+
+    fn current_keys(&mut self) -> Option<&mut Vec<K>> {
+        // If keys is none or some but empty, try to get next keys.
+        while self.keys.as_ref().map_or(true, Vec::is_empty) {
+            // Adjust indices.
+            if self.seg_index >= self.num_segments {
+                return None;
+            }
+
+            self.keys = self.map.keys(self.seg_index);
+            self.seg_index += 1;
+        }
+
+        self.keys.as_mut()
+    }
+}
+// License and Copyright Notice:
+//
+// Some of the code and doc comments in this module were ported or copied from
+// a Java class `com.github.benmanes.caffeine.cache.FrequencySketch` of Caffeine.
+// https://github.com/ben-manes/caffeine/blob/master/caffeine/src/main/java/com/github/benmanes/caffeine/cache/FrequencySketch.java
+//
+// The original code/comments from Caffeine are licensed under the Apache License,
+// Version 2.0 <https://github.com/ben-manes/caffeine/blob/master/LICENSE>
+//
+// Copyrights of the original code/comments are retained by their contributors.
+// For full authorship information, see the version control history of
+// https://github.com/ben-manes/caffeine/
+
+/// A probabilistic multi-set for estimating the popularity of an element within
+/// a time window. The maximum frequency of an element is limited to 15 (4-bits)
+/// and an aging process periodically halves the popularity of all elements.
+#[derive(Default)]
+pub(crate) struct FrequencySketch {
+    sample_size: u32,
+    table_mask: u64,
+    table: Box<[u64]>,
+    size: u32,
+}
+
+// A mixture of seeds from FNV-1a, CityHash, and Murmur3. (Taken from Caffeine)
+static SEED: [u64; 4] = [
+    0xc3a5_c85c_97cb_3127,
+    0xb492_b66f_be98_f273,
+    0x9ae1_6a3b_2f90_404f,
+    0xcbf2_9ce4_8422_2325,
+];
+
+static RESET_MASK: u64 = 0x7777_7777_7777_7777;
+
+static ONE_MASK: u64 = 0x1111_1111_1111_1111;
+
+// -------------------------------------------------------------------------------
+// Some of the code and doc comments in this module were ported or copied from
+// a Java class `com.github.benmanes.caffeine.cache.FrequencySketch` of Caffeine.
+// https://github.com/ben-manes/caffeine/blob/master/caffeine/src/main/java/com/github/benmanes/caffeine/cache/FrequencySketch.java
+// -------------------------------------------------------------------------------
+//
+// FrequencySketch maintains a 4-bit CountMinSketch [1] with periodic aging to
+// provide the popularity history for the TinyLfu admission policy [2].
+// The time and space efficiency of the sketch allows it to cheaply estimate the
+// frequency of an entry in a stream of cache access events.
+//
+// The counter matrix is represented as a single dimensional array holding 16
+// counters per slot. A fixed depth of four balances the accuracy and cost,
+// resulting in a width of four times the length of the array. To retain an
+// accurate estimation the array's length equals the maximum number of entries
+// in the cache, increased to the closest power-of-two to exploit more efficient
+// bit masking. This configuration results in a confidence of 93.75% and error
+// bound of e / width.
+//
+// The frequency of all entries is aged periodically using a sampling window
+// based on the maximum number of entries in the cache. This is referred to as
+// the reset operation by TinyLfu and keeps the sketch fresh by dividing all
+// counters by two and subtracting based on the number of odd counters
+// found. The O(n) cost of aging is amortized, ideal for hardware pre-fetching,
+// and uses inexpensive bit manipulations per array location.
+//
+// [1] An Improved Data Stream Summary: The Count-Min Sketch and its Applications
+//     http://dimacs.rutgers.edu/~graham/pubs/papers/cm-full.pdf
+// [2] TinyLFU: A Highly Efficient Cache Admission Policy
+//     https://dl.acm.org/citation.cfm?id=3149371
+//
+// -------------------------------------------------------------------------------
+
+impl FrequencySketch {
+    /// Initializes and increases the capacity of this `FrequencySketch` instance,
+    /// if necessary, to ensure that it can accurately estimate the popularity of
+    /// elements given the maximum size of the cache. This operation forgets all
+    /// previous counts when resizing.
+    pub(crate) fn ensure_capacity(&mut self, cap: u32) {
+        // The max byte size of the table, Box<[u64; table_size]>
+        //
+        // | Pointer width    | Max size |
+        // |:-----------------|---------:|
+        // | 16 bit           |    8 KiB |
+        // | 32 bit           |  128 MiB |
+        // | 64 bit or bigger |    8 GiB |
+
+        let maximum = if cfg!(target_pointer_width = "16") {
+            cap.min(1024)
+        } else if cfg!(target_pointer_width = "32") {
+            cap.min(2u32.pow(24)) // about 16 millions
+        } else {
+            // Same to Caffeine's limit:
+            //   `Integer.MAX_VALUE >>> 1` with `ceilingPowerOfTwo()` applied.
+            cap.min(2u32.pow(30)) // about 1 billion
+        };
+        let table_size = if maximum == 0 {
+            1
+        } else {
+            maximum.next_power_of_two()
+        };
+
+        if self.table.len() as u32 >= table_size {
+            return;
+        }
+
+        self.table = vec![0; table_size as usize].into_boxed_slice();
+        self.table_mask = table_size.saturating_sub(1) as u64;
+        self.sample_size = if cap == 0 {
+            10
+        } else {
+            maximum.saturating_mul(10).min(i32::MAX as u32)
+        };
+    }
+
+    /// Takes the hash value of an element, and returns the estimated number of
+    /// occurrences of the element, up to the maximum (15).
+    pub(crate) fn frequency(&self, hash: u64) -> u8 {
+        if self.table.is_empty() {
+            return 0;
+        }
+
+        let start = ((hash & 3) << 2) as u8;
+        let mut frequency = u8::MAX;
+        for i in 0..4 {
+            let index = self.index_of(hash, i);
+            let shift = (start + i) << 2;
+            let count = ((self.table[index] >> shift) & 0xF) as u8;
+            frequency = frequency.min(count);
+        }
+        frequency
+    }
+
+    /// Take a hash value of an element and increments the popularity of the
+    /// element if it does not exceed the maximum (15). The popularity of all
+    /// elements will be periodically down sampled when the observed events
+    /// exceeds a threshold. This process provides a frequency aging to allow
+    /// expired long term entries to fade away.
+    pub(crate) fn increment(&mut self, hash: u64) {
+        if self.table.is_empty() {
+            return;
+        }
+
+        let start = ((hash & 3) << 2) as u8;
+        let mut added = false;
+        for i in 0..4 {
+            let index = self.index_of(hash, i);
+            added |= self.increment_at(index, start + i);
+        }
+
+        if added {
+            self.size += 1;
+            if self.size >= self.sample_size {
+                self.reset();
+            }
+        }
+    }
+
+    /// Takes a table index (each entry has 16 counters) and counter index, and
+    /// increments the counter by 1 if it is not already at the maximum value
+    /// (15). Returns `true` if incremented.
+    fn increment_at(&mut self, table_index: usize, counter_index: u8) -> bool {
+        let offset = (counter_index as usize) << 2;
+        let mask = 0xF_u64 << offset;
+        if self.table[table_index] & mask != mask {
+            self.table[table_index] += 1u64 << offset;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reduces every counter by half of its original value.
+    fn reset(&mut self) {
+        let mut count = 0u32;
+        for entry in self.table.iter_mut() {
+            // Count number of odd numbers.
+            count += (*entry & ONE_MASK).count_ones();
+            *entry = (*entry >> 1) & RESET_MASK;
+        }
+        self.size = (self.size >> 1) - (count >> 2);
+    }
+
+    /// Returns the table index for the counter at the specified depth.
+    fn index_of(&self, hash: u64, depth: u8) -> usize {
+        let i = depth as usize;
+        let mut hash = hash.wrapping_add(SEED[i]).wrapping_mul(SEED[i]);
+        hash = hash.wrapping_add(hash >> 32);
+        (hash & self.table_mask) as usize
+    }
+
+    #[cfg(feature = "unstable-debug-counters")]
+    pub(crate) fn table_size(&self) -> u64 {
+        (self.table.len() * std::mem::size_of::<u64>()) as u64
+    }
+}
+
+// Methods only available for testing.
+#[cfg(test)]
+impl FrequencySketch {
+    pub(crate) fn table_len(&self) -> usize {
+        self.table.len()
+    }
+}
+
+// Some test cases were ported from Caffeine at:
+// https://github.com/ben-manes/caffeine/blob/master/caffeine/src/test/java/com/github/benmanes/caffeine/cache/FrequencySketchTest.java
+//
+// To see the debug prints, run test as `cargo test -- --nocapture`
+#[cfg(test)]
+mod tests {
+    use super::FrequencySketch;
+    use once_cell::sync::Lazy;
+    use std::hash::{BuildHasher, Hash, Hasher};
+
+    static ITEM: Lazy<u32> = Lazy::new(|| {
+        let mut buf = [0; 4];
+        getrandom::getrandom(&mut buf).unwrap();
+        u32::from_ne_bytes(buf)
+    });
+
+    // This test was ported from Caffeine.
+    #[test]
+    fn increment_once() {
+        let mut sketch = FrequencySketch::default();
+        sketch.ensure_capacity(512);
+        let hasher = hasher();
+        let item_hash = hasher(*ITEM);
+        sketch.increment(item_hash);
+        assert_eq!(sketch.frequency(item_hash), 1);
+    }
+
+    // This test was ported from Caffeine.
+    #[test]
+    fn increment_max() {
+        let mut sketch = FrequencySketch::default();
+        sketch.ensure_capacity(512);
+        let hasher = hasher();
+        let item_hash = hasher(*ITEM);
+        for _ in 0..20 {
+            sketch.increment(item_hash);
+        }
+        assert_eq!(sketch.frequency(item_hash), 15);
+    }
+
+    // This test was ported from Caffeine.
+    #[test]
+    fn increment_distinct() {
+        let mut sketch = FrequencySketch::default();
+        sketch.ensure_capacity(512);
+        let hasher = hasher();
+        sketch.increment(hasher(*ITEM));
+        sketch.increment(hasher(ITEM.wrapping_add(1)));
+        assert_eq!(sketch.frequency(hasher(*ITEM)), 1);
+        assert_eq!(sketch.frequency(hasher(ITEM.wrapping_add(1))), 1);
+        assert_eq!(sketch.frequency(hasher(ITEM.wrapping_add(2))), 0);
+    }
+
+    // This test was ported from Caffeine.
+    #[test]
+    fn index_of_around_zero() {
+        let mut sketch = FrequencySketch::default();
+        sketch.ensure_capacity(512);
+        let mut indexes = std::collections::HashSet::new();

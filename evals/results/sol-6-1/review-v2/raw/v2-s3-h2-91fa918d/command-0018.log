@@ -1,0 +1,590 @@
+use crate::SendFrame;
+
+use h2::frame::{self, Frame};
+use h2::proto::Error;
+use h2::SendError;
+
+use futures::future::poll_fn;
+use futures::{ready, Stream, StreamExt};
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+use super::assert::assert_frame_eq;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
+use std::{cmp, io, usize};
+
+/// A mock I/O
+#[derive(Debug)]
+pub struct Mock {
+    pipe: Pipe,
+}
+
+#[derive(Debug)]
+pub struct Handle {
+    codec: crate::Codec<Pipe>,
+}
+
+#[derive(Debug)]
+pub struct Pipe {
+    inner: Arc<Mutex<Inner>>,
+}
+
+#[derive(Debug)]
+struct Inner {
+    /// Data written by the test case to the h2 lib.
+    rx: Vec<u8>,
+
+    /// Notify when data is ready to be received.
+    rx_task: Option<Waker>,
+
+    /// Data written by the `h2` library to be read by the test case.
+    tx: Vec<u8>,
+
+    /// Notify when data is written. This notifies the test case waiters.
+    tx_task: Option<Waker>,
+
+    /// Number of bytes that can be written before `write` returns `Poll::Pending`.
+    tx_rem: usize,
+
+    /// Task to notify when write capacity becomes available.
+    tx_rem_task: Option<Waker>,
+
+    /// True when the pipe is closed.
+    closed: bool,
+
+    /// Trigger an `UnexpectedEof` error on read
+    unexpected_eof: bool,
+}
+
+const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Create a new mock and handle
+pub fn new() -> (Mock, Handle) {
+    new_with_write_capacity(usize::MAX)
+}
+
+/// Create a new mock and handle allowing up to `cap` bytes to be written.
+pub fn new_with_write_capacity(cap: usize) -> (Mock, Handle) {
+    let inner = Arc::new(Mutex::new(Inner {
+        rx: vec![],
+        rx_task: None,
+        tx: vec![],
+        tx_task: None,
+        tx_rem: cap,
+        tx_rem_task: None,
+        closed: false,
+        unexpected_eof: false,
+    }));
+
+    let mock = Mock {
+        pipe: Pipe {
+            inner: inner.clone(),
+        },
+    };
+
+    let handle = Handle {
+        codec: h2::Codec::new(Pipe { inner }),
+    };
+
+    (mock, handle)
+}
+
+// ===== impl Handle =====
+
+impl Handle {
+    /// Get a mutable reference to inner Codec.
+    pub fn codec_mut(&mut self) -> &mut crate::Codec<Pipe> {
+        &mut self.codec
+    }
+
+    pub fn close_without_notify(&mut self) {
+        let mut me = self.codec.get_mut().inner.lock().unwrap();
+        me.unexpected_eof = true;
+    }
+
+    /// Send a frame
+    pub async fn send(&mut self, item: SendFrame) -> Result<(), SendError> {
+        // Queue the frame
+        self.codec.buffer(item).unwrap();
+
+        // Flush the frame
+        poll_fn(|cx| {
+            let p = self.codec.flush(cx);
+            assert!(p.is_ready());
+            p
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Writes the client preface
+    pub async fn write_preface(&mut self) {
+        self.codec.get_mut().write_all(PREFACE).await.unwrap();
+    }
+
+    /// Read the client preface
+    pub async fn read_preface(&mut self) -> io::Result<()> {
+        let mut buf = vec![0u8; PREFACE.len()];
+        self.read_exact(&mut buf).await?;
+        assert_eq!(buf, PREFACE);
+        Ok(())
+    }
+
+    pub async fn recv_frame<F: Into<Frame>>(&mut self, expected: F) {
+        let frame = self.next().await.unwrap().unwrap();
+        assert_frame_eq(frame, expected);
+    }
+
+    pub async fn send_frame<F: Into<SendFrame>>(&mut self, frame: F) {
+        self.send(frame.into()).await.unwrap();
+    }
+
+    pub async fn recv_eof(&mut self) {
+        let frame = self.next().await;
+        assert!(frame.is_none());
+    }
+
+    pub async fn send_bytes(&mut self, data: &[u8]) {
+        use bytes::Buf;
+        use std::io::Cursor;
+
+        let buf: Vec<_> = data.into();
+        let mut buf = Cursor::new(buf);
+
+        poll_fn(move |cx| {
+            while buf.has_remaining() {
+                let res = Pin::new(self.codec.get_mut())
+                    .poll_write(cx, buf.chunk())
+                    .map_err(|e| panic!("write err={:?}", e));
+
+                let n = ready!(res).unwrap();
+                buf.advance(n);
+            }
+
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    /// Perform the H2 handshake
+    pub async fn assert_client_handshake(&mut self) -> frame::Settings {
+        self.assert_client_handshake_with_settings(frame::Settings::default())
+            .await
+    }
+
+    /// Perform the H2 handshake
+    pub async fn assert_client_handshake_with_settings<T>(&mut self, settings: T) -> frame::Settings
+    where
+        T: Into<frame::Settings>,
+    {
+        let settings = settings.into();
+        // Send a settings frame
+        self.send(settings.into()).await.unwrap();
+        self.read_preface().await.unwrap();
+
+        let settings = match self.next().await {
+            Some(frame) => match frame.unwrap() {
+                Frame::Settings(settings) => {
+                    // Send the ACK
+                    let ack = frame::Settings::ack();
+
+                    // TODO: Don't unwrap?
+                    self.send(ack.into()).await.unwrap();
+
+                    settings
+                }
+                frame => {
+                    panic!("unexpected frame; frame={:?}", frame);
+                }
+            },
+            None => {
+                panic!("unexpected EOF");
+            }
+        };
+
+        let frame = self.next().await.unwrap().unwrap();
+        let f = assert_settings!(frame);
+
+        // Is ACK
+        assert!(f.is_ack());
+
+        settings
+    }
+
+    /// Perform the H2 handshake
+    pub async fn assert_server_handshake(&mut self) -> frame::Settings {
+        self.assert_server_handshake_with_settings(frame::Settings::default())
+            .await
+    }
+
+    /// Perform the H2 handshake
+    pub async fn assert_server_handshake_with_settings<T>(&mut self, settings: T) -> frame::Settings
+    where
+        T: Into<frame::Settings>,
+    {
+        self.write_preface().await;
+
+        let settings = settings.into();
+        self.send(settings.into()).await.unwrap();
+
+        let frame = self.next().await.expect("unexpected EOF").unwrap();
+        let settings = assert_settings!(frame);
+
+        // Send the ACK
+        let ack = frame::Settings::ack();
+
+        // TODO: Don't unwrap?
+        self.send(ack.into()).await.unwrap();
+
+        let frame = self.next().await;
+        let f = assert_settings!(frame.unwrap().unwrap());
+
+        // Is ACK
+// ===== Build a codec from raw bytes =====
+
+#[macro_export]
+macro_rules! raw_codec {
+    (
+        $(
+            $fn:ident => [$($chunk:expr,)+];
+        )*
+    ) => {{
+        let mut b = $crate::prelude::mock_io::Builder::new();
+
+        $({
+            let mut chunk = vec![];
+
+            $(
+                $crate::raw::Chunk::push(&$chunk, &mut chunk);
+            )+
+
+            b.$fn(&chunk[..]);
+        })*
+
+        $crate::Codec::new(b.build())
+    }}
+}
+
+pub trait Chunk {
+    fn push(&self, dst: &mut Vec<u8>);
+}
+
+impl Chunk for u8 {
+    fn push(&self, dst: &mut Vec<u8>) {
+        dst.push(*self);
+    }
+}
+
+impl<'a> Chunk for &'a [u8] {
+    fn push(&self, dst: &mut Vec<u8>) {
+        dst.extend(*self)
+    }
+}
+
+impl<'a> Chunk for &'a str {
+    fn push(&self, dst: &mut Vec<u8>) {
+        dst.extend(self.as_bytes())
+    }
+}
+
+impl Chunk for Vec<u8> {
+    fn push(&self, dst: &mut Vec<u8>) {
+        dst.extend(self.iter())
+    }
+}
+tests/h2-tests/tests/codec_read.rs:17:async fn read_data_no_padding() {
+tests/h2-tests/tests/codec_read.rs:66:async fn read_data_padding() {
+tests/h2-tests/tests/flow_control.rs:1515:async fn data_padding() {
+tests/h2-tests/tests/flow_control.rs:1539:        srv.send_frame(frames::data(1, body).padded().eos()).await;
+use crate::codec::UserError;
+use crate::frame::{Reason, StreamId};
+use crate::{client, server};
+
+use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
+use crate::proto::*;
+
+use bytes::Bytes;
+use futures_core::Stream;
+use std::io;
+use std::marker::PhantomData;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::time::Duration;
+use tokio::io::AsyncRead;
+
+/// An H2 connection
+#[derive(Debug)]
+pub(crate) struct Connection<T, P, B: Buf = Bytes>
+where
+    P: Peer,
+{
+    /// Read / write frame values
+    codec: Codec<T, Prioritized<B>>,
+
+    inner: ConnectionInner<P, B>,
+}
+
+// Extracted part of `Connection` which does not depend on `T`. Reduces the amount of duplicated
+// method instantiations.
+#[derive(Debug)]
+struct ConnectionInner<P, B: Buf = Bytes>
+where
+    P: Peer,
+{
+    /// Tracks the connection level state transitions.
+    state: State,
+
+    /// An error to report back once complete.
+    ///
+    /// This exists separately from State in order to support
+    /// graceful shutdown.
+    error: Option<frame::GoAway>,
+
+    /// Pending GOAWAY frames to write.
+    go_away: GoAway,
+
+    /// Ping/pong handler
+    ping_pong: PingPong,
+
+    /// Connection settings
+    settings: Settings,
+
+    /// Stream state handler
+    streams: Streams<B, P>,
+
+    /// A `tracing` span tracking the lifetime of the connection.
+    span: tracing::Span,
+
+    /// Client or server
+    _phantom: PhantomData<P>,
+}
+
+struct DynConnection<'a, B: Buf = Bytes> {
+    state: &'a mut State,
+
+    go_away: &'a mut GoAway,
+
+    streams: DynStreams<'a, B>,
+
+    error: &'a mut Option<frame::GoAway>,
+
+    ping_pong: &'a mut PingPong,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Config {
+    pub next_stream_id: StreamId,
+    pub initial_max_send_streams: usize,
+    pub max_send_buffer_size: usize,
+    pub reset_stream_duration: Duration,
+    pub reset_stream_max: usize,
+    pub remote_reset_stream_max: usize,
+    pub local_error_reset_streams_max: Option<usize>,
+    pub settings: frame::Settings,
+}
+
+#[derive(Debug)]
+enum State {
+    /// Currently open in a sane state
+    Open,
+
+    /// The codec must be flushed
+    Closing(Reason, Initiator),
+
+    /// In a closed state
+    Closed(Reason, Initiator),
+}
+
+impl<T, P, B> Connection<T, P, B>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+    P: Peer,
+    B: Buf,
+{
+    pub fn new(codec: Codec<T, Prioritized<B>>, config: Config) -> Connection<T, P, B> {
+        fn streams_config(config: &Config) -> streams::Config {
+            streams::Config {
+                initial_max_send_streams: config.initial_max_send_streams,
+                local_max_buffer_size: config.max_send_buffer_size,
+                local_next_stream_id: config.next_stream_id,
+                local_push_enabled: config.settings.is_push_enabled().unwrap_or(true),
+                extended_connect_protocol_enabled: config
+                    .settings
+                    .is_extended_connect_protocol_enabled()
+                    .unwrap_or(false),
+                local_reset_duration: config.reset_stream_duration,
+                local_reset_max: config.reset_stream_max,
+                remote_reset_max: config.remote_reset_stream_max,
+                remote_init_window_sz: DEFAULT_INITIAL_WINDOW_SIZE,
+                remote_max_initiated: config
+                    .settings
+                    .max_concurrent_streams()
+                    .map(|max| max as usize),
+                local_max_error_reset_streams: config.local_error_reset_streams_max,
+            }
+        }
+        let streams = Streams::new(streams_config(&config));
+        Connection {
+            codec,
+            inner: ConnectionInner {
+                state: State::Open,
+                error: None,
+                go_away: GoAway::new(),
+                ping_pong: PingPong::new(),
+                settings: Settings::new(config.settings),
+                streams,
+                span: tracing::debug_span!("Connection", peer = %P::NAME),
+                _phantom: PhantomData,
+            },
+        }
+    }
+
+    /// connection flow control
+    pub(crate) fn set_target_window_size(&mut self, size: WindowSize) {
+        let _res = self.inner.streams.set_target_connection_window_size(size);
+        // TODO: proper error handling
+        debug_assert!(_res.is_ok());
+    }
+
+    /// Send a new SETTINGS frame with an updated initial window size.
+    pub(crate) fn set_initial_window_size(&mut self, size: WindowSize) -> Result<(), UserError> {
+        let mut settings = frame::Settings::default();
+        settings.set_initial_window_size(Some(size));
+        self.inner.settings.send_settings(settings)
+    }
+
+    /// Send a new SETTINGS frame with extended CONNECT protocol enabled.
+    pub(crate) fn set_enable_connect_protocol(&mut self) -> Result<(), UserError> {
+        let mut settings = frame::Settings::default();
+        settings.set_enable_connect_protocol(Some(1));
+        self.inner.settings.send_settings(settings)
+    }
+
+    /// Returns the maximum number of concurrent streams that may be initiated
+    /// by this peer.
+    pub(crate) fn max_send_streams(&self) -> usize {
+        self.inner.streams.max_send_streams()
+    }
+
+    /// Returns the maximum number of concurrent streams that may be initiated
+    /// by the remote peer.
+    pub(crate) fn max_recv_streams(&self) -> usize {
+        self.inner.streams.max_recv_streams()
+    }
+
+    #[cfg(feature = "unstable")]
+    pub fn num_wired_streams(&self) -> usize {
+        self.inner.streams.num_wired_streams()
+    }
+
+    /// Returns `Ready` when the connection is ready to receive a frame.
+    ///
+    /// Returns `Error` as this may raise errors that are caused by delayed
+    /// processing of received frames.
+    fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+        let _e = self.inner.span.enter();
+        let span = tracing::trace_span!("poll_ready");
+        let _e = span.enter();
+        // The order of these calls don't really matter too much
+        ready!(self.inner.ping_pong.send_pending_pong(cx, &mut self.codec))?;
+        ready!(self.inner.ping_pong.send_pending_ping(cx, &mut self.codec))?;
+        ready!(self
+            .inner
+            .settings
+            .poll_send(cx, &mut self.codec, &mut self.inner.streams))?;
+        ready!(self.inner.streams.send_pending_refusal(cx, &mut self.codec))?;
+
+        Poll::Ready(Ok(()))
+    }
+
+    /// Send any pending GOAWAY frames.
+    ///
+    /// This will return `Some(reason)` if the connection should be closed
+    /// afterwards. If this is a graceful shutdown, this returns `None`.
+    fn poll_go_away(&mut self, cx: &mut Context) -> Poll<Option<io::Result<Reason>>> {
+        self.inner.go_away.send_pending_go_away(cx, &mut self.codec)
+    }
+
+    pub fn go_away_from_user(&mut self, e: Reason) {
+use std::fmt;
+
+use super::Error;
+use bytes::{Buf, Bytes};
+
+/// Strip padding from the given payload.
+///
+/// It is assumed that the frame had the padded flag set. This means that the
+/// first byte is the length of the padding with that many
+/// 0 bytes expected to follow the actual payload.
+///
+/// # Returns
+///
+/// A slice of the given payload where the actual one is found and the length
+/// of the padding.
+///
+/// If the padded payload is invalid (e.g. the length of the padding is equal
+/// to the total length), returns `None`.
+pub fn strip_padding(payload: &mut Bytes) -> Result<u8, Error> {
+    let payload_len = payload.len();
+    if payload_len == 0 {
+        // If this is the case, the frame is invalid as no padding length can be
+        // extracted, even though the frame should be padded.
+        return Err(Error::TooMuchPadding);
+    }
+
+    let pad_len = payload[0] as usize;
+
+    if pad_len >= payload_len {
+        // This is invalid: the padding length MUST be less than the
+        // total frame size.
+        return Err(Error::TooMuchPadding);
+    }
+
+    payload.advance(1);
+    payload.truncate(payload_len - pad_len - 1);
+
+    Ok(pad_len as u8)
+}
+
+pub(super) fn debug_flags<'a, 'f: 'a>(
+    fmt: &'a mut fmt::Formatter<'f>,
+    bits: u8,
+) -> DebugFlags<'a, 'f> {
+    let result = write!(fmt, "({:#x}", bits);
+    DebugFlags {
+        fmt,
+        result,
+        started: false,
+    }
+}
+
+pub(super) struct DebugFlags<'a, 'f: 'a> {
+    fmt: &'a mut fmt::Formatter<'f>,
+    result: fmt::Result,
+    started: bool,
+}
+
+impl<'a, 'f: 'a> DebugFlags<'a, 'f> {
+    pub(super) fn flag_if(&mut self, enabled: bool, name: &str) -> &mut Self {
+        if enabled {
+            self.result = self.result.and_then(|()| {
+                let prefix = if self.started {
+                    " | "
+                } else {
+                    self.started = true;
+                    ": "
+                };
+
+                write!(self.fmt, "{}{}", prefix, name)
+            });
+        }
+        self
+    }
+
+    pub(super) fn finish(&mut self) -> fmt::Result {
+        self.result.and_then(|()| write!(self.fmt, ")"))
+    }
+}

@@ -1,0 +1,780 @@
+                    if error.code == TransportErrorCode::crypto(AlertDescription::CertificateRequired.into()));
+}
+
+#[test]
+fn congestion() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect();
+
+    const TARGET: u64 = 2048;
+    assert!(pair.client_conn_mut(client_ch).congestion_window() > TARGET);
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    // Send data without receiving ACKs until the congestion state falls below target
+    while pair.client_conn_mut(client_ch).congestion_window() > TARGET {
+        let n = pair.client_send(client_ch, s).write(&[42; 1024]).unwrap();
+        assert_eq!(n, 1024);
+        pair.drive_client();
+    }
+    // Ensure that the congestion state recovers after receiving the ACKs
+    pair.drive();
+    assert!(pair.client_conn_mut(client_ch).congestion_window() >= TARGET);
+    pair.client_send(client_ch, s).write(&[42; 1024]).unwrap();
+}
+
+#[test]
+fn high_latency_handshake() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.latency = Duration::from_micros(200 * 1000);
+    let (client_ch, server_ch) = pair.connect();
+    assert_eq!(pair.client_conn_mut(client_ch).bytes_in_flight(), 0);
+    assert_eq!(pair.server_conn_mut(server_ch).bytes_in_flight(), 0);
+    assert!(pair.client_conn_mut(client_ch).using_ecn());
+    assert!(pair.server_conn_mut(server_ch).using_ecn());
+}
+
+#[test]
+fn zero_rtt_happypath() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server.handle_incoming = Box::new(validate_incoming);
+    let config = client_config();
+
+    // Establish normal connection
+    let client_ch = pair.begin_connect(config.clone());
+    pair.drive();
+    pair.server.assert_accept();
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(0), [][..].into());
+    pair.drive();
+
+    pair.client.addr = SocketAddr::new(
+        Ipv6Addr::LOCALHOST.into(),
+        CLIENT_PORTS.lock().unwrap().next().unwrap(),
+    );
+    info!("resuming session");
+    let client_ch = pair.begin_connect(config);
+    assert!(pair.client_conn_mut(client_ch).has_0rtt());
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    const MSG: &[u8] = b"Hello, 0-RTT!";
+    pair.client_send(client_ch, s).write(MSG).unwrap();
+    pair.drive();
+
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::Connected)
+    );
+
+    assert!(pair.client_conn_mut(client_ch).accepted_0rtt());
+    let server_ch = pair.server.assert_accept();
+
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    // We don't currently preserve stream event order wrt. connection events
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Connected)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Stream(StreamEvent::Opened { dir: Dir::Uni }))
+    );
+
+    let mut recv = pair.server_recv(server_ch, s);
+    let mut chunks = recv.read(false).unwrap();
+    assert_matches!(
+        chunks.next(usize::MAX),
+        Ok(Some(chunk)) if chunk.offset == 0 && chunk.bytes == MSG
+    );
+    let _ = chunks.finalize();
+    assert_eq!(pair.client_conn_mut(client_ch).stats().path.lost_packets, 0);
+}
+
+#[test]
+fn zero_rtt_rejection() {
+    let _guard = subscribe();
+    let server_config = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![
+        "foo".into(),
+        "bar".into(),
+    ])));
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    let mut client_crypto = Arc::new(client_crypto_with_alpn(vec!["foo".into()]));
+    let client_config = ClientConfig::new(client_crypto.clone());
+
+    // Establish normal connection
+    let client_ch = pair.begin_connect(client_config);
+    pair.drive();
+    let server_ch = pair.server.assert_accept();
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Connected)
+    );
+    assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(0), [][..].into());
+    pair.drive();
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::ConnectionLost { .. })
+    );
+    assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
+    pair.client.connections.clear();
+    pair.server.connections.clear();
+
+    // We want to have a TLS client config with the existing session cache (so resumption could
+    // happen), but with different ALPN protocols (so that the server must reject it). Reuse
+    // the existing `ClientConfig` and change the ALPN protocols to make that happen.
+    let this = Arc::get_mut(&mut client_crypto).expect("QuicClientConfig is shared");
+    let inner = Arc::get_mut(&mut this.inner).expect("QuicClientConfig.inner is shared");
+    inner.alpn_protocols = vec!["bar".into()];
+
+    // Changing protocols invalidates 0-RTT
+    let client_config = ClientConfig::new(client_crypto);
+    info!("resuming session");
+    let client_ch = pair.begin_connect(client_config);
+    assert!(pair.client_conn_mut(client_ch).has_0rtt());
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    const MSG: &[u8] = b"Hello, 0-RTT!";
+    pair.client_send(client_ch, s).write(MSG).unwrap();
+    pair.drive();
+    assert!(!pair.client_conn_mut(client_ch).accepted_0rtt());
+    let server_ch = pair.server.assert_accept();
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Connected)
+    );
+    assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
+    let s2 = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(s, s2);
+
+    let mut recv = pair.server_recv(server_ch, s2);
+    let mut chunks = recv.read(false).unwrap();
+    assert_eq!(chunks.next(usize::MAX), Err(ReadError::Blocked));
+    let _ = chunks.finalize();
+    assert_eq!(pair.client_conn_mut(client_ch).stats().path.lost_packets, 0);
+}
+
+fn test_zero_rtt_incoming_limit<F: FnOnce(&mut ServerConfig)>(configure_server: F) {
+    // caller sets the server limit to 4000 bytes
+    // the client writes 8000 bytes
+    const CLIENT_WRITES: usize = 8000;
+use crate::Duration;
+use crate::connection::spaces::PendingAcks;
+use crate::frame::AckFrequency;
+use crate::transport_parameters::TransportParameters;
+use crate::{AckFrequencyConfig, TIMER_GRANULARITY, TransportError, VarInt};
+
+/// State associated to ACK frequency
+pub(super) struct AckFrequencyState {
+    //
+    // Sending ACK_FREQUENCY frames
+    //
+    in_flight_ack_frequency_frame: Option<(u64, Duration)>,
+    next_outgoing_sequence_number: VarInt,
+    pub(super) peer_max_ack_delay: Duration,
+
+    //
+    // Receiving ACK_FREQUENCY frames
+    //
+    last_ack_frequency_frame: Option<u64>,
+    pub(super) max_ack_delay: Duration,
+}
+
+impl AckFrequencyState {
+    pub(super) fn new(default_max_ack_delay: Duration) -> Self {
+        Self {
+            in_flight_ack_frequency_frame: None,
+            next_outgoing_sequence_number: VarInt(0),
+            peer_max_ack_delay: default_max_ack_delay,
+
+            last_ack_frequency_frame: None,
+            max_ack_delay: default_max_ack_delay,
+        }
+    }
+
+    /// Returns the `max_ack_delay` that should be requested of the peer when sending an
+    /// ACK_FREQUENCY frame
+    pub(super) fn candidate_max_ack_delay(
+        &self,
+        rtt: Duration,
+        config: &AckFrequencyConfig,
+        peer_params: &TransportParameters,
+    ) -> Duration {
+        // Use the peer's max_ack_delay if no custom max_ack_delay was provided in the config
+        let min_ack_delay =
+            Duration::from_micros(peer_params.min_ack_delay.map_or(0, |x| x.into()));
+        config
+            .max_ack_delay
+            .unwrap_or(self.peer_max_ack_delay)
+            .clamp(min_ack_delay, rtt.max(MIN_AUTOMATIC_ACK_DELAY))
+    }
+
+    /// Returns the `max_ack_delay` for the purposes of calculating the PTO
+    ///
+    /// This `max_ack_delay` is defined as the maximum of the peer's current `max_ack_delay` and all
+    /// in-flight `max_ack_delay`s (i.e. proposed values that haven't been acknowledged yet, but
+    /// might be already in use by the peer).
+    pub(super) fn max_ack_delay_for_pto(&self) -> Duration {
+        // Note: we have at most one in-flight ACK_FREQUENCY frame
+        if let Some((_, max_ack_delay)) = self.in_flight_ack_frequency_frame {
+            self.peer_max_ack_delay.max(max_ack_delay)
+        } else {
+            self.peer_max_ack_delay
+        }
+    }
+
+    /// Returns the next sequence number for an ACK_FREQUENCY frame
+    pub(super) fn next_sequence_number(&mut self) -> VarInt {
+        assert!(self.next_outgoing_sequence_number <= VarInt::MAX);
+
+        let seq = self.next_outgoing_sequence_number;
+        self.next_outgoing_sequence_number.0 += 1;
+        seq
+    }
+
+    /// Returns true if we should send an ACK_FREQUENCY frame
+    pub(super) fn should_send_ack_frequency(
+        &self,
+        rtt: Duration,
+        config: &AckFrequencyConfig,
+        peer_params: &TransportParameters,
+    ) -> bool {
+        if self.next_outgoing_sequence_number.0 == 0 {
+            // Always send at startup
+            return true;
+        }
+        let current = self
+            .in_flight_ack_frequency_frame
+            .map_or(self.peer_max_ack_delay, |(_, pending)| pending);
+        let desired = self.candidate_max_ack_delay(rtt, config, peer_params);
+        let error = (desired.as_secs_f32() / current.as_secs_f32()) - 1.0;
+        error.abs() > MAX_RTT_ERROR
+    }
+
+    /// Notifies the [`AckFrequencyState`] that a packet containing an ACK_FREQUENCY frame was sent
+    pub(super) fn ack_frequency_sent(&mut self, pn: u64, requested_max_ack_delay: Duration) {
+        self.in_flight_ack_frequency_frame = Some((pn, requested_max_ack_delay));
+    }
+
+    /// Notifies the [`AckFrequencyState`] that a packet has been ACKed
+    pub(super) fn on_acked(&mut self, pn: u64) {
+        match self.in_flight_ack_frequency_frame {
+            Some((number, requested_max_ack_delay)) if number == pn => {
+                self.in_flight_ack_frequency_frame = None;
+                self.peer_max_ack_delay = requested_max_ack_delay;
+            }
+            _ => {}
+        }
+    }
+
+    /// Notifies the [`AckFrequencyState`] that an ACK_FREQUENCY frame was received
+    ///
+    /// Updates the endpoint's params according to the payload of the ACK_FREQUENCY frame, or
+    /// returns an error in case the requested `max_ack_delay` is invalid.
+    ///
+    /// Returns `true` if the frame was processed and `false` if it was ignored because of being
+    /// stale.
+    pub(super) fn ack_frequency_received(
+        &mut self,
+        frame: &AckFrequency,
+        pending_acks: &mut PendingAcks,
+    ) -> Result<bool, TransportError> {
+        if self
+            .last_ack_frequency_frame
+            .is_some_and(|highest_sequence_nr| frame.sequence.into_inner() <= highest_sequence_nr)
+        {
+            return Ok(false);
+        }
+
+        self.last_ack_frequency_frame = Some(frame.sequence.into_inner());
+
+        // Update max_ack_delay
+        let max_ack_delay = Duration::from_micros(frame.request_max_ack_delay.into_inner());
+        if max_ack_delay < TIMER_GRANULARITY {
+            return Err(TransportError::PROTOCOL_VIOLATION(
+                "Requested Max Ack Delay in ACK_FREQUENCY frame is less than min_ack_delay",
+            ));
+        }
+        self.max_ack_delay = max_ack_delay;
+
+        // Update the rest of the params
+        pending_acks.set_ack_frequency_params(frame);
+
+        Ok(true)
+    }
+}
+
+/// Maximum proportion difference between the most recently requested max ACK delay and the
+/// currently desired one before a new request is sent, when the peer supports the ACK frequency
+/// extension and an explicit max ACK delay is not configured.
+const MAX_RTT_ERROR: f32 = 0.2;
+
+/// Minimum value to request the peer set max ACK delay to when the peer supports the ACK frequency
+/// extension and an explicit max ACK delay is not configured.
+// Keep in sync with `AckFrequencyConfig::max_ack_delay` documentation
+const MIN_AUTOMATIC_ACK_DELAY: Duration = Duration::from_millis(25);
+use std::any::Any;
+use std::sync::Arc;
+
+use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
+use crate::Instant;
+use crate::connection::RttEstimator;
+
+/// A simple, standard congestion controller
+#[derive(Debug, Clone)]
+pub struct NewReno {
+    config: Arc<NewRenoConfig>,
+    current_mtu: u64,
+    /// Maximum number of bytes in flight that may be sent.
+    window: u64,
+    /// Slow start threshold in bytes. When the congestion window is below ssthresh, the mode is
+    /// slow start and the window grows by the number of bytes acknowledged.
+    ssthresh: u64,
+    /// The time when QUIC first detects a loss, causing it to enter recovery. When a packet sent
+    /// after this time is acknowledged, QUIC exits recovery.
+    recovery_start_time: Instant,
+    /// Bytes which had been acked by the peer since leaving slow start
+    bytes_acked: u64,
+}
+
+impl NewReno {
+    /// Construct a state using the given `config` and current time `now`
+    pub fn new(config: Arc<NewRenoConfig>, now: Instant, current_mtu: u16) -> Self {
+        Self {
+            window: config.initial_window,
+            ssthresh: u64::MAX,
+            recovery_start_time: now,
+            current_mtu: current_mtu as u64,
+            config,
+            bytes_acked: 0,
+        }
+    }
+
+    fn minimum_window(&self) -> u64 {
+        2 * self.current_mtu
+    }
+}
+
+impl Controller for NewReno {
+    fn on_ack(
+        &mut self,
+        _now: Instant,
+        sent: Instant,
+        bytes: u64,
+        app_limited: bool,
+        _rtt: &RttEstimator,
+    ) {
+        if app_limited || sent <= self.recovery_start_time {
+            return;
+        }
+
+        if self.window < self.ssthresh {
+            // Slow start
+            self.window += bytes;
+
+            if self.window >= self.ssthresh {
+                // Exiting slow start
+                // Initialize `bytes_acked` for congestion avoidance. The idea
+                // here is that any bytes over `sshthresh` will already be counted
+                // towards the congestion avoidance phase - independent of when
+                // how close to `sshthresh` the `window` was when switching states,
+                // and independent of datagram sizes.
+                self.bytes_acked = self.window - self.ssthresh;
+            }
+        } else {
+            // Congestion avoidance
+            // This implementation uses the method which does not require
+            // floating point math, which also increases the window by 1 datagram
+            // for every round trip.
+            // This mechanism is called Appropriate Byte Counting in
+            // https://tools.ietf.org/html/rfc3465
+            self.bytes_acked += bytes;
+
+            if self.bytes_acked >= self.window {
+                self.bytes_acked -= self.window;
+                self.window += self.current_mtu;
+            }
+        }
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        is_persistent_congestion: bool,
+        _lost_bytes: u64,
+    ) {
+        if sent <= self.recovery_start_time {
+            return;
+        }
+
+        self.recovery_start_time = now;
+        self.window = (self.window as f32 * self.config.loss_reduction_factor) as u64;
+        self.window = self.window.max(self.minimum_window());
+        self.ssthresh = self.window;
+
+        if is_persistent_congestion {
+            self.window = self.minimum_window();
+        }
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.current_mtu = new_mtu as u64;
+        self.window = self.window.max(self.minimum_window());
+    }
+
+    fn window(&self) -> u64 {
+        self.window
+    }
+
+    fn metrics(&self) -> super::ControllerMetrics {
+        super::ControllerMetrics {
+            congestion_window: self.window(),
+            ssthresh: Some(self.ssthresh),
+            pacing_rate: None,
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.config.initial_window
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+/// Configuration for the `NewReno` congestion controller
+#[derive(Debug, Clone)]
+pub struct NewRenoConfig {
+    initial_window: u64,
+    loss_reduction_factor: f32,
+}
+
+impl NewRenoConfig {
+    /// Default limit on the amount of outstanding data in bytes.
+    ///
+    /// Recommended value: `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`
+    pub fn initial_window(&mut self, value: u64) -> &mut Self {
+        self.initial_window = value;
+        self
+    }
+
+    /// Reduction in congestion window when a new loss event is detected.
+    pub fn loss_reduction_factor(&mut self, value: f32) -> &mut Self {
+        self.loss_reduction_factor = value;
+        self
+    }
+}
+
+impl Default for NewRenoConfig {
+    fn default() -> Self {
+        Self {
+            initial_window: 14720.clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE),
+            loss_reduction_factor: 0.5,
+        }
+    }
+}
+
+impl ControllerFactory for NewRenoConfig {
+    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        Box::new(NewReno::new(self, now, current_mtu))
+    }
+}
+use std::any::Any;
+use std::cmp;
+use std::sync::Arc;
+
+use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
+use crate::connection::RttEstimator;
+use crate::{Duration, Instant};
+
+/// CUBIC Constants.
+///
+/// These are recommended value in RFC8312.
+const BETA_CUBIC: f64 = 0.7;
+
+const C: f64 = 0.4;
+
+/// CUBIC State Variables.
+///
+/// We need to keep those variables across the connection.
+/// k, w_max are described in the RFC.
+#[derive(Debug, Default, Clone)]
+pub(super) struct State {
+    k: f64,
+
+    w_max: f64,
+
+    // Store cwnd increment during congestion avoidance.
+    cwnd_inc: u64,
+}
+
+/// CUBIC Functions.
+///
+/// Note that these calculations are based on a count of cwnd as bytes,
+/// not packets.
+/// Unit of t (duration) and RTT are based on seconds (f64).
+impl State {
+    // K = cbrt(w_max * (1 - beta_cubic) / C) (Eq. 2)
+    fn cubic_k(&self, max_datagram_size: u64) -> f64 {
+        let w_max = self.w_max / max_datagram_size as f64;
+        (w_max * (1.0 - BETA_CUBIC) / C).cbrt()
+    }
+
+    // W_cubic(t) = C * (t - K)^3 - w_max (Eq. 1)
+    fn w_cubic(&self, t: Duration, max_datagram_size: u64) -> f64 {
+        let w_max = self.w_max / max_datagram_size as f64;
+
+        (C * (t.as_secs_f64() - self.k).powi(3) + w_max) * max_datagram_size as f64
+    }
+
+    // W_est(t) = w_max * beta_cubic + 3 * (1 - beta_cubic) / (1 + beta_cubic) *
+    // (t / RTT) (Eq. 4)
+    fn w_est(&self, t: Duration, rtt: Duration, max_datagram_size: u64) -> f64 {
+        let w_max = self.w_max / max_datagram_size as f64;
+        (w_max * BETA_CUBIC
+            + 3.0 * (1.0 - BETA_CUBIC) / (1.0 + BETA_CUBIC) * t.as_secs_f64() / rtt.as_secs_f64())
+            * max_datagram_size as f64
+    }
+}
+
+/// The RFC8312 congestion controller, as widely used for TCP
+#[derive(Debug, Clone)]
+pub struct Cubic {
+    config: Arc<CubicConfig>,
+    /// Maximum number of bytes in flight that may be sent.
+    window: u64,
+    /// Slow start threshold in bytes. When the congestion window is below ssthresh, the mode is
+    /// slow start and the window grows by the number of bytes acknowledged.
+    ssthresh: u64,
+    /// The time when QUIC first detects a loss, causing it to enter recovery. When a packet sent
+    /// after this time is acknowledged, QUIC exits recovery.
+    recovery_start_time: Option<Instant>,
+    cubic_state: State,
+    current_mtu: u64,
+}
+
+impl Cubic {
+    /// Construct a state using the given `config` and current time `now`
+    pub fn new(config: Arc<CubicConfig>, _now: Instant, current_mtu: u16) -> Self {
+        Self {
+            window: config.initial_window,
+            ssthresh: u64::MAX,
+            recovery_start_time: None,
+            config,
+            cubic_state: Default::default(),
+            current_mtu: current_mtu as u64,
+        }
+    }
+
+    fn minimum_window(&self) -> u64 {
+        2 * self.current_mtu
+    }
+}
+
+impl Controller for Cubic {
+    fn on_ack(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        bytes: u64,
+        app_limited: bool,
+        rtt: &RttEstimator,
+    ) {
+        if app_limited
+            || self
+                .recovery_start_time
+                .map(|recovery_start_time| sent <= recovery_start_time)
+                .unwrap_or(false)
+        {
+            return;
+        }
+
+        if self.window < self.ssthresh {
+            // Slow start
+            self.window += bytes;
+        } else {
+            // Congestion avoidance.
+            let ca_start_time;
+
+            match self.recovery_start_time {
+                Some(t) => ca_start_time = t,
+                None => {
+                    // When we come here without congestion_event() triggered,
+                    // initialize congestion_recovery_start_time, w_max and k.
+                    ca_start_time = now;
+                    self.recovery_start_time = Some(now);
+
+                    self.cubic_state.w_max = self.window as f64;
+                    self.cubic_state.k = 0.0;
+                }
+            }
+
+            let t = now - ca_start_time;
+
+            // w_cubic(t + rtt)
+            let w_cubic = self.cubic_state.w_cubic(t + rtt.get(), self.current_mtu);
+
+            // w_est(t)
+            let w_est = self.cubic_state.w_est(t, rtt.get(), self.current_mtu);
+
+            let mut cubic_cwnd = self.window;
+
+            if w_cubic < w_est {
+                // TCP friendly region.
+                cubic_cwnd = cmp::max(cubic_cwnd, w_est as u64);
+            } else if cubic_cwnd < w_cubic as u64 {
+                // Concave region or convex region use same increment.
+                let cubic_inc =
+                    (w_cubic - cubic_cwnd as f64) / cubic_cwnd as f64 * self.current_mtu as f64;
+
+                cubic_cwnd += cubic_inc as u64;
+            }
+
+            // Update the increment and increase cwnd by MSS.
+            self.cubic_state.cwnd_inc += cubic_cwnd - self.window;
+
+            // cwnd_inc can be more than 1 MSS in the late stage of max probing.
+            // however RFC9002 §7.3.3 (Congestion Avoidance) limits
+            // the increase of cwnd to 1 max_datagram_size per cwnd acknowledged.
+            if self.cubic_state.cwnd_inc >= self.current_mtu {
+                self.window += self.current_mtu;
+                self.cubic_state.cwnd_inc = 0;
+            }
+        }
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        is_persistent_congestion: bool,
+        _lost_bytes: u64,
+    ) {
+        if self
+            .recovery_start_time
+            .map(|recovery_start_time| sent <= recovery_start_time)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        self.recovery_start_time = Some(now);
+
+        // Fast convergence
+        if (self.window as f64) < self.cubic_state.w_max {
+            self.cubic_state.w_max = self.window as f64 * (1.0 + BETA_CUBIC) / 2.0;
+        } else {
+            self.cubic_state.w_max = self.window as f64;
+        }
+
+        self.ssthresh = cmp::max(
+            (self.cubic_state.w_max * BETA_CUBIC) as u64,
+            self.minimum_window(),
+        );
+        self.window = self.ssthresh;
+        self.cubic_state.k = self.cubic_state.cubic_k(self.current_mtu);
+
+        self.cubic_state.cwnd_inc = (self.cubic_state.cwnd_inc as f64 * BETA_CUBIC) as u64;
+
+        if is_persistent_congestion {
+            self.recovery_start_time = None;
+            self.cubic_state.w_max = self.window as f64;
+
+            // 4.7 Timeout - reduce ssthresh based on BETA_CUBIC
+            self.ssthresh = cmp::max(
+                (self.window as f64 * BETA_CUBIC) as u64,
+                self.minimum_window(),
+            );
+
+            self.cubic_state.cwnd_inc = 0;
+
+            self.window = self.minimum_window();
+        }
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.current_mtu = new_mtu as u64;
+        self.window = self.window.max(self.minimum_window());
+    }
+
+    fn window(&self) -> u64 {
+        self.window
+    }
+
+    fn metrics(&self) -> super::ControllerMetrics {
+        super::ControllerMetrics {
+            congestion_window: self.window(),
+            ssthresh: Some(self.ssthresh),
+            pacing_rate: None,
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.config.initial_window
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+/// Configuration for the `Cubic` congestion controller
+#[derive(Debug, Clone)]
+pub struct CubicConfig {
+    initial_window: u64,
+}
+
+impl CubicConfig {
+    /// Default limit on the amount of outstanding data in bytes.
+    ///
+    /// Recommended value: `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`
+    pub fn initial_window(&mut self, value: u64) -> &mut Self {
+        self.initial_window = value;
+        self
+    }
+}
+
+impl Default for CubicConfig {
+    fn default() -> Self {
+        Self {
+            initial_window: 14720.clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE),
+        }
+    }
+}
+
+impl ControllerFactory for CubicConfig {
+    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        Box::new(Cubic::new(self, now, current_mtu))
+    }
+}

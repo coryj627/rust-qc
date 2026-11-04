@@ -1,0 +1,731 @@
+    pub fn config(&self) -> &EndpointConfig {
+        &self.config
+    }
+
+    /// Number of connections that are currently open
+    pub fn open_connections(&self) -> usize {
+        self.connections.len()
+    }
+
+    /// Counter for the number of bytes currently used
+    /// in the buffers for Initial and 0-RTT messages for pending incoming connections
+    pub fn incoming_buffer_bytes(&self) -> u64 {
+        self.all_incoming_buffers_total_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn known_connections(&self) -> usize {
+        let x = self.connections.len();
+        debug_assert_eq!(x, self.index.connection_ids_initial.len());
+        // Not all connections have known reset tokens
+        debug_assert!(x >= self.index.connection_reset_tokens.0.len());
+        // Not all connections have unique remotes, and 0-length CIDs might not be in use.
+        debug_assert!(x >= self.index.incoming_connection_remotes.len());
+        debug_assert!(x >= self.index.outgoing_connection_remotes.len());
+        x
+    }
+
+    #[cfg(test)]
+    pub(crate) fn known_cids(&self) -> usize {
+        self.index.connection_ids.len()
+    }
+
+    /// Whether we've used up 3/4 of the available CID space
+    ///
+    /// We leave some space unused so that `new_cid` can be relied upon to finish quickly. We don't
+    /// bother to check when CID longer than 4 bytes are used because 2^40 connections is a lot.
+    fn cids_exhausted(&self) -> bool {
+        self.local_cid_generator.cid_len() <= 4
+            && self.local_cid_generator.cid_len() != 0
+            && (2usize.pow(self.local_cid_generator.cid_len() as u32 * 8)
+                - self.index.connection_ids.len())
+                < 2usize.pow(self.local_cid_generator.cid_len() as u32 * 8 - 2)
+    }
+}
+
+impl fmt::Debug for Endpoint {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("Endpoint")
+            .field("rng", &self.rng)
+            .field("index", &self.index)
+            .field("connections", &self.connections)
+            .field("config", &self.config)
+            .field("server_config", &self.server_config)
+            // incoming_buffers too large
+            .field("incoming_buffers.len", &self.incoming_buffers.len())
+            .field(
+                "all_incoming_buffers_total_bytes",
+                &self.all_incoming_buffers_total_bytes,
+            )
+            .finish()
+    }
+}
+
+/// Buffered Initial and 0-RTT messages for a pending incoming connection
+#[derive(Default)]
+struct IncomingBuffer {
+    datagrams: Vec<DatagramConnectionEvent>,
+    total_bytes: u64,
+}
+
+/// Part of protocol state incoming datagrams can be routed to
+#[derive(Copy, Clone, Debug)]
+enum RouteDatagramTo {
+    Incoming(usize),
+    Connection(ConnectionHandle),
+}
+
+/// Maps packets to existing connections
+#[derive(Default, Debug)]
+struct ConnectionIndex {
+    /// Identifies connections based on the initial DCID the peer utilized
+    ///
+    /// Uses a standard `HashMap` to protect against hash collision attacks.
+    ///
+    /// Used by the server, not the client.
+    connection_ids_initial: HashMap<ConnectionId, RouteDatagramTo>,
+    /// Identifies connections based on locally created CIDs
+    ///
+    /// Uses a cheaper hash function since keys are locally created
+    connection_ids: FxHashMap<ConnectionId, ConnectionHandle>,
+    /// Identifies incoming connections with zero-length CIDs
+    ///
+    /// Uses a standard `HashMap` to protect against hash collision attacks.
+    incoming_connection_remotes: HashMap<FourTuple, ConnectionHandle>,
+    /// Identifies outgoing connections with zero-length CIDs
+    ///
+    /// We don't yet support explicit source addresses for client connections, and zero-length CIDs
+    /// require a unique four-tuple, so at most one client connection with zero-length local CIDs
+    /// may be established per remote. We must omit the local address from the key because we don't
+    /// necessarily know what address we're sending from, and hence receiving at.
+    ///
+    /// Uses a standard `HashMap` to protect against hash collision attacks.
+    outgoing_connection_remotes: HashMap<SocketAddr, ConnectionHandle>,
+    /// Reset tokens provided by the peer for the CID each connection is currently sending to
+    ///
+    /// Incoming stateless resets do not have correct CIDs, so we need this to identify the correct
+    /// recipient, if any.
+    connection_reset_tokens: ResetTokenTable,
+}
+
+impl ConnectionIndex {
+    /// Associate an incoming connection with its initial destination CID
+    fn insert_initial_incoming(&mut self, dst_cid: ConnectionId, incoming_key: usize) {
+        if dst_cid.is_empty() {
+            return;
+        }
+        self.connection_ids_initial
+            .insert(dst_cid, RouteDatagramTo::Incoming(incoming_key));
+    }
+
+    /// Remove an association with an initial destination CID
+    fn remove_initial(&mut self, dst_cid: ConnectionId) {
+        if dst_cid.is_empty() {
+            return;
+        }
+        let removed = self.connection_ids_initial.remove(&dst_cid);
+        debug_assert!(removed.is_some());
+    }
+
+    /// Associate a connection with its initial destination CID
+    fn insert_initial(&mut self, dst_cid: ConnectionId, connection: ConnectionHandle) {
+        if dst_cid.is_empty() {
+            return;
+        }
+        self.connection_ids_initial
+            .insert(dst_cid, RouteDatagramTo::Connection(connection));
+    }
+
+    /// Associate a connection with its first locally-chosen destination CID if used, or otherwise
+    /// its current 4-tuple
+    fn insert_conn(
+    fn insert_conn(
+        &mut self,
+        addresses: FourTuple,
+        dst_cid: ConnectionId,
+        connection: ConnectionHandle,
+        side: Side,
+    ) {
+        match dst_cid.len() {
+            0 => match side {
+                Side::Server => {
+                    self.incoming_connection_remotes
+                        .insert(addresses, connection);
+                }
+                Side::Client => {
+                    self.outgoing_connection_remotes
+                        .insert(addresses.remote, connection);
+                }
+            },
+            _ => {
+                self.connection_ids.insert(dst_cid, connection);
+            }
+        }
+    }
+
+    /// Discard a connection ID
+    fn retire(&mut self, dst_cid: ConnectionId) {
+        self.connection_ids.remove(&dst_cid);
+    }
+
+    /// Remove all references to a connection
+    fn remove(&mut self, conn: &ConnectionMeta) {
+        if conn.side.is_server() {
+            self.remove_initial(conn.init_cid);
+        }
+        for cid in conn.loc_cids.values() {
+            self.connection_ids.remove(cid);
+        }
+        self.incoming_connection_remotes.remove(&conn.addresses);
+        self.outgoing_connection_remotes
+            .remove(&conn.addresses.remote);
+        if let Some((remote, token)) = conn.reset_token {
+            self.connection_reset_tokens.remove(remote, token);
+        }
+    }
+
+    /// Find the existing connection that `datagram` should be routed to, if any
+    fn get(&self, addresses: &FourTuple, datagram: &PartialDecode) -> Option<RouteDatagramTo> {
+        if !datagram.dst_cid().is_empty() {
+            if let Some(&ch) = self.connection_ids.get(datagram.dst_cid()) {
+                return Some(RouteDatagramTo::Connection(ch));
+            }
+        }
+        if datagram.is_initial() || datagram.is_0rtt() {
+            if let Some(&ch) = self.connection_ids_initial.get(datagram.dst_cid()) {
+                return Some(ch);
+            }
+        }
+        if datagram.dst_cid().is_empty() {
+            if let Some(&ch) = self.incoming_connection_remotes.get(addresses) {
+                return Some(RouteDatagramTo::Connection(ch));
+            }
+            if let Some(&ch) = self.outgoing_connection_remotes.get(&addresses.remote) {
+                return Some(RouteDatagramTo::Connection(ch));
+            }
+        }
+        let data = datagram.data();
+        if data.len() < RESET_TOKEN_SIZE {
+            return None;
+        }
+        self.connection_reset_tokens
+            .get(addresses.remote, &data[data.len() - RESET_TOKEN_SIZE..])
+            .cloned()
+            .map(RouteDatagramTo::Connection)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ConnectionMeta {
+    init_cid: ConnectionId,
+    /// Number of local connection IDs that have been issued in NEW_CONNECTION_ID frames.
+    cids_issued: u64,
+    loc_cids: FxHashMap<u64, ConnectionId>,
+    /// Remote/local addresses the connection began with
+    ///
+    /// Only needed to support connections with zero-length CIDs, which cannot migrate, so we don't
+    /// bother keeping it up to date.
+    addresses: FourTuple,
+    side: Side,
+    /// Reset token provided by the peer for the CID we're currently sending to, and the address
+    /// being sent to
+    reset_token: Option<(SocketAddr, ResetToken)>,
+}
+
+/// Internal identifier for a `Connection` currently associated with an endpoint
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct ConnectionHandle(pub usize);
+    }
+}
+
+/// Errors in the parameters being used to create a new connection
+///
+/// These arise before any I/O has been performed.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ConnectError {
+    /// The endpoint can no longer create new connections
+    ///
+    /// Indicates that a necessary component of the endpoint has been dropped or otherwise disabled.
+    #[error("endpoint stopping")]
+    EndpointStopping,
+    /// The connection could not be created because not enough of the CID space is available
+    ///
+    /// Try using longer connection IDs
+    #[error("CIDs exhausted")]
+    CidsExhausted,
+    /// The given server name was malformed
+    #[error("invalid server name: {0}")]
+    InvalidServerName(String),
+    /// The remote [`SocketAddr`] supplied was malformed
+    ///
+    /// Examples include attempting to connect to port 0, or using an inappropriate address family.
+    #[error("invalid remote address: {0}")]
+    InvalidRemoteAddress(SocketAddr),
+    /// No default client configuration was set up
+    ///
+    /// Use `Endpoint::connect_with` to specify a client configuration.
+    #[error("no default client config")]
+    NoDefaultClientConfig,
+    /// The local endpoint does not support the QUIC version specified in the client configuration
+    #[error("unsupported QUIC version")]
+    UnsupportedVersion,
+}
+
+/// Error type for attempting to accept an [`Incoming`]
+#[derive(Debug)]
+pub struct AcceptError {
+    /// Underlying error describing reason for failure
+//! QUIC connection transport parameters
+//!
+//! The `TransportParameters` type is used to represent the transport parameters
+//! negotiated by peers while establishing a QUIC connection. This process
+//! happens as part of the establishment of the TLS session. As such, the types
+//! contained in this modules should generally only be referred to by custom
+//! implementations of the `crypto::Session` trait.
+
+use std::{
+    convert::TryFrom,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
+};
+
+use bytes::{Buf, BufMut};
+use rand::{Rng as _, RngCore, seq::SliceRandom as _};
+use thiserror::Error;
+
+use crate::{
+    LOC_CID_COUNT, MAX_CID_SIZE, MAX_STREAM_COUNT, RESET_TOKEN_SIZE, ResetToken, Side,
+    TIMER_GRANULARITY, TransportError, VarInt,
+    cid_generator::ConnectionIdGenerator,
+    cid_queue::CidQueue,
+    coding::{BufExt, BufMutExt, UnexpectedEnd},
+    config::{EndpointConfig, ServerConfig, TransportConfig},
+    shared::ConnectionId,
+};
+
+// Apply a given macro to a list of all the transport parameters having integer types, along with
+// their codes and default values. Using this helps us avoid error-prone duplication of the
+// contained information across decoding, encoding, and the `Default` impl. Whenever we want to do
+// something with transport parameters, we'll handle the bulk of cases by writing a macro that
+// takes a list of arguments in this form, then passing it to this macro.
+macro_rules! apply_params {
+    ($macro:ident) => {
+        $macro! {
+            // #[doc] name (id) = default,
+            /// Milliseconds, disabled if zero
+            max_idle_timeout(MaxIdleTimeout) = 0,
+            /// Limits the size of UDP payloads that the endpoint is willing to receive
+            max_udp_payload_size(MaxUdpPayloadSize) = 65527,
+
+            /// Initial value for the maximum amount of data that can be sent on the connection
+            initial_max_data(InitialMaxData) = 0,
+            /// Initial flow control limit for locally-initiated bidirectional streams
+            initial_max_stream_data_bidi_local(InitialMaxStreamDataBidiLocal) = 0,
+            /// Initial flow control limit for peer-initiated bidirectional streams
+            initial_max_stream_data_bidi_remote(InitialMaxStreamDataBidiRemote) = 0,
+            /// Initial flow control limit for unidirectional streams
+            initial_max_stream_data_uni(InitialMaxStreamDataUni) = 0,
+
+            /// Initial maximum number of bidirectional streams the peer may initiate
+            initial_max_streams_bidi(InitialMaxStreamsBidi) = 0,
+            /// Initial maximum number of unidirectional streams the peer may initiate
+            initial_max_streams_uni(InitialMaxStreamsUni) = 0,
+
+            /// Exponent used to decode the ACK Delay field in the ACK frame
+            ack_delay_exponent(AckDelayExponent) = 3,
+            /// Maximum amount of time in milliseconds by which the endpoint will delay sending
+            /// acknowledgments
+            max_ack_delay(MaxAckDelay) = 25,
+            /// Maximum number of connection IDs from the peer that an endpoint is willing to store
+            active_connection_id_limit(ActiveConnectionIdLimit) = 2,
+        }
+    };
+}
+
+macro_rules! make_struct {
+    {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
+        /// Transport parameters used to negotiate connection-level preferences between peers
+        #[derive(Debug, Copy, Clone, Eq, PartialEq)]
+        pub struct TransportParameters {
+            $($(#[$doc])* pub(crate) $name : VarInt,)*
+
+            /// Does the endpoint support active connection migration
+            pub(crate) disable_active_migration: bool,
+            /// Maximum size for datagram frames
+            pub(crate) max_datagram_frame_size: Option<VarInt>,
+            /// The value that the endpoint included in the Source Connection ID field of the first
+            /// Initial packet it sends for the connection
+            pub(crate) initial_src_cid: Option<ConnectionId>,
+            /// The endpoint is willing to receive QUIC packets containing any value for the fixed
+            /// bit
+            pub(crate) grease_quic_bit: bool,
+
+            /// Minimum amount of time in microseconds by which the endpoint is able to delay
+            /// sending acknowledgments
+            ///
+            /// If a value is provided, it implies that the endpoint supports QUIC Acknowledgement
+            /// Frequency
+            pub(crate) min_ack_delay: Option<VarInt>,
+
+            // Server-only
+            /// The value of the Destination Connection ID field from the first Initial packet sent
+            /// by the client
+            pub(crate) original_dst_cid: Option<ConnectionId>,
+            /// The value that the server included in the Source Connection ID field of a Retry
+            /// packet
+            pub(crate) retry_src_cid: Option<ConnectionId>,
+            /// Token used by the client to verify a stateless reset from the server
+            pub(crate) stateless_reset_token: Option<ResetToken>,
+            /// The server's preferred address for communication after handshake completion
+            pub(crate) preferred_address: Option<PreferredAddress>,
+            /// The randomly generated reserved transport parameter to sustain future extensibility
+            /// of transport parameter extensions.
+            /// When present, it is included during serialization but ignored during deserialization.
+            pub(crate) grease_transport_parameter: Option<ReservedTransportParameter>,
+
+            /// Defines the order in which transport parameters are serialized.
+            ///
+            /// This field is initialized only for outgoing `TransportParameters` instances and
+            /// is set to `None` for `TransportParameters` received from a peer.
+            pub(crate) write_order: Option<[u8; TransportParameterId::SUPPORTED.len()]>,
+        }
+
+        // We deliberately don't implement the `Default` trait, since that would be public, and
+        // downstream crates should never construct `TransportParameters` except by decoding those
+        // supplied by a peer.
+        impl TransportParameters {
+            /// Standard defaults, used if the peer does not supply a given parameter.
+            pub(crate) fn default() -> Self {
+                Self {
+                    $($name: VarInt::from_u32($default),)*
+
+                    disable_active_migration: false,
+                    max_datagram_frame_size: None,
+                    initial_src_cid: None,
+                    grease_quic_bit: false,
+                    min_ack_delay: None,
+
+                    original_dst_cid: None,
+                    retry_src_cid: None,
+                    stateless_reset_token: None,
+                    preferred_address: None,
+                    grease_transport_parameter: None,
+                    write_order: None,
+                }
+            }
+        }
+    }
+}
+
+apply_params!(make_struct);
+
+impl TransportParameters {
+    pub(crate) fn new(
+        config: &TransportConfig,
+        endpoint_config: &EndpointConfig,
+        cid_gen: &dyn ConnectionIdGenerator,
+        initial_src_cid: ConnectionId,
+        server_config: Option<&ServerConfig>,
+        rng: &mut impl RngCore,
+    ) -> Self {
+        Self {
+            initial_src_cid: Some(initial_src_cid),
+            initial_max_streams_bidi: config.max_concurrent_bidi_streams,
+            initial_max_streams_uni: config.max_concurrent_uni_streams,
+            initial_max_data: config.receive_window,
+            initial_max_stream_data_bidi_local: config.stream_receive_window,
+            initial_max_stream_data_bidi_remote: config.stream_receive_window,
+            initial_max_stream_data_uni: config.stream_receive_window,
+            max_udp_payload_size: endpoint_config.max_udp_payload_size,
+            max_idle_timeout: config.max_idle_timeout.unwrap_or(VarInt(0)),
+            disable_active_migration: server_config.is_some_and(|c| !c.migration),
+            active_connection_id_limit: if cid_gen.cid_len() == 0 {
+                2 // i.e. default, i.e. unsent
+            } else {
+                CidQueue::LEN as u32
+            }
+            .into(),
+            max_datagram_frame_size: config
+                .datagram_receive_buffer_size
+                .map(|x| (x.min(u16::MAX.into()) as u16).into()),
+            grease_quic_bit: endpoint_config.grease_quic_bit,
+            min_ack_delay: Some(
+                VarInt::from_u64(u64::try_from(TIMER_GRANULARITY.as_micros()).unwrap()).unwrap(),
+            ),
+            grease_transport_parameter: Some(ReservedTransportParameter::random(rng)),
+            write_order: Some({
+                let mut order = std::array::from_fn(|i| i as u8);
+                order.shuffle(rng);
+                order
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// Check that these parameters are legal when resuming from
+    /// certain cached parameters
+    pub(crate) fn validate_resumption_from(&self, cached: &Self) -> Result<(), TransportError> {
+        if cached.active_connection_id_limit > self.active_connection_id_limit
+            || cached.initial_max_data > self.initial_max_data
+            || cached.initial_max_stream_data_bidi_local > self.initial_max_stream_data_bidi_local
+            || cached.initial_max_stream_data_bidi_remote > self.initial_max_stream_data_bidi_remote
+            || cached.initial_max_stream_data_uni > self.initial_max_stream_data_uni
+            || cached.initial_max_streams_bidi > self.initial_max_streams_bidi
+            || cached.initial_max_streams_uni > self.initial_max_streams_uni
+            || cached.max_datagram_frame_size > self.max_datagram_frame_size
+            || cached.grease_quic_bit && !self.grease_quic_bit
+        {
+            return Err(TransportError::PROTOCOL_VIOLATION(
+                "0-RTT accepted with incompatible transport parameters",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Maximum number of CIDs to issue to this peer
+    ///
+    /// Consider both a) the active_connection_id_limit from the other end; and
+    /// b) LOC_CID_COUNT used locally
+    pub(crate) fn issue_cids_limit(&self) -> u64 {
+        self.active_connection_id_limit.0.min(LOC_CID_COUNT)
+    }
+}
+
+/// A server's preferred address
+///
+/// This is communicated as a transport parameter during TLS session establishment.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) struct PreferredAddress {
+    pub(crate) address_v4: Option<SocketAddrV4>,
+    pub(crate) address_v6: Option<SocketAddrV6>,
+    pub(crate) connection_id: ConnectionId,
+    pub(crate) stateless_reset_token: ResetToken,
+}
+
+impl PreferredAddress {
+    fn wire_size(&self) -> u16 {
+        4 + 2 + 16 + 2 + 1 + self.connection_id.len() as u16 + 16
+    }
+
+    fn write<W: BufMut>(&self, w: &mut W) {
+        w.write(self.address_v4.map_or(Ipv4Addr::UNSPECIFIED, |x| *x.ip()));
+        w.write::<u16>(self.address_v4.map_or(0, |x| x.port()));
+        w.write(self.address_v6.map_or(Ipv6Addr::UNSPECIFIED, |x| *x.ip()));
+        w.write::<u16>(self.address_v6.map_or(0, |x| x.port()));
+        w.write::<u8>(self.connection_id.len() as u8);
+        w.put_slice(&self.connection_id);
+        w.put_slice(&self.stateless_reset_token);
+    }
+
+    fn read<R: Buf>(r: &mut R) -> Result<Self, Error> {
+        let ip_v4 = r.get::<Ipv4Addr>()?;
+        let port_v4 = r.get::<u16>()?;
+        let ip_v6 = r.get::<Ipv6Addr>()?;
+        let port_v6 = r.get::<u16>()?;
+        let cid_len = r.get::<u8>()?;
+        if r.remaining() < cid_len as usize || cid_len > MAX_CID_SIZE as u8 {
+            return Err(Error::Malformed);
+        }
+        let mut stage = [0; MAX_CID_SIZE];
+        r.copy_to_slice(&mut stage[0..cid_len as usize]);
+        let cid = ConnectionId::new(&stage[0..cid_len as usize]);
+        if r.remaining() < 16 {
+            return Err(Error::Malformed);
+        }
+        let mut token = [0; RESET_TOKEN_SIZE];
+        r.copy_to_slice(&mut token);
+        let address_v4 = if ip_v4.is_unspecified() && port_v4 == 0 {
+            None
+        } else {
+            Some(SocketAddrV4::new(ip_v4, port_v4))
+        };
+        let address_v6 = if ip_v6.is_unspecified() && port_v6 == 0 {
+            None
+        } else {
+            Some(SocketAddrV6::new(ip_v6, port_v6, 0, 0))
+        };
+        if address_v4.is_none() && address_v6.is_none() {
+            return Err(Error::IllegalValue);
+        }
+        Ok(Self {
+            address_v4,
+            address_v6,
+            connection_id: cid,
+            stateless_reset_token: token.into(),
+        })
+    }
+}
+
+//! Connection statistics
+
+use crate::{Dir, Duration, frame::Frame};
+
+/// Statistics about UDP datagrams transmitted or received on a connection
+///
+/// All QUIC packets are carried by UDP datagrams. Hence, these statistics cover all traffic on a connection.
+#[derive(Default, Debug, Copy, Clone)]
+#[non_exhaustive]
+pub struct UdpStats {
+    /// The amount of UDP datagrams observed
+    pub datagrams: u64,
+    /// The total amount of bytes which have been transferred inside UDP datagrams
+    pub bytes: u64,
+    /// The amount of I/O operations executed
+    ///
+    /// Can be less than `datagrams` when GSO, GRO, and/or batched system calls are in use.
+    pub ios: u64,
+}
+
+impl UdpStats {
+    pub(crate) fn on_sent(&mut self, datagrams: u64, bytes: usize) {
+        self.datagrams += datagrams;
+        self.bytes += bytes as u64;
+        self.ios += 1;
+    }
+}
+
+/// Number of frames transmitted or received of each frame type
+#[derive(Default, Copy, Clone)]
+#[non_exhaustive]
+#[allow(missing_docs)]
+pub struct FrameStats {
+    pub acks: u64,
+    pub ack_frequency: u64,
+    pub crypto: u64,
+    pub connection_close: u64,
+    pub data_blocked: u64,
+    pub datagram: u64,
+    pub handshake_done: u8,
+    pub immediate_ack: u64,
+    pub max_data: u64,
+    pub max_stream_data: u64,
+    pub max_streams_bidi: u64,
+    pub max_streams_uni: u64,
+    pub new_connection_id: u64,
+    pub new_token: u64,
+    pub path_challenge: u64,
+    pub path_response: u64,
+    pub ping: u64,
+    pub reset_stream: u64,
+    pub retire_connection_id: u64,
+    pub stream_data_blocked: u64,
+    pub streams_blocked_bidi: u64,
+    pub streams_blocked_uni: u64,
+    pub stop_sending: u64,
+    pub stream: u64,
+}
+
+impl FrameStats {
+    pub(crate) fn record(&mut self, frame: &Frame) {
+        match frame {
+            Frame::Padding => {}
+            Frame::Ping => self.ping += 1,
+            Frame::Ack(_) => self.acks += 1,
+            Frame::ResetStream(_) => self.reset_stream += 1,
+            Frame::StopSending(_) => self.stop_sending += 1,
+            Frame::Crypto(_) => self.crypto += 1,
+            Frame::Datagram(_) => self.datagram += 1,
+            Frame::NewToken(_) => self.new_token += 1,
+            Frame::MaxData(_) => self.max_data += 1,
+            Frame::MaxStreamData { .. } => self.max_stream_data += 1,
+            Frame::MaxStreams { dir, .. } => {
+                if *dir == Dir::Bi {
+                    self.max_streams_bidi += 1;
+                } else {
+                    self.max_streams_uni += 1;
+                }
+            }
+            Frame::DataBlocked { .. } => self.data_blocked += 1,
+            Frame::Stream(_) => self.stream += 1,
+            Frame::StreamDataBlocked { .. } => self.stream_data_blocked += 1,
+            Frame::StreamsBlocked { dir, .. } => {
+                if *dir == Dir::Bi {
+                    self.streams_blocked_bidi += 1;
+                } else {
+                    self.streams_blocked_uni += 1;
+                }
+            }
+            Frame::NewConnectionId(_) => self.new_connection_id += 1,
+            Frame::RetireConnectionId { .. } => self.retire_connection_id += 1,
+            Frame::PathChallenge(_) => self.path_challenge += 1,
+            Frame::PathResponse(_) => self.path_response += 1,
+            Frame::Close(_) => self.connection_close += 1,
+            Frame::AckFrequency(_) => self.ack_frequency += 1,
+            Frame::ImmediateAck => self.immediate_ack += 1,
+            Frame::HandshakeDone => self.handshake_done = self.handshake_done.saturating_add(1),
+        }
+    }
+}
+
+impl std::fmt::Debug for FrameStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrameStats")
+            .field("ACK", &self.acks)
+            .field("ACK_FREQUENCY", &self.ack_frequency)
+            .field("CONNECTION_CLOSE", &self.connection_close)
+            .field("CRYPTO", &self.crypto)
+            .field("DATA_BLOCKED", &self.data_blocked)
+            .field("DATAGRAM", &self.datagram)
+            .field("HANDSHAKE_DONE", &self.handshake_done)
+            .field("IMMEDIATE_ACK", &self.immediate_ack)
+            .field("MAX_DATA", &self.max_data)
+            .field("MAX_STREAM_DATA", &self.max_stream_data)
+            .field("MAX_STREAMS_BIDI", &self.max_streams_bidi)
+            .field("MAX_STREAMS_UNI", &self.max_streams_uni)
+            .field("NEW_CONNECTION_ID", &self.new_connection_id)
+            .field("NEW_TOKEN", &self.new_token)
+            .field("PATH_CHALLENGE", &self.path_challenge)
+            .field("PATH_RESPONSE", &self.path_response)
+            .field("PING", &self.ping)
+            .field("RESET_STREAM", &self.reset_stream)
+            .field("RETIRE_CONNECTION_ID", &self.retire_connection_id)
+            .field("STREAM_DATA_BLOCKED", &self.stream_data_blocked)
+            .field("STREAMS_BLOCKED_BIDI", &self.streams_blocked_bidi)
+            .field("STREAMS_BLOCKED_UNI", &self.streams_blocked_uni)
+            .field("STOP_SENDING", &self.stop_sending)
+            .field("STREAM", &self.stream)
+            .finish()
+    }
+}
+
+/// Statistics related to a transmission path
+#[derive(Debug, Default, Copy, Clone)]
+#[non_exhaustive]
+pub struct PathStats {
+    /// Current best estimate of this connection's latency (round-trip-time)
+    pub rtt: Duration,
+    /// Current congestion window of the connection
+    pub cwnd: u64,
+    /// Congestion events on the connection
+    pub congestion_events: u64,
+    /// The amount of packets lost on this path
+    pub lost_packets: u64,
+    /// The amount of bytes lost on this path
+    pub lost_bytes: u64,
+    /// The amount of packets sent on this path
+    pub sent_packets: u64,
+    /// The amount of PLPMTUD probe packets sent on this path (also counted by `sent_packets`)
+    pub sent_plpmtud_probes: u64,
+    /// The amount of PLPMTUD probe packets lost on this path (ignored by `lost_packets` and
+    /// `lost_bytes`)
+    pub lost_plpmtud_probes: u64,
+    /// The number of times a black hole was detected in the path
+    pub black_holes_detected: u64,
+    /// Largest UDP payload size the path currently supports
+    pub current_mtu: u16,
+}
+
+/// Connection statistics
+#[derive(Debug, Default, Copy, Clone)]
+#[non_exhaustive]
+pub struct ConnectionStats {
+    /// Statistics about UDP datagrams transmitted on a connection
+    pub udp_tx: UdpStats,
+    /// Statistics about UDP datagrams received on a connection
+    pub udp_rx: UdpStats,
+    /// Statistics about frames transmitted on a connection
+    pub frame_tx: FrameStats,
+    /// Statistics about frames received on a connection
+    pub frame_rx: FrameStats,
+    /// Statistics related to the current transmission path
+    pub path: PathStats,
+}

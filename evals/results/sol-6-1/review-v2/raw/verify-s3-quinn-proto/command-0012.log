@@ -1,0 +1,662 @@
+    pub(super) endpoint: Endpoint,
+    pub(super) addr: SocketAddr,
+    socket: Option<UdpSocket>,
+    timeout: Option<Instant>,
+    pub(super) outbound: VecDeque<(Transmit, Bytes)>,
+    delayed: VecDeque<(Transmit, Bytes)>,
+    pub(super) inbound: VecDeque<(Instant, Option<EcnCodepoint>, BytesMut)>,
+    accepted: Option<Result<ConnectionHandle, ConnectionError>>,
+    pub(super) connections: HashMap<ConnectionHandle, Connection>,
+    conn_events: HashMap<ConnectionHandle, VecDeque<ConnectionEvent>>,
+    pub(super) captured_packets: Vec<Vec<u8>>,
+    pub(super) capture_inbound_packets: bool,
+    pub(super) handle_incoming: Box<dyn FnMut(&Incoming) -> IncomingConnectionBehavior>,
+    pub(super) waiting_incoming: Vec<Incoming>,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub(super) enum IncomingConnectionBehavior {
+    Accept,
+    Reject,
+    Retry,
+    Wait,
+}
+
+pub(super) fn validate_incoming(incoming: &Incoming) -> IncomingConnectionBehavior {
+    if incoming.remote_address_validated() {
+        IncomingConnectionBehavior::Accept
+    } else {
+        IncomingConnectionBehavior::Retry
+    }
+}
+
+impl TestEndpoint {
+    fn new(endpoint: Endpoint, addr: SocketAddr) -> Self {
+        let socket = if env::var_os("SSLKEYLOGFILE").is_some() {
+            let socket = UdpSocket::bind(addr).expect("failed to bind UDP socket");
+            socket
+                .set_read_timeout(Some(Duration::from_millis(10)))
+                .unwrap();
+            Some(socket)
+        } else {
+            None
+        };
+        Self {
+            endpoint,
+            addr,
+            socket,
+            timeout: None,
+            outbound: VecDeque::new(),
+            delayed: VecDeque::new(),
+            inbound: VecDeque::new(),
+            accepted: None,
+            connections: HashMap::default(),
+            conn_events: HashMap::default(),
+            captured_packets: Vec::new(),
+            capture_inbound_packets: false,
+            handle_incoming: Box::new(|_| IncomingConnectionBehavior::Accept),
+            waiting_incoming: Vec::new(),
+        }
+    }
+
+    pub(super) fn drive(&mut self, now: Instant, remote: SocketAddr) {
+        self.drive_incoming(now, remote);
+        self.drive_outgoing(now);
+    }
+
+    pub(super) fn drive_incoming(&mut self, now: Instant, remote: SocketAddr) {
+        if let Some(ref socket) = self.socket {
+            loop {
+                let mut buf = [0; 8192];
+                if socket.recv_from(&mut buf).is_err() {
+                    break;
+                }
+            }
+        }
+        let buffer_size = self.endpoint.config().get_max_udp_payload_size() as usize;
+        let mut buf = Vec::with_capacity(buffer_size);
+
+        while self.inbound.front().is_some_and(|x| x.0 <= now) {
+            let (recv_time, ecn, packet) = self.inbound.pop_front().unwrap();
+            if let Some(event) = self
+                .endpoint
+                .handle(recv_time, remote, None, ecn, packet, &mut buf)
+            {
+                match event {
+                    DatagramEvent::NewConnection(incoming) => {
+                        match (self.handle_incoming)(&incoming) {
+                            IncomingConnectionBehavior::Accept => {
+                                let _ = self.try_accept(incoming, now);
+                            }
+                            IncomingConnectionBehavior::Reject => {
+                                self.reject(incoming);
+                            }
+                            IncomingConnectionBehavior::Retry => {
+                                self.retry(incoming);
+                            }
+                            IncomingConnectionBehavior::Wait => {
+                                self.waiting_incoming.push(incoming);
+                            }
+                        }
+                    }
+                    DatagramEvent::ConnectionEvent(ch, event) => {
+                        if self.capture_inbound_packets {
+                            let packet = self.connections[&ch].decode_packet(&event);
+                            self.captured_packets.extend(packet);
+                        }
+
+                        self.conn_events.entry(ch).or_default().push_back(event);
+                    }
+                    DatagramEvent::Response(transmit) => {
+                        let size = transmit.size;
+                        self.outbound.extend(split_transmit(transmit, &buf[..size]));
+                        buf.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn drive_outgoing(&mut self, now: Instant) {
+        let buffer_size = self.endpoint.config().get_max_udp_payload_size() as usize;
+        let mut buf = Vec::with_capacity(buffer_size);
+
+        assert!(self.delayed.is_empty());
+        mem::swap(&mut self.delayed, &mut self.outbound);
+    }
+
+    pub(super) fn finish_delay(&mut self) {
+        self.outbound.extend(self.delayed.drain(..));
+    }
+
+    pub(super) fn try_accept(
+        &mut self,
+        incoming: Incoming,
+        now: Instant,
+    ) -> Result<ConnectionHandle, ConnectionError> {
+        let mut buf = Vec::new();
+        match self.endpoint.accept(incoming, now, &mut buf, None) {
+            Ok((ch, conn)) => {
+                self.connections.insert(ch, conn);
+                self.accepted = Some(Ok(ch));
+                Ok(ch)
+            }
+            Err(error) => {
+                if let Some(transmit) = error.response {
+                    let size = transmit.size;
+                    self.outbound.extend(split_transmit(transmit, &buf[..size]));
+                }
+                self.accepted = Some(Err(error.cause.clone()));
+                Err(error.cause)
+            }
+        }
+    }
+
+    let client_stats = pair.client_conn_mut(client_ch).stats();
+    let server_stats = pair.server_conn_mut(server_ch).stats();
+
+    // Sanity check (all MTU probes should have been lost)
+    assert_eq!(client_stats.path.sent_plpmtud_probes, 9);
+    assert_eq!(client_stats.path.lost_plpmtud_probes, 9);
+    assert_eq!(server_stats.path.sent_plpmtud_probes, 9);
+    assert_eq!(server_stats.path.lost_plpmtud_probes, 9);
+
+    // No congestion events
+    assert_eq!(client_stats.path.congestion_events, 0);
+    assert_eq!(server_stats.path.congestion_events, 0);
+}
+
+#[test]
+fn connect_detects_mtu() {
+    let _guard = subscribe();
+    let max_udp_payload_and_expected_mtu = &[(1200, 1200), (1400, 1389), (1500, 1452)];
+
+    for &(pair_max_udp, expected_mtu) in max_udp_payload_and_expected_mtu {
+        let mut pair = Pair::default();
+        pair.mtu = pair_max_udp;
+        let (client_ch, server_ch) = pair.connect();
+        pair.drive();
+
+        assert_eq!(pair.client_conn_mut(client_ch).path_mtu(), expected_mtu);
+        assert_eq!(pair.server_conn_mut(server_ch).path_mtu(), expected_mtu);
+    }
+}
+
+#[test]
+fn migrate_detects_new_mtu_and_respects_original_peer_max_udp_payload_size() {
+    let _guard = subscribe();
+
+    let client_max_udp_payload_size: u16 = 1400;
+
+    // Set up a client with a max payload size of 1400 (and use the defaults for the server)
+    let server_endpoint_config = EndpointConfig::default();
+    let server = Endpoint::new(
+        Arc::new(server_endpoint_config),
+        Some(Arc::new(server_config())),
+        true,
+        None,
+    );
+    let client_endpoint_config = EndpointConfig {
+        max_udp_payload_size: VarInt::from(client_max_udp_payload_size),
+        ..EndpointConfig::default()
+    };
+    let client = Endpoint::new(Arc::new(client_endpoint_config), None, true, None);
+    let mut pair = Pair::new_from_endpoint(client, server);
+    pair.mtu = 1300;
+
+    // Connect
+    let (client_ch, server_ch) = pair.connect();
+    pair.drive();
+
+    // Sanity check: MTUD ran to completion (the numbers differ because binary search stops when
+    // changes are smaller than 20, otherwise both endpoints would converge at the same MTU of 1300)
+    assert_eq!(pair.client_conn_mut(client_ch).path_mtu(), 1293);
+    assert_eq!(pair.server_conn_mut(server_ch).path_mtu(), 1300);
+
+    // Migrate client to a different port (and simulate a higher path MTU)
+    pair.mtu = 1500;
+    pair.client.addr = SocketAddr::new(
+        Ipv4Addr::new(127, 0, 0, 1).into(),
+        CLIENT_PORTS.lock().unwrap().next().unwrap(),
+    );
+    pair.client_conn_mut(client_ch).ping();
+    pair.drive();
+
+    // Sanity check: the server saw that the client address was updated
+    assert_eq!(
+        pair.server_conn_mut(server_ch).remote_address(),
+        pair.client.addr
+    );
+
+    // MTU detection has successfully run after migrating
+    assert_eq!(
+        pair.server_conn_mut(server_ch).path_mtu(),
+        client_max_udp_payload_size
+    );
+
+    // Sanity check: the client keeps the old MTU, because migration is triggered by incoming
+    // packets from a different address
+    assert_eq!(pair.client_conn_mut(client_ch).path_mtu(), 1293);
+}
+
+#[test]
+fn connect_runs_mtud_again_after_600_seconds() {
+    let _guard = subscribe();
+    let mut server_config = server_config();
+    let mut client_config = client_config();
+
+    // Note: we use an infinite idle timeout to ensure we can wait 600 seconds without the
+    // connection closing
+    Arc::get_mut(&mut server_config.transport)
+        .unwrap()
+        .max_idle_timeout(None);
+    Arc::get_mut(&mut client_config.transport)
+        .unwrap()
+        .max_idle_timeout(None);
+        assert!(!mtud.black_hole_detected(Instant::now()));
+        assert_eq!(mtud.black_hole_detector.largest_non_probe_lost(), None);
+        assert_eq!(mtud.black_hole_detector.suspicious_loss_burst_count(), 1);
+    }
+
+    #[test]
+    fn black_hole_detector_ignores_empty_burst() {
+        let mut mtud = default_mtud();
+        assert!(!mtud.black_hole_detected(Instant::now()));
+        assert_eq!(mtud.black_hole_detector.suspicious_loss_burst_count(), 0);
+    }
+
+    #[test]
+    fn mtu_discovery_disabled_does_nothing() {
+        let mut mtud = MtuDiscovery::disabled(1_200, 1_200);
+        let probe_size = mtud.poll_transmit(Instant::now(), 0);
+        assert_eq!(probe_size, None);
+    }
+
+    #[test]
+    fn mtu_discovery_disabled_lost_four_packet_bursts_triggers_black_hole_detection() {
+        let mut mtud = MtuDiscovery::disabled(1_400, 1_250);
+        let now = Instant::now();
+
+        for i in 0..4 {
+            // The packets are never contiguous, so each one has its own burst
+
+impl TransportConfig {
+    /// Maximum number of incoming bidirectional streams that may be open concurrently
+    ///
+    /// Must be nonzero for the peer to open any bidirectional streams.
+    ///
+    /// Worst-case memory use is directly proportional to `max_concurrent_bidi_streams *
+    /// stream_receive_window`, with an upper bound proportional to `receive_window`.
+    pub fn max_concurrent_bidi_streams(&mut self, value: VarInt) -> &mut Self {
+        self.max_concurrent_bidi_streams = value;
+        self
+    }
+
+    /// Variant of `max_concurrent_bidi_streams` affecting unidirectional streams
+    pub fn max_concurrent_uni_streams(&mut self, value: VarInt) -> &mut Self {
+        self.max_concurrent_uni_streams = value;
+        self
+    }
+
+    /// Maximum duration of inactivity to accept before timing out the connection.
+    ///
+    /// The true idle timeout is the minimum of this and the peer's own max idle timeout. `None`
+    /// represents an infinite timeout. Defaults to 30 seconds.
+    ///
+    /// **WARNING**: If a peer or its network path malfunctions or acts maliciously, an infinite
+    /// idle timeout can result in permanently hung futures!
+    ///
+    /// ```
+    /// # use std::{convert::TryInto, time::Duration};
+    /// # use quinn_proto::{TransportConfig, VarInt, VarIntBoundsExceeded};
+    /// # fn main() -> Result<(), VarIntBoundsExceeded> {
+    /// let mut config = TransportConfig::default();
+    ///
+    /// // Set the idle timeout as `VarInt`-encoded milliseconds
+    /// config.max_idle_timeout(Some(VarInt::from_u32(10_000).into()));
+    ///
+    /// // Set the idle timeout as a `Duration`
+    /// config.max_idle_timeout(Some(Duration::from_secs(10).try_into()?));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn max_idle_timeout(&mut self, value: Option<IdleTimeout>) -> &mut Self {
+        self.max_idle_timeout = value.map(|t| t.0);
+        self
+    }
+
+    /// rate of false positives in [`validate`](ConnectionIdGenerator::validate) reduces the risk
+    /// incurred by a small minimum reset interval.
+    ///
+    /// [ISAKMP/IKE
+    /// amplification]: https://bughunters.google.com/blog/5960150648750080/preventing-cross-service-udp-loops-in-quic#isakmp-ike-amplification-vs-quic
+    pub fn min_reset_interval(&mut self, value: Duration) -> &mut Self {
+        self.min_reset_interval = value;
+        self
+    }
+
+    /// Optional seed to be used internally for random number generation
+    ///
+    /// By default, quinn will initialize an endpoint's rng using a platform entropy source.
+    /// However, you can seed the rng yourself through this method (e.g. if you need to run quinn
+    /// deterministically or if you are using quinn in an environment that doesn't have a source of
+    /// entropy available).
+    pub fn rng_seed(&mut self, seed: Option<[u8; 32]>) -> &mut Self {
+        self.rng_seed = seed;
+        self
+    }
+}
+
+impl fmt::Debug for EndpointConfig {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("EndpointConfig")
+            // reset_key not debug
+            .field("max_udp_payload_size", &self.max_udp_payload_size)
+            // cid_generator_factory not debug
+            .field("supported_versions", &self.supported_versions)
+/*
+ * Based on Google code released under BSD license here:
+ * https://groups.google.com/forum/#!topic/bbr-dev/3RTgkzi5ZD8
+ */
+
+/*
+ * Kathleen Nichols' algorithm for tracking the minimum (or maximum)
+ * value of a data stream over some fixed time interval.  (E.g.,
+ * the minimum RTT over the past five minutes.) It uses constant
+ * space and constant time per update yet almost always delivers
+ * the same minimum as an implementation that has to keep all the
+ * data in the window.
+ *
+ * The algorithm keeps track of the best, 2nd best & 3rd best min
+ * values, maintaining an invariant that the measurement time of
+ * the n'th best >= n-1'th best. It also makes sure that the three
+ * values are widely separated in the time window since that bounds
+ * the worse case error when that data is monotonically increasing
+ * over the window.
+ *
+ * Upon getting a new min, we can forget everything earlier because
+ * it has no value - the new min is <= everything else in the window
+ * by definition and it samples the most recent. So we restart fresh on
+ * every new min and overwrites 2nd & 3rd choices. The same property
+ * holds for 2nd & 3rd best.
+ */
+
+use std::fmt::Debug;
+
+#[derive(Copy, Clone, Debug)]
+pub(super) struct MinMax {
+    /// round count, not a timestamp
+    window: u64,
+    samples: [MinMaxSample; 3],
+}
+
+impl MinMax {
+    pub(super) fn get(&self) -> u64 {
+        self.samples[0].value
+    }
+
+    fn fill(&mut self, sample: MinMaxSample) {
+        self.samples.fill(sample);
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.fill(Default::default())
+    }
+
+    /// update_min is also defined in the original source, but removed here since it is not used.
+    pub(super) fn update_max(&mut self, current_round: u64, measurement: u64) {
+        let sample = MinMaxSample {
+            time: current_round,
+            value: measurement,
+        };
+
+        if self.samples[0].value == 0  /* uninitialised */
+            || /* found new max? */ sample.value >= self.samples[0].value
+            || /* nothing left in window? */ sample.time - self.samples[2].time > self.window
+        {
+            self.fill(sample); /* forget earlier samples */
+            return;
+        }
+
+        if sample.value >= self.samples[1].value {
+            self.samples[2] = sample;
+            self.samples[1] = sample;
+        } else if sample.value >= self.samples[2].value {
+            self.samples[2] = sample;
+        }
+
+        self.subwin_update(sample);
+    }
+
+    /* As time advances, update the 1st, 2nd, and 3rd choices. */
+    fn subwin_update(&mut self, sample: MinMaxSample) {
+        let dt = sample.time - self.samples[0].time;
+        if dt > self.window {
+            /*
+             * Passed entire window without a new sample so make 2nd
+             * choice the new sample & 3rd choice the new 2nd choice.
+             * we may have to iterate this since our 2nd choice
+             * may also be outside the window (we checked on entry
+             * that the third choice was in the window).
+             */
+            self.samples[0] = self.samples[1];
+            self.samples[1] = self.samples[2];
+            self.samples[2] = sample;
+            if sample.time - self.samples[0].time > self.window {
+                self.samples[0] = self.samples[1];
+                self.samples[1] = self.samples[2];
+                self.samples[2] = sample;
+            }
+        } else if self.samples[1].time == self.samples[0].time && dt > self.window / 4 {
+            /*
+             * We've passed a quarter of the window without a new sample
+             * so take a 2nd choice from the 2nd quarter of the window.
+             */
+            self.samples[2] = sample;
+            self.samples[1] = sample;
+        } else if self.samples[2].time == self.samples[1].time && dt > self.window / 2 {
+            /*
+             * We've passed half the window without finding a new sample
+             * so take a 3rd choice from the last half of the window
+             */
+            self.samples[2] = sample;
+        }
+    }
+}
+
+impl Default for MinMax {
+    fn default() -> Self {
+        Self {
+            window: 10,
+            samples: [Default::default(); 3],
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, Default)]
+struct MinMaxSample {
+    /// round number, not a timestamp
+    time: u64,
+    value: u64,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test() {
+        let round = 25;
+        let mut min_max = MinMax::default();
+        min_max.update_max(round + 1, 100);
+        assert_eq!(100, min_max.get());
+        min_max.update_max(round + 3, 120);
+        assert_eq!(120, min_max.get());
+        min_max.update_max(round + 5, 160);
+        assert_eq!(160, min_max.get());
+        min_max.update_max(round + 7, 100);
+        assert_eq!(160, min_max.get());
+        min_max.update_max(round + 10, 100);
+        assert_eq!(160, min_max.get());
+        min_max.update_max(round + 14, 100);
+        assert_eq!(160, min_max.get());
+        min_max.update_max(round + 16, 100);
+        assert_eq!(100, min_max.get());
+        min_max.update_max(round + 18, 130);
+        assert_eq!(130, min_max.get());
+    }
+}
+            meta.loc_cids.insert(sequence, id);
+            ids.push(IssuedCid {
+                sequence,
+                id,
+                reset_token: ResetToken::new(&*self.config.reset_key, id),
+            });
+        }
+        ConnectionEvent(ConnectionEventInner::NewIdentifiers(ids, now))
+    }
+
+    /// Generate a connection ID for `ch`
+    fn new_cid(&mut self, ch: ConnectionHandle) -> ConnectionId {
+        loop {
+            let cid = self.local_cid_generator.generate_cid();
+            if cid.is_empty() {
+                // Zero-length CID; nothing to track
+                debug_assert_eq!(self.local_cid_generator.cid_len(), 0);
+                return cid;
+            }
+            if let hash_map::Entry::Vacant(e) = self.index.connection_ids.entry(cid) {
+                e.insert(ch);
+                break cid;
+            }
+        }
+    }
+
+    fn handle_first_packet(
+        &mut self,
+    /// Provide control over streams
+    #[must_use]
+    pub fn streams(&mut self) -> Streams<'_> {
+        Streams {
+            state: &mut self.streams,
+            conn_state: &self.state,
+        }
+    }
+
+    /// Provide control over streams
+    #[must_use]
+    pub fn recv_stream(&mut self, id: StreamId) -> RecvStream<'_> {
+        assert!(id.dir() == Dir::Bi || id.initiator() != self.side.side());
+        RecvStream {
+            id,
+            state: &mut self.streams,
+            pending: &mut self.spaces[SpaceId::Data].pending,
+        }
+    }
+
+    /// Provide control over streams
+    #[must_use]
+    pub fn send_stream(&mut self, id: StreamId) -> SendStream<'_> {
+        assert!(id.dir() == Dir::Bi || id.initiator() == self.side.side());
+        SendStream {
+            id,
+            state: &mut self.streams,
+            pending: &mut self.spaces[SpaceId::Data].pending,
+            conn_state: &self.state,
+        }
+    }
+
+    /// Returns packets to transmit
+    ///
+    /// Connections should be polled for transmit after:
+    /// - the application performed some I/O on the connection
+use std::{
+    fmt,
+    mem::size_of,
+    net::{IpAddr, SocketAddr},
+};
+
+use bytes::{Buf, BufMut, Bytes};
+use rand::Rng;
+
+use crate::{
+    Duration, RESET_TOKEN_SIZE, ServerConfig, SystemTime, UNIX_EPOCH,
+    coding::{BufExt, BufMutExt},
+    crypto::{HandshakeTokenKey, HmacKey},
+    packet::InitialHeader,
+    shared::ConnectionId,
+};
+
+/// Responsible for limiting clients' ability to reuse validation tokens
+///
+/// [_RFC 9000 § 8.1.4:_](https://www.rfc-editor.org/rfc/rfc9000.html#section-8.1.4)
+///
+/// > Attackers could replay tokens to use servers as amplifiers in DDoS attacks. To protect
+/// > against such attacks, servers MUST ensure that replay of tokens is prevented or limited.
+/// > Servers SHOULD ensure that tokens sent in Retry packets are only accepted for a short time,
+/// > as they are returned immediately by clients. Tokens that are provided in NEW_TOKEN frames
+/// > (Section 19.7) need to be valid for longer but SHOULD NOT be accepted multiple times.
+/// > Servers are encouraged to allow tokens to be used only once, if possible; tokens MAY include
+/// > additional information about clients to further narrow applicability or reuse.
+///
+/// `TokenLog` pertains only to tokens provided in NEW_TOKEN frames.
+pub trait TokenLog: Send + Sync {
+    /// Record that the token was used and, ideally, return a token reuse error if the token may
+    /// have been already used previously
+    ///
+    /// False negatives and false positives are both permissible. Called when a client uses an
+    /// address validation token.
+    ///
+    /// Parameters:
+    /// - `nonce`: A server-generated random unique value for the token.
+    /// - `issued`: The time the server issued the token.
+    /// - `lifetime`: The expiration time of address validation tokens sent via NEW_TOKEN frames,
+    ///   as configured by [`ServerValidationTokenConfig::lifetime`][1].
+    ///
+    /// [1]: crate::ValidationTokenConfig::lifetime
+    ///
+    /// ## Security & Performance
+    ///
+    /// To the extent that it is possible to repeatedly trigger false negatives (returning `Ok` for
+    /// a token which has been reused), an attacker could use the server to perform [amplification
+    /// attacks][2]. The QUIC specification requires that this be limited, if not prevented fully.
+    ///
+    /// A false positive (returning `Err` for a token which has never been used) is not a security
+    /// vulnerability; it is permissible for a `TokenLog` to always return `Err`. A false positive
+    /// causes the token to be ignored, which may cause the transmission of some 0.5-RTT data to be
+    /// delayed until the handshake completes, if a sufficient amount of 0.5-RTT data it sent.
+    ///
+    /// [2]: https://en.wikipedia.org/wiki/Denial-of-service_attack#Amplification
+    fn check_and_insert(
+        &self,
+        nonce: u128,
+        issued: SystemTime,
+        lifetime: Duration,
+    ) -> Result<(), TokenReuseError>;
+}
+
+/// Error for when a validation token may have been reused
+pub struct TokenReuseError;
+
+/// Null implementation of [`TokenLog`], which never accepts tokens
+pub struct NoneTokenLog;
+
+impl TokenLog for NoneTokenLog {
+    fn check_and_insert(&self, _: u128, _: SystemTime, _: Duration) -> Result<(), TokenReuseError> {
+        Err(TokenReuseError)
+    }
+}
+
+/// Responsible for storing validation tokens received from servers and retrieving them for use in
+/// subsequent connections
+pub trait TokenStore: Send + Sync {
+    /// Potentially store a token for later one-time use
+    ///
+    /// Called when a NEW_TOKEN frame is received from the server.
+    fn insert(&self, server_name: &str, token: Bytes);
+
+    /// Try to find and take a token that was stored with the given server name
+    ///
+    /// The same token must never be returned from `take` twice, as doing so can be used to
+    /// de-anonymize a client's traffic.
+    ///

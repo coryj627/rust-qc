@@ -1,0 +1,832 @@
+2.3025 minutes used of 15.0
+//! Common data types for notifications.
+
+#[cfg(feature = "sync")]
+pub(crate) mod notifier;
+
+use std::{future::Future, pin::Pin, sync::Arc};
+
+/// A future returned by an eviction listener.
+///
+/// You can use the [`boxed` method][boxed-method] of `FutureExt` trait to convert a
+/// regular `Future` object into `ListenerFuture`.
+///
+/// [boxed-method]: ../future/trait.FutureExt.html#method.boxed
+pub type ListenerFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+#[cfg(feature = "sync")]
+pub(crate) type EvictionListener<K, V> =
+    Arc<dyn Fn(Arc<K>, V, RemovalCause) + Send + Sync + 'static>;
+
+#[cfg(feature = "future")]
+pub(crate) type AsyncEvictionListener<K, V> =
+    Box<dyn Fn(Arc<K>, V, RemovalCause) -> ListenerFuture + Send + Sync + 'static>;
+
+// NOTE: Currently, dropping the cache will drop all entries without sending
+// notifications. Calling `invalidate_all` method of the cache will trigger
+// the notifications, but currently there is no way to know when all entries
+// have been invalidated and their notifications have been sent.
+
+/// Indicates the reason why a cached entry was removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemovalCause {
+    /// The entry's expiration timestamp has passed.
+    Expired,
+    /// The entry was manually removed by the user.
+    Explicit,
+    /// The entry itself was not actually removed, but its value was replaced by
+    /// the user.
+    Replaced,
+    /// The entry was evicted due to size constraints.
+    Size,
+}
+
+impl RemovalCause {
+    pub fn was_evicted(&self) -> bool {
+        matches!(self, Self::Expired | Self::Size)
+    }
+}
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+use futures_util::FutureExt;
+
+use crate::notification::{AsyncEvictionListener, RemovalCause};
+
+pub(crate) struct RemovalNotifier<K, V> {
+    listener: AsyncEvictionListener<K, V>,
+    is_enabled: AtomicBool,
+    #[cfg(feature = "logging")]
+    cache_name: Option<String>,
+}
+
+impl<K, V> RemovalNotifier<K, V> {
+    pub(crate) fn new(listener: AsyncEvictionListener<K, V>, _cache_name: Option<String>) -> Self {
+        Self {
+            listener,
+            is_enabled: AtomicBool::new(true),
+            #[cfg(feature = "logging")]
+            cache_name: _cache_name,
+        }
+    }
+
+    pub(crate) async fn notify(&self, key: Arc<K>, value: V, cause: RemovalCause) {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        if !self.is_enabled.load(Ordering::Acquire) {
+            return;
+        }
+
+        // This macro unwraps the result of the catch_unwind call if it is Ok. And
+        // disable the notifier and do early return if the listener panicked.
+        macro_rules! try_or_disable {
+            ($match_expr:expr) => {
+                match $match_expr {
+                    Ok(v) => v,
+                    Err(_payload) => {
+                        self.is_enabled.store(false, Ordering::Release);
+                        #[cfg(feature = "logging")]
+                        log_panic(&*_payload, self.cache_name.as_deref());
+                        return;
+                    }
+                }
+            };
+        }
+
+        let listener_clo = || (self.listener)(key, value, cause);
+
+        // Safety: It is safe to assert unwind safety here because we will not
+        // call the listener again if it has been panicked.
+        let fut = try_or_disable!(catch_unwind(AssertUnwindSafe(listener_clo)));
+        try_or_disable!(AssertUnwindSafe(fut).catch_unwind().await);
+    }
+}
+
+#[cfg(feature = "logging")]
+fn log_panic(payload: &(dyn std::any::Any + Send + 'static), cache_name: Option<&str>) {
+    // Try to downcast the payload into &str or String.
+    //
+    // NOTE: Clippy will complain if we use `if let Some(_)` here.
+    // https://rust-lang.github.io/rust-clippy/master/index.html#manual_map
+    let message: Option<std::borrow::Cow<'_, str>> =
+        (payload.downcast_ref::<&str>().map(|s| (*s).into()))
+            .or_else(|| payload.downcast_ref::<String>().map(Into::into));
+
+    let cn = cache_name
+        .map(|name| format!("[{name}] "))
+        .unwrap_or_default();
+
+    if let Some(m) = message {
+        log::error!("{cn}Disabled the eviction listener because it panicked at '{m}'");
+    } else {
+        log::error!("{cn}Disabled the eviction listener because it panicked");
+    }
+}
+    ///
+    /// **Result**
+    ///
+    /// - `get_file_size()` was called exactly once by thread 0.
+    /// - Other threads were blocked until thread 0 inserted the value.
+    ///
+    /// ```console
+    /// Thread 0 started.
+    /// Thread 1 started.
+    /// Thread 2 started.
+    /// get_file_size() called by thread 0.
+    /// Thread 3 started.
+    /// Thread 2 got the value. (len: 1466)
+    /// Thread 0 got the value. (len: 1466)
+    /// Thread 1 got the value. (len: 1466)
+    /// Thread 3 got the value. (len: 1466)
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This method panics when the `init` closure has panicked. When it happens,
+    /// only the caller whose `init` closure panicked will get the panic (e.g. only
+    /// thread 1 in the above sample). If there are other calls in progress (e.g.
+    /// thread 0, 2 and 3 above), this method will restart and resolve one of the
+    /// remaining `init` closure.
+    ///
+    pub fn optionally_get_with<F>(&self, key: K, init: F) -> Option<V>
+    where
+        F: FnOnce() -> Option<V>,
+    {
+        let hash = self.base.hash(&key);
+        let key = Arc::new(key);
+
+        self.get_or_optionally_insert_with_hash_and_fun(key, hash, init, false)
+            .map(Entry::into_value)
+    }
+
+    /// Similar to [`optionally_get_with`](#method.optionally_get_with), but instead
+    /// of passing an owned key, you can pass a reference to the key. If the key does
+    /// not exist in the cache, the key will be cloned to create new entry in the
+    /// cache.
+    pub fn optionally_get_with_by_ref<F, Q>(&self, key: &Q, init: F) -> Option<V>
+    where
+        F: FnOnce() -> Option<V>,
+        Q: Equivalent<K> + ToOwned<Owned = K> + Hash + ?Sized,
+    {
+        let hash = self.base.hash(key);
+        self.get_or_optionally_insert_with_hash_by_ref_and_fun(key, hash, init, false)
+            .map(Entry::into_value)
+    }
+
+    pub(super) fn get_or_optionally_insert_with_hash_and_fun<F>(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        init: F,
+        need_key: bool,
+    ) -> Option<Entry<K, V>>
+    where
+        F: FnOnce() -> Option<V>,
+    {
+        let entry = self.get_with_hash(&*key, hash, need_key);
+        if entry.is_some() {
+            return entry;
+        }
+
+        self.optionally_insert_with_hash_and_fun(key, hash, init, need_key)
+    }
+
+    pub(super) fn get_or_optionally_insert_with_hash_by_ref_and_fun<F, Q>(
+        &self,
+        key: &Q,
+        hash: u64,
+        init: F,
+        need_key: bool,
+    ) -> Option<Entry<K, V>>
+    where
+        F: FnOnce() -> Option<V>,
+        Q: Equivalent<K> + ToOwned<Owned = K> + Hash + ?Sized,
+    {
+        let entry = self.get_with_hash(key, hash, need_key);
+        if entry.is_some() {
+            return entry;
+        }
+
+        let key = Arc::new(key.to_owned());
+        self.optionally_insert_with_hash_and_fun(key, hash, init, need_key)
+    }
+
+    pub(super) fn optionally_insert_with_hash_and_fun<F>(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        init: F,
+        need_key: bool,
+    ) -> Option<Entry<K, V>>
+    where
+        F: FnOnce() -> Option<V>,
+    {
+        let get = || {
+            let ignore_if = None as Option<&mut fn(&V) -> bool>;
+            self.base
+                .get_with_hash_without_recording(&*key, hash, ignore_if)
+        };
+        let insert = |v| self.insert_with_hash(key.clone(), hash, v);
+
+        let k = if need_key {
+            Some(Arc::clone(&key))
+        } else {
+            None
+        };
+
+        let type_id = ValueInitializer::<K, V, S>::type_id_for_optionally_get_with();
+        let post_init = ValueInitializer::<K, V, S>::post_init_for_optionally_get_with;
+
+        match self
+            .value_initializer
+            .try_init_or_read(&key, type_id, get, init, insert, post_init)
+        {
+            InitResult::Initialized(v) => {
+                crossbeam_epoch::pin().flush();
+                Some(Entry::new(k, v, true, false))
+            }
+            InitResult::ReadExisting(v) => Some(Entry::new(k, v, false, false)),
+            InitResult::InitErr(_) => {
+                crossbeam_epoch::pin().flush();
+                None
+            }
+        }
+    }
+
+    /// Returns a _clone_ of the value corresponding to the key. If the value does
+    /// not exist, evaluates the `init` closure, and inserts the value if `Ok(value)`
+    /// was returned. If `Err(_)` was returned from the closure, this method does not
+    /// insert a value and returns the `Err` wrapped by [`std::sync::Arc`][std-arc].
+    ///
+    /// [std-arc]: https://doc.rust-lang.org/stable/std/sync/struct.Arc.html
+    ///
+    /// # Concurrent calls on the same key
+    ///
+    /// This method guarantees that concurrent calls on the same not-existing key are
+    /// coalesced into one evaluation of the `init` closure (as long as these
+    /// closures return the same error type). Only one of the calls evaluates its
+    /// closure, and other calls wait for that closure to complete.
+    ///
+    /// The following code snippet demonstrates this behavior:
+    ///
+    /// ```rust
+    /// use moka::sync::Cache;
+    /// use std::{path::Path, thread};
+    ///
+    /// /// This function tries to get the file size in bytes.
+    /// fn get_file_size(thread_id: u8, path: impl AsRef<Path>) -> Result<u64, std::io::Error> {
+    ///     println!("get_file_size() called by thread {thread_id}.");
+    ///     Ok(std::fs::metadata(path)?.len())
+    /// }
+    ///
+    /// let cache = Cache::new(100);
+    ///
+    /// // Spawn four threads.
+    /// let threads: Vec<_> = (0..4_u8)
+    ///     .map(|thread_id| {
+    ///         let my_cache = cache.clone();
+    ///         thread::spawn(move || {
+    ///             println!("Thread {thread_id} started.");
+    ///
+    ///             // Try to insert and get the value for key1. Although all four
+    ///             // threads will call `try_get_with` at the same time,
+    ///             // get_file_size() must be called only once.
+    ///             let value = my_cache.try_get_with(
+    ///                 "key1",
+    ///                 || get_file_size(thread_id, "./Cargo.toml"),
+    ///             );
+    ///
+    ///             // Ensure the value exists now.
+    ///             assert!(value.is_ok());
+    ///             assert!(my_cache.get(&"key1").is_some());
+    ///
+    ///             println!(
+    ///                 "Thread {thread_id} got the value. (len: {})",
+    ///                 value.unwrap()
+    ///             );
+    ///         })
+    ///     })
+    ///     .collect();
+    ///
+    /// // Wait all threads to complete.
+    /// threads
+    ///     .into_iter()
+    ///     .for_each(|t| t.join().expect("Thread failed"));
+    /// ```
+    ///
+    /// **Result**
+    ///
+    /// - `get_file_size()` was called exactly once by thread 1.
+    /// - Other threads were blocked until thread 1 inserted the value.
+    ///
+    /// ```console
+    /// Thread 1 started.
+    /// Thread 2 started.
+    /// get_file_size() called by thread 1.
+    /// Thread 3 started.
+    /// Thread 0 started.
+    /// Thread 2 got the value. (len: 1466)
+    /// Thread 0 got the value. (len: 1466)
+    /// Thread 1 got the value. (len: 1466)
+    /// Thread 3 got the value. (len: 1466)
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// This method panics when the `init` closure has panicked. When it happens,
+    /// only the caller whose `init` closure panicked will get the panic (e.g. only
+    /// thread 1 in the above sample). If there are other calls in progress (e.g.
+    /// thread 0, 2 and 3 above), this method will restart and resolve one of the
+    /// remaining `init` closure.
+    ///
+    pub fn try_get_with<F, E>(&self, key: K, init: F) -> Result<V, Arc<E>>
+    where
+        F: FnOnce() -> Result<V, E>,
+        E: Send + Sync + 'static,
+    {
+        let hash = self.base.hash(&key);
+        let key = Arc::new(key);
+        self.get_or_try_insert_with_hash_and_fun(key, hash, init, false)
+            .map(Entry::into_value)
+    }
+
+    /// Similar to [`try_get_with`](#method.try_get_with), but instead of passing an
+    /// owned key, you can pass a reference to the key. If the key does not exist in
+    /// the cache, the key will be cloned to create new entry in the cache.
+    pub fn try_get_with_by_ref<F, E, Q>(&self, key: &Q, init: F) -> Result<V, Arc<E>>
+    where
+        F: FnOnce() -> Result<V, E>,
+        E: Send + Sync + 'static,
+        Q: Equivalent<K> + ToOwned<Owned = K> + Hash + ?Sized,
+    {
+        let hash = self.base.hash(key);
+        self.get_or_try_insert_with_hash_by_ref_and_fun(key, hash, init, false)
+            .map(Entry::into_value)
+    }
+
+    pub(crate) fn get_or_try_insert_with_hash_and_fun<F, E>(
+        &self,
+        key: Arc<K>,
+        hash: u64,
+        init: F,
+        need_key: bool,
+    ) -> Result<Entry<K, V>, Arc<E>>
+    where
+        F: FnOnce() -> Result<V, E>,
+        E: Send + Sync + 'static,
+    {
+        if let Some(entry) = self.get_with_hash(&*key, hash, need_key) {
+            return Ok(entry);
+        }
+
+        self.try_insert_with_hash_and_fun(key, hash, init, need_key)
+    }
+
+    pub(crate) fn get_or_try_insert_with_hash_by_ref_and_fun<F, Q, E>(
+        &self,
+        key: &Q,
+        hash: u64,
+        init: F,
+        need_key: bool,
+    ) -> Result<Entry<K, V>, Arc<E>>
+    where
+        F: FnOnce() -> Result<V, E>,
+        E: Send + Sync + 'static,
+        Q: Equivalent<K> + ToOwned<Owned = K> + Hash + ?Sized,
+use crate::common::{
+    concurrent::constants::{
+        LOG_SYNC_INTERVAL_MILLIS, READ_LOG_FLUSH_POINT, WRITE_LOG_FLUSH_POINT,
+    },
+    time::{AtomicInstant, Instant},
+    HousekeeperConfig,
+};
+
+use std::{
+    hash::{BuildHasher, Hash},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+
+use async_lock::Mutex;
+use futures_util::future::{BoxFuture, Shared};
+
+use super::base_cache::Inner;
+
+pub(crate) struct Housekeeper {
+    /// A shared `Future` of the maintenance task that is currently being resolved.
+    current_task: Mutex<Option<Shared<BoxFuture<'static, bool>>>>,
+    run_after: AtomicInstant,
+    /// A flag to indicate if the last call on `run_pending_tasks` method left some
+    /// entries to evict.
+    ///
+    /// Used only when the eviction listener closure is set for this cache instance
+    /// because, if not, `run_pending_tasks` will never leave entries to evict.
+    more_entries_to_evict: Option<AtomicBool>,
+    /// The timeout duration for the `run_pending_tasks` method. This is a safe-guard
+    /// to prevent cache read/write operations (that may call `run_pending_tasks`
+    /// internally) from being blocked for a long time when the user wrote a slow
+    /// eviction listener closure.
+    ///
+    /// Used only when the eviction listener closure is set for this cache instance.
+    maintenance_task_timeout: Option<Duration>,
+    /// The maximum repeat count for receiving operation logs from the read and write
+    /// log channels. Default: `MAX_LOG_SYNC_REPEATS`.
+    max_log_sync_repeats: u32,
+    /// The batch size of entries to be processed by each internal eviction method.
+    /// Default: `EVICTION_BATCH_SIZE`.
+    eviction_batch_size: u32,
+    auto_run_enabled: AtomicBool,
+    #[cfg(test)]
+    pub(crate) start_count: AtomicUsize,
+    #[cfg(test)]
+    pub(crate) complete_count: AtomicUsize,
+}
+
+impl Housekeeper {
+    pub(crate) fn new(
+        is_eviction_listener_enabled: bool,
+        config: HousekeeperConfig,
+        now: Instant,
+    ) -> Self {
+        let (more_entries_to_evict, maintenance_task_timeout) = if is_eviction_listener_enabled {
+            (
+                Some(AtomicBool::new(false)),
+                Some(config.maintenance_task_timeout),
+            )
+        } else {
+            (None, None)
+        };
+
+        Self {
+            current_task: Mutex::default(),
+            run_after: AtomicInstant::new(Self::sync_after(now)),
+            more_entries_to_evict,
+            maintenance_task_timeout,
+            max_log_sync_repeats: config.max_log_sync_repeats,
+            eviction_batch_size: config.eviction_batch_size,
+            auto_run_enabled: AtomicBool::new(true),
+            #[cfg(test)]
+            start_count: Default::default(),
+            #[cfg(test)]
+            complete_count: Default::default(),
+        }
+    }
+
+    pub(crate) fn should_apply_reads(&self, ch_len: usize, now: Instant) -> bool {
+        self.more_entries_to_evict() || self.should_apply(ch_len, READ_LOG_FLUSH_POINT, now)
+    }
+
+    pub(crate) fn should_apply_writes(&self, ch_len: usize, now: Instant) -> bool {
+        self.more_entries_to_evict() || self.should_apply(ch_len, WRITE_LOG_FLUSH_POINT, now)
+    }
+
+    #[inline]
+    fn more_entries_to_evict(&self) -> bool {
+        self.more_entries_to_evict
+            .as_ref()
+            .map(|v| v.load(Ordering::Acquire))
+            .unwrap_or(false)
+    }
+
+    fn set_more_entries_to_evict(&self, v: bool) {
+        if let Some(flag) = &self.more_entries_to_evict {
+            flag.store(v, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    fn should_apply(&self, ch_len: usize, ch_flush_point: usize, now: Instant) -> bool {
+        self.auto_run_enabled.load(Ordering::Relaxed)
+            && (ch_len >= ch_flush_point || now >= self.run_after.instant().unwrap())
+    }
+
+    pub(crate) async fn run_pending_tasks<K, V, S>(&self, cache: Arc<Inner<K, V, S>>)
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher + Clone + Send + Sync + 'static,
+    {
+        let mut current_task = self.current_task.lock().await;
+        self.do_run_pending_tasks(Arc::clone(&cache), &mut current_task)
+            .await;
+
+        drop(current_task);
+
+        // If there are any async tasks waiting in `BaseCache::schedule_write_op`
+        // method for the write op channel, notify them.
+        cache.write_op_ch_ready_event.notify(usize::MAX);
+    }
+
+    /// Tries to run the pending tasks if the lock is free. Returns `true` if there
+    /// are more entries to evict in next run.
+    pub(crate) async fn try_run_pending_tasks<K, V, S>(&self, cache: &Arc<Inner<K, V, S>>) -> bool
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher + Clone + Send + Sync + 'static,
+    {
+        if let Some(mut current_task) = self.current_task.try_lock() {
+            self.do_run_pending_tasks(Arc::clone(cache), &mut current_task)
+                .await;
+        } else {
+            return false;
+        }
+
+        // The `current_task` lock should be free now.
+
+        // If there are any async tasks waiting in `BaseCache::schedule_write_op`
+        // method for the write op channel, notify them.
+        cache.write_op_ch_ready_event.notify(usize::MAX);
+        true
+    }
+
+    async fn do_run_pending_tasks<K, V, S>(
+        &self,
+        cache: Arc<Inner<K, V, S>>,
+        current_task: &mut Option<Shared<BoxFuture<'static, bool>>>,
+    ) where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher + Clone + Send + Sync + 'static,
+    {
+        use futures_util::FutureExt;
+
+        let now = cache.current_time();
+        let more_to_evict;
+        // Async Cancellation Safety: Our maintenance task is cancellable as we save
+        // it in the lock. If it is canceled, we will resume it in the next run.
+
+        if let Some(task) = &*current_task {
+            // This task was cancelled in the previous run due to the enclosing
+            // Future was dropped. Resume the task now by awaiting.
+            more_to_evict = task.clone().await;
+        } else {
+            let timeout = self.maintenance_task_timeout;
+            let repeats = self.max_log_sync_repeats;
+            let batch_size = self.eviction_batch_size;
+            // Create a new maintenance task and await it.
+            let task = async move {
+                cache
+                    .do_run_pending_tasks(timeout, repeats, batch_size)
+                    .await
+            }
+            .boxed()
+            .shared();
+            *current_task = Some(task.clone());
+
+            #[cfg(test)]
+            self.start_count.fetch_add(1, Ordering::AcqRel);
+
+            more_to_evict = task.await;
+        }
+
+        // If we are here, it means that the maintenance task has been completed.
+        // We can remove it from the lock.
+        *current_task = None;
+        self.run_after.set_instant(Self::sync_after(now));
+        self.set_more_entries_to_evict(more_to_evict);
+
+        #[cfg(test)]
+        self.complete_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn sync_after(now: Instant) -> Instant {
+        let dur = Duration::from_millis(LOG_SYNC_INTERVAL_MILLIS);
+        now.saturating_add(dur)
+    }
+}
+
+#[cfg(test)]
+impl Housekeeper {
+    pub(crate) fn disable_auto_run(&self) {
+        self.auto_run_enabled.store(false, Ordering::Relaxed);
+    }
+}
+// License and Copyright Notice:
+//
+// Some of the code and doc comments in this module were ported or copied from
+// a Java class `com.github.benmanes.caffeine.cache.FrequencySketch` of Caffeine.
+// https://github.com/ben-manes/caffeine/blob/master/caffeine/src/main/java/com/github/benmanes/caffeine/cache/FrequencySketch.java
+//
+// The original code/comments from Caffeine are licensed under the Apache License,
+// Version 2.0 <https://github.com/ben-manes/caffeine/blob/master/LICENSE>
+//
+// Copyrights of the original code/comments are retained by their contributors.
+// For full authorship information, see the version control history of
+// https://github.com/ben-manes/caffeine/
+
+/// A probabilistic multi-set for estimating the popularity of an element within
+/// a time window. The maximum frequency of an element is limited to 15 (4-bits)
+/// and an aging process periodically halves the popularity of all elements.
+#[derive(Default)]
+pub(crate) struct FrequencySketch {
+    sample_size: u32,
+    table_mask: u64,
+    table: Box<[u64]>,
+    size: u32,
+}
+
+// A mixture of seeds from FNV-1a, CityHash, and Murmur3. (Taken from Caffeine)
+static SEED: [u64; 4] = [
+    0xc3a5_c85c_97cb_3127,
+    0xb492_b66f_be98_f273,
+    0x9ae1_6a3b_2f90_404f,
+    0xcbf2_9ce4_8422_2325,
+];
+
+static RESET_MASK: u64 = 0x7777_7777_7777_7777;
+
+static ONE_MASK: u64 = 0x1111_1111_1111_1111;
+
+// -------------------------------------------------------------------------------
+// Some of the code and doc comments in this module were ported or copied from
+// a Java class `com.github.benmanes.caffeine.cache.FrequencySketch` of Caffeine.
+// https://github.com/ben-manes/caffeine/blob/master/caffeine/src/main/java/com/github/benmanes/caffeine/cache/FrequencySketch.java
+// -------------------------------------------------------------------------------
+//
+// FrequencySketch maintains a 4-bit CountMinSketch [1] with periodic aging to
+// provide the popularity history for the TinyLfu admission policy [2].
+// The time and space efficiency of the sketch allows it to cheaply estimate the
+// frequency of an entry in a stream of cache access events.
+//
+// The counter matrix is represented as a single dimensional array holding 16
+// counters per slot. A fixed depth of four balances the accuracy and cost,
+// resulting in a width of four times the length of the array. To retain an
+// accurate estimation the array's length equals the maximum number of entries
+// in the cache, increased to the closest power-of-two to exploit more efficient
+// bit masking. This configuration results in a confidence of 93.75% and error
+// bound of e / width.
+//
+// The frequency of all entries is aged periodically using a sampling window
+// based on the maximum number of entries in the cache. This is referred to as
+// the reset operation by TinyLfu and keeps the sketch fresh by dividing all
+// counters by two and subtracting based on the number of odd counters
+// found. The O(n) cost of aging is amortized, ideal for hardware pre-fetching,
+// and uses inexpensive bit manipulations per array location.
+//
+// [1] An Improved Data Stream Summary: The Count-Min Sketch and its Applications
+//     http://dimacs.rutgers.edu/~graham/pubs/papers/cm-full.pdf
+// [2] TinyLFU: A Highly Efficient Cache Admission Policy
+//     https://dl.acm.org/citation.cfm?id=3149371
+//
+// -------------------------------------------------------------------------------
+
+impl FrequencySketch {
+    /// Initializes and increases the capacity of this `FrequencySketch` instance,
+    /// if necessary, to ensure that it can accurately estimate the popularity of
+    /// elements given the maximum size of the cache. This operation forgets all
+    /// previous counts when resizing.
+    pub(crate) fn ensure_capacity(&mut self, cap: u32) {
+        // The max byte size of the table, Box<[u64; table_size]>
+        //
+        // | Pointer width    | Max size |
+        // |:-----------------|---------:|
+        // | 16 bit           |    8 KiB |
+        // | 32 bit           |  128 MiB |
+        // | 64 bit or bigger |    8 GiB |
+
+        let maximum = if cfg!(target_pointer_width = "16") {
+            cap.min(1024)
+        } else if cfg!(target_pointer_width = "32") {
+            cap.min(2u32.pow(24)) // about 16 millions
+        } else {
+            // Same to Caffeine's limit:
+            //   `Integer.MAX_VALUE >>> 1` with `ceilingPowerOfTwo()` applied.
+            cap.min(2u32.pow(30)) // about 1 billion
+        };
+        let table_size = if maximum == 0 {
+            1
+        } else {
+            maximum.next_power_of_two()
+        };
+
+        if self.table.len() as u32 >= table_size {
+            return;
+        }
+
+        self.table = vec![0; table_size as usize].into_boxed_slice();
+        self.table_mask = table_size.saturating_sub(1) as u64;
+        self.sample_size = if cap == 0 {
+            10
+        } else {
+            maximum.saturating_mul(10).min(i32::MAX as u32)
+        };
+    }
+
+    /// Takes the hash value of an element, and returns the estimated number of
+    /// occurrences of the element, up to the maximum (15).
+    pub(crate) fn frequency(&self, hash: u64) -> u8 {
+        if self.table.is_empty() {
+            return 0;
+        }
+
+        let start = ((hash & 3) << 2) as u8;
+        let mut frequency = u8::MAX;
+        for i in 0..4 {
+            let index = self.index_of(hash, i);
+            let shift = (start + i) << 2;
+            let count = ((self.table[index] >> shift) & 0xF) as u8;
+            frequency = frequency.min(count);
+        }
+        frequency
+    }
+
+    /// Take a hash value of an element and increments the popularity of the
+    /// element if it does not exceed the maximum (15). The popularity of all
+    /// elements will be periodically down sampled when the observed events
+    /// exceeds a threshold. This process provides a frequency aging to allow
+    /// expired long term entries to fade away.
+    pub(crate) fn increment(&mut self, hash: u64) {
+        if self.table.is_empty() {
+            return;
+        }
+
+        let start = ((hash & 3) << 2) as u8;
+        let mut added = false;
+        for i in 0..4 {
+            let index = self.index_of(hash, i);
+            added |= self.increment_at(index, start + i);
+        }
+
+        if added {
+            self.size += 1;
+            if self.size >= self.sample_size {
+                self.reset();
+            }
+        }
+    }
+
+    /// Takes a table index (each entry has 16 counters) and counter index, and
+    /// increments the counter by 1 if it is not already at the maximum value
+    /// (15). Returns `true` if incremented.
+    fn increment_at(&mut self, table_index: usize, counter_index: u8) -> bool {
+        let offset = (counter_index as usize) << 2;
+        let mask = 0xF_u64 << offset;
+        if self.table[table_index] & mask != mask {
+            self.table[table_index] += 1u64 << offset;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reduces every counter by half of its original value.
+    fn reset(&mut self) {
+        let mut count = 0u32;
+        for entry in self.table.iter_mut() {
+            // Count number of odd numbers.
+            count += (*entry & ONE_MASK).count_ones();
+            *entry = (*entry >> 1) & RESET_MASK;
+        }
+        self.size = (self.size >> 1) - (count >> 2);
+    }
+
+    /// Returns the table index for the counter at the specified depth.
+    fn index_of(&self, hash: u64, depth: u8) -> usize {
+        let i = depth as usize;
+        let mut hash = hash.wrapping_add(SEED[i]).wrapping_mul(SEED[i]);
+        hash = hash.wrapping_add(hash >> 32);
+        (hash & self.table_mask) as usize
+    }
+
+    #[cfg(feature = "unstable-debug-counters")]
+    pub(crate) fn table_size(&self) -> u64 {
+        (self.table.len() * std::mem::size_of::<u64>()) as u64
+    }
+}
+
+// Methods only available for testing.
+#[cfg(test)]
+impl FrequencySketch {
+    pub(crate) fn table_len(&self) -> usize {
+        self.table.len()
+    }
+}
+
+// Some test cases were ported from Caffeine at:
+// https://github.com/ben-manes/caffeine/blob/master/caffeine/src/test/java/com/github/benmanes/caffeine/cache/FrequencySketchTest.java
+//
+// To see the debug prints, run test as `cargo test -- --nocapture`
+#[cfg(test)]
+mod tests {
+    use super::FrequencySketch;
+    use once_cell::sync::Lazy;
+    use std::hash::{BuildHasher, Hash, Hasher};
+
+    static ITEM: Lazy<u32> = Lazy::new(|| {
+        let mut buf = [0; 4];
+        getrandom::getrandom(&mut buf).unwrap();
+        u32::from_ne_bytes(buf)
+    });
+
+    // This test was ported from Caffeine.
+    #[test]
+    fn increment_once() {

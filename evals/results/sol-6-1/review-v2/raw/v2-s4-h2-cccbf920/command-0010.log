@@ -1,0 +1,670 @@
+            queued_tx.send(()).unwrap();
+            drop((req2, req3));
+        };
+
+        join(async move { conn.await.expect("h2") }, f).await;
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn allow_empty_data_for_head() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("HEAD", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(
+            frames::headers(1)
+                .response(200)
+                .field("content-length", 100),
+        )
+        .await;
+        srv.send_frame(frames::data(1, "").eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::Builder::new()
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        tokio::spawn(async {
+            h2.await.expect("connection failed");
+        });
+        let request = Request::builder()
+            .method(Method::HEAD)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        let (_, mut body) = response.await.unwrap().into_parts();
+        assert_eq!(body.data().await.unwrap().unwrap(), "");
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn reject_none_zero_content_length_header_with_end_stream() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(
+            frames::headers(1)
+                .response(200)
+                .field("content-length", 100)
+                .eos(),
+        )
+        .await;
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::Builder::new()
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        tokio::spawn(async {
+            h2.await.expect("connection failed");
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        let _ = response.await.unwrap_err();
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn early_hints() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(103)).await;
+        srv.send_frame(frames::headers(1).response(200).field("content-length", 2))
+            .await;
+        srv.send_frame(frames::data(1, "ok").eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::Builder::new()
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        tokio::spawn(async {
+            h2.await.expect("connection failed");
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+
+        Ok(())
+    }
+
+    fn recv_push_promise<B>(
+        &mut self,
+        send_buffer: &SendBuffer<B>,
+        frame: frame::PushPromise,
+    ) -> Result<(), Error> {
+        let id = frame.stream_id();
+        let promised_id = frame.promised_id();
+
+        // First, ensure that the initiating stream is still in a valid state.
+        let parent_key = match self.store.find_mut(&id) {
+            Some(stream) => {
+                // The GOAWAY process has begun. All streams with a greater ID
+                // than specified as part of GOAWAY should be ignored.
+                if id > self.actions.recv.max_stream_id() {
+                    tracing::trace!(
+                        "id ({:?}) > max_stream_id ({:?}), ignoring PUSH_PROMISE",
+                        id,
+                        self.actions.recv.max_stream_id()
+                    );
+                    return Ok(());
+                }
+
+                // The stream must be receive open
+                if !stream.state.ensure_recv_open()? {
+                    proto_err!(conn: "recv_push_promise: initiating stream is not opened");
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+                }
+
+                stream.key()
+            }
+            None => {
+                proto_err!(conn: "recv_push_promise: initiating stream is in an invalid state");
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+            }
+        };
+
+        // TODO: Streams in the reserved states do not count towards the concurrency
+        // limit. However, it seems like there should be a cap otherwise this
+        // could grow in memory indefinitely.
+
+        // Ensure that we can reserve streams
+        self.actions.recv.ensure_can_reserve()?;
+
+        // Next, open the stream.
+        //
+        // If `None` is returned, then the stream is being refused. There is no
+        // further work to be done.
+        if self
+            .actions
+            .recv
+            .open(promised_id, Open::PushPromise, &mut self.counts)?
+            .is_none()
+        {
+            return Ok(());
+        }
+
+        // Try to handle the frame and create a corresponding key for the pushed stream
+        // this requires a bit of indirection to make the borrow checker happy.
+        let child_key: Option<store::Key> = {
+            // Create state for the stream
+            let stream = self.store.insert(promised_id, {
+                Stream::new(
+                    promised_id,
+                    self.actions.send.init_window_sz(),
+                    self.actions.recv.init_window_sz(),
+                )
+            });
+
+            let actions = &mut self.actions;
+
+            self.counts.transition(stream, |counts, stream| {
+                let stream_valid = actions.recv.recv_push_promise(frame, stream);
+
+                match stream_valid {
+                    Ok(()) => Ok(Some(stream.key())),
+                    _ => {
+                        let mut send_buffer = send_buffer.inner.lock().unwrap();
+                        actions
+                            .reset_on_recv_stream_err(
+                                &mut *send_buffer,
+                                stream,
+                                counts,
+                                stream_valid,
+                            )
+                            .map(|()| None)
+                    }
+                }
+            })?
+        };
+        // If we're successful, push the headers and stream...
+        if let Some(child) = child_key {
+            let mut ppp = self.store[parent_key].pending_push_promises.take();
+            ppp.push(&mut self.store.resolve(child));
+
+            let parent = &mut self.store.resolve(parent_key);
+            parent.pending_push_promises = ppp;
+            parent.notify_push();
+use std::convert::TryInto;
+use std::fmt;
+
+use bytes::Bytes;
+use http::{HeaderMap, StatusCode};
+
+use h2::frame::{self, Frame, StreamId};
+
+pub const SETTINGS: &[u8] = &[0, 0, 0, 4, 0, 0, 0, 0, 0];
+pub const SETTINGS_ACK: &[u8] = &[0, 0, 0, 4, 1, 0, 0, 0, 0];
+
+// ==== helper functions to easily construct h2 Frames ====
+
+pub fn headers<T>(id: T) -> Mock<frame::Headers>
+where
+    T: Into<StreamId>,
+{
+    Mock(frame::Headers::new(
+        id.into(),
+        frame::Pseudo::default(),
+        HeaderMap::default(),
+    ))
+}
+
+pub fn data<T, B>(id: T, buf: B) -> Mock<frame::Data>
+where
+    T: Into<StreamId>,
+    B: AsRef<[u8]>,
+{
+    let buf = Bytes::copy_from_slice(buf.as_ref());
+    Mock(frame::Data::new(id.into(), buf))
+}
+
+pub fn push_promise<T1, T2>(id: T1, promised: T2) -> Mock<frame::PushPromise>
+where
+    T1: Into<StreamId>,
+    T2: Into<StreamId>,
+{
+    Mock(frame::PushPromise::new(
+        id.into(),
+        promised.into(),
+        frame::Pseudo::default(),
+        HeaderMap::default(),
+    ))
+}
+
+pub fn window_update<T>(id: T, sz: u32) -> frame::WindowUpdate
+where
+    T: Into<StreamId>,
+{
+    frame::WindowUpdate::new(id.into(), sz)
+}
+
+pub fn go_away<T>(id: T) -> Mock<frame::GoAway>
+where
+    T: Into<StreamId>,
+{
+    Mock(frame::GoAway::new(id.into(), frame::Reason::NO_ERROR))
+}
+
+pub fn reset<T>(id: T) -> Mock<frame::Reset>
+where
+    T: Into<StreamId>,
+{
+    Mock(frame::Reset::new(id.into(), frame::Reason::NO_ERROR))
+}
+
+pub fn settings() -> Mock<frame::Settings> {
+    Mock(frame::Settings::default())
+}
+
+pub fn settings_ack() -> Mock<frame::Settings> {
+    Mock(frame::Settings::ack())
+}
+
+pub fn ping(payload: [u8; 8]) -> Mock<frame::Ping> {
+    Mock(frame::Ping::new(payload))
+}
+
+// === Generic helpers of all frame types
+
+pub struct Mock<T>(T);
+
+impl<T: fmt::Debug> fmt::Debug for Mock<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl<T> From<Mock<T>> for Frame
+where
+    T: Into<Frame>,
+{
+    fn from(src: Mock<T>) -> Self {
+        src.0.into()
+    }
+}
+
+// Headers helpers
+
+impl Mock<frame::Headers> {
+    pub fn request<M, U>(self, method: M, uri: U) -> Self
+    where
+        M: TryInto<http::Method>,
+        M::Error: fmt::Debug,
+        U: TryInto<http::Uri>,
+        U::Error: fmt::Debug,
+    {
+        let method = method.try_into().unwrap();
+        let uri = uri.try_into().unwrap();
+        let (id, _, fields) = self.into_parts();
+        let extensions = Default::default();
+        let pseudo = frame::Pseudo::request(method, uri, extensions);
+        let frame = frame::Headers::new(id, pseudo, fields);
+        Mock(frame)
+    }
+
+    pub fn method<M>(self, method: M) -> Self
+    where
+        M: TryInto<http::Method>,
+        M::Error: fmt::Debug,
+    {
+        let method = method.try_into().unwrap();
+        let (id, pseudo, fields) = self.into_parts();
+        let frame = frame::Headers::new(
+            id,
+            frame::Pseudo {
+                method: Some(method),
+                ..pseudo
+            },
+            fields,
+        );
+        Mock(frame)
+    }
+
+    pub fn pseudo(self, pseudo: frame::Pseudo) -> Self {
+        let (id, _, fields) = self.into_parts();
+        let frame = frame::Headers::new(id, pseudo, fields);
+        Mock(frame)
+    }
+
+    pub fn response<S>(self, status: S) -> Self
+    where
+        S: TryInto<http::StatusCode>,
+        S::Error: fmt::Debug,
+    {
+        let status = status.try_into().unwrap();
+        let (id, _, fields) = self.into_parts();
+        let frame = frame::Headers::new(id, frame::Pseudo::response(status), fields);
+        Mock(frame)
+    }
+
+    pub fn fields(self, fields: HeaderMap) -> Self {
+        let (id, pseudo, _) = self.into_parts();
+        let frame = frame::Headers::new(id, pseudo, fields);
+        Mock(frame)
+    }
+
+    pub fn field<K, V>(self, key: K, value: V) -> Self
+    where
+        K: TryInto<http::header::HeaderName>,
+        K::Error: fmt::Debug,
+        V: TryInto<http::header::HeaderValue>,
+        V::Error: fmt::Debug,
+    {
+        let (id, pseudo, mut fields) = self.into_parts();
+        fields.insert(key.try_into().unwrap(), value.try_into().unwrap());
+        let frame = frame::Headers::new(id, pseudo, fields);
+        Mock(frame)
+    }
+
+    pub fn status(self, value: StatusCode) -> Self {
+        let (id, mut pseudo, fields) = self.into_parts();
+
+        pseudo.set_status(value);
+
+        Mock(frame::Headers::new(id, pseudo, fields))
+    }
+
+    pub fn scheme(self, value: &str) -> Self {
+        let (id, mut pseudo, fields) = self.into_parts();
+        let value = value.parse().unwrap();
+
+        pseudo.set_scheme(value);
+
+        Mock(frame::Headers::new(id, pseudo, fields))
+    }
+
+    pub fn eos(mut self) -> Self {
+        self.0.set_end_stream();
+        self
+    }
+
+    pub fn into_fields(self) -> HeaderMap {
+        self.0.into_parts().1
+    }
+
+    fn into_parts(self) -> (StreamId, frame::Pseudo, HeaderMap) {
+        assert!(!self.0.is_end_stream(), "eos flag will be lost");
+        assert!(self.0.is_end_headers(), "unset eoh will be lost");
+use crate::SendFrame;
+
+use h2::frame::{self, Frame};
+use h2::proto::Error;
+use h2::SendError;
+
+use futures::future::poll_fn;
+use futures::{ready, Stream, StreamExt};
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+use super::assert::assert_frame_eq;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
+use std::{cmp, io, usize};
+
+/// A mock I/O
+#[derive(Debug)]
+pub struct Mock {
+    pipe: Pipe,
+}
+
+#[derive(Debug)]
+pub struct Handle {
+    codec: crate::Codec<Pipe>,
+}
+
+#[derive(Debug)]
+pub struct Pipe {
+    inner: Arc<Mutex<Inner>>,
+}
+
+#[derive(Debug)]
+struct Inner {
+    /// Data written by the test case to the h2 lib.
+    rx: Vec<u8>,
+
+    /// Notify when data is ready to be received.
+    rx_task: Option<Waker>,
+
+    /// Data written by the `h2` library to be read by the test case.
+    tx: Vec<u8>,
+
+    /// Notify when data is written. This notifies the test case waiters.
+    tx_task: Option<Waker>,
+
+    /// Number of bytes that can be written before `write` returns `Poll::Pending`.
+    tx_rem: usize,
+
+    /// Task to notify when write capacity becomes available.
+    tx_rem_task: Option<Waker>,
+
+    /// True when the pipe is closed.
+    closed: bool,
+
+    /// Trigger an `UnexpectedEof` error on read
+    unexpected_eof: bool,
+}
+
+const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Create a new mock and handle
+pub fn new() -> (Mock, Handle) {
+    new_with_write_capacity(usize::MAX)
+}
+
+/// Create a new mock and handle allowing up to `cap` bytes to be written.
+pub fn new_with_write_capacity(cap: usize) -> (Mock, Handle) {
+    let inner = Arc::new(Mutex::new(Inner {
+        rx: vec![],
+        rx_task: None,
+        tx: vec![],
+        tx_task: None,
+        tx_rem: cap,
+        tx_rem_task: None,
+        closed: false,
+        unexpected_eof: false,
+    }));
+
+    let mock = Mock {
+        pipe: Pipe {
+            inner: inner.clone(),
+        },
+    };
+
+    let handle = Handle {
+        codec: h2::Codec::new(Pipe { inner }),
+    };
+
+    (mock, handle)
+}
+
+// ===== impl Handle =====
+
+impl Handle {
+    /// Get a mutable reference to inner Codec.
+    pub fn codec_mut(&mut self) -> &mut crate::Codec<Pipe> {
+        &mut self.codec
+            self.notify_capacity();
+        }
+    }
+
+    /// If the capacity was limited because of the max_send_buffer_size,
+    /// then consider waking the send task again...
+    pub fn notify_capacity(&mut self) {
+        self.send_capacity_inc = true;
+        tracing::trace!("  notifying task");
+        self.notify_send();
+    }
+
+    /// Returns `Err` when the decrement cannot be completed due to overflow.
+    pub fn dec_content_length(&mut self, len: usize) -> Result<(), ()> {
+        match self.content_length {
+            ContentLength::Remaining(ref mut rem) => match rem.checked_sub(len as u64) {
+                Some(val) => *rem = val,
+                None => return Err(()),
+            },
+            ContentLength::Head => {
+                if len != 0 {
+                    return Err(());
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    pub fn ensure_content_length_zero(&self) -> Result<(), ()> {
+        match self.content_length {
+            ContentLength::Remaining(0) => Ok(()),
+            ContentLength::Remaining(_) => Err(()),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn notify_send(&mut self) {
+        if let Some(task) = self.send_task.take() {
+            task.wake();
+        }
+    }
+
+    pub fn wait_send(&mut self, cx: &Context) {
+        self.send_task = Some(cx.waker().clone());
+    }
+
+    pub fn notify_recv(&mut self) {
+        if let Some(task) = self.recv_task.take() {
+            task.wake();
+        }
+    }
+
+    pub(super) fn notify_push(&mut self) {
+        if let Some(task) = self.push_task.take() {
+        let sz = frame.payload().len();
+
+        // This should have been enforced at the codec::FramedRead layer, so
+        // this is just a sanity check.
+        assert!(sz <= MAX_WINDOW_SIZE as usize);
+
+        let sz = sz as WindowSize;
+
+        let is_ignoring_frame = stream.state.is_local_error();
+
+        if !is_ignoring_frame && !stream.state.is_recv_streaming() {
+            // TODO: There are cases where this can be a stream error of
+            // STREAM_CLOSED instead...
+
+            // Receiving a DATA frame when not expecting one is a protocol
+            // error.
+            proto_err!(conn: "unexpected DATA frame; stream={:?}", stream.id);
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+        }
+
+        tracing::trace!(
+            "recv_data; size={}; connection={}; stream={}",
+            sz,
+            self.flow.window_size(),
+            stream.recv_flow.window_size()
+        );
+
+        if is_ignoring_frame {
+            tracing::trace!(
+                "recv_data; frame ignored on locally reset {:?} for some time",
+                stream.id,
+            );
+            return self.ignore_data(sz);
+        }
+
+        // Ensure that there is enough capacity on the connection before acting
+        // on the stream.
+        self.consume_connection_window(sz)?;
+
+        if stream.recv_flow.window_size() < sz {
+            // http://httpwg.org/specs/rfc7540.html#WINDOW_UPDATE
+            // > A receiver MAY respond with a stream error (Section 5.4.2) or
+            // > connection error (Section 5.4.1) of type FLOW_CONTROL_ERROR if
+            // > it is unable to accept a frame.
+            //
+            // So, for violating the **stream** window, we can send either a
+            // stream or connection error. We've opted to send a stream
+            // error.
+            return Err(Error::library_reset(stream.id, Reason::FLOW_CONTROL_ERROR));
+        }
+
+        if stream.dec_content_length(frame.payload().len()).is_err() {
+            proto_err!(stream:
+                "recv_data: content-length overflow; stream={:?}; len={:?}",
+                stream.id,
+                frame.payload().len(),
+            );
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
+        }
+
+        if frame.is_end_stream() {
+            if stream.ensure_content_length_zero().is_err() {
+                proto_err!(stream:
+                    "recv_data: content-length underflow; stream={:?}; len={:?}",
+                    stream.id,
+                    frame.payload().len(),
+                );
+                return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
+            }
+
+            if stream.state.recv_close().is_err() {
+                proto_err!(conn: "recv_data: failed to transition to closed state; stream={:?}", stream.id);
+                return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+            }
+        }
+
+        // Received a frame, but no one cared about it. fix issue#648
+        if !stream.is_recv {
+            tracing::trace!(
+                "recv_data; frame ignored on stream release {:?} for some time",
+                stream.id,
+9.290466666666667 minutes used of 15.0

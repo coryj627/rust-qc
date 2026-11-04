@@ -1,0 +1,1972 @@
+use std::any::TypeId;
+use std::cell::Cell;
+use std::marker::PhantomData;
+use std::os::raw::c_int;
+use std::ptr;
+
+use rustc_hash::FxHashMap;
+
+use super::UserDataStorage;
+use crate::error::{Error, Result};
+use crate::types::CallbackPtr;
+use crate::util::{get_userdata, rawget_field, rawset_field, take_userdata};
+
+// This is a trick to check if a type is `Sync` or not.
+// It uses leaked specialization feature from stdlib.
+struct IsSync<'a, T> {
+    is_sync: &'a Cell<bool>,
+    _marker: PhantomData<T>,
+}
+
+impl<T> Clone for IsSync<'_, T> {
+    fn clone(&self) -> Self {
+        self.is_sync.set(false);
+        IsSync {
+            is_sync: self.is_sync,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<T: Sync> Copy for IsSync<'_, T> {}
+
+pub(crate) fn is_sync<T>() -> bool {
+    let is_sync = Cell::new(true);
+    let _ = [IsSync::<T> {
+        is_sync: &is_sync,
+        _marker: PhantomData,
+    }]
+    .clone();
+    is_sync.get()
+}
+
+// Userdata type hints,  used to match types of wrapped userdata
+#[derive(Clone, Copy)]
+pub(crate) struct TypeIdHints {
+    t: TypeId,
+
+    #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+    rc: TypeId,
+    #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+    rc_refcell: TypeId,
+
+    #[cfg(feature = "userdata-wrappers")]
+    arc: TypeId,
+    #[cfg(feature = "userdata-wrappers")]
+    arc_mutex: TypeId,
+    #[cfg(feature = "userdata-wrappers")]
+    arc_rwlock: TypeId,
+    #[cfg(feature = "userdata-wrappers")]
+    arc_pl_mutex: TypeId,
+    #[cfg(feature = "userdata-wrappers")]
+    arc_pl_rwlock: TypeId,
+}
+
+impl TypeIdHints {
+    pub(crate) fn new<T: 'static>() -> Self {
+        Self {
+            t: TypeId::of::<T>(),
+
+            #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+            rc: TypeId::of::<std::rc::Rc<T>>(),
+            #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+            rc_refcell: TypeId::of::<std::rc::Rc<std::cell::RefCell<T>>>(),
+
+            #[cfg(feature = "userdata-wrappers")]
+            arc: TypeId::of::<std::sync::Arc<T>>(),
+            #[cfg(feature = "userdata-wrappers")]
+            arc_mutex: TypeId::of::<std::sync::Arc<std::sync::Mutex<T>>>(),
+            #[cfg(feature = "userdata-wrappers")]
+            arc_rwlock: TypeId::of::<std::sync::Arc<std::sync::RwLock<T>>>(),
+            #[cfg(feature = "userdata-wrappers")]
+            arc_pl_mutex: TypeId::of::<std::sync::Arc<parking_lot::Mutex<T>>>(),
+            #[cfg(feature = "userdata-wrappers")]
+            arc_pl_rwlock: TypeId::of::<std::sync::Arc<parking_lot::RwLock<T>>>(),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn type_id(&self) -> TypeId {
+        self.t
+    }
+}
+
+pub(crate) unsafe fn borrow_userdata_scoped<T, R>(
+    state: *mut ffi::lua_State,
+    idx: c_int,
+    type_id: Option<TypeId>,
+    type_hints: TypeIdHints,
+    f: impl FnOnce(&T) -> R,
+) -> Result<R> {
+    match type_id {
+        Some(type_id) if type_id == type_hints.t => {
+            let ud = get_userdata::<UserDataStorage<T>>(state, idx);
+            (*ud).try_borrow_scoped(|ud| f(ud))
+        }
+
+        #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+        Some(type_id) if type_id == type_hints.rc => {
+            let ud = get_userdata::<UserDataStorage<std::rc::Rc<T>>>(state, idx);
+            (*ud).try_borrow_scoped(|ud| f(ud))
+        }
+        #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+        Some(type_id) if type_id == type_hints.rc_refcell => {
+            let ud = get_userdata::<UserDataStorage<std::rc::Rc<std::cell::RefCell<T>>>>(state, idx);
+            (*ud).try_borrow_scoped(|ud| {
+                let ud = ud.try_borrow().map_err(|_| Error::UserDataBorrowError)?;
+                Ok(f(&ud))
+            })?
+        }
+
+        #[cfg(feature = "userdata-wrappers")]
+        Some(type_id) if type_id == type_hints.arc => {
+            let ud = get_userdata::<UserDataStorage<std::sync::Arc<T>>>(state, idx);
+            (*ud).try_borrow_scoped(|ud| f(ud))
+        }
+        #[cfg(feature = "userdata-wrappers")]
+        Some(type_id) if type_id == type_hints.arc_mutex => {
+            let ud = get_userdata::<UserDataStorage<std::sync::Arc<std::sync::Mutex<T>>>>(state, idx);
+            (*ud).try_borrow_scoped(|ud| {
+                let ud = ud.try_lock().map_err(|_| Error::UserDataBorrowError)?;
+                Ok(f(&ud))
+            })?
+        }
+        #[cfg(feature = "userdata-wrappers")]
+        Some(type_id) if type_id == type_hints.arc_rwlock => {
+            let ud = get_userdata::<UserDataStorage<std::sync::Arc<std::sync::RwLock<T>>>>(state, idx);
+            (*ud).try_borrow_scoped(|ud| {
+                let ud = ud.try_read().map_err(|_| Error::UserDataBorrowError)?;
+                Ok(f(&ud))
+            })?
+        }
+        #[cfg(feature = "userdata-wrappers")]
+        Some(type_id) if type_id == type_hints.arc_pl_mutex => {
+            let ud = get_userdata::<UserDataStorage<std::sync::Arc<parking_lot::Mutex<T>>>>(state, idx);
+            (*ud).try_borrow_scoped(|ud| {
+                let ud = ud.try_lock().ok_or(Error::UserDataBorrowError)?;
+                Ok(f(&ud))
+            })?
+        }
+        #[cfg(feature = "userdata-wrappers")]
+        Some(type_id) if type_id == type_hints.arc_pl_rwlock => {
+            let ud = get_userdata::<UserDataStorage<std::sync::Arc<parking_lot::RwLock<T>>>>(state, idx);
+            (*ud).try_borrow_scoped(|ud| {
+                let ud = ud.try_read().ok_or(Error::UserDataBorrowError)?;
+                Ok(f(&ud))
+            })?
+        }
+        _ => Err(Error::UserDataTypeMismatch),
+    }
+}
+
+pub(crate) unsafe fn borrow_userdata_scoped_mut<T, R>(
+    state: *mut ffi::lua_State,
+    idx: c_int,
+    type_id: Option<TypeId>,
+    type_hints: TypeIdHints,
+    f: impl FnOnce(&mut T) -> R,
+) -> Result<R> {
+    match type_id {
+        Some(type_id) if type_id == type_hints.t => {
+            let ud = get_userdata::<UserDataStorage<T>>(state, idx);
+            (*ud).try_borrow_scoped_mut(|ud| f(ud))
+        }
+
+        #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+        Some(type_id) if type_id == type_hints.rc => {
+            let ud = get_userdata::<UserDataStorage<std::rc::Rc<T>>>(state, idx);
+            (*ud).try_borrow_scoped_mut(|ud| match std::rc::Rc::get_mut(ud) {
+                Some(ud) => Ok(f(ud)),
+                None => Err(Error::UserDataBorrowMutError),
+            })?
+        }
+        #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+        Some(type_id) if type_id == type_hints.rc_refcell => {
+            let ud = get_userdata::<UserDataStorage<std::rc::Rc<std::cell::RefCell<T>>>>(state, idx);
+            (*ud).try_borrow_scoped(|ud| {
+                let mut ud = ud.try_borrow_mut().map_err(|_| Error::UserDataBorrowMutError)?;
+                Ok(f(&mut ud))
+            })?
+        }
+
+        #[cfg(feature = "userdata-wrappers")]
+        Some(type_id) if type_id == type_hints.arc => {
+            let ud = get_userdata::<UserDataStorage<std::sync::Arc<T>>>(state, idx);
+            (*ud).try_borrow_scoped_mut(|ud| match std::sync::Arc::get_mut(ud) {
+                Some(ud) => Ok(f(ud)),
+                None => Err(Error::UserDataBorrowMutError),
+            })?
+        }
+        #[cfg(feature = "userdata-wrappers")]
+        Some(type_id) if type_id == type_hints.arc_mutex => {
+            let ud = get_userdata::<UserDataStorage<std::sync::Arc<std::sync::Mutex<T>>>>(state, idx);
+            (*ud).try_borrow_scoped_mut(|ud| {
+                let mut ud = ud.try_lock().map_err(|_| Error::UserDataBorrowMutError)?;
+                Ok(f(&mut ud))
+            })?
+        }
+        #[cfg(feature = "userdata-wrappers")]
+        Some(type_id) if type_id == type_hints.arc_rwlock => {
+            let ud = get_userdata::<UserDataStorage<std::sync::Arc<std::sync::RwLock<T>>>>(state, idx);
+            (*ud).try_borrow_scoped_mut(|ud| {
+                let mut ud = ud.try_write().map_err(|_| Error::UserDataBorrowMutError)?;
+                Ok(f(&mut ud))
+            })?
+        }
+        #[cfg(feature = "userdata-wrappers")]
+        Some(type_id) if type_id == type_hints.arc_pl_mutex => {
+            let ud = get_userdata::<UserDataStorage<std::sync::Arc<parking_lot::Mutex<T>>>>(state, idx);
+            (*ud).try_borrow_scoped_mut(|ud| {
+                let mut ud = ud.try_lock().ok_or(Error::UserDataBorrowMutError)?;
+                Ok(f(&mut ud))
+            })?
+        }
+        #[cfg(feature = "userdata-wrappers")]
+        Some(type_id) if type_id == type_hints.arc_pl_rwlock => {
+            let ud = get_userdata::<UserDataStorage<std::sync::Arc<parking_lot::RwLock<T>>>>(state, idx);
+            (*ud).try_borrow_scoped_mut(|ud| {
+                let mut ud = ud.try_write().ok_or(Error::UserDataBorrowMutError)?;
+                Ok(f(&mut ud))
+            })?
+        }
+        _ => Err(Error::UserDataTypeMismatch),
+    }
+}
+
+// Populates the given table with the appropriate members to be a userdata metatable for the given
+// type. This function takes the given table at the `metatable` index, and adds an appropriate
+// `__gc` member to it for the given type and a `__metatable` entry to protect the table from script
+// access. The function also, if given a `field_getters` or `methods` tables, will create an
+// `__index` metamethod (capturing previous one) to lookup in `field_getters` first, then `methods`
+// and falling back to the captured `__index` if no matches found.
+// The same is also applicable for `__newindex` metamethod and `field_setters` table.
+// Internally uses 9 stack spaces and does not call checkstack.
+pub(crate) unsafe fn init_userdata_metatable(
+    state: *mut ffi::lua_State,
+    metatable: c_int,
+    field_getters: Option<c_int>,
+    field_setters: Option<c_int>,
+    methods: Option<c_int>,
+    _methods_map: Option<FxHashMap<Vec<u8>, CallbackPtr>>, // Used only in Luau for `__namecall`
+) -> Result<()> {
+    if field_getters.is_some() || methods.is_some() {
+        // Push `__index` generator function
+        init_userdata_metatable_index(state)?;
+
+        let index_type = rawget_field(state, metatable, "__index")?;
+        match index_type {
+            ffi::LUA_TNIL | ffi::LUA_TTABLE | ffi::LUA_TFUNCTION => {
+                for &idx in &[field_getters, methods] {
+                    if let Some(idx) = idx {
+                        ffi::lua_pushvalue(state, idx);
+                    } else {
+                        ffi::lua_pushnil(state);
+                    }
+                }
+
+                // Generate `__index`
+                protect_lua!(state, 4, 1, fn(state) ffi::lua_call(state, 3, 1))?;
+            }
+            _ => mlua_panic!("improper `__index` type: {}", index_type),
+        }
+
+        rawset_field(state, metatable, "__index")?;
+
+        #[cfg(feature = "luau")]
+        if let Some(methods_map) = _methods_map {
+            // In Luau we can speedup method calls by providing a dedicated `__namecall` metamethod
+            push_userdata_metatable_namecall(state, methods_map)?;
+            rawset_field(state, metatable, "__namecall")?;
+        }
+    }
+
+    if let Some(field_setters) = field_setters {
+        // Push `__newindex` generator function
+        init_userdata_metatable_newindex(state)?;
+
+        let newindex_type = rawget_field(state, metatable, "__newindex")?;
+        match newindex_type {
+            ffi::LUA_TNIL | ffi::LUA_TTABLE | ffi::LUA_TFUNCTION => {
+                ffi::lua_pushvalue(state, field_setters);
+                // Generate `__newindex`
+                protect_lua!(state, 3, 1, fn(state) ffi::lua_call(state, 2, 1))?;
+            }
+            _ => mlua_panic!("improper `__newindex` type: {}", newindex_type),
+        }
+
+        rawset_field(state, metatable, "__newindex")?;
+    }
+
+    ffi::lua_pushboolean(state, 0);
+    rawset_field(state, metatable, "__metatable")?;
+
+    Ok(())
+}
+
+unsafe extern "C-unwind" fn lua_error_impl(state: *mut ffi::lua_State) -> c_int {
+    ffi::lua_error(state);
+}
+
+unsafe extern "C-unwind" fn lua_isfunction_impl(state: *mut ffi::lua_State) -> c_int {
+    ffi::lua_pushboolean(state, ffi::lua_isfunction(state, -1));
+    1
+}
+
+unsafe extern "C-unwind" fn lua_istable_impl(state: *mut ffi::lua_State) -> c_int {
+    ffi::lua_pushboolean(state, ffi::lua_istable(state, -1));
+    1
+}
+
+unsafe fn init_userdata_metatable_index(state: *mut ffi::lua_State) -> Result<()> {
+    let index_key = &USERDATA_METATABLE_INDEX as *const u8 as *const _;
+    if ffi::lua_rawgetp(state, ffi::LUA_REGISTRYINDEX, index_key) == ffi::LUA_TFUNCTION {
+        return Ok(());
+    }
+    ffi::lua_pop(state, 1);
+
+    // Create and cache `__index` generator
+    let code = cr#"
+        local error, isfunction, istable = ...
+        return function (__index, field_getters, methods)
+            -- Common case: has field getters and index is a table
+            if field_getters ~= nil and methods == nil and istable(__index) then
+                return function (self, key)
+                    local field_getter = field_getters[key]
+                    if field_getter ~= nil then
+                        return field_getter(self)
+                    end
+                    return __index[key]
+                end
+            end
+
+            return function (self, key)
+                if field_getters ~= nil then
+                    local field_getter = field_getters[key]
+                    if field_getter ~= nil then
+                        return field_getter(self)
+                    end
+                end
+
+                if methods ~= nil then
+                    local method = methods[key]
+                    if method ~= nil then
+                        return method
+                    end
+                end
+
+                if isfunction(__index) then
+                    return __index(self, key)
+                elseif __index == nil then
+                    error("attempt to get an unknown field '"..key.."'")
+                else
+                    return __index[key]
+                end
+            end
+        end
+    "#;
+    protect_lua!(state, 0, 1, |state| {
+        let ret = ffi::luaL_loadbuffer(state, code.as_ptr(), code.count_bytes(), cstr!("=__mlua_index"));
+        if ret != ffi::LUA_OK {
+            ffi::lua_error(state);
+        }
+        ffi::lua_pushcfunction(state, lua_error_impl);
+        ffi::lua_pushcfunction(state, lua_isfunction_impl);
+        ffi::lua_pushcfunction(state, lua_istable_impl);
+        ffi::lua_call(state, 3, 1);
+
+        #[cfg(feature = "luau-jit")]
+        if ffi::luau_codegen_supported() != 0 {
+            ffi::luau_codegen_compile(state, -1);
+        }
+
+        // Store in the registry
+        ffi::lua_pushvalue(state, -1);
+        ffi::lua_rawsetp(state, ffi::LUA_REGISTRYINDEX, index_key);
+    })
+}
+
+unsafe fn init_userdata_metatable_newindex(state: *mut ffi::lua_State) -> Result<()> {
+    let newindex_key = &USERDATA_METATABLE_NEWINDEX as *const u8 as *const _;
+    if ffi::lua_rawgetp(state, ffi::LUA_REGISTRYINDEX, newindex_key) == ffi::LUA_TFUNCTION {
+        return Ok(());
+    }
+    ffi::lua_pop(state, 1);
+
+    // Create and cache `__newindex` generator
+    let code = cr#"
+        local error, isfunction = ...
+        return function (__newindex, field_setters)
+            return function (self, key, value)
+                if field_setters ~= nil then
+                    local field_setter = field_setters[key]
+                    if field_setter ~= nil then
+                        field_setter(self, value)
+                        return
+                    end
+                end
+
+                if isfunction(__newindex) then
+                    __newindex(self, key, value)
+                elseif __newindex == nil then
+                    error("attempt to set an unknown field '"..key.."'")
+                else
+                    __newindex[key] = value
+                end
+            end
+        end
+    "#;
+    protect_lua!(state, 0, 1, |state| {
+        let code_len = code.count_bytes();
+        let ret = ffi::luaL_loadbuffer(state, code.as_ptr(), code_len, cstr!("=__mlua_newindex"));
+        if ret != ffi::LUA_OK {
+            ffi::lua_error(state);
+        }
+        ffi::lua_pushcfunction(state, lua_error_impl);
+        ffi::lua_pushcfunction(state, lua_isfunction_impl);
+        ffi::lua_call(state, 2, 1);
+
+        #[cfg(feature = "luau-jit")]
+        if ffi::luau_codegen_supported() != 0 {
+            ffi::luau_codegen_compile(state, -1);
+        }
+
+        // Store in the registry
+        ffi::lua_pushvalue(state, -1);
+        ffi::lua_rawsetp(state, ffi::LUA_REGISTRYINDEX, newindex_key);
+    })
+}
+
+#[cfg(feature = "luau")]
+unsafe fn push_userdata_metatable_namecall(
+    state: *mut ffi::lua_State,
+    methods_map: FxHashMap<Vec<u8>, CallbackPtr>,
+) -> Result<()> {
+    unsafe extern "C-unwind" fn namecall(state: *mut ffi::lua_State) -> c_int {
+        let name = ffi::lua_namecallatom(state, ptr::null_mut());
+        if name.is_null() {
+            ffi::luaL_error(state, cstr!("attempt to call an unknown method"));
+        }
+        let name_cs = std::ffi::CStr::from_ptr(name);
+        let methods_map = get_userdata::<FxHashMap<Vec<u8>, CallbackPtr>>(state, ffi::lua_upvalueindex(1));
+        let callback_ptr = match (*methods_map).get(name_cs.to_bytes()) {
+            Some(ptr) => *ptr,
+            #[rustfmt::skip]
+            None => ffi::luaL_error(state, cstr!("attempt to call an unknown method '%s'"), name),
+        };
+        crate::state::callback_error_ext(state, ptr::null_mut(), true, |extra, nargs| {
+            let rawlua = (*extra).raw_lua();
+            (*callback_ptr)(rawlua, nargs)
+        })
+    }
+
+    // Automatic destructor is provided for any Luau userdata
+    crate::util::push_userdata(state, methods_map, true)?;
+    protect_lua!(state, 1, 1, |state| {
+        ffi::lua_pushcclosured(state, namecall, cstr!("__namecall"), 1);
+    })
+}
+
+// This method is called by Lua GC when it's time to collect the userdata.
+//
+// This method is usually used to collect internal userdata.
+#[cfg(not(feature = "luau"))]
+pub(crate) unsafe extern "C-unwind" fn collect_userdata<T>(state: *mut ffi::lua_State) -> c_int {
+    let ud = get_userdata::<T>(state, -1);
+    ptr::drop_in_place(ud);
+    0
+}
+
+// This method is called by Luau GC when it's time to collect the userdata.
+#[cfg(feature = "luau")]
+pub(crate) unsafe extern "C" fn collect_userdata<T>(
+    state: *mut ffi::lua_State,
+    ud: *mut std::os::raw::c_void,
+) {
+    // Almost none Lua operations are allowed when destructor is running,
+    // so we need to set a flag to prevent calling any Lua functions
+    let extra = (*ffi::lua_callbacks(state)).userdata as *mut crate::state::ExtraData;
+    (*extra).running_gc = true;
+    // Luau does not support _any_ panics in destructors (they are declared as "C", NOT as "C-unwind"),
+    // so any panics will trigger `abort()`.
+    ptr::drop_in_place(ud as *mut T);
+    (*extra).running_gc = false;
+}
+
+// This method can be called by user or Lua GC to destroy the userdata.
+// It checks if the userdata is safe to destroy and sets the "destroyed" metatable
+// to prevent further GC collection.
+pub(super) unsafe extern "C-unwind" fn destroy_userdata_storage<T>(state: *mut ffi::lua_State) -> c_int {
+    let ud = get_userdata::<UserDataStorage<T>>(state, 1);
+    if (*ud).is_safe_to_destroy() {
+        take_userdata::<UserDataStorage<T>>(state, 1);
+        ffi::lua_pushboolean(state, 1);
+    } else {
+        ffi::lua_pushboolean(state, 0);
+    }
+    1
+}
+
+static USERDATA_METATABLE_INDEX: u8 = 0;
+static USERDATA_METATABLE_NEWINDEX: u8 = 0;
+use std::any::{type_name, TypeId};
+use std::ops::{Deref, DerefMut};
+use std::os::raw::c_int;
+use std::{fmt, mem};
+
+use crate::error::{Error, Result};
+use crate::state::{Lua, RawLua};
+use crate::traits::FromLua;
+use crate::userdata::AnyUserData;
+use crate::util::get_userdata;
+use crate::value::Value;
+
+use super::cell::{UserDataStorage, UserDataVariant};
+use super::lock::{LockGuard, RawLock, UserDataLock};
+use super::util::is_sync;
+
+#[cfg(feature = "userdata-wrappers")]
+use {
+    parking_lot::{
+        Mutex as MutexPL, MutexGuard as MutexGuardPL, RwLock as RwLockPL,
+        RwLockReadGuard as RwLockReadGuardPL, RwLockWriteGuard as RwLockWriteGuardPL,
+    },
+    std::sync::Arc,
+};
+#[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+use {
+    std::cell::{Ref, RefCell, RefMut},
+    std::rc::Rc,
+};
+
+/// A wrapper type for a userdata value that provides read access.
+///
+/// It implements [`FromLua`] and can be used to receive a typed userdata from Lua.
+pub struct UserDataRef<T: 'static> {
+    // It's important to drop the guard first, as it refers to the `inner` data.
+    _guard: LockGuard<'static, RawLock>,
+    inner: UserDataRefInner<T>,
+}
+
+impl<T> Deref for UserDataRef<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.inner
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for UserDataRef<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<T: fmt::Display> fmt::Display for UserDataRef<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<T> TryFrom<UserDataVariant<T>> for UserDataRef<T> {
+    type Error = Error;
+
+    #[inline]
+    fn try_from(variant: UserDataVariant<T>) -> Result<Self> {
+        let guard = if cfg!(not(feature = "send")) || is_sync::<T>() {
+            variant.raw_lock().try_lock_shared_guarded()
+        } else {
+            variant.raw_lock().try_lock_exclusive_guarded()
+        };
+        let guard = guard.map_err(|_| Error::UserDataBorrowError)?;
+        let guard = unsafe { mem::transmute::<LockGuard<_>, LockGuard<'static, _>>(guard) };
+        Ok(UserDataRef::from_parts(UserDataRefInner::Default(variant), guard))
+    }
+}
+
+impl<T: 'static> FromLua for UserDataRef<T> {
+    fn from_lua(value: Value, _: &Lua) -> Result<Self> {
+        try_value_to_userdata::<T>(value)?.borrow()
+    }
+
+    #[inline]
+    unsafe fn from_stack(idx: c_int, lua: &RawLua) -> Result<Self> {
+        Self::borrow_from_stack(lua, lua.state(), idx)
+    }
+}
+
+impl<T: 'static> UserDataRef<T> {
+    #[inline(always)]
+    fn from_parts(inner: UserDataRefInner<T>, guard: LockGuard<'static, RawLock>) -> Self {
+        Self { _guard: guard, inner }
+    }
+
+    #[cfg(feature = "userdata-wrappers")]
+    fn remap<U>(
+        self,
+        f: impl FnOnce(UserDataVariant<T>) -> Result<UserDataRefInner<U>>,
+    ) -> Result<UserDataRef<U>> {
+        match &self.inner {
+            UserDataRefInner::Default(variant) => {
+                let inner = f(variant.clone())?;
+                Ok(UserDataRef::from_parts(inner, self._guard))
+            }
+            _ => Err(Error::UserDataTypeMismatch),
+        }
+    }
+
+    pub(crate) unsafe fn borrow_from_stack(
+        lua: &RawLua,
+        state: *mut ffi::lua_State,
+        idx: c_int,
+    ) -> Result<Self> {
+        let type_id = lua.get_userdata_type_id::<T>(state, idx)?;
+        match type_id {
+            Some(type_id) if type_id == TypeId::of::<T>() => {
+                let ud = get_userdata::<UserDataStorage<T>>(state, idx);
+                (*ud).try_borrow_owned()
+            }
+
+            #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+            Some(type_id) if type_id == TypeId::of::<Rc<T>>() => {
+                let ud = get_userdata::<UserDataStorage<Rc<T>>>(state, idx);
+                ((*ud).try_borrow_owned()).and_then(|ud| ud.transform_rc())
+            }
+            #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+            Some(type_id) if type_id == TypeId::of::<Rc<RefCell<T>>>() => {
+                let ud = get_userdata::<UserDataStorage<Rc<RefCell<T>>>>(state, idx);
+                ((*ud).try_borrow_owned()).and_then(|ud| ud.transform_rc_refcell())
+            }
+
+            #[cfg(feature = "userdata-wrappers")]
+            Some(type_id) if type_id == TypeId::of::<Arc<T>>() => {
+                let ud = get_userdata::<UserDataStorage<Arc<T>>>(state, idx);
+                ((*ud).try_borrow_owned()).and_then(|ud| ud.transform_arc())
+            }
+            #[cfg(feature = "userdata-wrappers")]
+            Some(type_id) if type_id == TypeId::of::<Arc<MutexPL<T>>>() => {
+                let ud = get_userdata::<UserDataStorage<Arc<MutexPL<T>>>>(state, idx);
+                ((*ud).try_borrow_owned()).and_then(|ud| ud.transform_arc_mutex_pl())
+            }
+            #[cfg(feature = "userdata-wrappers")]
+            Some(type_id) if type_id == TypeId::of::<Arc<RwLockPL<T>>>() => {
+                let ud = get_userdata::<UserDataStorage<Arc<RwLockPL<T>>>>(state, idx);
+                ((*ud).try_borrow_owned()).and_then(|ud| ud.transform_arc_rwlock_pl())
+            }
+            _ => Err(Error::UserDataTypeMismatch),
+        }
+    }
+}
+
+#[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+impl<T> UserDataRef<Rc<T>> {
+    fn transform_rc(self) -> Result<UserDataRef<T>> {
+        self.remap(|variant| Ok(UserDataRefInner::Rc(variant)))
+    }
+}
+
+#[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+impl<T> UserDataRef<Rc<RefCell<T>>> {
+    fn transform_rc_refcell(self) -> Result<UserDataRef<T>> {
+        self.remap(|variant| unsafe {
+            let obj = &*variant.as_ptr();
+            let r#ref = obj.try_borrow().map_err(|_| Error::UserDataBorrowError)?;
+            let borrow = std::mem::transmute::<Ref<T>, Ref<'static, T>>(r#ref);
+            Ok(UserDataRefInner::RcRefCell(borrow, variant))
+        })
+    }
+}
+
+#[cfg(feature = "userdata-wrappers")]
+impl<T> UserDataRef<Arc<T>> {
+    fn transform_arc(self) -> Result<UserDataRef<T>> {
+        self.remap(|variant| Ok(UserDataRefInner::Arc(variant)))
+    }
+}
+
+#[cfg(feature = "userdata-wrappers")]
+impl<T> UserDataRef<Arc<MutexPL<T>>> {
+    fn transform_arc_mutex_pl(self) -> Result<UserDataRef<T>> {
+        self.remap(|variant| unsafe {
+            let obj = &*variant.as_ptr();
+            let guard = obj.try_lock().ok_or(Error::UserDataBorrowError)?;
+            let borrow = std::mem::transmute::<MutexGuardPL<T>, MutexGuardPL<'static, T>>(guard);
+            Ok(UserDataRefInner::ArcMutexPL(borrow, variant))
+        })
+    }
+}
+
+#[cfg(feature = "userdata-wrappers")]
+impl<T> UserDataRef<Arc<RwLockPL<T>>> {
+    fn transform_arc_rwlock_pl(self) -> Result<UserDataRef<T>> {
+        self.remap(|variant| unsafe {
+            let obj = &*variant.as_ptr();
+            let guard = obj.try_read().ok_or(Error::UserDataBorrowError)?;
+            let borrow = std::mem::transmute::<RwLockReadGuardPL<T>, RwLockReadGuardPL<'static, T>>(guard);
+            Ok(UserDataRefInner::ArcRwLockPL(borrow, variant))
+        })
+    }
+}
+
+#[allow(unused)]
+enum UserDataRefInner<T: 'static> {
+    Default(UserDataVariant<T>),
+
+    #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+    Rc(UserDataVariant<Rc<T>>),
+    #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+    RcRefCell(Ref<'static, T>, UserDataVariant<Rc<RefCell<T>>>),
+
+    #[cfg(feature = "userdata-wrappers")]
+    Arc(UserDataVariant<Arc<T>>),
+    #[cfg(feature = "userdata-wrappers")]
+    ArcMutexPL(MutexGuardPL<'static, T>, UserDataVariant<Arc<MutexPL<T>>>),
+    #[cfg(feature = "userdata-wrappers")]
+    ArcRwLockPL(RwLockReadGuardPL<'static, T>, UserDataVariant<Arc<RwLockPL<T>>>),
+}
+
+impl<T> Deref for UserDataRefInner<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        match self {
+            Self::Default(inner) => unsafe { &*inner.as_ptr() },
+
+            #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+            Self::Rc(inner) => unsafe { &*Rc::as_ptr(&*inner.as_ptr()) },
+            #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+            Self::RcRefCell(x, ..) => x,
+
+            #[cfg(feature = "userdata-wrappers")]
+            Self::Arc(inner) => unsafe { &*Arc::as_ptr(&*inner.as_ptr()) },
+            #[cfg(feature = "userdata-wrappers")]
+            Self::ArcMutexPL(x, ..) => x,
+            #[cfg(feature = "userdata-wrappers")]
+            Self::ArcRwLockPL(x, ..) => x,
+        }
+    }
+}
+
+/// A wrapper type for a userdata value that provides read and write access.
+///
+/// It implements [`FromLua`] and can be used to receive a typed userdata from Lua.
+pub struct UserDataRefMut<T: 'static> {
+    // It's important to drop the guard first, as it refers to the `inner` data.
+    _guard: LockGuard<'static, RawLock>,
+    inner: UserDataRefMutInner<T>,
+}
+
+impl<T> Deref for UserDataRefMut<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<T> DerefMut for UserDataRefMut<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for UserDataRefMut<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<T: fmt::Display> fmt::Display for UserDataRefMut<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (**self).fmt(f)
+    }
+}
+
+impl<T> TryFrom<UserDataVariant<T>> for UserDataRefMut<T> {
+    type Error = Error;
+
+    #[inline]
+    fn try_from(variant: UserDataVariant<T>) -> Result<Self> {
+        let guard = variant.raw_lock().try_lock_exclusive_guarded();
+        let guard = guard.map_err(|_| Error::UserDataBorrowMutError)?;
+        let guard = unsafe { mem::transmute::<LockGuard<_>, LockGuard<'static, _>>(guard) };
+        Ok(UserDataRefMut::from_parts(
+            UserDataRefMutInner::Default(variant),
+            guard,
+        ))
+    }
+}
+
+impl<T: 'static> FromLua for UserDataRefMut<T> {
+    fn from_lua(value: Value, _: &Lua) -> Result<Self> {
+        try_value_to_userdata::<T>(value)?.borrow_mut()
+    }
+
+    unsafe fn from_stack(idx: c_int, lua: &RawLua) -> Result<Self> {
+        Self::borrow_from_stack(lua, lua.state(), idx)
+    }
+}
+
+impl<T: 'static> UserDataRefMut<T> {
+    #[inline(always)]
+    fn from_parts(inner: UserDataRefMutInner<T>, guard: LockGuard<'static, RawLock>) -> Self {
+        Self { _guard: guard, inner }
+    }
+
+    #[cfg(feature = "userdata-wrappers")]
+    fn remap<U>(
+        self,
+        f: impl FnOnce(UserDataVariant<T>) -> Result<UserDataRefMutInner<U>>,
+    ) -> Result<UserDataRefMut<U>> {
+        match &self.inner {
+            UserDataRefMutInner::Default(variant) => {
+                let inner = f(variant.clone())?;
+                Ok(UserDataRefMut::from_parts(inner, self._guard))
+            }
+            _ => Err(Error::UserDataTypeMismatch),
+        }
+    }
+
+    pub(crate) unsafe fn borrow_from_stack(
+        lua: &RawLua,
+        state: *mut ffi::lua_State,
+        idx: c_int,
+    ) -> Result<Self> {
+        let type_id = lua.get_userdata_type_id::<T>(state, idx)?;
+        match type_id {
+            Some(type_id) if type_id == TypeId::of::<T>() => {
+                let ud = get_userdata::<UserDataStorage<T>>(state, idx);
+                (*ud).try_borrow_owned_mut()
+            }
+
+            #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+            Some(type_id) if type_id == TypeId::of::<Rc<T>>() => Err(Error::UserDataBorrowMutError),
+            #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+            Some(type_id) if type_id == TypeId::of::<Rc<RefCell<T>>>() => {
+                let ud = get_userdata::<UserDataStorage<Rc<RefCell<T>>>>(state, idx);
+                ((*ud).try_borrow_owned_mut()).and_then(|ud| ud.transform_rc_refcell())
+            }
+
+            #[cfg(feature = "userdata-wrappers")]
+            Some(type_id) if type_id == TypeId::of::<Arc<T>>() => Err(Error::UserDataBorrowMutError),
+            #[cfg(feature = "userdata-wrappers")]
+            Some(type_id) if type_id == TypeId::of::<Arc<MutexPL<T>>>() => {
+                let ud = get_userdata::<UserDataStorage<Arc<MutexPL<T>>>>(state, idx);
+                ((*ud).try_borrow_owned_mut()).and_then(|ud| ud.transform_arc_mutex_pl())
+            }
+            #[cfg(feature = "userdata-wrappers")]
+            Some(type_id) if type_id == TypeId::of::<Arc<RwLockPL<T>>>() => {
+                let ud = get_userdata::<UserDataStorage<Arc<RwLockPL<T>>>>(state, idx);
+                ((*ud).try_borrow_owned_mut()).and_then(|ud| ud.transform_arc_rwlock_pl())
+            }
+            _ => Err(Error::UserDataTypeMismatch),
+        }
+    }
+}
+
+#[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+impl<T> UserDataRefMut<Rc<RefCell<T>>> {
+    fn transform_rc_refcell(self) -> Result<UserDataRefMut<T>> {
+        self.remap(|variant| unsafe {
+            let obj = &*variant.as_ptr();
+            let refmut = obj.try_borrow_mut().map_err(|_| Error::UserDataBorrowMutError)?;
+            let borrow = std::mem::transmute::<RefMut<T>, RefMut<'static, T>>(refmut);
+            Ok(UserDataRefMutInner::RcRefCell(borrow, variant))
+        })
+    }
+}
+
+#[cfg(feature = "userdata-wrappers")]
+impl<T> UserDataRefMut<Arc<MutexPL<T>>> {
+    fn transform_arc_mutex_pl(self) -> Result<UserDataRefMut<T>> {
+        self.remap(|variant| unsafe {
+            let obj = &*variant.as_ptr();
+            let guard = obj.try_lock().ok_or(Error::UserDataBorrowMutError)?;
+            let borrow = std::mem::transmute::<MutexGuardPL<T>, MutexGuardPL<'static, T>>(guard);
+            Ok(UserDataRefMutInner::ArcMutexPL(borrow, variant))
+        })
+    }
+}
+
+#[cfg(feature = "userdata-wrappers")]
+impl<T> UserDataRefMut<Arc<RwLockPL<T>>> {
+    fn transform_arc_rwlock_pl(self) -> Result<UserDataRefMut<T>> {
+        self.remap(|variant| unsafe {
+            let obj = &*variant.as_ptr();
+            let guard = obj.try_write().ok_or(Error::UserDataBorrowMutError)?;
+            let borrow = std::mem::transmute::<RwLockWriteGuardPL<T>, RwLockWriteGuardPL<'static, T>>(guard);
+            Ok(UserDataRefMutInner::ArcRwLockPL(borrow, variant))
+        })
+    }
+}
+
+#[allow(unused)]
+enum UserDataRefMutInner<T: 'static> {
+    Default(UserDataVariant<T>),
+
+    #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+    RcRefCell(RefMut<'static, T>, UserDataVariant<Rc<RefCell<T>>>),
+
+    #[cfg(feature = "userdata-wrappers")]
+    ArcMutexPL(MutexGuardPL<'static, T>, UserDataVariant<Arc<MutexPL<T>>>),
+    #[cfg(feature = "userdata-wrappers")]
+    ArcRwLockPL(RwLockWriteGuardPL<'static, T>, UserDataVariant<Arc<RwLockPL<T>>>),
+}
+
+impl<T> Deref for UserDataRefMutInner<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        match self {
+            Self::Default(inner) => unsafe { &*inner.as_ptr() },
+
+            #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+            Self::RcRefCell(x, ..) => x,
+
+            #[cfg(feature = "userdata-wrappers")]
+            Self::ArcMutexPL(x, ..) => x,
+            #[cfg(feature = "userdata-wrappers")]
+            Self::ArcRwLockPL(x, ..) => x,
+        }
+    }
+}
+
+impl<T> DerefMut for UserDataRefMutInner<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        match self {
+            Self::Default(inner) => unsafe { &mut *inner.as_ptr() },
+
+            #[cfg(all(feature = "userdata-wrappers", not(feature = "send")))]
+            Self::RcRefCell(x, ..) => x,
+
+            #[cfg(feature = "userdata-wrappers")]
+            Self::ArcMutexPL(x, ..) => x,
+            #[cfg(feature = "userdata-wrappers")]
+            Self::ArcRwLockPL(x, ..) => x,
+        }
+    }
+}
+
+#[inline]
+fn try_value_to_userdata<T>(value: Value) -> Result<AnyUserData> {
+    match value {
+        Value::UserData(ud) => Ok(ud),
+        _ => Err(Error::FromLuaConversionError {
+            from: value.type_name(),
+            to: "userdata".to_string(),
+            message: Some(format!("expected userdata of type {}", type_name::<T>())),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod assertions {
+    use super::*;
+
+    #[cfg(feature = "send")]
+    static_assertions::assert_impl_all!(UserDataRef<()>: Send, Sync);
+    #[cfg(feature = "send")]
+    static_assertions::assert_not_impl_all!(UserDataRef<std::rc::Rc<()>>: Send, Sync);
+    #[cfg(feature = "send")]
+    static_assertions::assert_impl_all!(UserDataRefMut<()>: Sync, Send);
+    #[cfg(feature = "send")]
+    static_assertions::assert_not_impl_all!(UserDataRefMut<std::rc::Rc<()>>: Send, Sync);
+
+    #[cfg(not(feature = "send"))]
+    static_assertions::assert_not_impl_all!(UserDataRef<()>: Send, Sync);
+    #[cfg(not(feature = "send"))]
+    static_assertions::assert_not_impl_all!(UserDataRefMut<()>: Send, Sync);
+}
+use std::os::raw::c_int;
+use std::string::String as StdString;
+use std::sync::Arc;
+
+use crate::error::{Error, Result};
+use crate::multi::MultiValue;
+use crate::private::Sealed;
+use crate::state::{Lua, RawLua, WeakLua};
+use crate::types::MaybeSend;
+use crate::util::{check_stack, parse_lookup_path, short_type_name};
+use crate::value::Value;
+
+#[cfg(feature = "async")]
+use {crate::function::AsyncCallFuture, std::future::Future};
+
+/// Trait for types convertible to [`Value`].
+pub trait IntoLua: Sized {
+    /// Performs the conversion.
+    fn into_lua(self, lua: &Lua) -> Result<Value>;
+
+    /// Pushes the value into the Lua stack.
+    ///
+    /// # Safety
+    /// This method does not check Lua stack space.
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn push_into_stack(self, lua: &RawLua) -> Result<()> {
+        lua.push_value(&self.into_lua(lua.lua())?)
+    }
+}
+
+/// Trait for types convertible from [`Value`].
+pub trait FromLua: Sized {
+    /// Performs the conversion.
+    fn from_lua(value: Value, lua: &Lua) -> Result<Self>;
+
+    /// Performs the conversion for an argument (eg. function argument).
+    ///
+    /// `i` is the argument index (position),
+    /// `to` is a function name that received the argument.
+    #[doc(hidden)]
+    #[inline]
+    fn from_lua_arg(arg: Value, i: usize, to: Option<&str>, lua: &Lua) -> Result<Self> {
+        Self::from_lua(arg, lua).map_err(|err| Error::BadArgument {
+            to: to.map(|s| s.to_string()),
+            pos: i,
+            name: None,
+            cause: Arc::new(err),
+        })
+    }
+
+    /// Performs the conversion for a value in the Lua stack at index `idx`.
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn from_stack(idx: c_int, lua: &RawLua) -> Result<Self> {
+        Self::from_lua(lua.stack_value(idx, None), lua.lua())
+    }
+
+    /// Same as `from_lua_arg` but for a value in the Lua stack at index `idx`.
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn from_stack_arg(idx: c_int, i: usize, to: Option<&str>, lua: &RawLua) -> Result<Self> {
+        Self::from_stack(idx, lua).map_err(|err| Error::BadArgument {
+            to: to.map(|s| s.to_string()),
+            pos: i,
+            name: None,
+            cause: Arc::new(err),
+        })
+    }
+}
+
+/// Trait for types convertible to any number of Lua values.
+///
+/// This is a generalization of [`IntoLua`], allowing any number of resulting Lua values instead of
+/// just one. Any type that implements [`IntoLua`] will automatically implement this trait.
+pub trait IntoLuaMulti: Sized {
+    /// Performs the conversion.
+    fn into_lua_multi(self, lua: &Lua) -> Result<MultiValue>;
+
+    /// Pushes the values into the Lua stack.
+    ///
+    /// Returns number of pushed values.
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn push_into_stack_multi(self, lua: &RawLua) -> Result<c_int> {
+        let values = self.into_lua_multi(lua.lua())?;
+        let len: c_int = values.len().try_into().unwrap();
+        unsafe {
+            check_stack(lua.state(), len + 1)?;
+            for val in &values {
+                lua.push_value(val)?;
+            }
+        }
+        Ok(len)
+    }
+}
+
+/// Trait for types that can be created from an arbitrary number of Lua values.
+///
+/// This is a generalization of [`FromLua`], allowing an arbitrary number of Lua values to
+/// participate in the conversion. Any type that implements [`FromLua`] will automatically
+/// implement this trait.
+pub trait FromLuaMulti: Sized {
+    /// Performs the conversion.
+    ///
+    /// In case `values` contains more values than needed to perform the conversion, the excess
+    /// values should be ignored. This reflects the semantics of Lua when calling a function or
+    /// assigning values. Similarly, if not enough values are given, conversions should assume that
+    /// any missing values are nil.
+    fn from_lua_multi(values: MultiValue, lua: &Lua) -> Result<Self>;
+
+    /// Performs the conversion for a list of arguments.
+    ///
+    /// `i` is an index (position) of the first argument,
+    /// `to` is a function name that received the arguments.
+    #[doc(hidden)]
+    #[inline]
+    fn from_lua_args(args: MultiValue, i: usize, to: Option<&str>, lua: &Lua) -> Result<Self> {
+        let _ = (i, to);
+        Self::from_lua_multi(args, lua)
+    }
+
+    /// Performs the conversion for a number of values in the Lua stack.
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn from_stack_multi(nvals: c_int, lua: &RawLua) -> Result<Self> {
+        let mut values = MultiValue::with_capacity(nvals as usize);
+        for idx in 0..nvals {
+            values.push_back(lua.stack_value(-nvals + idx, None));
+        }
+        Self::from_lua_multi(values, lua.lua())
+    }
+
+    /// Same as `from_lua_args` but for a number of values in the Lua stack.
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn from_stack_args(nargs: c_int, i: usize, to: Option<&str>, lua: &RawLua) -> Result<Self> {
+        let _ = (i, to);
+        Self::from_stack_multi(nargs, lua)
+    }
+}
+
+/// A trait for types that can be used as Lua objects (usually table and userdata).
+pub trait ObjectLike: Sealed {
+    /// Gets the value associated to `key` from the object, assuming it has `__index` metamethod.
+    fn get<V: FromLua>(&self, key: impl IntoLua) -> Result<V>;
+
+    /// Sets the value associated to `key` in the object, assuming it has `__newindex` metamethod.
+    fn set(&self, key: impl IntoLua, value: impl IntoLua) -> Result<()>;
+
+    /// Calls the object as a function assuming it has `__call` metamethod.
+    ///
+    /// The metamethod is called with the object as its first argument, followed by the passed
+    /// arguments.
+    fn call<R>(&self, args: impl IntoLuaMulti) -> Result<R>
+    where
+        R: FromLuaMulti;
+
+    /// Asynchronously calls the object as a function assuming it has `__call` metamethod.
+    ///
+    /// The metamethod is called with the object as its first argument, followed by the passed
+    /// arguments.
+    #[cfg(feature = "async")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+    fn call_async<R>(&self, args: impl IntoLuaMulti) -> AsyncCallFuture<R>
+    where
+        R: FromLuaMulti;
+
+    /// Gets the function associated to key `name` from the object and calls it,
+    /// passing the object itself along with `args` as function arguments.
+    fn call_method<R>(&self, name: &str, args: impl IntoLuaMulti) -> Result<R>
+    where
+        R: FromLuaMulti;
+
+    /// Gets the function associated to key `name` from the object and asynchronously calls it,
+    /// passing the object itself along with `args` as function arguments.
+    ///
+    /// This might invoke the `__index` metamethod.
+    #[cfg(feature = "async")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+    fn call_async_method<R>(&self, name: &str, args: impl IntoLuaMulti) -> AsyncCallFuture<R>
+    where
+        R: FromLuaMulti;
+
+    /// Gets the function associated to key `name` from the object and calls it,
+    /// passing `args` as function arguments.
+    ///
+    /// This might invoke the `__index` metamethod.
+    fn call_function<R>(&self, name: &str, args: impl IntoLuaMulti) -> Result<R>
+    where
+        R: FromLuaMulti;
+
+    /// Gets the function associated to key `name` from the object and asynchronously calls it,
+    /// passing `args` as function arguments.
+    ///
+    /// This might invoke the `__index` metamethod.
+    #[cfg(feature = "async")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+    fn call_async_function<R>(&self, name: &str, args: impl IntoLuaMulti) -> AsyncCallFuture<R>
+    where
+        R: FromLuaMulti;
+
+    /// Look up a value by a path of keys.
+    ///
+    /// The syntax is similar to accessing nested tables in Lua, with additional support for
+    /// `?` operator to perform safe navigation.
+    ///
+    /// For example, the path `a[1].c` is equivalent to `table.a[1].c` in Lua.
+    /// With `?` operator, `a[1]?.c` is equivalent to `table.a[1] and table.a[1].c or nil` in Lua.
+    ///
+    /// Bracket notation rules:
+    /// - `[123]` - integer keys
+    /// - `["string key"]` or `['string key']` - string keys (must be quoted)
+    /// - String keys support escape sequences: `\"`, `\'`, `\\`
+    fn get_path<V: FromLua>(&self, path: &str) -> Result<V> {
+        let mut current = self.to_value();
+        for (key, safe_nil) in parse_lookup_path(path)? {
+            current = match current {
+                Value::Table(table) => table.get::<Value>(key),
+                Value::UserData(ud) => ud.get::<Value>(key),
+                _ => {
+                    let type_name = current.type_name();
+                    let err = format!("attempt to index a {type_name} value with key '{key}'");
+                    Err(Error::runtime(err))
+                }
+            }?;
+            if safe_nil && (current == Value::Nil || current == Value::NULL) {
+                break;
+            }
+        }
+
+        let lua = self.weak_lua().lock();
+        V::from_lua(current, lua.lua())
+    }
+
+    /// Converts the object to a string in a human-readable format.
+    ///
+    /// This might invoke the `__tostring` metamethod.
+    fn to_string(&self) -> Result<StdString>;
+
+    /// Converts the object to a Lua value.
+    fn to_value(&self) -> Value;
+
+    /// Gets a reference to the associated Lua state.
+    #[doc(hidden)]
+    fn weak_lua(&self) -> &WeakLua;
+}
+
+/// A trait for types that can be used as Lua functions.
+pub trait LuaNativeFn<A: FromLuaMulti> {
+use std::collections::{vec_deque, VecDeque};
+use std::iter::FromIterator;
+use std::mem;
+use std::ops::{Deref, DerefMut};
+use std::os::raw::c_int;
+use std::result::Result as StdResult;
+
+use crate::error::Result;
+use crate::state::{Lua, RawLua};
+use crate::traits::{FromLua, FromLuaMulti, IntoLua, IntoLuaMulti};
+use crate::util::check_stack;
+use crate::value::{Nil, Value};
+
+/// Result is convertible to [`MultiValue`] following the common Lua idiom of returning the result
+/// on success, or in the case of an error, returning `nil` and an error message.
+impl<T: IntoLua, E: IntoLua> IntoLuaMulti for StdResult<T, E> {
+    #[inline]
+    fn into_lua_multi(self, lua: &Lua) -> Result<MultiValue> {
+        match self {
+            Ok(val) => (val,).into_lua_multi(lua),
+            Err(err) => (Nil, err).into_lua_multi(lua),
+        }
+    }
+
+    #[inline]
+    unsafe fn push_into_stack_multi(self, lua: &RawLua) -> Result<c_int> {
+        match self {
+            Ok(val) => (val,).push_into_stack_multi(lua),
+            Err(err) => (Nil, err).push_into_stack_multi(lua),
+        }
+    }
+}
+
+impl<E: IntoLua> IntoLuaMulti for StdResult<(), E> {
+    #[inline]
+    fn into_lua_multi(self, lua: &Lua) -> Result<MultiValue> {
+        match self {
+            Ok(_) => const { Ok(MultiValue::new()) },
+            Err(err) => (Nil, err).into_lua_multi(lua),
+        }
+    }
+
+    #[inline]
+    unsafe fn push_into_stack_multi(self, lua: &RawLua) -> Result<c_int> {
+        match self {
+            Ok(_) => Ok(0),
+            Err(err) => (Nil, err).push_into_stack_multi(lua),
+        }
+    }
+}
+
+impl<T: IntoLua> IntoLuaMulti for T {
+    #[inline]
+    fn into_lua_multi(self, lua: &Lua) -> Result<MultiValue> {
+        let mut v = MultiValue::with_capacity(1);
+        v.push_back(self.into_lua(lua)?);
+        Ok(v)
+    }
+
+    #[inline]
+    unsafe fn push_into_stack_multi(self, lua: &RawLua) -> Result<c_int> {
+        self.push_into_stack(lua)?;
+        Ok(1)
+    }
+}
+
+impl<T: FromLua> FromLuaMulti for T {
+    #[inline]
+    fn from_lua_multi(mut values: MultiValue, lua: &Lua) -> Result<Self> {
+        T::from_lua(values.pop_front().unwrap_or(Nil), lua)
+    }
+
+    #[inline]
+    fn from_lua_args(mut args: MultiValue, i: usize, to: Option<&str>, lua: &Lua) -> Result<Self> {
+        T::from_lua_arg(args.pop_front().unwrap_or(Nil), i, to, lua)
+    }
+
+    #[inline]
+    unsafe fn from_stack_multi(nvals: c_int, lua: &RawLua) -> Result<Self> {
+        if nvals == 0 {
+            return T::from_lua(Nil, lua.lua());
+        }
+        T::from_stack(-nvals, lua)
+    }
+
+    #[inline]
+    unsafe fn from_stack_args(nargs: c_int, i: usize, to: Option<&str>, lua: &RawLua) -> Result<Self> {
+        if nargs == 0 {
+            return T::from_lua_arg(Nil, i, to, lua.lua());
+        }
+        T::from_stack_arg(-nargs, i, to, lua)
+    }
+}
+
+/// Multiple Lua values used for both argument passing and also for multiple return values.
+#[derive(Default, Debug, Clone)]
+pub struct MultiValue(VecDeque<Value>);
+
+impl Deref for MultiValue {
+    type Target = VecDeque<Value>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for MultiValue {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl MultiValue {
+    /// Creates an empty `MultiValue` containing no values.
+    #[inline]
+    pub const fn new() -> MultiValue {
+        MultiValue(VecDeque::new())
+    }
+
+    /// Creates an empty `MultiValue` container with space for at least `capacity` elements.
+    pub fn with_capacity(capacity: usize) -> MultiValue {
+        MultiValue(VecDeque::with_capacity(capacity))
+    }
+
+    /// Creates a `MultiValue` container from vector of values.
+    ///
+    /// This method works in *O*(1) time and does not allocate any additional memory.
+    #[inline]
+    pub fn from_vec(vec: Vec<Value>) -> MultiValue {
+        vec.into()
+    }
+
+    /// Consumes the `MultiValue` and returns a vector of values.
+    ///
+    /// This method needs *O*(*n*) data movement if the circular buffer doesn't happen to be at the
+    /// beginning of the allocation.
+    #[inline]
+    pub fn into_vec(self) -> Vec<Value> {
+        self.into()
+    }
+
+    #[inline]
+    pub(crate) fn from_lua_iter<T: IntoLua>(lua: &Lua, iter: impl IntoIterator<Item = T>) -> Result<Self> {
+        let iter = iter.into_iter();
+        let mut multi_value = MultiValue::with_capacity(iter.size_hint().0);
+        for value in iter {
+            multi_value.push_back(value.into_lua(lua)?);
+        }
+        Ok(multi_value)
+    }
+}
+
+impl From<Vec<Value>> for MultiValue {
+    #[inline]
+    fn from(value: Vec<Value>) -> Self {
+        MultiValue(value.into())
+    }
+}
+
+impl From<MultiValue> for Vec<Value> {
+    #[inline]
+    fn from(value: MultiValue) -> Self {
+        value.0.into()
+    }
+}
+
+impl FromIterator<Value> for MultiValue {
+    #[inline]
+    fn from_iter<I: IntoIterator<Item = Value>>(iter: I) -> Self {
+        let mut multi_value = MultiValue::new();
+        multi_value.extend(iter);
+        multi_value
+    }
+}
+
+impl IntoIterator for MultiValue {
+    type Item = Value;
+    type IntoIter = vec_deque::IntoIter<Value>;
+
+    #[inline]
+    fn into_iter(mut self) -> Self::IntoIter {
+        let deque = mem::take(&mut self.0);
+        mem::forget(self);
+        deque.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a MultiValue {
+    type Item = &'a Value;
+    type IntoIter = vec_deque::Iter<'a, Value>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl IntoLuaMulti for MultiValue {
+    #[inline]
+    fn into_lua_multi(self, _: &Lua) -> Result<MultiValue> {
+        Ok(self)
+    }
+}
+
+impl FromLuaMulti for MultiValue {
+    #[inline]
+    fn from_lua_multi(values: MultiValue, _: &Lua) -> Result<Self> {
+        Ok(values)
+    }
+}
+
+/// Wraps a variable number of `T`s.
+///
+/// Can be used to work with variadic functions more easily. Using this type as the last argument of
+/// a Rust callback will accept any number of arguments from Lua and convert them to the type `T`
+/// using [`FromLua`]. `Variadic<T>` can also be returned from a callback, returning a variable
+/// number of values to Lua.
+///
+/// The [`MultiValue`] type is equivalent to `Variadic<Value>`.
+///
+/// # Examples
+///
+/// ```
+/// # use mlua::{Lua, Result, Variadic};
+/// # fn main() -> Result<()> {
+/// # let lua = Lua::new();
+/// let add = lua.create_function(|_, vals: Variadic<f64>| -> Result<f64> {
+///     Ok(vals.iter().sum())
+/// })?;
+/// lua.globals().set("add", add)?;
+/// assert_eq!(lua.load("add(3, 2, 5)").eval::<f32>()?, 10.0);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Default, Debug, Clone)]
+pub struct Variadic<T>(Vec<T>);
+
+impl<T> Variadic<T> {
+    /// Creates an empty `Variadic` wrapper containing no values.
+    pub const fn new() -> Variadic<T> {
+        Variadic(Vec::new())
+    }
+
+    /// Creates an empty `Variadic` container with space for at least `capacity` elements.
+    pub fn with_capacity(capacity: usize) -> Variadic<T> {
+        Variadic(Vec::with_capacity(capacity))
+    }
+}
+
+impl<T> Deref for Variadic<T> {
+    type Target = Vec<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> DerefMut for Variadic<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T> From<Vec<T>> for Variadic<T> {
+    #[inline]
+    fn from(vec: Vec<T>) -> Self {
+        Variadic(vec)
+    }
+}
+
+impl<T> From<Variadic<T>> for Vec<T> {
+    #[inline]
+    fn from(value: Variadic<T>) -> Self {
+        value.0
+    }
+}
+
+impl<T> FromIterator<T> for Variadic<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Variadic(Vec::from_iter(iter))
+    }
+}
+
+impl<T> IntoIterator for Variadic<T> {
+    type Item = T;
+    type IntoIter = <Vec<T> as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<T: IntoLua> IntoLuaMulti for Variadic<T> {
+    #[inline]
+    fn into_lua_multi(self, lua: &Lua) -> Result<MultiValue> {
+        MultiValue::from_lua_iter(lua, self)
+    }
+
+    unsafe fn push_into_stack_multi(self, lua: &RawLua) -> Result<c_int> {
+        let nresults = self.len() as i32;
+        check_stack(lua.state(), nresults + 1)?;
+        for value in self.0 {
+            value.push_into_stack(lua)?;
+        }
+        Ok(nresults)
+    }
+}
+
+impl<T: FromLua> FromLuaMulti for Variadic<T> {
+    #[inline]
+    fn from_lua_multi(mut values: MultiValue, lua: &Lua) -> Result<Self> {
+        values
+            .drain(..)
+            .map(|val| T::from_lua(val, lua))
+            .collect::<Result<Vec<T>>>()
+            .map(Variadic)
+    }
+}
+
+macro_rules! impl_tuple {
+    () => (
+        impl IntoLuaMulti for () {
+            #[inline]
+            fn into_lua_multi(self, _: &Lua) -> Result<MultiValue> {
+                const { Ok(MultiValue::new()) }
+            }
+
+            #[inline]
+            unsafe fn push_into_stack_multi(self, _lua: &RawLua) -> Result<c_int> {
+                Ok(0)
+            }
+        }
+
+        impl FromLuaMulti for () {
+            #[inline]
+            fn from_lua_multi(_values: MultiValue, _lua: &Lua) -> Result<Self> {
+                Ok(())
+            }
+
+            #[inline]
+            unsafe fn from_stack_multi(_nvals: c_int, _lua: &RawLua) -> Result<Self> {
+                Ok(())
+            }
+        }
+    );
+
+    ($last:ident $($name:ident)*) => (
+        impl<$($name,)* $last> IntoLuaMulti for ($($name,)* $last,)
+            where $($name: IntoLua,)*
+                  $last: IntoLuaMulti
+        {
+            #[allow(unused_mut, non_snake_case)]
+            #[inline]
+            fn into_lua_multi(self, lua: &Lua) -> Result<MultiValue> {
+                let ($($name,)* $last,) = self;
+
+                let mut results = $last.into_lua_multi(lua)?;
+                push_reverse!(results, $($name.into_lua(lua)?,)*);
+                Ok(results)
+            }
+
+            #[allow(non_snake_case)]
+            #[inline]
+            unsafe fn push_into_stack_multi(self, lua: &RawLua) -> Result<c_int> {
+                let ($($name,)* $last,) = self;
+                let mut nresults = 0;
+                $(
+                    _ = $name;
+                    nresults += 1;
+                )*
+                check_stack(lua.state(), nresults + 1)?;
+                $(
+                    $name.push_into_stack(lua)?;
+                )*
+                nresults += $last.push_into_stack_multi(lua)?;
+                Ok(nresults)
+            }
+        }
+
+        impl<$($name,)* $last> FromLuaMulti for ($($name,)* $last,)
+            where $($name: FromLua,)*
+                  $last: FromLuaMulti
+        {
+            #[allow(unused_mut, non_snake_case)]
+            #[inline]
+            fn from_lua_multi(mut values: MultiValue, lua: &Lua) -> Result<Self> {
+                $(let $name = FromLua::from_lua(values.pop_front().unwrap_or(Nil), lua)?;)*
+                let $last = FromLuaMulti::from_lua_multi(values, lua)?;
+                Ok(($($name,)* $last,))
+            }
+
+            #[allow(unused_mut, non_snake_case)]
+            #[inline]
+            fn from_lua_args(mut args: MultiValue, mut i: usize, to: Option<&str>, lua: &Lua) -> Result<Self> {
+                $(
+                    let $name = FromLua::from_lua_arg(args.pop_front().unwrap_or(Nil), i, to, lua)?;
+                    i += 1;
+                )*
+                let $last = FromLuaMulti::from_lua_args(args, i, to, lua)?;
+                Ok(($($name,)* $last,))
+            }
+
+            #[allow(unused_mut, non_snake_case)]
+            #[inline]
+            unsafe fn from_stack_multi(mut nvals: c_int, lua: &RawLua) -> Result<Self> {
+                $(
+                    let $name = if nvals > 0 {
+                        nvals -= 1;
+                        FromLua::from_stack(-(nvals + 1), lua)
+                    } else {
+                        FromLua::from_lua(Nil, lua.lua())
+                    }?;
+                )*
+                let $last = FromLuaMulti::from_stack_multi(nvals, lua)?;
+                Ok(($($name,)* $last,))
+            }
+
+            #[allow(unused_mut, non_snake_case)]
+            #[inline]
+            unsafe fn from_stack_args(mut nargs: c_int, mut i: usize, to: Option<&str>, lua: &RawLua) -> Result<Self> {
+                $(
+                    let $name = if nargs > 0 {
+                        nargs -= 1;
+                        FromLua::from_stack_arg(-(nargs + 1), i, to, lua)
+                    } else {
+                        FromLua::from_lua_arg(Nil, i, to, lua.lua())
+                    }?;
+                    i += 1;
+                )*
+                let $last = FromLuaMulti::from_stack_args(nargs, i, to, lua)?;
+                Ok(($($name,)* $last,))
+            }
+        }
+    );
+}
+
+macro_rules! push_reverse {
+    ($multi_value:expr, $first:expr, $($rest:expr,)*) => (
+        push_reverse!($multi_value, $($rest,)*);
+        $multi_value.push_front($first);
+    );
+
+    ($multi_value:expr, $first:expr) => (
+        $multi_value.push_front($first);
+    );
+
+    ($multi_value:expr,) => ();
+}
+
+impl_tuple!();
+impl_tuple!(A);
+impl_tuple!(A B);
+impl_tuple!(A B C);
+impl_tuple!(A B C D);
+impl_tuple!(A B C D E);
+impl_tuple!(A B C D E F);
+impl_tuple!(A B C D E F G);
+impl_tuple!(A B C D E F G H);
+impl_tuple!(A B C D E F G H I);
+impl_tuple!(A B C D E F G H I J);
+impl_tuple!(A B C D E F G H I J K);
+impl_tuple!(A B C D E F G H I J K L);
+impl_tuple!(A B C D E F G H I J K L M);
+impl_tuple!(A B C D E F G H I J K L M N);
+impl_tuple!(A B C D E F G H I J K L M N O);
+impl_tuple!(A B C D E F G H I J K L M N O P);
+
+#[cfg(test)]
+mod assertions {
+    use super::*;
+
+    #[cfg(not(feature = "send"))]
+    static_assertions::assert_not_impl_any!(MultiValue: Send);
+    #[cfg(feature = "send")]
+    static_assertions::assert_impl_all!(MultiValue: Send, Sync);
+}
+use std::cmp::Ordering;
+use std::collections::HashSet;
+use std::os::raw::c_void;
+use std::string::String as StdString;
+use std::{fmt, ptr, str};
+
+use num_traits::FromPrimitive;
+
+use crate::error::{Error, Result};
+use crate::function::Function;
+use crate::string::{BorrowedStr, String};
+use crate::table::Table;
+use crate::thread::Thread;
+use crate::types::{Integer, LightUserData, Number, ValueRef};
+use crate::userdata::AnyUserData;
+use crate::util::{check_stack, StackGuard};
+
+#[cfg(feature = "serde")]
+use {
+    crate::table::SerializableTable,
+    rustc_hash::FxHashSet,
+    serde::ser::{self, Serialize, Serializer},
+    std::{cell::RefCell, rc::Rc, result::Result as StdResult},
+};
+
+/// A dynamically typed Lua value.
+///
+/// The non-primitive variants (eg. string/table/function/thread/userdata) contain handle types
+/// into the internal Lua state. It is a logic error to mix handle types between separate
+/// `Lua` instances, and doing so will result in a panic.
+#[derive(Clone, Default)]
+pub enum Value {
+    /// The Lua value `nil`.
+    #[default]
+    Nil,
+    /// The Lua value `true` or `false`.
+    Boolean(bool),
+    /// A "light userdata" object, equivalent to a raw pointer.
+    LightUserData(LightUserData),
+    /// An integer number.
+    ///
+    /// Any Lua number convertible to a `Integer` will be represented as this variant.
+    Integer(Integer),
+    /// A floating point number.
+    Number(Number),
+    /// A Luau vector.
+    #[cfg(any(feature = "luau", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    Vector(crate::Vector),
+    /// An interned string, managed by Lua.
+    ///
+    /// Unlike Rust strings, Lua strings may not be valid UTF-8.
+    String(String),
+    /// Reference to a Lua table.
+    Table(Table),
+    /// Reference to a Lua function (or closure).
+    Function(Function),
+    /// Reference to a Lua thread (or coroutine).
+    Thread(Thread),
+    /// Reference to a userdata object that holds a custom type which implements `UserData`.
+    ///
+    /// Special builtin userdata types will be represented as other `Value` variants.
+    UserData(AnyUserData),
+    /// A Luau buffer.
+    #[cfg(any(feature = "luau", doc))]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    Buffer(crate::Buffer),
+    /// `Error` is a special builtin userdata type. When received from Lua it is implicitly cloned.
+    Error(Box<Error>),
+    /// Any other value not known to mlua (eg. LuaJIT CData).
+    Other(#[doc(hidden)] ValueRef),
+}
+
+pub use self::Value::Nil;
+
+impl Value {
+    /// A special value (lightuserdata) to represent null value.
+    ///
+    /// It can be used in Lua tables without downsides of `nil`.
+    pub const NULL: Value = Value::LightUserData(LightUserData(ptr::null_mut()));
+
+    /// Returns type name of this value.
+    pub fn type_name(&self) -> &'static str {
+        match *self {
+            Value::Nil => "nil",
+            Value::Boolean(_) => "boolean",
+            Value::LightUserData(_) => "lightuserdata",
+            Value::Integer(_) => "integer",
+            Value::Number(_) => "number",
+            #[cfg(feature = "luau")]
+            Value::Vector(_) => "vector",
+            Value::String(_) => "string",
+            Value::Table(_) => "table",
+            Value::Function(_) => "function",
+            Value::Thread(_) => "thread",
+            Value::UserData(_) => "userdata",
+            #[cfg(feature = "luau")]
+            Value::Buffer(_) => "buffer",
+            Value::Error(_) => "error",
+            Value::Other(_) => "other",
+        }
+    }
+
+    /// Compares two values for equality.
+    ///
+    /// Equality comparisons do not convert strings to numbers or vice versa.
+    /// Tables, functions, threads, and userdata are compared by reference:
+    /// two objects are considered equal only if they are the same object.
+    ///
+    /// If table or userdata have `__eq` metamethod then mlua will try to invoke it.
+    /// The first value is checked first. If that value does not define a metamethod
+    /// for `__eq`, then mlua will check the second value.
+    /// Then mlua calls the metamethod with the two values as arguments, if found.
+    pub fn equals(&self, other: &Self) -> Result<bool> {
+        match (self, other) {
+            (Value::Table(a), Value::Table(b)) => a.equals(b),
+            (Value::UserData(a), Value::UserData(b)) => a.equals(b),
+            (a, b) => Ok(a == b),
+        }
+    }
+
+    /// Converts the value to a generic C pointer.
+    ///
+    /// The value can be a userdata, a table, a thread, a string, or a function; otherwise it
+    /// returns NULL. Different objects will give different pointers.
+    /// There is no way to convert the pointer back to its original value.
+    ///
+    /// Typically this function is used only for hashing and debug information.
+    #[inline]
+    pub fn to_pointer(&self) -> *const c_void {
+        match self {
+            Value::String(String(vref)) => {
+                // In Lua < 5.4 (excluding Luau), string pointers are NULL
+                // Use alternative approach
+                let lua = vref.lua.lock();
+                unsafe { ffi::lua_tostring(lua.ref_thread(), vref.index) as *const c_void }
+            }
+            Value::LightUserData(ud) => ud.0,
+            Value::Table(Table(vref))
+            | Value::Function(Function(vref))
+            | Value::Thread(Thread(vref, ..))
+            | Value::UserData(AnyUserData(vref))
+            | Value::Other(vref) => vref.to_pointer(),
+            #[cfg(feature = "luau")]
+            Value::Buffer(crate::Buffer(vref)) => vref.to_pointer(),
+            _ => ptr::null(),
+        }
+    }
+
+    /// Converts the value to a string.
+    ///
+    /// This might invoke the `__tostring` metamethod for non-primitive types (eg. tables,
+    /// functions).
+    pub fn to_string(&self) -> Result<StdString> {
+        unsafe fn invoke_to_string(vref: &ValueRef) -> Result<StdString> {
+            let lua = vref.lua.lock();
+            let state = lua.state();
+            let _guard = StackGuard::new(state);
+            check_stack(state, 3)?;
+
+            lua.push_ref(vref);
+            protect_lua!(state, 1, 1, fn(state) {
+                ffi::luaL_tolstring(state, -1, ptr::null_mut());
+            })?;
+            Ok(String(lua.pop_ref()).to_str()?.to_string())
+        }
+
+        match self {
+            Value::Nil => Ok("nil".to_string()),
+            Value::Boolean(b) => Ok(b.to_string()),
+            Value::LightUserData(ud) if ud.0.is_null() => Ok("null".to_string()),
+            Value::LightUserData(ud) => Ok(format!("lightuserdata: {:p}", ud.0)),
+            Value::Integer(i) => Ok(i.to_string()),
+            Value::Number(n) => Ok(n.to_string()),
+            #[cfg(feature = "luau")]
+            Value::Vector(v) => Ok(v.to_string()),
+            Value::String(s) => Ok(s.to_str()?.to_string()),
+            Value::Table(Table(vref))
+            | Value::Function(Function(vref))
+            | Value::Thread(Thread(vref, ..))
+            | Value::UserData(AnyUserData(vref))
+            | Value::Other(vref) => unsafe { invoke_to_string(vref) },
+            #[cfg(feature = "luau")]
+            Value::Buffer(crate::Buffer(vref)) => unsafe { invoke_to_string(vref) },
+            Value::Error(err) => Ok(err.to_string()),
+        }
+    }
+
+    /// Returns `true` if the value is a [`Nil`].
+    #[inline]
+    pub fn is_nil(&self) -> bool {
+        self == &Nil
+    }
+
+    /// Returns `true` if the value is a [`NULL`].
+    ///
+    /// [`NULL`]: Value::NULL
+    #[inline]
+    pub fn is_null(&self) -> bool {
+        self == &Self::NULL
+    }
+
+    /// Returns `true` if the value is a boolean.
+    #[inline]
+    pub fn is_boolean(&self) -> bool {
+        self.as_boolean().is_some()
+    }
+
+    /// Cast the value to boolean.
+    ///
+    /// If the value is a Boolean, returns it or `None` otherwise.
+    #[inline]
+    pub fn as_boolean(&self) -> Option<bool> {
+        match *self {
+            Value::Boolean(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if the value is a [`LightUserData`].
+    #[inline]
+    pub fn is_light_userdata(&self) -> bool {
+        self.as_light_userdata().is_some()
+    }
+
+    /// Cast the value to [`LightUserData`].
+    ///
+    /// If the value is a [`LightUserData`], returns it or `None` otherwise.
+    #[inline]
+    pub fn as_light_userdata(&self) -> Option<LightUserData> {
+        match *self {
+            Value::LightUserData(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if the value is an [`Integer`].
+    #[inline]
+    pub fn is_integer(&self) -> bool {
+        self.as_integer().is_some()
+    }
+
+    /// Cast the value to [`Integer`].
+    ///
+    /// If the value is a Lua [`Integer`], returns it or `None` otherwise.
+    #[inline]
+    pub fn as_integer(&self) -> Option<Integer> {
+        match *self {
+            Value::Integer(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// Cast the value to `i32`.
+    ///
+    /// If the value is a Lua [`Integer`], try to convert it to `i32` or return `None` otherwise.
+    #[inline]
+    pub fn as_i32(&self) -> Option<i32> {
+        #[allow(clippy::useless_conversion)]
+        self.as_integer().and_then(|i| i32::try_from(i).ok())

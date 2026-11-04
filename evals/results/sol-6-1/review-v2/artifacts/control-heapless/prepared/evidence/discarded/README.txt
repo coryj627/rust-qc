@@ -1,0 +1,1 @@
+Exploratory probe only, excluded from all seven final controls. The deque candidate was discarded after its probe failed an additional postcondition. No final claim or refutation relies on that candidate. initial_probes.rs and initial_probes.log preserve the initial run; the final probes are ../control_probes.rs and ../probes.log.

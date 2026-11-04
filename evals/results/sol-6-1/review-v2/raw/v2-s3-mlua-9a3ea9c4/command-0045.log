@@ -1,0 +1,469 @@
+    }
+}
+
+pub(crate) unsafe extern "C-unwind" fn error_traceback(state: *mut ffi::lua_State) -> c_int {
+    // Luau calls error handler for memory allocation errors, skip it
+    // See https://github.com/luau-lang/luau/issues/880
+    #[cfg(feature = "luau")]
+    if MemoryState::limit_reached(state) {
+        return 0;
+    }
+
+    if ffi::lua_checkstack(state, 2) == 0 {
+        // If we don't have enough stack space to even check the error type, do
+        // nothing so we don't risk shadowing a rust panic.
+        return 1;
+    }
+
+    if get_internal_userdata::<WrappedFailure>(state, -1, ptr::null()).is_null() {
+        let s = ffi::luaL_tolstring(state, -1, ptr::null_mut());
+        if ffi::lua_checkstack(state, ffi::LUA_TRACEBACK_STACK) != 0 {
+            ffi::luaL_traceback(state, state, s, 0);
+            ffi::lua_remove(state, -2);
+        }
+    }
+
+    1
+}
+
+// A variant of `error_traceback` that can safely inspect another (yielded) thread stack
+pub(crate) unsafe fn error_traceback_thread(state: *mut ffi::lua_State, thread: *mut ffi::lua_State) {
+    // Move error object to the main thread to safely call `__tostring` metamethod if present
+    ffi::lua_xmove(thread, state, 1);
+
+    if get_internal_userdata::<WrappedFailure>(state, -1, ptr::null()).is_null() {
+        let s = ffi::luaL_tolstring(state, -1, ptr::null_mut());
+        if ffi::lua_checkstack(state, ffi::LUA_TRACEBACK_STACK) != 0 {
+            ffi::luaL_traceback(state, thread, s, 0);
+            ffi::lua_remove(state, -2);
+        }
+    }
+}
+
+// Initialize the error, panic, and destructed userdata metatables.
+pub(crate) unsafe fn init_error_registry(state: *mut ffi::lua_State) -> Result<()> {
+    check_stack(state, 7)?;
+
+    // Create error and panic metatables
+
+    static ERROR_PRINT_BUFFER_KEY: u8 = 0;
+
+    unsafe extern "C-unwind" fn error_tostring(state: *mut ffi::lua_State) -> c_int {
+        callback_error(state, |_| {
+            check_stack(state, 3)?;
+
+            let err_buf = match get_internal_userdata::<WrappedFailure>(state, -1, ptr::null()).as_ref() {
+                Some(WrappedFailure::Error(error)) => {
+                    let err_buf_key = &ERROR_PRINT_BUFFER_KEY as *const u8 as *const c_void;
+                    ffi::lua_rawgetp(state, ffi::LUA_REGISTRYINDEX, err_buf_key);
+                    let err_buf = ffi::lua_touserdata(state, -1) as *mut String;
+                    ffi::lua_pop(state, 2);
+
+                    (*err_buf).clear();
+                    // Depending on how the API is used and what error types scripts are given, it may
+                    // be possible to make this consume arbitrary amounts of memory (for example, some
+                    // kind of recursive error structure?)
+                    let _ = write!(&mut (*err_buf), "{error}");
+                    Ok(err_buf)
+                }
+                Some(WrappedFailure::Panic(Some(panic))) => {
+                    let err_buf_key = &ERROR_PRINT_BUFFER_KEY as *const u8 as *const c_void;
+                    ffi::lua_rawgetp(state, ffi::LUA_REGISTRYINDEX, err_buf_key);
+                    let err_buf = ffi::lua_touserdata(state, -1) as *mut String;
+                    (*err_buf).clear();
+                    ffi::lua_pop(state, 2);
+
+                    if let Some(msg) = panic.downcast_ref::<&str>() {
+                        let _ = write!(&mut (*err_buf), "{msg}");
+                    } else if let Some(msg) = panic.downcast_ref::<String>() {
+                        let _ = write!(&mut (*err_buf), "{msg}");
+                    } else {
+                        let _ = write!(&mut (*err_buf), "<panic>");
+                    };
+                    Ok(err_buf)
+                }
+                Some(WrappedFailure::Panic(None)) => Err(Error::PreviouslyResumedPanic),
+                _ => {
+                    // I'm not sure whether this is possible to trigger without bugs in mlua?
+                    Err(Error::UserDataTypeMismatch)
+                }
+            }?;
+
+            push_string(state, (*err_buf).as_bytes(), true)?;
+            (*err_buf).clear();
+
+            Ok(1)
+        })
+    }
+
+    init_internal_metatable::<WrappedFailure>(
+        state,
+        Some(|state| {
+            ffi::lua_pushcfunction(state, error_tostring);
+            ffi::lua_setfield(state, -2, cstr!("__tostring"));
+
+            // This is mostly for Luau typeof() function
+            ffi::lua_pushstring(state, cstr!("error"));
+            ffi::lua_setfield(state, -2, cstr!("__type"));
+        }),
+    )?;
+
+    // Create destructed userdata metatable
+
+    unsafe extern "C-unwind" fn destructed_error(state: *mut ffi::lua_State) -> c_int {
+        callback_error(state, |_| Err(Error::UserDataDestructed))
+    }
+
+    push_table(state, 0, 26, true)?;
+    ffi::lua_pushcfunction(state, destructed_error);
+    for &method in &[
+        "__add",
+        "__sub",
+        "__mul",
+        "__div",
+        "__mod",
+        "__pow",
+        "__unm",
+        #[cfg(any(feature = "lua54", feature = "lua53", feature = "luau"))]
+        "__idiv",
+        #[cfg(any(feature = "lua54", feature = "lua53"))]
+        "__band",
+        #[cfg(any(feature = "lua54", feature = "lua53"))]
+        "__bor",
+        #[cfg(any(feature = "lua54", feature = "lua53"))]
+        "__bxor",
+        #[cfg(any(feature = "lua54", feature = "lua53"))]
+        "__bnot",
+        #[cfg(any(feature = "lua54", feature = "lua53"))]
+        "__shl",
+        #[cfg(any(feature = "lua54", feature = "lua53"))]
+        "__shr",
+        "__concat",
+        "__len",
+        "__eq",
+        "__lt",
+        "__le",
+        "__index",
+        "__newindex",
+        "__call",
+        "__tostring",
+        #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luajit52"))]
+        "__pairs",
+        #[cfg(any(feature = "lua53", feature = "lua52", feature = "luajit52"))]
+        "__ipairs",
+        #[cfg(feature = "luau")]
+        "__iter",
+        #[cfg(feature = "luau")]
+        "__namecall",
+        #[cfg(feature = "lua54")]
+        "__close",
+    ] {
+        ffi::lua_pushvalue(state, -1);
+        rawset_field(state, -3, method)?;
+    }
+    ffi::lua_pop(state, 1);
+
+    protect_lua!(state, 1, 0, fn(state) {
+        let destructed_mt_key = &DESTRUCTED_USERDATA_METATABLE as *const u8 as *const c_void;
+        ffi::lua_rawsetp(state, ffi::LUA_REGISTRYINDEX, destructed_mt_key);
+    })?;
+
+    // Create error print buffer
+    init_internal_metatable::<String>(state, None)?;
+    push_internal_userdata(state, String::new(), true)?;
+    protect_lua!(state, 1, 0, fn(state) {
+        let err_buf_key = &ERROR_PRINT_BUFFER_KEY as *const u8 as *const c_void;
+        ffi::lua_rawsetp(state, ffi::LUA_REGISTRYINDEX, err_buf_key);
+
+impl<T, E> ExternalResult<T> for StdResult<T, E>
+where
+    E: ExternalError,
+{
+    fn into_lua_err(self) -> Result<T> {
+        self.map_err(|e| e.into_lua_err())
+    }
+}
+
+/// Provides the `context` method for [`Error`] and `Result<T, Error>`.
+pub trait ErrorContext: Sealed {
+    /// Wraps the error value with additional context.
+    fn context<C: fmt::Display>(self, context: C) -> Self;
+
+    /// Wrap the error value with additional context that is evaluated lazily
+    /// only once an error does occur.
+    fn with_context<C: fmt::Display>(self, f: impl FnOnce(&Error) -> C) -> Self;
+}
+
+impl ErrorContext for Error {
+    fn context<C: fmt::Display>(self, context: C) -> Self {
+        let context = context.to_string();
+        match self {
+            Error::WithContext { cause, .. } => Error::WithContext { context, cause },
+            _ => Error::WithContext {
+                context,
+                cause: Arc::new(self),
+            },
+        }
+    }
+
+    fn with_context<C: fmt::Display>(self, f: impl FnOnce(&Error) -> C) -> Self {
+        let context = f(&self).to_string();
+        match self {
+            Error::WithContext { cause, .. } => Error::WithContext { context, cause },
+            _ => Error::WithContext {
+                context,
+                cause: Arc::new(self),
+            },
+        }
+    }
+}
+
+impl<T> ErrorContext for Result<T> {
+    fn context<C: fmt::Display>(self, context: C) -> Self {
+        self.map_err(|err| err.context(context))
+    }
+
+    fn with_context<C: fmt::Display>(self, f: impl FnOnce(&Error) -> C) -> Self {
+        self.map_err(|err| err.with_context(f))
+    }
+}
+
+impl From<AddrParseError> for Error {
+    fn from(err: AddrParseError) -> Self {
+        Error::external(err)
+    }
+}
+
+impl From<IoError> for Error {
+use std::error::Error as _;
+use std::{fmt, io};
+
+use mlua::{Error, ErrorContext, Lua, Result};
+
+#[test]
+fn test_error_context() -> Result<()> {
+    let lua = Lua::new();
+
+    let func =
+        lua.create_function(|_, ()| Err::<(), _>(Error::runtime("runtime error")).context("some context"))?;
+    lua.globals().set("func", func)?;
+
+    let msg = lua
+        .load("local _, err = pcall(func); return tostring(err)")
+        .eval::<String>()?;
+    assert!(msg.contains("some context"));
+    assert!(msg.contains("runtime error"));
+
+    let func2 = lua.create_function(|lua, ()| {
+        lua.globals()
+            .get::<String>("nonextant")
+            .with_context(|_| "failed to find global")
+    })?;
+    lua.globals().set("func2", func2)?;
+
+    let msg2 = lua
+        .load("local _, err = pcall(func2); return tostring(err)")
+        .eval::<String>()?;
+    assert!(msg2.contains("failed to find global"));
+    assert!(msg2.contains("error converting Lua nil to String"));
+
+    // Rewrite context message and test `downcast_ref`
+    let func3 = lua.create_function(|_, ()| {
+        Err::<(), _>(Error::external(io::Error::new(io::ErrorKind::Other, "other")))
+            .context("some context")
+            .context("some new context")
+    })?;
+    let err = func3.call::<()>(()).unwrap_err();
+    let err = err.parent().unwrap();
+    assert!(!err.to_string().contains("some context"));
+    assert!(err.to_string().contains("some new context"));
+    assert!(err.downcast_ref::<io::Error>().is_some());
+    assert!(err.downcast_ref::<fmt::Error>().is_none());
+
+    Ok(())
+}
+
+#[test]
+fn test_error_chain() -> Result<()> {
+    let lua = Lua::new();
+
+    // Check that `Error::ExternalError` creates a chain with a single element
+    let io_err = io::Error::new(io::ErrorKind::Other, "other");
+    assert_eq!(Error::external(io_err).chain().count(), 1);
+
+    let func = lua.create_function(|_, ()| {
+        let err = Error::external(io::Error::new(io::ErrorKind::Other, "other")).context("io error");
+        Err::<(), _>(err)
+    })?;
+    let err = func.call::<()>(()).unwrap_err();
+    assert_eq!(err.chain().count(), 3);
+    for (i, err) in err.chain().enumerate() {
+        match i {
+            0 => assert!(matches!(err.downcast_ref(), Some(Error::CallbackError { .. }))),
+            1 => assert!(matches!(err.downcast_ref(), Some(Error::WithContext { .. }))),
+            2 => assert!(matches!(err.downcast_ref(), Some(io::Error { .. }))),
+            _ => unreachable!(),
+        }
+    }
+
+    let err = err.parent().unwrap();
+    assert!(err.source().is_none()); // The source is included to the `Display` output
+    assert!(err.to_string().contains("io error"));
+    assert!(err.to_string().contains("other"));
+
+    Ok(())
+}
+
+#[cfg(feature = "anyhow")]
+#[test]
+fn test_error_anyhow() -> Result<()> {
+    use mlua::IntoLua;
+
+    let lua = Lua::new();
+
+    let err = anyhow::Error::msg("anyhow error");
+    let val = err.into_lua(&lua)?;
+    assert!(val.is_error());
+    assert_eq!(val.as_error().unwrap().to_string(), "anyhow error");
+
+    // Try Error -> anyhow::Error -> Error roundtrip
+    let err = Error::runtime("runtime error");
+    let err = anyhow::Error::new(err);
+    let err = err.into_lua(&lua)?;
+    assert!(err.is_error());
+    let err = err.as_error().unwrap();
+    assert!(matches!(err, Error::RuntimeError(msg) if msg == "runtime error"));
+
+    Ok(())
+}
+    /// Marks the Lua state as safe.
+    #[inline(always)]
+    pub(super) fn mark_safe(&self) {
+        unsafe { (*self.extra.get()).safe = true };
+    }
+
+    /// Loads the specified subset of the standard libraries into an existing Lua state.
+    ///
+    /// Use the [`StdLib`] flags to specify the libraries you want to load.
+    ///
+    /// [`StdLib`]: crate::StdLib
+    pub(super) unsafe fn load_std_libs(&self, libs: StdLib) -> Result<()> {
+        let is_safe = (*self.extra.get()).safe;
+
+        #[cfg(not(feature = "luau"))]
+        if is_safe && libs.contains(StdLib::DEBUG) {
+            return Err(Error::SafetyError(
+                "the unsafe `debug` module can't be loaded in safe mode".to_string(),
+            ));
+        }
+        #[cfg(feature = "luajit")]
+        if is_safe && libs.contains(StdLib::FFI) {
+            return Err(Error::SafetyError(
+                "the unsafe `ffi` module can't be loaded in safe mode".to_string(),
+            ));
+        }
+
+        let res = load_std_libs(self.main_state(), libs);
+
+        // If `package` library loaded into a safe lua state then disable C modules
+        #[cfg(not(feature = "luau"))]
+        if is_safe {
+            let curr_libs = (*self.extra.get()).libs;
+            if (curr_libs ^ (curr_libs | libs)).contains(StdLib::PACKAGE) {
+                mlua_expect!(self.lua().disable_c_modules(), "Error disabling C modules");
+            }
+        }
+        #[cfg(feature = "luau")]
+        let _ = is_safe;
+        unsafe { (*self.extra.get()).libs |= libs };
+
+        res
+    }
+
+    /// Private version of [`Lua::try_set_app_data`]
+    #[inline]
+    pub(crate) fn set_priv_app_data<T: MaybeSend + 'static>(&self, data: T) -> Option<T> {
+        let extra = unsafe { &*self.extra.get() };
+        extra.app_data_priv.insert(data)
+    }
+
+    /// Private version of [`Lua::app_data_ref`]
+    #[track_caller]
+    #[inline]
+    pub(crate) fn priv_app_data_ref<T: 'static>(&self) -> Option<AppDataRef<'_, T>> {
+        let extra = unsafe { &*self.extra.get() };
+        extra.app_data_priv.borrow(None)
+    }
+
+    /// Private version of [`Lua::app_data_mut`]
+    #[track_caller]
+    #[inline]
+    pub(crate) fn priv_app_data_mut<T: 'static>(&self) -> Option<AppDataRefMut<'_, T>> {
+        let extra = unsafe { &*self.extra.get() };
+        extra.app_data_priv.borrow_mut(None)
+    }
+
+    /// See [`Lua::create_registry_value`]
+    #[inline]
+    pub(crate) fn owns_registry_value(&self, key: &RegistryKey) -> bool {
+        let registry_unref_list = unsafe { &(*self.extra.get()).registry_unref_list };
+        Arc::ptr_eq(&key.unref_list, registry_unref_list)
+    }
+
+    pub(crate) fn load_chunk(
+        &self,
+        name: Option<&CStr>,
+        env: Option<&Table>,
+        mode: Option<ChunkMode>,
+        source: &[u8],
+    ) -> Result<Function> {
+        let state = self.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            check_stack(state, 3)?;
+
+            let name = name.map(CStr::as_ptr).unwrap_or(ptr::null());
+            let mode = match mode {
+                Some(ChunkMode::Binary) => cstr!("b"),
+                Some(ChunkMode::Text) => cstr!("t"),
+                None => cstr!("bt"),
+            };
+            let status = if self.unlikely_memory_error() {
+                self.load_chunk_inner(state, name, env, mode, source)
+            } else {
+                // Luau and Lua 5.2 can trigger an exception during chunk loading
+                protect_lua!(state, 0, 1, |state| {
+                    self.load_chunk_inner(state, name, env, mode, source)
+                })?
+            };
+            match status {
+                ffi::LUA_OK => Ok(Function(self.pop_ref())),
+                err => Err(pop_error(state, err)),
+            }
+        }
+    }
+
+    pub(crate) unsafe fn load_chunk_inner(
+        &self,
+        state: *mut ffi::lua_State,
+        name: *const c_char,
+        env: Option<&Table>,
+        mode: *const c_char,
+        source: &[u8],
+    ) -> c_int {
+        let status = ffi::luaL_loadbufferenv(
+            state,
+            source.as_ptr() as *const c_char,
+            source.len(),
+            name,
+            mode,
+            match env {
+                Some(env) => {
+                    self.push_ref(&env.0);
+                    -1
+                }
+                _ => 0,
+            },
+        );
+        #[cfg(feature = "luau-jit")]
+        if status == ffi::LUA_OK {

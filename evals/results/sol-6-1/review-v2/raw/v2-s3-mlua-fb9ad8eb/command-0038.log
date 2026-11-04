@@ -1,0 +1,413 @@
+pub(crate) unsafe fn push_string(state: *mut ffi::lua_State, s: &[u8], protect: bool) -> Result<()> {
+    // Always use protected mode if the string is too long
+    if protect || s.len() >= const { 1 << 30 } {
+        protect_lua!(state, 0, 1, |state| {
+            ffi::lua_pushlstring(state, s.as_ptr() as *const c_char, s.len());
+        })
+    } else {
+        ffi::lua_pushlstring(state, s.as_ptr() as *const c_char, s.len());
+        Ok(())
+    }
+}
+
+// Uses 3 stack spaces (when protect), does not call checkstack.
+#[cfg(feature = "luau")]
+#[inline(always)]
+pub(crate) unsafe fn push_buffer(state: *mut ffi::lua_State, size: usize, protect: bool) -> Result<*mut u8> {
+    let data = if protect || size > const { 1024 * 1024 * 1024 } {
+        protect_lua!(state, 0, 1, |state| ffi::lua_newbuffer(state, size))?
+    } else {
+        ffi::lua_newbuffer(state, size)
+    };
+    Ok(data as *mut u8)
+}
+
+// Uses 3 stack spaces, does not call checkstack.
+#[inline]
+pub(crate) unsafe fn push_table(
+    state: *mut ffi::lua_State,
+    narr: usize,
+    nrec: usize,
+    protect: bool,
+) -> Result<()> {
+    let narr: c_int = narr.try_into().unwrap_or(c_int::MAX);
+    let nrec: c_int = nrec.try_into().unwrap_or(c_int::MAX);
+    if protect || narr >= const { 1 << 26 } || nrec >= const { 1 << 26 } {
+        protect_lua!(state, 0, 1, |state| ffi::lua_createtable(state, narr, nrec))
+    } else {
+        ffi::lua_createtable(state, narr, nrec);
+        Ok(())
+    }
+}
+
+// Uses 4 stack spaces, does not call checkstack.
+pub(crate) unsafe fn rawget_field(state: *mut ffi::lua_State, table: c_int, field: &str) -> Result<c_int> {
+    ffi::lua_pushvalue(state, table);
+    protect_lua!(state, 1, 1, |state| {
+        ffi::lua_pushlstring(state, field.as_ptr() as *const c_char, field.len());
+        ffi::lua_rawget(state, -2)
+    })
+}
+
+// Uses 4 stack spaces, does not call checkstack.
+pub(crate) unsafe fn rawset_field(state: *mut ffi::lua_State, table: c_int, field: &str) -> Result<()> {
+    ffi::lua_pushvalue(state, table);
+    protect_lua!(state, 2, 0, |state| {
+        ffi::lua_pushlstring(state, field.as_ptr() as *const c_char, field.len());
+        ffi::lua_rotate(state, -3, 2);
+        ffi::lua_rawset(state, -3);
+    })
+}
+
+// A variant of `pcall` that does not allow Lua to catch Rust panics from `callback_error`.
+pub(crate) unsafe extern "C-unwind" fn safe_pcall(state: *mut ffi::lua_State) -> c_int {
+    ffi::luaL_checkstack(state, 2, ptr::null());
+
+    let top = ffi::lua_gettop(state);
+    if top == 0 {
+        ffi::lua_pushstring(state, cstr!("not enough arguments to pcall"));
+        ffi::lua_error(state);
+    }
+
+    if ffi::lua_pcall(state, top - 1, ffi::LUA_MULTRET, 0) == ffi::LUA_OK {
+        ffi::lua_pushboolean(state, 1);
+        ffi::lua_insert(state, 1);
+        ffi::lua_gettop(state)
+    } else {
+        let wf_ud = get_internal_userdata::<WrappedFailure>(state, -1, ptr::null());
+        if let Some(WrappedFailure::Panic(_)) = wf_ud.as_ref() {
+            ffi::lua_error(state);
+        }
+        ffi::lua_pushboolean(state, 0);
+        ffi::lua_insert(state, -2);
+        2
+    }
+}
+
+// A variant of `xpcall` that does not allow Lua to catch Rust panics from `callback_error`.
+pub(crate) unsafe extern "C-unwind" fn safe_xpcall(state: *mut ffi::lua_State) -> c_int {
+    unsafe extern "C-unwind" fn xpcall_msgh(state: *mut ffi::lua_State) -> c_int {
+        ffi::luaL_checkstack(state, 2, ptr::null());
+
+use std::sync::Arc;
+
+use mlua::{Error, GCMode, Lua, Result, UserData};
+
+#[test]
+fn test_memory_limit() -> Result<()> {
+    let lua = Lua::new();
+
+    let initial_memory = lua.used_memory();
+    assert!(
+        initial_memory > 0,
+        "used_memory reporting is wrong, lua uses memory for stdlib"
+    );
+
+    let f = lua
+        .load("local t = {}; for i = 1,10000 do t[i] = i end")
+        .into_function()?;
+    f.call::<()>(()).expect("should trigger no memory limit");
+
+    if cfg!(feature = "luajit") && lua.set_memory_limit(0).is_err() {
+        // seems this luajit version does not support memory limit
+        return Ok(());
+    }
+
+    lua.set_memory_limit(initial_memory + 10000)?;
+    match f.call::<()>(()) {
+        Err(Error::MemoryError(_)) => {}
+        something_else => panic!("did not trigger memory error: {:?}", something_else),
+    };
+
+    lua.set_memory_limit(0)?;
+    f.call::<()>(()).expect("should trigger no memory limit");
+
+    // Test memory limit during chunk loading
+    lua.set_memory_limit(1024)?;
+    match lua
+        .load("local t = {}; for i = 1,10000 do t[i] = i end")
+        .into_function()
+    {
+        Err(Error::MemoryError(_)) => {}
+        _ => panic!("did not trigger memory error"),
+    };
+
+    Ok(())
+}
+
+#[test]
+fn test_memory_limit_thread() -> Result<()> {
+    let lua = Lua::new();
+
+    let f = lua
+        .load("local t = {}; for i = 1,10000 do t[i] = i end")
+        .into_function()?;
+
+    if cfg!(feature = "luajit") && lua.set_memory_limit(0).is_err() {
+        // seems this luajit version does not support memory limit
+        return Ok(());
+    }
+
+    let thread = lua.create_thread(f)?;
+    lua.set_memory_limit(lua.used_memory() + 10000)?;
+    match thread.resume::<()>(()) {
+        Err(Error::MemoryError(_)) => {}
+        something_else => panic!("did not trigger memory error: {:?}", something_else),
+    };
+
+    Ok(())
+}
+
+#[test]
+fn test_gc_control() -> Result<()> {
+    let lua = Lua::new();
+    let globals = lua.globals();
+
+    #[cfg(feature = "lua54")]
+    {
+        assert_eq!(lua.gc_gen(0, 0), GCMode::Incremental);
+        assert_eq!(lua.gc_inc(0, 0, 0), GCMode::Generational);
+    }
+
+    #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52", feature = "luau"))]
+    {
+        assert!(lua.gc_is_running());
+        lua.gc_stop();
+        assert!(!lua.gc_is_running());
+        lua.gc_restart();
+        assert!(lua.gc_is_running());
+    }
+
+    assert_eq!(lua.gc_inc(200, 100, 13), GCMode::Incremental);
+
+    struct MyUserdata(#[allow(unused)] Arc<()>);
+    impl UserData for MyUserdata {}
+
+    let rc = Arc::new(());
+    globals.set("userdata", lua.create_userdata(MyUserdata(rc.clone()))?)?;
+    globals.raw_remove("userdata")?;
+
+    assert_eq!(Arc::strong_count(&rc), 2);
+    lua.gc_collect()?;
+    lua.gc_collect()?;
+    assert_eq!(Arc::strong_count(&rc), 1);
+
+    Ok(())
+}
+
+#[cfg(any(feature = "lua53", feature = "lua52"))]
+#[test]
+fn test_gc_error() {
+    use mlua::Error;
+
+    let lua = Lua::new();
+    match lua
+        .load(
+            r#"
+            val = nil
+            table = {}
+            setmetatable(table, {
+                __gc = function()
+                    error("gcwascalled")
+                end
+            })
+            table = nil
+            collectgarbage("collect")
+    "#,
+        )
+        .exec()
+    {
+        Err(Error::GarbageCollectorError(_)) => {}
+        Err(e) => panic!("__gc error did not result in correct error, instead: {}", e),
+        Ok(()) => panic!("__gc error did not result in error"),
+    }
+}
+use mlua::{Error, Lua, ObjectLike, Result, Table, Value};
+
+#[test]
+fn test_globals_set_get() -> Result<()> {
+    let lua = Lua::new();
+
+    let globals = lua.globals();
+    globals.set("foo", "bar")?;
+    globals.set("baz", "baf")?;
+    assert_eq!(globals.get::<String>("foo")?, "bar");
+    assert_eq!(globals.get::<String>("baz")?, "baf");
+
+    lua.load(r#"assert(foo == "bar")"#).exec().unwrap();
+
+    Ok(())
+}
+
+#[test]
+fn test_table() -> Result<()> {
+    let lua = Lua::new();
+
+    let globals = lua.globals();
+
+    lua.load(
+        r#"
+        table1 = {1, 2, 3, 4, 5}
+        table2 = {}
+        table3 = {1, 2, nil, 4, 5}
+    "#,
+    )
+    .exec()?;
+
+    let table1 = globals.get::<Table>("table1")?;
+    assert_eq!(table1.len()?, 5);
+    assert!(!table1.is_empty());
+    assert_eq!(
+        table1.pairs().collect::<Result<Vec<(i64, i64)>>>()?,
+        vec![(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]
+    );
+    assert_eq!(
+        table1.sequence_values().collect::<Result<Vec<i64>>>()?,
+        vec![1, 2, 3, 4, 5]
+    );
+    assert_eq!(table1, [1, 2, 3, 4, 5]);
+    assert_eq!(table1, [1, 2, 3, 4, 5].as_slice());
+
+    let table2 = globals.get::<Table>("table2")?;
+    assert_eq!(table2.len()?, 0);
+    assert!(table2.is_empty());
+    assert_eq!(table2.pairs().collect::<Result<Vec<(i64, i64)>>>()?, vec![]);
+    assert_eq!(table2, [0; 0]);
+
+    let table3 = globals.get::<Table>("table3")?;
+    // sequence_values should only iterate until the first border
+    assert_eq!(table3, [1, 2]);
+    assert_eq!(
+        table3.sequence_values().collect::<Result<Vec<i64>>>()?,
+        vec![1, 2]
+    );
+
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "linux")] // Linux allow overcommiting the memory (relevant for CI)
+fn test_table_with_large_capacity() {
+    let lua = Lua::new();
+
+    let t = lua.create_table_with_capacity(1 << 26, 1 << 26);
+    assert!(t.is_ok());
+}
+
+#[test]
+fn test_table_push_pop() -> Result<()> {
+    let lua = Lua::new();
+
+    // Test raw access
+    let table1 = lua.create_sequence_from([123])?;
+    table1.raw_push(321)?;
+    assert_eq!(table1, [123, 321]);
+    assert_eq!(table1.raw_pop::<i64>()?, 321);
+    assert_eq!(table1.raw_pop::<i64>()?, 123);
+    assert_eq!(table1.raw_pop::<Value>()?, Value::Nil); // An extra pop should do nothing
+    assert_eq!(table1.raw_len(), 0);
+    assert_eq!(table1, [0; 0]);
+
+    // Test access through metamethods
+    let table2 = lua
+        .load(
+            r#"
+        local proxy_table = {234}
+        table2 = setmetatable({}, {
+            __len = function() return #proxy_table end,
+            __index = proxy_table,
+            __newindex = proxy_table,
+        })
+        return table2
+    "#,
+        )
+        .eval::<Table>()?;
+    table2.push(345)?;
+    assert_eq!(table2.len()?, 2);
+    assert_eq!(
+        table2.sequence_values::<i64>().collect::<Result<Vec<_>>>()?,
+        vec![]
+    );
+    assert_eq!(table2.pop::<i64>()?, 345);
+    assert_eq!(table2.pop::<i64>()?, 234);
+    assert_eq!(table2.pop::<Value>()?, Value::Nil);
+    assert_eq!(table2.len()?, 0);
+
+    Ok(())
+}
+
+#[test]
+
+pub(crate) mod private {
+    use super::*;
+
+    pub trait Sealed {}
+
+    impl Sealed for Error {}
+    impl<T> Sealed for std::result::Result<T, Error> {}
+    impl Sealed for Lua {}
+    impl Sealed for Table {}
+    impl Sealed for AnyUserData {}
+}
+   460	                }
+   461	                None => return Ok(None),
+   462	            }
+   463	        }
+   464	    }
+   465	
+   466	    fn size_hint(&self) -> Option<usize> {
+   467	        match self.seq.size_hint() {
+   468	            (lower, Some(upper)) if lower == upper => Some(upper),
+   469	            _ => None,
+   470	        }
+   471	    }
+   472	}
+   473	
+   474	#[cfg(feature = "luau")]
+   475	struct VecDeserializer {
+   476	    vec: crate::Vector,
+   477	    next: usize,
+   478	    options: Options,
+   479	    visited: Rc<RefCell<FxHashSet<*const c_void>>>,
+   480	}
+   481	
+   482	#[cfg(feature = "luau")]
+   483	impl<'de> de::SeqAccess<'de> for VecDeserializer {
+   484	    type Error = Error;
+   485	
+   486	    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>>
+   487	    where
+   488	        T: de::DeserializeSeed<'de>,
+   489	    {
+   490	        match self.vec.0.get(self.next) {
+/work/tmp/baseline-skip.log
+/work/tmp/baseline.log
+/work/tmp/doc54-full.log
+/work/tmp/doctests.log
+/work/tmp/extended54-skip.log
+/work/tmp/extended54.log
+/work/tmp/fmt.log
+/work/tmp/gate.log
+/work/tmp/lua51-tests.log
+/work/tmp/lua52-tests.log
+/work/tmp/lua53-tests.log
+/work/tmp/luau-tests.log
+/work/tmp/miri.log
+/work/tmp/nan-key.log
+/work/tmp/nil-key.log
+/work/tmp/regressions-final.log
+/work/tmp/regressions-luau.log
+/work/tmp/regressions.log
+/work/tmp/review-crate/.gitignore
+/work/tmp/review-crate/CHANGELOG.md
+/work/tmp/review-crate/Cargo.lock
+/work/tmp/review-crate/Cargo.toml
+/work/tmp/review-crate/FAQ.md
+/work/tmp/review-crate/LICENSE
+/work/tmp/review-crate/README.md
+/work/tmp/review-crate/codecov.yml
+/work/tmp/review-crate/rustfmt.toml
+/work/tmp/review-crate/tarpaulin.toml
+/work/tmp/review-crate/typos.toml
+/work/tmp/scan.log
+/work/tmp/send-minimal.log

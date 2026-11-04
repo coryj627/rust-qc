@@ -1,0 +1,743 @@
+     82 src/cht.rs
+    125 src/common.rs
+    150 src/future.rs
+    305 src/lib.rs
+     47 src/notification.rs
+     71 src/ops.rs
+    400 src/policy.rs
+     40 src/sync.rs
+   3294 src/sync/base_cache.rs
+    618 src/sync/builder.rs
+   5132 src/sync/cache.rs
+   1097 src/sync/entry_selector.rs
+    385 src/sync/invalidator.rs
+     94 src/sync/key_lock.rs
+   2005 src/sync/segment.rs
+    390 src/sync/value_initializer.rs
+   3535 src/future/base_cache.rs
+    489 src/future/builder.rs
+   5761 src/future/cache.rs
+   1318 src/future/entry_selector.rs
+    215 src/future/housekeeper.rs
+    391 src/future/invalidator.rs
+     94 src/future/key_lock.rs
+     78 src/future/notifier.rs
+    667 src/future/value_initializer.rs
+     16 src/common/builder_utils.rs
+    386 src/common/concurrent.rs
+    783 src/common/deque.rs
+     92 src/common/entry.rs
+     31 src/common/error.rs
+    401 src/common/frequency_sketch.rs
+    149 src/common/iter.rs
+     81 src/common/test_utils.rs
+     10 src/common/time.rs
+    802 src/common/timer_wheel.rs
+  29534 total
+use std::{error::Error, fmt::Display};
+
+/// The error type for the functionalities around
+/// [`Cache::invalidate_entries_if`][invalidate-if] method.
+///
+/// [invalidate-if]: ./sync/struct.Cache.html#method.invalidate_entries_if
+#[derive(Debug)]
+pub enum PredicateError {
+    /// This cache does not have a necessary configuration enabled to support
+    /// invalidating entries with a closure.
+    ///
+    /// To enable the configuration, call
+    /// [`CacheBuilder::support_invalidation_closures`][support-invalidation-closures]
+    /// method at the cache creation time.
+    ///
+    /// [support-invalidation-closures]: ./sync/struct.CacheBuilder.html#method.support_invalidation_closures
+    InvalidationClosuresDisabled,
+}
+
+impl Display for PredicateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Support for invalidation closures is disabled in this cache. \
+            Please enable it by calling the support_invalidation_closures \
+            method of the builder at the cache creation time",
+        )
+    }
+}
+
+impl Error for PredicateError {}
+use std::time::Duration;
+
+const YEAR_SECONDS: u64 = 365 * 24 * 3600;
+
+pub(crate) fn ensure_expirations_or_panic(
+    time_to_live: Option<Duration>,
+    time_to_idle: Option<Duration>,
+) {
+    let max_duration = Duration::from_secs(1_000 * YEAR_SECONDS);
+    if let Some(d) = time_to_live {
+        assert!(d <= max_duration, "time_to_live is longer than 1000 years");
+    }
+    if let Some(d) = time_to_idle {
+        assert!(d <= max_duration, "time_to_idle is longer than 1000 years");
+    }
+}
+use std::{
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+#[derive(Clone, Debug)]
+/// The policy of a cache.
+pub struct Policy {
+    max_capacity: Option<u64>,
+    num_segments: usize,
+    time_to_live: Option<Duration>,
+    time_to_idle: Option<Duration>,
+}
+
+impl Policy {
+    pub(crate) fn new(
+        max_capacity: Option<u64>,
+        num_segments: usize,
+        time_to_live: Option<Duration>,
+        time_to_idle: Option<Duration>,
+    ) -> Self {
+        Self {
+            max_capacity,
+            num_segments,
+            time_to_live,
+            time_to_idle,
+        }
+    }
+
+    /// Returns the `max_capacity` of the cache.
+    pub fn max_capacity(&self) -> Option<u64> {
+        self.max_capacity
+    }
+
+    #[cfg(feature = "sync")]
+    pub(crate) fn set_max_capacity(&mut self, capacity: Option<u64>) {
+        self.max_capacity = capacity;
+    }
+
+    /// Returns the number of internal segments of the cache.
+    pub fn num_segments(&self) -> usize {
+        self.num_segments
+    }
+
+    #[cfg(feature = "sync")]
+    pub(crate) fn set_num_segments(&mut self, num: usize) {
+        self.num_segments = num;
+    }
+
+    /// Returns the `time_to_live` of the cache.
+    pub fn time_to_live(&self) -> Option<Duration> {
+        self.time_to_live
+    }
+
+    /// Returns the `time_to_idle` of the cache.
+    pub fn time_to_idle(&self) -> Option<Duration> {
+        self.time_to_idle
+    }
+}
+
+/// The eviction (and admission) policy of a cache.
+///
+/// When the cache is full, the eviction/admission policy is used to determine which
+/// items should be admitted to the cache and which cached items should be evicted.
+/// The choice of a policy will directly affect the performance (hit rate) of the
+/// cache.
+///
+/// The following policies are available:
+///
+/// - **TinyLFU** (default):
+///   - Suitable for most workloads.
+///   - TinyLFU combines the LRU eviction policy and an admission policy based on the
+///     historical popularity of keys.
+///   - Note that it tracks not only the keys currently in the cache, but all hit and
+///     missed keys. The data structure used to _estimate_ the popularity of keys is
+///     a modified Count-Min Sketch, which has a very low memory footprint (thus the
+///     name "tiny").
+/// - **LRU**:
+///   - Suitable for some workloads with strong recency bias, such as streaming data
+///     processing.
+///
+/// LFU stands for Least Frequently Used. LRU stands for Least Recently Used.
+///
+/// Use associate function [`EvictionPolicy::tiny_lfu`](#method.tiny_lfu) or
+/// [`EvictionPolicy::lru`](#method.lru) to obtain an instance of `EvictionPolicy`.
+#[derive(Clone, Default)]
+pub struct EvictionPolicy {
+    pub(crate) config: EvictionPolicyConfig,
+}
+
+impl EvictionPolicy {
+    /// Returns the TinyLFU policy, which is suitable for most workloads.
+    ///
+    /// TinyLFU is a combination of the LRU eviction policy and the admission policy
+    /// based on the historical popularity of keys.
+    ///
+    /// Note that it tracks not only the keys currently in the cache, but all hit and
+    /// missed keys. The data structure used to _estimate_ the popularity of keys is
+    /// a modified Count-Min Sketch, which has a very low memory footprint (thus the
+    /// name "tiny").
+    pub fn tiny_lfu() -> Self {
+        Self {
+            config: EvictionPolicyConfig::TinyLfu,
+        }
+    }
+
+    /// Returns the LRU policy.
+    ///
+    /// Suitable for some workloads with strong recency bias, such as streaming data
+    /// processing.
+    pub fn lru() -> Self {
+        Self {
+            config: EvictionPolicyConfig::Lru,
+        }
+    }
+}
+
+impl fmt::Debug for EvictionPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.config {
+            EvictionPolicyConfig::TinyLfu => write!(f, "EvictionPolicy::TinyLfu"),
+            EvictionPolicyConfig::Lru => write!(f, "EvictionPolicy::Lru"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum EvictionPolicyConfig {
+    #[default]
+    TinyLfu,
+    Lru,
+}
+
+/// Calculates when cache entries expire. A single expiration time is retained on
+/// each entry so that the lifetime of an entry may be extended or reduced by
+/// subsequent evaluations.
+///
+/// `Expiry` trait provides three methods. They specify the expiration time of an
+/// entry by returning a `Some(duration)` until the entry expires:
+///
+/// - [`expire_after_create`](#method.expire_after_create) &mdash; Returns the
+///   duration (or none) after the entry's creation.
+/// - [`expire_after_read`](#method.expire_after_read) &mdash; Returns the duration
+///   (or none)  after its last read.
+/// - [`expire_after_update`](#method.expire_after_update) &mdash; Returns the
+///   duration (or none)  after its last update.
+///
+/// The default implementations are provided that return `None` (no expiration) or
+/// `current_duration: Option<Instant>` (not modify the current expiration time).
+/// Override some of them as you need.
+///
+pub trait Expiry<K, V> {
+    /// Specifies that the entry should be automatically removed from the cache once
+    /// the duration has elapsed after the entry's creation. This method is called
+    /// for cache write methods such as `insert` and `get_with` but only when the key
+    /// was not present in the cache.
+    ///
+    /// # Parameters
+    ///
+    /// - `key` &mdash; A reference to the key of the entry.
+    /// - `value` &mdash; A reference to the value of the entry.
+    /// - `created_at` &mdash; The time when this entry was inserted.
+    ///
+    /// # Return value
+    ///
+    /// The returned `Option<Duration>` is used to set the expiration time of the
+    /// entry.
+    ///
+    /// - Returning `Some(duration)` &mdash; The expiration time is set to
+    ///   `created_at + duration`.
+    /// - Returning `None` &mdash; The expiration time is cleared (no expiration).
+    ///   - This is the value that the default implementation returns.
+    ///
+    /// # Notes on `time_to_live` and `time_to_idle` policies
+    ///
+    /// When the cache is configured with `time_to_live` and/or `time_to_idle`
+    /// policies, the entry will be evicted after the earliest of the expiration time
+    /// returned by this expiry, the `time_to_live` and `time_to_idle` policies.
+    #[allow(unused_variables)]
+    fn expire_after_create(&self, key: &K, value: &V, created_at: Instant) -> Option<Duration> {
+        None
+    }
+
+    /// Specifies that the entry should be automatically removed from the cache once
+    /// the duration has elapsed after its last read. This method is called for cache
+    /// read methods such as `get` and `get_with` but only when the key is present in
+    /// the cache.
+    ///
+    /// # Parameters
+    ///
+    /// - `key` &mdash; A reference to the key of the entry.
+    /// - `value` &mdash; A reference to the value of the entry.
+    /// - `read_at` &mdash; The time when this entry was read.
+    /// - `duration_until_expiry` &mdash; The remaining duration until the entry
+    ///   expires. (Calculated by `expiration_time - read_at`)
+    /// - `last_modified_at` &mdash; The time when this entry was created or updated.
+    ///
+    /// # Return value
+    ///
+    /// The returned `Option<Duration>` is used to set the expiration time of the
+    /// entry.
+    ///
+    /// - Returning `Some(duration)` &mdash; The expiration time is set to
+    ///   `read_at + duration`.
+    /// - Returning `None` &mdash; The expiration time is cleared (no expiration).
+    /// - Returning `duration_until_expiry` will not modify the expiration time.
+    ///   - This is the value that the default implementation returns.
+    ///
+    /// # Notes on `time_to_live` and `time_to_idle` policies
+    ///
+    /// When the cache is configured with `time_to_live` and/or `time_to_idle`
+    /// policies, then:
+    ///
+    /// - The entry will be evicted after the earliest of the expiration time
+    ///   returned by this expiry, the `time_to_live` and `time_to_idle` policies.
+    /// - The `duration_until_expiry` takes in account the `time_to_live` and
+    ///   `time_to_idle` policies.
+    #[allow(unused_variables)]
+    fn expire_after_read(
+        &self,
+        key: &K,
+        value: &V,
+        read_at: Instant,
+        duration_until_expiry: Option<Duration>,
+        last_modified_at: Instant,
+    ) -> Option<Duration> {
+        duration_until_expiry
+    }
+
+    /// Specifies that the entry should be automatically removed from the cache once
+    /// the duration has elapsed after the replacement of its value. This method is
+    /// called for cache write methods such as `insert` but only when the key is
+    /// already present in the cache.
+    ///
+    /// # Parameters
+    ///
+    /// - `key` &mdash; A reference to the key of the entry.
+    /// - `value` &mdash; A reference to the value of the entry.
+    /// - `updated_at` &mdash; The time when this entry was updated.
+    /// - `duration_until_expiry` &mdash; The remaining duration until the entry
+    ///   expires. (Calculated by `expiration_time - updated_at`)
+    ///
+    /// # Return value
+    ///
+    /// The returned `Option<Duration>` is used to set the expiration time of the
+    /// entry.
+    ///
+    /// - Returning `Some(duration)` &mdash; The expiration time is set to
+    ///   `updated_at + duration`.
+    /// - Returning `None` &mdash; The expiration time is cleared (no expiration).
+    /// - Returning `duration_until_expiry` will not modify the expiration time.
+    ///   - This is the value that the default implementation returns.
+    ///
+    /// # Notes on `time_to_live` and `time_to_idle` policies
+    ///
+    /// When the cache is configured with `time_to_live` and/or `time_to_idle`
+    /// policies, then:
+    ///
+    /// - The entry will be evicted after the earliest of the expiration time
+    ///   returned by this expiry, the `time_to_live` and `time_to_idle` policies.
+    /// - The `duration_until_expiry` takes in account the `time_to_live` and
+    ///   `time_to_idle` policies.
+    #[allow(unused_variables)]
+    fn expire_after_update(
+        &self,
+        key: &K,
+        value: &V,
+        updated_at: Instant,
+        duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
+        duration_until_expiry
+    }
+}
+
+pub(crate) struct ExpirationPolicy<K, V> {
+    time_to_live: Option<Duration>,
+    time_to_idle: Option<Duration>,
+    expiry: Option<Arc<dyn Expiry<K, V> + Send + Sync + 'static>>,
+}
+
+impl<K, V> Default for ExpirationPolicy<K, V> {
+    fn default() -> Self {
+        Self {
+            time_to_live: None,
+            time_to_idle: None,
+            expiry: None,
+        }
+    }
+}
+
+impl<K, V> Clone for ExpirationPolicy<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            time_to_live: self.time_to_live,
+            time_to_idle: self.time_to_idle,
+            expiry: self.expiry.clone(),
+        }
+    }
+}
+
+impl<K, V> ExpirationPolicy<K, V> {
+    #[cfg(test)]
+    pub(crate) fn new(
+        time_to_live: Option<Duration>,
+        time_to_idle: Option<Duration>,
+        expiry: Option<Arc<dyn Expiry<K, V> + Send + Sync + 'static>>,
+    ) -> Self {
+        Self {
+            time_to_live,
+            time_to_idle,
+            expiry,
+        }
+    }
+
+    /// Returns the `time_to_live` of the cache.
+    pub(crate) fn time_to_live(&self) -> Option<Duration> {
+        self.time_to_live
+    }
+
+    pub(crate) fn set_time_to_live(&mut self, duration: Duration) {
+        self.time_to_live = Some(duration);
+    }
+
+    /// Returns the `time_to_idle` of the cache.
+    pub(crate) fn time_to_idle(&self) -> Option<Duration> {
+        self.time_to_idle
+    }
+
+    pub(crate) fn set_time_to_idle(&mut self, duration: Duration) {
+        self.time_to_idle = Some(duration);
+    }
+
+    pub(crate) fn expiry(&self) -> Option<Arc<dyn Expiry<K, V> + Send + Sync + 'static>> {
+        self.expiry.clone()
+    }
+
+    pub(crate) fn set_expiry(&mut self, expiry: Arc<dyn Expiry<K, V> + Send + Sync + 'static>) {
+        self.expiry = Some(expiry);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_utils {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    #[derive(Default)]
+    pub(crate) struct ExpiryCallCounters {
+        expected_creations: AtomicU8,
+        expected_reads: AtomicU8,
+        expected_updates: AtomicU8,
+        actual_creations: AtomicU8,
+        actual_reads: AtomicU8,
+        actual_updates: AtomicU8,
+    }
+
+    impl ExpiryCallCounters {
+        pub(crate) fn incl_expected_creations(&self) {
+            self.expected_creations.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub(crate) fn incl_expected_reads(&self) {
+            self.expected_reads.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub(crate) fn incl_expected_updates(&self) {
+            self.expected_updates.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub(crate) fn incl_actual_creations(&self) {
+            self.actual_creations.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub(crate) fn incl_actual_reads(&self) {
+            self.actual_reads.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub(crate) fn incl_actual_updates(&self) {
+            self.actual_updates.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pub(crate) fn verify(&self) {
+            assert_eq!(
+                self.expected_creations.load(Ordering::Relaxed),
+                self.actual_creations.load(Ordering::Relaxed),
+                "expected_creations != actual_creations"
+            );
+            assert_eq!(
+                self.expected_reads.load(Ordering::Relaxed),
+                self.actual_reads.load(Ordering::Relaxed),
+                "expected_reads != actual_reads"
+            );
+            assert_eq!(
+                self.expected_updates.load(Ordering::Relaxed),
+                self.actual_updates.load(Ordering::Relaxed),
+                "expected_updates != actual_updates"
+            );
+        }
+    }
+}
+use parking_lot::RwLock;
+use std::{
+    any::{Any, TypeId},
+    fmt,
+    hash::{BuildHasher, Hash},
+    sync::Arc,
+};
+
+use crate::{
+    common::concurrent::arc::MiniArc,
+    ops::compute::{CompResult, Op},
+    Entry,
+};
+
+use super::{Cache, ComputeNone, OptionallyNone};
+
+const WAITER_MAP_NUM_SEGMENTS: usize = 64;
+
+type ErrorObject = Arc<dyn Any + Send + Sync + 'static>;
+
+// type WaiterValue<V> = Option<Result<V, ErrorObject>>;
+enum WaiterValue<V> {
+    Computing,
+    Ready(Result<V, ErrorObject>),
+    ReadyNone,
+    // https://github.com/moka-rs/moka/issues/43
+    InitClosurePanicked,
+}
+
+impl<V> fmt::Debug for WaiterValue<V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WaiterValue::Computing => write!(f, "Computing"),
+            WaiterValue::Ready(_) => write!(f, "Ready"),
+            WaiterValue::ReadyNone => write!(f, "ReadyNone"),
+            WaiterValue::InitClosurePanicked => write!(f, "InitFuturePanicked"),
+        }
+    }
+}
+
+type Waiter<V> = MiniArc<RwLock<WaiterValue<V>>>;
+
+pub(crate) enum InitResult<V, E> {
+    Initialized(V),
+    ReadExisting(V),
+    InitErr(Arc<E>),
+}
+
+pub(crate) struct ValueInitializer<K, V, S> {
+    // TypeId is the type ID of the concrete error type of generic type E in the
+    // try_get_with method. We use the type ID as a part of the key to ensure that
+    // we can always downcast the trait object ErrorObject (in Waiter<V>) into
+    // its concrete type.
+    waiters: crate::cht::SegmentedHashMap<(Arc<K>, TypeId), Waiter<V>, S>,
+}
+
+impl<K, V, S> ValueInitializer<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn with_hasher(hasher: S) -> Self {
+        Self {
+            waiters: crate::cht::SegmentedHashMap::with_num_segments_and_hasher(
+                WAITER_MAP_NUM_SEGMENTS,
+                hasher,
+            ),
+        }
+    }
+
+    /// # Panics
+    /// Panics if the `init` closure has been panicked.
+    pub(crate) fn try_init_or_read<O, E>(
+        &self,
+        key: &Arc<K>,
+        type_id: TypeId,
+        // Closure to get an existing value from cache.
+        mut get: impl FnMut() -> Option<V>,
+        // Closure to initialize a new value.
+        init: impl FnOnce() -> O,
+        // Closure to insert a new value into cache.
+        mut insert: impl FnMut(V),
+        // Function to convert a value O, returned from the init future, into
+        // Result<V, E>.
+        post_init: fn(O) -> Result<V, E>,
+    ) -> InitResult<V, E>
+    where
+        E: Send + Sync + 'static,
+    {
+        use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+        use InitResult::{InitErr, ReadExisting};
+
+        const MAX_RETRIES: usize = 200;
+        let mut retries = 0;
+
+        let (w_key, w_hash) = self.waiter_key_hash(key, type_id);
+
+        let waiter = MiniArc::new(RwLock::new(WaiterValue::Computing));
+        let mut lock = waiter.write();
+
+        loop {
+            let Some(existing_waiter) = self.try_insert_waiter(w_key.clone(), w_hash, &waiter)
+            else {
+                // Inserted.
+                break;
+            };
+
+            // Somebody else's waiter already exists, so wait for its result to become available.
+            let waiter_result = existing_waiter.read();
+            match &*waiter_result {
+                WaiterValue::Ready(Ok(value)) => return ReadExisting(value.clone()),
+                WaiterValue::Ready(Err(e)) => return InitErr(Arc::clone(e).downcast().unwrap()),
+                // Somebody else's init closure has been panicked.
+                WaiterValue::InitClosurePanicked => {
+                    retries += 1;
+                    assert!(
+                        retries < MAX_RETRIES,
+                        "Too many retries. Tried to read the return value from the `init` \
+                        closure but failed {retries} times. Maybe the `init` kept panicking?"
+                    );
+
+                    // Retry from the beginning.
+                    continue;
+                }
+                // Unexpected state.
+                s @ (WaiterValue::Computing | WaiterValue::ReadyNone) => panic!(
+                    "Got unexpected state `{s:?}` after resolving `init` future. \
+                    This might be a bug in Moka"
+                ),
+            }
+        }
+
+        // Our waiter was inserted.
+
+        // Check if the value has already been inserted by other thread.
+        if let Some(value) = get() {
+            // Yes. Set the waiter value, remove our waiter, and return
+            // the existing value.
+            *lock = WaiterValue::Ready(Ok(value.clone()));
+            self.remove_waiter(w_key, w_hash);
+            return InitResult::ReadExisting(value);
+        }
+
+        // The value still does note exist. Let's evaluate the init
+        // closure. Catching panic is safe here as we do not try to
+        // evaluate the closure again.
+        match catch_unwind(AssertUnwindSafe(init)) {
+            // Evaluated.
+            Ok(value) => {
+                let init_res = match post_init(value) {
+                    Ok(value) => {
+                        insert(value.clone());
+                        *lock = WaiterValue::Ready(Ok(value.clone()));
+                        InitResult::Initialized(value)
+                    }
+                    Err(e) => {
+                        let err: ErrorObject = Arc::new(e);
+                        *lock = WaiterValue::Ready(Err(Arc::clone(&err)));
+                        InitResult::InitErr(err.downcast().unwrap())
+                    }
+                };
+                self.remove_waiter(w_key, w_hash);
+                init_res
+            }
+            // Panicked.
+            Err(payload) => {
+                *lock = WaiterValue::InitClosurePanicked;
+                // Remove the waiter so that others can retry.
+                self.remove_waiter(w_key, w_hash);
+                resume_unwind(payload);
+            }
+        }
+        // The write lock will be unlocked here.
+    }
+
+    /// # Panics
+    /// Panics if the `init` closure has been panicked.
+    pub(crate) fn try_compute<F, O, E>(
+        &self,
+        c_key: Arc<K>,
+        c_hash: u64,
+        cache: &Cache<K, V, S>,
+        f: F,
+        post_init: fn(O) -> Result<Op<V>, E>,
+        allow_nop: bool,
+    ) -> Result<CompResult<K, V>, E>
+    where
+        V: 'static,
+        F: FnOnce(Option<Entry<K, V>>) -> O,
+        E: Send + Sync + 'static,
+    {
+        use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+
+        let type_id = TypeId::of::<ComputeNone>();
+        let (w_key, w_hash) = self.waiter_key_hash(&c_key, type_id);
+        let waiter = MiniArc::new(RwLock::new(WaiterValue::Computing));
+        // NOTE: We have to acquire a write lock before `try_insert_waiter`,
+        // so that any concurrent attempt will get our lock and wait on it.
+        let mut lock = waiter.write();
+
+        loop {
+            let Some(existing_waiter) = self.try_insert_waiter(w_key.clone(), w_hash, &waiter)
+            else {
+                // Inserted.
+                break;
+            };
+
+            // Somebody else's waiter already exists, so wait for it to finish
+            // (wait for it to release the write lock).
+            let waiter_result = existing_waiter.read();
+            match &*waiter_result {
+                // Unexpected state.
+                WaiterValue::Computing => panic!(
+                    "Got unexpected state `Computing` after resolving `init` future. \
+                    This might be a bug in Moka"
+                ),
+                _ => {
+                    // Try to insert our waiter again.
+                    continue;
+                }
+            }
+        }
+
+        // Our waiter was inserted.
+
+        // Get the current value.
+        let ignore_if = None as Option<&mut fn(&V) -> bool>;
+        let maybe_entry = cache
+            .base
+            .get_with_hash_and_ignore_if(&*c_key, c_hash, ignore_if, true);
+        let maybe_value = if allow_nop {
+            maybe_entry.as_ref().map(|ent| ent.value().clone())
+        } else {
+            None
+        };
+        let entry_existed = maybe_entry.is_some();
+
+        // Evaluate the `f` closure. Catching panic is safe here as we will not
+        // evaluate the closure again.
+        let output = match catch_unwind(AssertUnwindSafe(|| f(maybe_entry))) {
+            // Evaluated.
+            Ok(output) => {
+                *lock = WaiterValue::ReadyNone;
+                output
+            }
+            // Panicked.
+            Err(payload) => {
+                *lock = WaiterValue::InitClosurePanicked;
+                // Remove the waiter so that others can retry.
+                self.remove_waiter(w_key, w_hash);
+                resume_unwind(payload);
+            }
+        };
+
+        let op = match post_init(output) {
+            Ok(op) => op,
+            Err(e) => {
+                self.remove_waiter(w_key, w_hash);
+                return Err(e);

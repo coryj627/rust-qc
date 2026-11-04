@@ -1,0 +1,5 @@
+{"bug":"K001","A":{"v":"missed"},"B":{"v":"missed"},"C":{"v":"missed"},"D":{"v":"missed"}}
+{"bug":"K002","A":{"v":"found","ref":"#10"},"B":{"v":"partial","ref":"#13","why":"Identifies skipped metadata callbacks, but omits lost Unix permissions during stream extraction."},"C":{"v":"partial","ref":"#7","why":"Identifies skipped metadata callbacks, but omits lost Unix permissions during stream extraction."},"D":{"v":"partial","ref":"Stream visitors silently receive no additional metadata","why":"Identifies skipped metadata callbacks, but omits lost Unix permissions during stream extraction."}}
+{"bug":"K003","A":{"v":"missed"},"B":{"v":"missed"},"C":{"v":"missed"},"D":{"v":"missed"}}
+{"bug":"K004","A":{"v":"missed"},"B":{"v":"missed"},"C":{"v":"missed"},"D":{"v":"missed"}}
+{"bug":"K005","A":{"v":"missed"},"B":{"v":"missed"},"C":{"v":"missed"},"D":{"v":"missed"}}

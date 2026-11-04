@@ -1,0 +1,837 @@
+167:    pub async fn and_compute_with<F, Fut>(self, f: F) -> compute::CompResult<K, V>
+230:    pub async fn and_try_compute_with<F, Fut, E>(self, f: F) -> Result<compute::CompResult<K, V>, E>
+242:    pub async fn and_try_compute_if_nobody_else<F, Fut, E>(
+339:    pub async fn and_upsert_with<F, Fut>(self, f: F) -> Entry<K, V>
+381:    pub async fn or_default(self) -> Entry<K, V>
+424:    pub async fn or_insert(self, default: V) -> Entry<K, V> {
+484:    pub async fn or_insert_with(self, init: impl Future<Output = V>) -> Entry<K, V> {
+501:    pub async fn or_insert_with_if(
+576:    pub async fn or_optionally_insert_with(
+651:    pub async fn or_try_insert_with<F, E>(self, init: F) -> Result<Entry<K, V>, Arc<E>>
+822:    pub async fn and_compute_with<F, Fut>(self, f: F) -> compute::CompResult<K, V>
+885:    pub async fn and_try_compute_with<F, Fut, E>(self, f: F) -> Result<compute::CompResult<K, V>, E>
+897:    pub async fn and_try_compute_if_nobody_else<F, Fut, E>(
+994:    pub async fn and_upsert_with<F, Fut>(self, f: F) -> Entry<K, V>
+1037:    pub async fn or_default(self) -> Entry<K, V>
+1079:    pub async fn or_insert(self, default: V) -> Entry<K, V> {
+1138:    pub async fn or_insert_with(self, init: impl Future<Output = V>) -> Entry<K, V> {
+1154:    pub async fn or_insert_with_if(
+1233:    pub async fn or_optionally_insert_with(
+1308:    pub async fn or_try_insert_with<F, E>(self, init: F) -> Result<Entry<K, V>, Arc<E>>
+//! Provides a thread-safe, concurrent asynchronous (futures aware) cache
+//! implementation.
+//!
+//! To use this module, enable a crate feature called "future".
+
+use crossbeam_channel::Sender;
+use futures_util::future::{BoxFuture, Shared};
+use std::{future::Future, hash::Hash, sync::Arc};
+
+use crate::common::{concurrent::WriteOp, time::Instant};
+
+mod base_cache;
+mod builder;
+mod cache;
+mod entry_selector;
+mod housekeeper;
+mod invalidator;
+mod key_lock;
+mod notifier;
+mod value_initializer;
+
+pub use {
+    builder::CacheBuilder,
+    cache::Cache,
+    entry_selector::{OwnedKeyEntrySelector, RefKeyEntrySelector},
+};
+
+/// The type of the unique ID to identify a predicate used by
+/// [`Cache::invalidate_entries_if`][invalidate-if] method.
+///
+/// A `PredicateId` is a `String` of UUID (version 4).
+///
+/// [invalidate-if]: ./struct.Cache.html#method.invalidate_entries_if
+pub type PredicateId = String;
+
+pub(crate) type PredicateIdStr<'a> = &'a str;
+
+// Empty struct to be used in `InitResult::InitErr` to represent the Option None.
+pub(crate) struct OptionallyNone;
+
+// Empty struct to be used in `InitResult::InitErr` to represent the Compute None.
+pub(crate) struct ComputeNone;
+
+impl<T: ?Sized> FutureExt for T where T: Future {}
+
+pub trait FutureExt: Future {
+    fn boxed<'a, T>(self) -> BoxFuture<'a, T>
+    where
+        Self: Future<Output = T> + Sized + Send + 'a,
+    {
+        Box::pin(self)
+    }
+}
+
+/// Iterator visiting all key-value pairs in a cache in arbitrary order.
+///
+/// Call [`Cache::iter`](./struct.Cache.html#method.iter) method to obtain an `Iter`.
+pub struct Iter<'i, K, V>(crate::common::iter::Iter<'i, K, V>);
+
+impl<'i, K, V> Iter<'i, K, V> {
+    pub(crate) fn new(inner: crate::common::iter::Iter<'i, K, V>) -> Self {
+        Self(inner)
+    }
+}
+
+impl<K, V> Iterator for Iter<'_, K, V>
+where
+    K: Eq + Hash + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+{
+    type Item = (Arc<K>, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+}
+
+/// Operation that has been interrupted (stopped polling) by async cancellation.
+pub(crate) enum InterruptedOp<K, V> {
+    CallEvictionListener {
+        ts: Instant,
+        // 'static means that the future can capture only owned value and/or static
+        // references. No non-static references are allowed.
+        future: Shared<BoxFuture<'static, ()>>,
+        op: WriteOp<K, V>,
+    },
+    SendWriteOp {
+        ts: Instant,
+        op: WriteOp<K, V>,
+    },
+}
+
+/// Drop guard for an async task being performed. If this guard is dropped while it
+/// is still having the shared `future` or the write `op`, it will convert them to an
+/// `InterruptedOp` and send it to the interrupted operations channel. Later, the
+/// interrupted op will be retried by `retry_interrupted_ops` method of
+/// `BaseCache`.
+struct CancelGuard<'a, K, V> {
+    interrupted_op_ch: &'a Sender<InterruptedOp<K, V>>,
+    ts: Instant,
+    future: Option<Shared<BoxFuture<'static, ()>>>,
+    op: Option<WriteOp<K, V>>,
+}
+
+impl<'a, K, V> CancelGuard<'a, K, V> {
+    fn new(interrupted_op_ch: &'a Sender<InterruptedOp<K, V>>, ts: Instant) -> Self {
+        Self {
+            interrupted_op_ch,
+            ts,
+            future: None,
+            op: None,
+        }
+    }
+
+    fn set_future_and_op(&mut self, future: Shared<BoxFuture<'static, ()>>, op: WriteOp<K, V>) {
+        self.future = Some(future);
+        self.op = Some(op);
+    }
+
+    fn set_op(&mut self, op: WriteOp<K, V>) {
+        self.op = Some(op);
+    }
+
+    fn unset_future(&mut self) {
+        self.future = None;
+    }
+
+    fn clear(&mut self) {
+        self.future = None;
+        self.op = None;
+    }
+}
+
+impl<K, V> Drop for CancelGuard<'_, K, V> {
+    fn drop(&mut self) {
+        let interrupted_op = match (self.future.take(), self.op.take()) {
+            (Some(future), Some(op)) => InterruptedOp::CallEvictionListener {
+                ts: self.ts,
+                future,
+                op,
+            },
+            (None, Some(op)) => InterruptedOp::SendWriteOp { ts: self.ts, op },
+            _ => return,
+        };
+
+        self.interrupted_op_ch
+            .send(interrupted_op)
+            .expect("Failed to send a pending op");
+    }
+}
+use crate::common::{concurrent::arc::MiniArc, deque::DeqNode, time::Instant};
+
+use parking_lot::Mutex;
+use std::{fmt, ptr::NonNull, sync::Arc};
+use tagptr::TagNonNull;
+
+pub(crate) mod arc;
+pub(crate) mod constants;
+pub(crate) mod deques;
+pub(crate) mod entry_info;
+
+#[cfg(feature = "sync")]
+pub(crate) mod housekeeper;
+
+#[cfg(feature = "unstable-debug-counters")]
+pub(crate) mod debug_counters;
+
+use self::entry_info::EntryInfo;
+
+use super::timer_wheel::TimerNode;
+
+pub(crate) type Weigher<K, V> = Arc<dyn Fn(&K, &V) -> u32 + Send + Sync + 'static>;
+
+pub(crate) trait AccessTime {
+    fn last_accessed(&self) -> Option<Instant>;
+    fn set_last_accessed(&self, timestamp: Instant);
+    fn last_modified(&self) -> Option<Instant>;
+    fn set_last_modified(&self, timestamp: Instant);
+}
+
+#[derive(Debug)]
+pub(crate) struct KeyHash<K> {
+    pub(crate) key: Arc<K>,
+    pub(crate) hash: u64,
+}
+
+impl<K> KeyHash<K> {
+    pub(crate) fn new(key: Arc<K>, hash: u64) -> Self {
+        Self { key, hash }
+    }
+}
+
+impl<K> Clone for KeyHash<K> {
+    fn clone(&self) -> Self {
+        Self {
+            key: Arc::clone(&self.key),
+            hash: self.hash,
+        }
+    }
+}
+
+pub(crate) struct KeyHashDate<K> {
+    entry_info: MiniArc<EntryInfo<K>>,
+}
+
+impl<K> KeyHashDate<K> {
+    pub(crate) fn new(entry_info: &MiniArc<EntryInfo<K>>) -> Self {
+        Self {
+            entry_info: MiniArc::clone(entry_info),
+        }
+    }
+
+    pub(crate) fn key(&self) -> &Arc<K> {
+        &self.entry_info.key_hash().key
+    }
+
+    pub(crate) fn hash(&self) -> u64 {
+        self.entry_info.key_hash().hash
+    }
+
+    pub(crate) fn entry_info(&self) -> &EntryInfo<K> {
+        &self.entry_info
+    }
+
+    pub(crate) fn last_modified(&self) -> Option<Instant> {
+        self.entry_info.last_modified()
+    }
+
+    pub(crate) fn last_accessed(&self) -> Option<Instant> {
+        self.entry_info.last_accessed()
+    }
+
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.entry_info.is_dirty()
+    }
+}
+
+pub(crate) struct KvEntry<K, V> {
+    pub(crate) key: Arc<K>,
+    pub(crate) entry: MiniArc<ValueEntry<K, V>>,
+}
+
+impl<K, V> KvEntry<K, V> {
+    pub(crate) fn new(key: Arc<K>, entry: MiniArc<ValueEntry<K, V>>) -> Self {
+        Self { key, entry }
+    }
+}
+
+impl<K, V> Clone for KvEntry<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            key: Arc::clone(&self.key),
+            entry: MiniArc::clone(&self.entry),
+        }
+    }
+}
+
+impl<K> AccessTime for DeqNode<KeyHashDate<K>> {
+    #[inline]
+    fn last_accessed(&self) -> Option<Instant> {
+        self.element.entry_info.last_accessed()
+    }
+
+    #[inline]
+    fn set_last_accessed(&self, timestamp: Instant) {
+        self.element.entry_info.set_last_accessed(timestamp);
+    }
+
+    #[inline]
+    fn last_modified(&self) -> Option<Instant> {
+        self.element.entry_info.last_modified()
+    }
+
+    #[inline]
+    fn set_last_modified(&self, timestamp: Instant) {
+        self.element.entry_info.set_last_modified(timestamp);
+    }
+}
+
+// DeqNode for an access order queue.
+type KeyDeqNodeAo<K> = TagNonNull<DeqNode<KeyHashDate<K>>, 2>;
+
+// DeqNode for the write order queue.
+type KeyDeqNodeWo<K> = NonNull<DeqNode<KeyHashDate<K>>>;
+
+// DeqNode for the timer wheel.
+type DeqNodeTimer<K> = NonNull<DeqNode<TimerNode<K>>>;
+
+pub(crate) struct DeqNodes<K> {
+    access_order_q_node: Option<KeyDeqNodeAo<K>>,
+    write_order_q_node: Option<KeyDeqNodeWo<K>>,
+    timer_node: Option<DeqNodeTimer<K>>,
+}
+
+impl<K> Default for DeqNodes<K> {
+    fn default() -> Self {
+        Self {
+            access_order_q_node: None,
+            write_order_q_node: None,
+            timer_node: None,
+        }
+    }
+}
+
+// We need this `unsafe impl` as DeqNodes have NonNull pointers.
+unsafe impl<K> Send for DeqNodes<K> {}
+
+impl<K> DeqNodes<K> {
+    pub(crate) fn set_timer_node(&mut self, timer_node: Option<DeqNodeTimer<K>>) {
+        self.timer_node = timer_node;
+    }
+}
+
+pub(crate) struct ValueEntry<K, V> {
+    pub(crate) value: V,
+    info: MiniArc<EntryInfo<K>>,
+    nodes: MiniArc<Mutex<DeqNodes<K>>>,
+}
+
+impl<K, V> ValueEntry<K, V> {
+    pub(crate) fn new(value: V, entry_info: MiniArc<EntryInfo<K>>) -> Self {
+        #[cfg(feature = "unstable-debug-counters")]
+        self::debug_counters::InternalGlobalDebugCounters::value_entry_created();
+
+        Self {
+            value,
+            info: entry_info,
+            nodes: MiniArc::new(Mutex::new(DeqNodes::default())),
+        }
+    }
+
+    pub(crate) fn new_from(value: V, entry_info: MiniArc<EntryInfo<K>>, other: &Self) -> Self {
+        #[cfg(feature = "unstable-debug-counters")]
+        self::debug_counters::InternalGlobalDebugCounters::value_entry_created();
+        Self {
+            value,
+            info: entry_info,
+            nodes: MiniArc::clone(&other.nodes),
+        }
+    }
+
+    pub(crate) fn entry_info(&self) -> &MiniArc<EntryInfo<K>> {
+        &self.info
+    }
+
+    pub(crate) fn is_admitted(&self) -> bool {
+        self.info.is_admitted()
+    }
+
+    pub(crate) fn set_admitted(&self, value: bool) {
+        self.info.set_admitted(value);
+    }
+
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.info.is_dirty()
+    }
+
+    #[inline]
+    pub(crate) fn policy_weight(&self) -> u32 {
+        self.info.policy_weight()
+    }
+
+    pub(crate) fn deq_nodes(&self) -> &MiniArc<Mutex<DeqNodes<K>>> {
+        &self.nodes
+    }
+
+    pub(crate) fn access_order_q_node(&self) -> Option<KeyDeqNodeAo<K>> {
+        self.nodes.lock().access_order_q_node
+    }
+
+    pub(crate) fn set_access_order_q_node(&self, node: Option<KeyDeqNodeAo<K>>) {
+        self.nodes.lock().access_order_q_node = node;
+    }
+
+    pub(crate) fn take_access_order_q_node(&self) -> Option<KeyDeqNodeAo<K>> {
+        self.nodes.lock().access_order_q_node.take()
+    }
+
+    pub(crate) fn write_order_q_node(&self) -> Option<KeyDeqNodeWo<K>> {
+        self.nodes.lock().write_order_q_node
+    }
+
+    pub(crate) fn set_write_order_q_node(&self, node: Option<KeyDeqNodeWo<K>>) {
+        self.nodes.lock().write_order_q_node = node;
+    }
+
+    pub(crate) fn take_write_order_q_node(&self) -> Option<KeyDeqNodeWo<K>> {
+        self.nodes.lock().write_order_q_node.take()
+    }
+
+    pub(crate) fn timer_node(&self) -> Option<DeqNodeTimer<K>> {
+        self.nodes.lock().timer_node
+    }
+
+    pub(crate) fn set_timer_node(&self, node: Option<DeqNodeTimer<K>>) {
+        self.nodes.lock().timer_node = node;
+    }
+
+    pub(crate) fn take_timer_node(&self) -> Option<DeqNodeTimer<K>> {
+        self.nodes.lock().timer_node.take()
+    }
+
+    pub(crate) fn unset_q_nodes(&self) {
+        let mut nodes = self.nodes.lock();
+        nodes.access_order_q_node = None;
+        nodes.write_order_q_node = None;
+    }
+}
+
+#[cfg(feature = "unstable-debug-counters")]
+impl<K, V> Drop for ValueEntry<K, V> {
+    fn drop(&mut self) {
+        self::debug_counters::InternalGlobalDebugCounters::value_entry_dropped();
+    }
+}
+
+impl<K, V> AccessTime for MiniArc<ValueEntry<K, V>> {
+    #[inline]
+    fn last_accessed(&self) -> Option<Instant> {
+        self.info.last_accessed()
+    }
+
+    #[inline]
+    fn set_last_accessed(&self, timestamp: Instant) {
+        self.info.set_last_accessed(timestamp);
+    }
+
+    #[inline]
+    fn last_modified(&self) -> Option<Instant> {
+        self.info.last_modified()
+    }
+
+    #[inline]
+    fn set_last_modified(&self, timestamp: Instant) {
+        self.info.set_last_modified(timestamp);
+use super::constants::LOG_SYNC_INTERVAL_MILLIS;
+
+use super::constants::{READ_LOG_FLUSH_POINT, WRITE_LOG_FLUSH_POINT};
+use crate::common::time::{AtomicInstant, Instant};
+use crate::common::HousekeeperConfig;
+
+use parking_lot::{Mutex, MutexGuard};
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
+
+pub(crate) trait InnerSync {
+    /// Runs the pending tasks. Returns `true` if there are more entries to evict in
+    /// next run.
+    fn run_pending_tasks(
+        &self,
+        timeout: Option<Duration>,
+        max_log_sync_repeats: u32,
+        eviction_batch_size: u32,
+    ) -> bool;
+
+    fn now(&self) -> Instant;
+}
+
+pub(crate) struct Housekeeper {
+    run_lock: Mutex<()>,
+    run_after: AtomicInstant,
+    /// A flag to indicate if the last call on `run_pending_tasks` method left some
+    /// entries to evict.
+    ///
+    /// Used only when the eviction listener closure is set for this cache instance
+    /// because, if not, `run_pending_tasks` will never leave entries to evict.
+    more_entries_to_evict: Option<AtomicBool>,
+    /// The timeout duration for the `run_pending_tasks` method. This is a safe-guard
+    /// to prevent cache read/write operations (that may call `run_pending_tasks`
+    /// internally) from being blocked for a long time when the user wrote a slow
+    /// eviction listener closure.
+    ///
+    /// Used only when the eviction listener closure is set for this cache instance.
+    maintenance_task_timeout: Option<Duration>,
+    /// The maximum repeat count for receiving operation logs from the read and write
+    /// log channels. Default: `MAX_LOG_SYNC_REPEATS`.
+    max_log_sync_repeats: u32,
+    /// The batch size of entries to be processed by each internal eviction method.
+    /// Default: `EVICTION_BATCH_SIZE`.
+    eviction_batch_size: u32,
+    auto_run_enabled: AtomicBool,
+}
+
+impl Housekeeper {
+    pub(crate) fn new(
+        is_eviction_listener_enabled: bool,
+        config: HousekeeperConfig,
+        now: Instant,
+    ) -> Self {
+        let (more_entries_to_evict, maintenance_task_timeout) = if is_eviction_listener_enabled {
+            (
+                Some(AtomicBool::new(false)),
+                Some(config.maintenance_task_timeout),
+            )
+        } else {
+            (None, None)
+        };
+
+        Self {
+            run_lock: Mutex::default(),
+            run_after: AtomicInstant::new(Self::sync_after(now)),
+            more_entries_to_evict,
+            maintenance_task_timeout,
+            max_log_sync_repeats: config.max_log_sync_repeats,
+            eviction_batch_size: config.eviction_batch_size,
+            auto_run_enabled: AtomicBool::new(true),
+        }
+    }
+
+    pub(crate) fn should_apply_reads(&self, ch_len: usize, now: Instant) -> bool {
+        self.more_entries_to_evict() || self.should_apply(ch_len, READ_LOG_FLUSH_POINT, now)
+    }
+
+    pub(crate) fn should_apply_writes(&self, ch_len: usize, now: Instant) -> bool {
+        self.more_entries_to_evict() || self.should_apply(ch_len, WRITE_LOG_FLUSH_POINT, now)
+    }
+
+    #[inline]
+    fn more_entries_to_evict(&self) -> bool {
+        self.more_entries_to_evict
+            .as_ref()
+            .map(|v| v.load(Ordering::Acquire))
+            .unwrap_or(false)
+    }
+
+    fn set_more_entries_to_evict(&self, v: bool) {
+        if let Some(flag) = &self.more_entries_to_evict {
+            flag.store(v, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    fn should_apply(&self, ch_len: usize, ch_flush_point: usize, now: Instant) -> bool {
+        self.auto_run_enabled.load(Ordering::Relaxed)
+            && (ch_len >= ch_flush_point || now >= self.run_after.instant().unwrap())
+    }
+
+    pub(crate) fn run_pending_tasks<T: InnerSync>(&self, cache: &T) {
+        let lock = self.run_lock.lock();
+        self.do_run_pending_tasks(cache, lock);
+    }
+
+    pub(crate) fn try_run_pending_tasks<T: InnerSync>(&self, cache: &T) -> bool {
+        if let Some(lock) = self.run_lock.try_lock() {
+            self.do_run_pending_tasks(cache, lock);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn do_run_pending_tasks<T: InnerSync>(&self, cache: &T, _lock: MutexGuard<'_, ()>) {
+        let now = cache.now();
+        self.run_after.set_instant(Self::sync_after(now));
+        let timeout = self.maintenance_task_timeout;
+        let repeats = self.max_log_sync_repeats;
+        let batch_size = self.eviction_batch_size;
+        let more_to_evict = cache.run_pending_tasks(timeout, repeats, batch_size);
+        self.set_more_entries_to_evict(more_to_evict);
+    }
+
+    fn sync_after(now: Instant) -> Instant {
+        let dur = Duration::from_millis(LOG_SYNC_INTERVAL_MILLIS);
+        now.saturating_add(dur)
+    }
+}
+
+#[cfg(test)]
+impl Housekeeper {
+    pub(crate) fn disable_auto_run(&self) {
+        self.auto_run_enabled.store(false, Ordering::Relaxed);
+    }
+}
+    #[inline]
+    fn get_key_value_and_then<Q, F, T>(&self, key: &Q, hash: u64, with_entry: F) -> Option<T>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+        F: FnOnce(&Arc<K>, &MiniArc<ValueEntry<K, V>>) -> Option<T>,
+    {
+        self.cache
+            .get_key_value_and_then(hash, |k| key.equivalent(k as &K), with_entry)
+    }
+
+    #[inline]
+    fn remove_entry<Q>(&self, key: &Q, hash: u64) -> Option<KvEntry<K, V>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        self.cache
+            .remove_entry(hash, |k| key.equivalent(k as &K))
+            .map(|(key, entry)| KvEntry::new(key, entry))
+    }
+
+    fn keys(&self, cht_segment: usize) -> Option<Vec<Arc<K>>> {
+        // Do `Arc::clone` instead of `Arc::downgrade`. Updating existing entry
+        // in the cht with a new value replaces the key in the cht even though the
+        // old and new keys are equal. If we return `Weak<K>`, it will not be
+        // upgraded later to `Arc<K> as the key may have been replaced with a new
+        // key that equals to the old key.
+        self.cache.keys(cht_segment, Arc::clone)
+    }
+
+    #[inline]
+    fn register_invalidation_predicate(
+        &self,
+        predicate: PredicateFun<K, V>,
+        registered_at: Instant,
+    ) -> Result<PredicateId, PredicateError> {
+        if let Some(inv) = &self.invalidator {
+            inv.register_predicate(predicate, registered_at)
+        } else {
+            Err(PredicateError::InvalidationClosuresDisabled)
+        }
+    }
+
+    /// Returns `true` if the entry is invalidated by `invalidate_entries_if` method.
+    #[inline]
+    fn is_invalidated_entry(&self, key: &Arc<K>, entry: &MiniArc<ValueEntry<K, V>>) -> bool
+    where
+        V: Clone,
+    {
+        if let Some(inv) = &self.invalidator {
+            return inv.apply_predicates(key, entry);
+        }
+        false
+    }
+
+    #[inline]
+    fn weigh(&self, key: &K, value: &V) -> u32 {
+        self.weigher.as_ref().map_or(1, |w| w(key, value))
+    }
+}
+
+impl<K, V, S> InnerSync for Inner<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn run_pending_tasks(
+        &self,
+        timeout: Option<Duration>,
+        max_log_sync_repeats: u32,
+        eviction_batch_size: u32,
+    ) -> bool {
+        self.do_run_pending_tasks(timeout, max_log_sync_repeats, eviction_batch_size)
+    }
+
+    fn now(&self) -> Instant {
+        self.current_time()
+    }
+}
+
+impl<K, V, S> Inner<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn do_run_pending_tasks(
+        &self,
+        timeout: Option<Duration>,
+        max_log_sync_repeats: u32,
+        eviction_batch_size: u32,
+    ) -> bool {
+        if self.max_capacity == Some(0) {
+            return false;
+        }
+
+        // Acquire some locks.
+        let mut deqs = self.deques.lock();
+        let mut timer_wheel = self.timer_wheel.lock();
+
+        let started_at = if timeout.is_some() {
+            Some(self.current_time())
+        } else {
+            None
+        };
+        let mut should_process_logs = true;
+        let mut calls = 0u32;
+        let current_ec = self.entry_count.load();
+        let current_ws = self.weighted_size.load();
+        let mut eviction_state =
+            EvictionState::new(current_ec, current_ws, self.removal_notifier.as_ref());
+
+        loop {
+            if should_process_logs {
+                let r_len = self.read_op_ch.len();
+                if r_len > 0 {
+                    self.apply_reads(&mut deqs, &mut timer_wheel, r_len);
+                }
+
+                let w_len = self.write_op_ch.len();
+                if w_len > 0 {
+                    self.apply_writes(&mut deqs, &mut timer_wheel, w_len, &mut eviction_state);
+                }
+
+                if self.eviction_policy == EvictionPolicyConfig::TinyLfu
+                    && self.should_enable_frequency_sketch(&eviction_state.counters)
+                {
+                    self.enable_frequency_sketch(&eviction_state.counters);
+                }
+
+                calls += 1;
+            }
+
+            // Set this flag to `false`. The `evict_*` and `invalidate_*` methods
+            // below may set it to `true` if there are more entries to evict in next
+            // loop.
+            eviction_state.more_entries_to_evict = false;
+            let last_eviction_count = eviction_state.counters.eviction_count;
+
+            // Evict entries if there are any expired entries in the hierarchical
+            // timer wheels.
+            if timer_wheel.is_enabled() {
+                self.evict_expired_entries_using_timers(
+                    &mut timer_wheel,
+                    &mut deqs,
+                    &mut eviction_state,
+                );
+            }
+
+            // Evict entries if there are any expired entries in the write order or
+            // access order deques.
+            if self.has_expiry() || self.has_valid_after() {
+                self.evict_expired_entries_using_deqs(
+                    &mut deqs,
+                    &mut timer_wheel,
+                    eviction_batch_size,
+                    &mut eviction_state,
+                );
+            }
+
+            // Evict entries if there are any invalidation predicates set by the
+            // `invalidate_entries_if` method.
+            if let Some(invalidator) = &self.invalidator {
+                if !invalidator.is_empty() {
+                    self.invalidate_entries(
+                        invalidator,
+                        &mut deqs,
+                        &mut timer_wheel,
+                        eviction_batch_size,
+                        &mut eviction_state,
+                    );
+                }
+            }
+
+            // Evict if this cache has more entries than its capacity.
+            let weights_to_evict = self.weights_to_evict(&eviction_state.counters);
+            if weights_to_evict > 0 {
+                self.evict_lru_entries(
+                    &mut deqs,
+                    &mut timer_wheel,
+                    eviction_batch_size,
+                    weights_to_evict,
+                    &mut eviction_state,
+                );
+            }
+
+            // Check whether to continue this loop or not.
+
+            should_process_logs = calls <= max_log_sync_repeats
+                && (self.read_op_ch.len() >= READ_LOG_FLUSH_POINT
+                    || self.write_op_ch.len() >= WRITE_LOG_FLUSH_POINT);
+
+            let should_evict_more_entries = eviction_state.more_entries_to_evict
+                // Check if there were any entries evicted in this loop.
+                && (eviction_state.counters.eviction_count - last_eviction_count) > 0;
+
+            // Break the loop if there will be nothing to do in next loop.
+            if !should_process_logs && !should_evict_more_entries {
+                break;
+            }
+
+            // Break the loop if the eviction listener is set and timeout has been
+            // reached.
+            if let (Some(to), Some(started)) = (timeout, started_at) {
+                let elapsed = self.current_time().saturating_duration_since(started);
+                if elapsed >= to {
+                    break;
+                }
+            }
+        }
+
+        debug_assert_eq!(self.entry_count.load(), current_ec);
+        debug_assert_eq!(self.weighted_size.load(), current_ws);
+        self.entry_count.store(eviction_state.counters.entry_count);
+        self.weighted_size
+            .store(eviction_state.counters.weighted_size);
+
+        crossbeam_epoch::pin().flush();
+
+        // Ensure the deqs lock is held until here.
+        drop(deqs);
+
+        eviction_state.more_entries_to_evict
+    }
+}
+
+//
+// private methods
+//
+impl<K, V, S> Inner<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    fn has_enough_capacity(&self, candidate_weight: u32, counters: &EvictionCounters) -> bool {
+        self.max_capacity.map_or(true, |limit| {
+            counters.weighted_size + candidate_weight as u64 <= limit
+        })
+    }
+
+4.878333333333333 minutes used of 45.0

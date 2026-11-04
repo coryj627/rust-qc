@@ -1,0 +1,546 @@
+            return Err(ErrorType::Eof);
+        }
+
+        if error_mask != 0 {
+            return Err(ErrorType::Syntax);
+        }
+
+        if unsafe { utf8_validator.finalize(None).is_err() } {
+            Err(ErrorType::InvalidUtf8)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// SIMD aligned buffer
+struct AlignedBuf {
+    layout: Layout,
+    capacity: usize,
+    len: usize,
+    inner: NonNull<u8>,
+}
+// We use allow Sync + Send here since we know u8 is sync and send
+// we never reallocate or grow this buffer only allocate it in
+// create then deallocate it in drop.
+//
+// An example of this can be found [in the official rust docs](https://doc.rust-lang.org/nomicon/vec/vec-raw.html).
+
+unsafe impl Send for AlignedBuf {}
+unsafe impl Sync for AlignedBuf {}
+impl AlignedBuf {
+    /// Creates a new buffer that is  aligned with the simd register size
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        let Ok(layout) = Layout::from_size_align(capacity, SIMDJSON_PADDING) else {
+            Self::capacity_overflow()
+        };
+        if mem::size_of::<usize>() < 8 && capacity > isize::MAX as usize {
+            Self::capacity_overflow()
+        }
+        unsafe {
+            let Some(inner) = NonNull::new(alloc(layout)) else {
+                handle_alloc_error(layout)
+            };
+            Self {
+                layout,
+                capacity,
+                len: 0,
+                inner,
+            }
+        }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.inner.as_ptr()
+    }
+
+    fn capacity_overflow() -> ! {
+        panic!("capacity overflow");
+    }
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+    unsafe fn set_len(&mut self, n: usize) {
+        assert!(
+            n <= self.capacity,
+            "New size ({}) can not be larger then capacity ({}).",
+            n,
+            self.capacity
+        );
+        self.len = n;
+    }
+}
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        unsafe {
+            dealloc(self.inner.as_ptr(), self.layout);
+        }
+    }
+}
+
+impl Deref for AlignedBuf {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { std::slice::from_raw_parts(self.inner.as_ptr(), self.len) }
+    }
+}
+
+impl DerefMut for AlignedBuf {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { std::slice::from_raw_parts_mut(self.inner.as_ptr(), self.len) }
+    }
+}
+use crate::Deserializer;
+use crate::Result;
+use crate::SillyWrapper;
+use crate::error::ErrorType;
+use crate::impls::neon::stage1::bit_mask;
+use crate::safer_unchecked::GetSaferUnchecked;
+use crate::stringparse::{ESCAPE_MAP, handle_unicode_codepoint};
+
+use std::arch::aarch64::{
+    uint8x16_t, vandq_u8, vceqq_u8, vgetq_lane_u32, vld1q_u8, vmovq_n_u8, vpaddq_u8,
+    vreinterpretq_u32_u8,
+};
+
+#[cfg_attr(not(feature = "no-inline"), inline)]
+fn find_bs_bits_and_quote_bits(v0: uint8x16_t, v1: uint8x16_t) -> (u32, u32) {
+    unsafe {
+        let quote_mask = vmovq_n_u8(b'"');
+        let bs_mask = vmovq_n_u8(b'\\');
+        let bit_mask = bit_mask();
+
+        let cmp_bs_0: uint8x16_t = vceqq_u8(v0, bs_mask);
+        let cmp_bs_1: uint8x16_t = vceqq_u8(v1, bs_mask);
+        let cmp_qt_0: uint8x16_t = vceqq_u8(v0, quote_mask);
+        let cmp_qt_1: uint8x16_t = vceqq_u8(v1, quote_mask);
+
+        let cmp_bs_0 = vandq_u8(cmp_bs_0, bit_mask);
+        let cmp_bs_1 = vandq_u8(cmp_bs_1, bit_mask);
+        let cmp_qt_0 = vandq_u8(cmp_qt_0, bit_mask);
+        let cmp_qt_1 = vandq_u8(cmp_qt_1, bit_mask);
+
+        let sum0: uint8x16_t = vpaddq_u8(cmp_bs_0, cmp_bs_1);
+        let sum1: uint8x16_t = vpaddq_u8(cmp_qt_0, cmp_qt_1);
+        let sum0 = vpaddq_u8(sum0, sum1);
+        let sum0 = vpaddq_u8(sum0, sum0);
+
+        (
+            vgetq_lane_u32(vreinterpretq_u32_u8(sum0), 0),
+            vgetq_lane_u32(vreinterpretq_u32_u8(sum0), 1),
+        )
+    }
+}
+
+#[allow(clippy::if_not_else, clippy::too_many_lines)]
+#[cfg_attr(not(feature = "no-inline"), inline)]
+pub(crate) fn parse_str<'invoke, 'de>(
+    input: SillyWrapper<'de>,
+    data: &'invoke [u8],
+    buffer: &'invoke mut [u8],
+    mut idx: usize,
+) -> Result<&'de str> {
+    use ErrorType::{InvalidEscape, InvalidUnicodeCodepoint};
+    let input = input.input;
+
+    // Add 1 to skip the initial "
+    idx += 1;
+    //let mut read: usize = 0;
+
+    // we include the terminal '"' so we know where to end
+    // This is safe since we check sub's length in the range access above and only
+    // create sub sliced form sub to `sub.len()`.
+
+    let src: &[u8] = unsafe { data.get_kinda_unchecked(idx..) };
+    let mut src_i: usize = 0;
+    let mut len = src_i;
+    loop {
+        let (v0, v1) = unsafe {
+            (
+                vld1q_u8(src.get_kinda_unchecked(src_i..src_i + 16).as_ptr()),
+                vld1q_u8(src.get_kinda_unchecked(src_i + 16..src_i + 32).as_ptr()),
+            )
+        };
+
+        let (bs_bits, quote_bits) = find_bs_bits_and_quote_bits(v0, v1);
+
+        if (bs_bits.wrapping_sub(1) & quote_bits) != 0 {
+            // we encountered quotes first. Move dst to point to quotes and exit
+            // find out where the quote is...
+            let quote_dist: u32 = quote_bits.trailing_zeros();
+
+            ///////////////////////
+            // Above, check for overflow in case someone has a crazy string (>=4GB?)
+            // But only add the overflow check when the document itself exceeds 4GB
+            // Currently unneeded because we refuse to parse docs larger or equal to 4GB.
+            ////////////////////////
+
+            // we advance the point, accounting for the fact that we have a NULl termination
+
+            len += quote_dist as usize;
+            unsafe {
+                let v =
+                    std::str::from_utf8_unchecked(std::slice::from_raw_parts(input.add(idx), len));
+                return Ok(v);
+            }
+
+            // we compare the pointers since we care if they are 'at the same spot'
+            // not if they are the same value
+        }
+        if (quote_bits.wrapping_sub(1) & bs_bits) == 0 {
+            // they are the same. Since they can't co-occur, it means we encountered
+            // neither.
+            src_i += 32;
+            len += 32;
+        } else {
+            // Move to the 'bad' character
+            let bs_dist: u32 = bs_bits.trailing_zeros();
+            len += bs_dist as usize;
+            src_i += bs_dist as usize;
+            break;
+        }
+    }
+
+    let mut dst_i: usize = 0;
+
+    // To be more conform with upstream
+    loop {
+        let (v0, v1) = unsafe {
+            (
+                vld1q_u8(src.get_kinda_unchecked(src_i..src_i + 16).as_ptr()),
+                vld1q_u8(src.get_kinda_unchecked(src_i + 16..src_i + 32).as_ptr()),
+            )
+        };
+
+        unsafe {
+            buffer
+                .get_kinda_unchecked_mut(dst_i..dst_i + 32)
+                .copy_from_slice(src.get_kinda_unchecked(src_i..src_i + 32));
+        }
+
+        // store to dest unconditionally - we can overwrite the bits we don't like
+        // later
+        let (bs_bits, quote_bits) = find_bs_bits_and_quote_bits(v0, v1);
+
+        if (bs_bits.wrapping_sub(1) & quote_bits) != 0 {
+            // we encountered quotes first. Move dst to point to quotes and exit
+            // find out where the quote is...
+            let quote_dist: u32 = quote_bits.trailing_zeros();
+
+            ///////////////////////
+            // Above, check for overflow in case someone has a crazy string (>=4GB?)
+            // But only add the overflow check when the document itself exceeds 4GB
+            // Currently unneeded because we refuse to parse docs larger or equal to 4GB.
+            ////////////////////////
+
+            // we advance the point, accounting for the fact that we have a NULl termination
+
+            dst_i += quote_dist as usize;
+            unsafe {
+                input
+                    .add(idx + len)
+                    .copy_from_nonoverlapping(buffer.as_ptr(), dst_i);
+                let v = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                    input.add(idx),
+                    len + dst_i,
+                ));
+                return Ok(v);
+            }
+
+            // we compare the pointers since we care if they are 'at the same spot'
+            // not if they are the same value
+        }
+        if (quote_bits.wrapping_sub(1) & bs_bits) != 0 {
+            // find out where the backspace is
+            let bs_dist: u32 = bs_bits.trailing_zeros();
+            let escape_char: u8 = unsafe { *src.get_kinda_unchecked(src_i + bs_dist as usize + 1) };
+            // we encountered backslash first. Handle backslash
+            if escape_char == b'u' {
+                // move src/dst up to the start; they will be further adjusted
+                // within the unicode codepoint handling code.
+                src_i += bs_dist as usize;
+                dst_i += bs_dist as usize;
+                let Ok((o, s)) =
+                    handle_unicode_codepoint(unsafe { src.get_kinda_unchecked(src_i..) }, unsafe {
+                        buffer.get_kinda_unchecked_mut(dst_i..)
+                    })
+                else {
+                    return Err(Deserializer::error_c(src_i, 'u', InvalidUnicodeCodepoint));
+                };
+                if o == 0 {
+                    return Err(Deserializer::error_c(src_i, 'u', InvalidUnicodeCodepoint));
+                }
+                // We moved o steps forward at the destination and 6 on the source
+                src_i += s;
+                dst_i += o;
+            } else {
+                // simple 1:1 conversion. Will eat bs_dist+2 characters in input and
+                // write bs_dist+1 characters to output
+                // note this may reach beyond the part of the buffer we've actually
+                // seen. I think this is ok
+                let escape_result: u8 =
+                    unsafe { *ESCAPE_MAP.get_kinda_unchecked(escape_char as usize) };
+                if escape_result == 0 {
+                    return Err(Deserializer::error_c(
+                        src_i,
+                        escape_char as char,
+                        InvalidEscape,
+                    ));
+                }
+                unsafe {
+                    *buffer.get_kinda_unchecked_mut(dst_i + bs_dist as usize) = escape_result;
+                }
+                src_i += bs_dist as usize + 2;
+                dst_i += bs_dist as usize + 1;
+            }
+        } else {
+            // they are the same. Since they can't co-occur, it means we encountered
+            // neither.
+            src_i += 32;
+            dst_i += 32;
+        }
+    }
+}
+use std::ops::Range;
+
+use crate::charutils::{codepoint_to_utf8, hex_to_u32_nocheck};
+use crate::error::ErrorType;
+use crate::safer_unchecked::GetSaferUnchecked;
+
+/// begin copypasta
+/// These chars yield themselves: " \ /
+/// b -> backspace, f -> formfeed, n -> newline, r -> cr, t -> horizontal tab
+/// u not handled in this table as it's Container
+pub(crate) const ESCAPE_MAP: [u8; 256] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x0.
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x22, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x2f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, // 0x4.
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5c, 0, 0, 0, // 0x5.
+    0, 0, 0x08, 0, 0, 0, 0x0c, 0, 0, 0, 0, 0, 0, 0, 0x0a, 0, // 0x6.
+    0, 0, 0x0d, 0, 0x09, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x7.
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+const HIGH_SURROGATES: Range<u32> = 0xd800..0xdc00;
+const LOW_SURROGATES: Range<u32> = 0xdc00..0xe000;
+
+/// handle a unicode codepoint
+/// write appropriate values into dest
+#[cfg_attr(not(feature = "no-inline"), inline)]
+#[allow(dead_code)]
+pub(crate) fn handle_unicode_codepoint(
+    src_ptr: &[u8],
+    dst_ptr: &mut [u8],
+) -> Result<(usize, usize), ErrorType> {
+    let (code_point, src_offset) = get_unicode_codepoint(src_ptr)?;
+    let offset: usize = codepoint_to_utf8(code_point, dst_ptr);
+    Ok((offset, src_offset))
+}
+
+/// handle a unicode codepoint
+/// write appropriate values into dest
+/// src will advance 6 bytes or 12 bytes
+/// dest will advance a variable amount (return via pointer)
+/// return true if the unicode codepoint was valid
+/// We work in little-endian then swap at write time
+#[cfg_attr(not(feature = "no-inline"), inline)]
+pub(crate) fn get_unicode_codepoint(mut src_ptr: &[u8]) -> Result<(u32, usize), ErrorType> {
+    // hex_to_u32_nocheck fills high 16 bits of the return value with 1s if the
+    // conversion isn't valid; we defer the check for this to inside the
+    // multilingual plane check
+    let mut code_point: u32 = hex_to_u32_nocheck(unsafe { src_ptr.get_kinda_unchecked(2..) });
+    src_ptr = unsafe { src_ptr.get_kinda_unchecked(6..) };
+    let mut src_offset = 6;
+    // check for low surrogate for characters outside the Basic
+    // Multilingual Plane.
+    if HIGH_SURROGATES.contains(&code_point) {
+        if (unsafe { *src_ptr.get_kinda_unchecked(0) } != b'\\')
+            || unsafe { *src_ptr.get_kinda_unchecked(1) } != b'u'
+        {
+            return Ok((0, src_offset));
+        }
+
+        let code_point_2: u32 = hex_to_u32_nocheck(unsafe { src_ptr.get_kinda_unchecked(2..) });
+
+        // if the first code point is invalid we will get here, as we will go past
+        // the check for being outside the Basic Multilingual plane. If we don't
+        // find a \u immediately afterwards we fail out anyhow, but if we do,
+        // this check catches both the case of the first code point being invalid
+        // or the second code point being invalid.
+        if ((code_point | code_point_2) >> 16) != 0 {
+            return Ok((0, src_offset));
+        }
+        let Some(c1) = code_point.checked_sub(0xd800) else {
+            return Err(ErrorType::InvalidUtf8);
+        };
+        let Some(c2) = code_point_2.checked_sub(0xdc00) else {
+            return Err(ErrorType::InvalidUtf8);
+        };
+        code_point = ((c1 << 10) | c2) + 0x10000;
+        src_offset += 6;
+    } else if LOW_SURROGATES.contains(&code_point) {
+        // This is a low surrogate on it's own, which is invalid.
+        return Err(ErrorType::InvalidUtf8);
+    }
+    Ok((code_point, src_offset))
+}
+use crate::{
+    Deserializer, ErrorType, Result, SillyWrapper,
+    safer_unchecked::GetSaferUnchecked,
+    stringparse::{ESCAPE_MAP, get_unicode_codepoint},
+};
+
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) unsafe fn parse_str<'invoke, 'de>(
+    input: SillyWrapper<'de>,
+    data: &'invoke [u8],
+    _buffer: &'invoke mut [u8],
+    idx: usize,
+) -> Result<&'de str> {
+    use ErrorType::{InvalidEscape, InvalidUnicodeCodepoint};
+
+    let input = input.input;
+    // skip leading `"`
+    let src: &[u8] = unsafe { data.get_kinda_unchecked(idx + 1..) };
+    let input = unsafe { input.add(idx + 1) };
+
+    let mut src_i = 0;
+    let mut b = unsafe { *src.get_kinda_unchecked(src_i) };
+
+    // quickly skip all the "good stuff"
+    while b != b'"' && b != b'\\' {
+        src_i += 1;
+        b = unsafe { *src.get_kinda_unchecked(src_i) };
+    }
+    if b == b'"' {
+        let v = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(input, src_i)) };
+        return Ok(v);
+    }
+
+    // we hit an escape sequence now it gets tricky
+    // our destination index is idx +1 to skip the '"' + our current position
+    let mut dst_i = src_i;
+    while b != b'"' {
+        if b == b'\\' {
+            // don't advance i yet
+            let escape_char = unsafe { *src.get_kinda_unchecked(src_i + 1) };
+            if escape_char == b'u' {
+                // got to reduce by 1 since we have to include the '\\' for get_unicode_codepoint
+                let (cp, src_offset) =
+                    unsafe { get_unicode_codepoint(src.get_kinda_unchecked(src_i..)) }.map_err(
+                        |_| Deserializer::error_c(idx + 1 + src_i, 'u', InvalidUnicodeCodepoint),
+                    )?;
+
+                // from  codepoint_to_utf8 since we write directly to input
+                unsafe {
+                    if cp <= 0x7F {
+                        input.add(dst_i).write(cp as u8);
+                        dst_i += 1;
+                    } else if cp <= 0x7FF {
+                        input.add(dst_i).write(((cp >> 6) + 192) as u8);
+                        dst_i += 1;
+                        input.add(dst_i).write(((cp & 63) + 128) as u8);
+                        dst_i += 1;
+                    } else if cp <= 0xFFFF {
+                        input.add(dst_i).write(((cp >> 12) + 224) as u8);
+                        dst_i += 1;
+                        input.add(dst_i).write((((cp >> 6) & 63) + 128) as u8);
+                        dst_i += 1;
+                        input.add(dst_i).write(((cp & 63) + 128) as u8);
+                        dst_i += 1;
+                    } else if cp <= 0x0010_FFFF {
+                        input.add(dst_i).write(((cp >> 18) + 240) as u8);
+                        dst_i += 1;
+                        input.add(dst_i).write((((cp >> 12) & 63) + 128) as u8);
+                        dst_i += 1;
+                        input.add(dst_i).write((((cp >> 6) & 63) + 128) as u8);
+                        dst_i += 1;
+                        input.add(dst_i).write(((cp & 63) + 128) as u8);
+                        dst_i += 1;
+                    } else {
+                        return Err(Deserializer::error_c(
+                            idx + 1 + src_i,
+                            'u',
+                            InvalidUnicodeCodepoint,
+                        ));
+                    }
+                }
+                // We have to subtract one since we're already moving to the next character at the end of the loop
+                src_i += src_offset - 1;
+            } else {
+                let escape_result: u8 =
+                    unsafe { *ESCAPE_MAP.get_kinda_unchecked(escape_char as usize) };
+                if escape_result == 0 {
+                    return Err(Deserializer::error_c(
+                        idx + 1 + src_i,
+                        escape_char as char,
+                        InvalidEscape,
+                    ));
+                }
+                unsafe { input.add(dst_i).write(escape_result) };
+                dst_i += 1;
+                // move i for reading the escape char
+                src_i += 1;
+            }
+        } else {
+            unsafe { input.add(dst_i).write(b) };
+            dst_i += 1;
+        }
+        src_i += 1;
+        b = unsafe { *src.get_kinda_unchecked(src_i) };
+    }
+    unsafe {
+        Ok(std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+            input, dst_i,
+        )))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::SIMDJSON_PADDING;
+
+    fn deser_str(input: &[u8]) -> Result<String> {
+        let mut input = input.to_vec();
+        let mut input2 = input.clone();
+        input2.append(vec![0; SIMDJSON_PADDING * 2].as_mut());
+        let mut buffer = vec![0; 1024];
+
+        let r = unsafe {
+            super::parse_str(input.as_mut_ptr().into(), &input2, buffer.as_mut_slice(), 0)?
+        };
+        Ok(String::from(r))
+    }
+    use super::*;
+    #[test]
+    fn easy_string() -> Result<()> {
+        let s = deser_str(&br#""snot""#[..])?;
+        assert_eq!("snot", s);
+        Ok(())
+    }
+
+    #[test]
+    fn string_with_quote() -> Result<()> {
+        let s = deser_str(&br#""snot says:\n \"badger\"""#[..])?;
+        assert_eq!("snot says:\n \"badger\"", s);
+        Ok(())
+    }
+
+    #[test]
+    fn string_with_utf8() -> Result<()> {
+        let s = deser_str(&br#""\u000e""#[..])?;
+        assert_eq!("\u{e}", s);
+        Ok(())
+    }
+}
+nightly-2026-10-01-aarch64-unknown-linux-gnu
+1.99.1-aarch64-unknown-linux-gnu (active, default)
+aarch64-unknown-linux-gnu
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+clippy 0.1.99 (58cf8f9c35 2026-10-13)

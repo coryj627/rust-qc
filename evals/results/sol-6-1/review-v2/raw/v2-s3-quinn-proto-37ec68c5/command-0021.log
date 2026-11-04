@@ -1,0 +1,556 @@
+//! Logic for controlling the rate at which data is sent
+
+use crate::Instant;
+use crate::connection::RttEstimator;
+use std::any::Any;
+use std::sync::Arc;
+
+mod bbr;
+mod cubic;
+mod new_reno;
+
+pub use bbr::{Bbr, BbrConfig};
+pub use cubic::{Cubic, CubicConfig};
+pub use new_reno::{NewReno, NewRenoConfig};
+
+/// Common interface for different congestion controllers
+pub trait Controller: Send + Sync {
+    /// One or more packets were just sent
+    #[allow(unused_variables)]
+    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {}
+
+    /// Packet deliveries were confirmed
+    ///
+    /// `app_limited` indicates whether the connection was blocked on outgoing
+    /// application data prior to receiving these acknowledgements.
+    #[allow(unused_variables)]
+    fn on_ack(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        bytes: u64,
+        app_limited: bool,
+        rtt: &RttEstimator,
+    ) {
+    }
+
+    /// Packets are acked in batches, all with the same `now` argument. This indicates one of those batches has completed.
+    #[allow(unused_variables)]
+    fn on_end_acks(
+        &mut self,
+        now: Instant,
+        in_flight: u64,
+        app_limited: bool,
+        largest_packet_num_acked: Option<u64>,
+    ) {
+    }
+
+    /// Packets were deemed lost or marked congested
+    ///
+    /// `in_persistent_congestion` indicates whether all packets sent within the persistent
+    /// congestion threshold period ending when the most recent packet in this batch was sent were
+    /// lost.
+    /// `lost_bytes` indicates how many bytes were lost. This value will be 0 for ECN triggers.
+    fn on_congestion_event(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        is_persistent_congestion: bool,
+        lost_bytes: u64,
+    );
+
+    /// The known MTU for the current network path has been updated
+    fn on_mtu_update(&mut self, new_mtu: u16);
+
+    /// Number of ack-eliciting bytes that may be in flight
+    fn window(&self) -> u64;
+
+    /// Retrieve implementation-specific metrics used to populate `qlog` traces when they are enabled
+    fn metrics(&self) -> ControllerMetrics {
+        ControllerMetrics {
+            congestion_window: self.window(),
+            ssthresh: None,
+            pacing_rate: None,
+        }
+    }
+
+    /// Duplicate the controller's state
+    fn clone_box(&self) -> Box<dyn Controller>;
+
+    /// Initial congestion window
+    fn initial_window(&self) -> u64;
+
+    /// Returns Self for use in down-casting to extract implementation details
+    fn into_any(self: Box<Self>) -> Box<dyn Any>;
+}
+
+/// Common congestion controller metrics
+#[derive(Default)]
+#[non_exhaustive]
+pub struct ControllerMetrics {
+    /// Congestion window (bytes)
+    pub congestion_window: u64,
+    /// Slow start threshold (bytes)
+    pub ssthresh: Option<u64>,
+    /// Pacing rate (bits/s)
+    pub pacing_rate: Option<u64>,
+}
+
+/// Constructs controllers on demand
+pub trait ControllerFactory {
+    /// Construct a fresh `Controller`
+    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller>;
+}
+
+const BASE_DATAGRAM_SIZE: u64 = 1200;
+use std::any::Any;
+use std::fmt::Debug;
+use std::sync::Arc;
+
+use rand::{Rng, SeedableRng};
+
+use crate::congestion::ControllerMetrics;
+use crate::congestion::bbr::bw_estimation::BandwidthEstimation;
+use crate::congestion::bbr::min_max::MinMax;
+use crate::connection::RttEstimator;
+use crate::{Duration, Instant};
+
+use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
+
+mod bw_estimation;
+mod min_max;
+
+/// Experimental! Use at your own risk.
+///
+/// Aims for reduced buffer bloat and improved performance over high bandwidth-delay product networks.
+/// Based on google's quiche implementation <https://source.chromium.org/chromium/chromium/src/+/master:net/third_party/quiche/src/quic/core/congestion_control/bbr_sender.cc>
+/// of BBR <https://datatracker.ietf.org/doc/html/draft-cardwell-iccrg-bbr-congestion-control>.
+/// More discussion and links at <https://groups.google.com/g/bbr-dev>.
+#[derive(Debug, Clone)]
+pub struct Bbr {
+    config: Arc<BbrConfig>,
+    current_mtu: u64,
+    max_bandwidth: BandwidthEstimation,
+    acked_bytes: u64,
+    mode: Mode,
+    loss_state: LossState,
+    recovery_state: RecoveryState,
+    recovery_window: u64,
+    is_at_full_bandwidth: bool,
+    pacing_gain: f32,
+    high_gain: f32,
+    drain_gain: f32,
+    cwnd_gain: f32,
+    high_cwnd_gain: f32,
+    last_cycle_start: Option<Instant>,
+    current_cycle_offset: u8,
+    init_cwnd: u64,
+    min_cwnd: u64,
+    prev_in_flight_count: u64,
+    exit_probe_rtt_at: Option<Instant>,
+    probe_rtt_last_started_at: Option<Instant>,
+    min_rtt: Duration,
+    exiting_quiescence: bool,
+    pacing_rate: u64,
+    max_acked_packet_number: u64,
+    max_sent_packet_number: u64,
+    end_recovery_at_packet_number: u64,
+    cwnd: u64,
+    current_round_trip_end_packet_number: u64,
+    round_count: u64,
+    bw_at_last_round: u64,
+    round_wo_bw_gain: u64,
+    ack_aggregation: AckAggregationState,
+    random_number_generator: rand::rngs::StdRng,
+}
+
+impl Bbr {
+    /// Construct a state using the given `config` and current time `now`
+    pub fn new(config: Arc<BbrConfig>, current_mtu: u16) -> Self {
+        let initial_window = config.initial_window;
+        Self {
+            config,
+            current_mtu: current_mtu as u64,
+            max_bandwidth: BandwidthEstimation::default(),
+            acked_bytes: 0,
+            mode: Mode::Startup,
+            loss_state: Default::default(),
+            recovery_state: RecoveryState::NotInRecovery,
+            recovery_window: 0,
+            is_at_full_bandwidth: false,
+            pacing_gain: K_DEFAULT_HIGH_GAIN,
+            high_gain: K_DEFAULT_HIGH_GAIN,
+            drain_gain: 1.0 / K_DEFAULT_HIGH_GAIN,
+            cwnd_gain: K_DEFAULT_HIGH_GAIN,
+            high_cwnd_gain: K_DEFAULT_HIGH_GAIN,
+            last_cycle_start: None,
+            current_cycle_offset: 0,
+            init_cwnd: initial_window,
+            min_cwnd: calculate_min_window(current_mtu as u64),
+            prev_in_flight_count: 0,
+            exit_probe_rtt_at: None,
+            probe_rtt_last_started_at: None,
+            min_rtt: Default::default(),
+            exiting_quiescence: false,
+            pacing_rate: 0,
+            max_acked_packet_number: 0,
+            max_sent_packet_number: 0,
+            end_recovery_at_packet_number: 0,
+            cwnd: initial_window,
+            current_round_trip_end_packet_number: 0,
+            round_count: 0,
+            bw_at_last_round: 0,
+            round_wo_bw_gain: 0,
+            ack_aggregation: AckAggregationState::default(),
+            random_number_generator: rand::rngs::StdRng::from_os_rng(),
+        }
+    }
+
+    fn enter_startup_mode(&mut self) {
+        self.mode = Mode::Startup;
+        self.pacing_gain = self.high_gain;
+        self.cwnd_gain = self.high_cwnd_gain;
+    }
+
+    fn enter_probe_bandwidth_mode(&mut self, now: Instant) {
+        self.mode = Mode::ProbeBw;
+        self.cwnd_gain = K_DERIVED_HIGH_CWNDGAIN;
+        self.last_cycle_start = Some(now);
+        // Pick a random offset for the gain cycle out of {0, 2..7} range. 1 is
+        // excluded because in that case increased gain and decreased gain would not
+        // follow each other.
+        let mut rand_index = self
+            .random_number_generator
+            .random_range(0..K_PACING_GAIN.len() as u8 - 1);
+        if rand_index >= 1 {
+            rand_index += 1;
+        }
+        self.current_cycle_offset = rand_index;
+        self.pacing_gain = K_PACING_GAIN[rand_index as usize];
+    }
+
+    fn update_recovery_state(&mut self, is_round_start: bool) {
+        // Exit recovery when there are no losses for a round.
+        if self.loss_state.has_losses() {
+            self.end_recovery_at_packet_number = self.max_sent_packet_number;
+        }
+        match self.recovery_state {
+            // Enter conservation on the first loss.
+            RecoveryState::NotInRecovery if self.loss_state.has_losses() => {
+                self.recovery_state = RecoveryState::Conservation;
+                // This will cause the |recovery_window| to be set to the
+                // correct value in CalculateRecoveryWindow().
+                self.recovery_window = 0;
+                // Since the conservation phase is meant to be lasting for a whole
+                // round, extend the current round as if it were started right now.
+                self.current_round_trip_end_packet_number = self.max_sent_packet_number;
+            }
+            RecoveryState::Growth | RecoveryState::Conservation => {
+                if self.recovery_state == RecoveryState::Conservation && is_round_start {
+                    self.recovery_state = RecoveryState::Growth;
+                }
+                // Exit recovery if appropriate.
+                if !self.loss_state.has_losses()
+                    && self.max_acked_packet_number > self.end_recovery_at_packet_number
+                {
+                    self.recovery_state = RecoveryState::NotInRecovery;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn update_gain_cycle_phase(&mut self, now: Instant, in_flight: u64) {
+        // In most cases, the cycle is advanced after an RTT passes.
+        let mut should_advance_gain_cycling = self
+            .last_cycle_start
+            .map(|last_cycle_start| now.duration_since(last_cycle_start) > self.min_rtt)
+            .unwrap_or(false);
+        // If the pacing gain is above 1.0, the connection is trying to probe the
+        // bandwidth by increasing the number of bytes in flight to at least
+        // pacing_gain * BDP.  Make sure that it actually reaches the target, as
+        // long as there are no losses suggesting that the buffers are not able to
+        // hold that much.
+        if self.pacing_gain > 1.0
+            && !self.loss_state.has_losses()
+            && self.prev_in_flight_count < self.get_target_cwnd(self.pacing_gain)
+        {
+            should_advance_gain_cycling = false;
+        }
+
+        // If pacing gain is below 1.0, the connection is trying to drain the extra
+        // queue which could have been incurred by probing prior to it.  If the
+        // number of bytes in flight falls down to the estimated BDP value earlier,
+        // conclude that the queue has been successfully drained and exit this cycle
+        // early.
+        if self.pacing_gain < 1.0 && in_flight <= self.get_target_cwnd(1.0) {
+            should_advance_gain_cycling = true;
+        }
+
+        if should_advance_gain_cycling {
+            self.current_cycle_offset = (self.current_cycle_offset + 1) % K_PACING_GAIN.len() as u8;
+            self.last_cycle_start = Some(now);
+            // Stay in low gain mode until the target BDP is hit.  Low gain mode
+            // will be exited immediately when the target BDP is achieved.
+            if DRAIN_TO_TARGET
+                && self.pacing_gain < 1.0
+                && (K_PACING_GAIN[self.current_cycle_offset as usize] - 1.0).abs() < f32::EPSILON
+                && in_flight > self.get_target_cwnd(1.0)
+            {
+                return;
+            }
+            self.pacing_gain = K_PACING_GAIN[self.current_cycle_offset as usize];
+        }
+    }
+
+    fn maybe_exit_startup_or_drain(&mut self, now: Instant, in_flight: u64) {
+        if self.mode == Mode::Startup && self.is_at_full_bandwidth {
+            self.mode = Mode::Drain;
+            self.pacing_gain = self.drain_gain;
+            self.cwnd_gain = self.high_cwnd_gain;
+        }
+        if self.mode == Mode::Drain && in_flight <= self.get_target_cwnd(1.0) {
+            self.enter_probe_bandwidth_mode(now);
+        }
+    }
+
+    fn is_min_rtt_expired(&self, now: Instant, app_limited: bool) -> bool {
+        !app_limited
+            && self
+                .probe_rtt_last_started_at
+                .map(|last| now.saturating_duration_since(last) > Duration::from_secs(10))
+                .unwrap_or(true)
+    }
+
+    fn maybe_enter_or_exit_probe_rtt(
+        &mut self,
+        now: Instant,
+        is_round_start: bool,
+        bytes_in_flight: u64,
+        app_limited: bool,
+    ) {
+        let min_rtt_expired = self.is_min_rtt_expired(now, app_limited);
+        if min_rtt_expired && !self.exiting_quiescence && self.mode != Mode::ProbeRtt {
+            self.mode = Mode::ProbeRtt;
+            self.pacing_gain = 1.0;
+            // Do not decide on the time to exit ProbeRtt until the
+            // |bytes_in_flight| is at the target small value.
+            self.exit_probe_rtt_at = None;
+            self.probe_rtt_last_started_at = Some(now);
+        }
+
+        if self.mode == Mode::ProbeRtt {
+            if self.exit_probe_rtt_at.is_none() {
+                // If the window has reached the appropriate size, schedule exiting
+                // ProbeRtt.  The CWND during ProbeRtt is
+                // kMinimumCongestionWindow, but we allow an extra packet since QUIC
+                // checks CWND before sending a packet.
+                if bytes_in_flight < self.get_probe_rtt_cwnd() + self.current_mtu {
+                    const K_PROBE_RTT_TIME: Duration = Duration::from_millis(200);
+                    self.exit_probe_rtt_at = Some(now + K_PROBE_RTT_TIME);
+                }
+            } else if is_round_start && now >= self.exit_probe_rtt_at.unwrap() {
+                if !self.is_at_full_bandwidth {
+                    self.enter_startup_mode();
+                } else {
+                    self.enter_probe_bandwidth_mode(now);
+                }
+            }
+        }
+
+        self.exiting_quiescence = false;
+    }
+
+    fn get_target_cwnd(&self, gain: f32) -> u64 {
+        let bw = self.max_bandwidth.get_estimate();
+use std::fmt::{Debug, Display, Formatter};
+
+use super::min_max::MinMax;
+use crate::{Duration, Instant};
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BandwidthEstimation {
+    total_acked: u64,
+    prev_total_acked: u64,
+    acked_time: Option<Instant>,
+    prev_acked_time: Option<Instant>,
+    total_sent: u64,
+    prev_total_sent: u64,
+    sent_time: Option<Instant>,
+    prev_sent_time: Option<Instant>,
+    max_filter: MinMax,
+    acked_at_last_window: u64,
+}
+
+impl BandwidthEstimation {
+    pub(crate) fn on_sent(&mut self, now: Instant, bytes: u64) {
+        self.prev_total_sent = self.total_sent;
+        self.total_sent += bytes;
+        self.prev_sent_time = self.sent_time;
+        self.sent_time = Some(now);
+    }
+
+    pub(crate) fn on_ack(
+        &mut self,
+        now: Instant,
+        _sent: Instant,
+        bytes: u64,
+        round: u64,
+        app_limited: bool,
+    ) {
+        self.prev_total_acked = self.total_acked;
+        self.total_acked += bytes;
+        self.prev_acked_time = self.acked_time;
+        self.acked_time = Some(now);
+
+        let prev_sent_time = match self.prev_sent_time {
+            Some(prev_sent_time) => prev_sent_time,
+            None => return,
+        };
+
+        let send_rate = match self.sent_time {
+            Some(sent_time) if sent_time > prev_sent_time => Self::bw_from_delta(
+                self.total_sent - self.prev_total_sent,
+                sent_time - prev_sent_time,
+            )
+            .unwrap_or(0),
+            _ => u64::MAX, // will take the min of send and ack, so this is just a skip
+        };
+
+        let ack_rate = match self.prev_acked_time {
+            Some(prev_acked_time) => Self::bw_from_delta(
+                self.total_acked - self.prev_total_acked,
+                now - prev_acked_time,
+            )
+            .unwrap_or(0),
+            None => 0,
+        };
+
+        let bandwidth = send_rate.min(ack_rate);
+        if !app_limited && self.max_filter.get() < bandwidth {
+            self.max_filter.update_max(round, bandwidth);
+        }
+    }
+
+    pub(crate) fn bytes_acked_this_window(&self) -> u64 {
+        self.total_acked - self.acked_at_last_window
+    }
+
+    pub(crate) fn end_acks(&mut self, _current_round: u64, _app_limited: bool) {
+        self.acked_at_last_window = self.total_acked;
+    }
+
+    pub(crate) fn get_estimate(&self) -> u64 {
+        self.max_filter.get()
+    }
+
+    pub(crate) const fn bw_from_delta(bytes: u64, delta: Duration) -> Option<u64> {
+        let window_duration_ns = delta.as_nanos();
+        if window_duration_ns == 0 {
+            return None;
+        }
+        let b_ns = bytes * 1_000_000_000;
+        let bytes_per_second = b_ns / (window_duration_ns as u64);
+        Some(bytes_per_second)
+    }
+}
+
+impl Display for BandwidthEstimation {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:.3} MB/s",
+            self.get_estimate() as f32 / (1024 * 1024) as f32
+        )
+    }
+}
+quinn-proto/src/packet.rs:47:            .unwrap_or(dgram_len);
+quinn-proto/src/packet.rs:130:            let number = Self::decrypt_header(&mut buf, header_crypto.unwrap())?;
+quinn-proto/src/packet.rs:160:                number: Self::decrypt_header(&mut buf, header_crypto.unwrap())?,
+quinn-proto/src/packet.rs:173:                let number = Self::decrypt_header(&mut buf, header_crypto.unwrap())?;
+quinn-proto/src/packet.rs:486:            assert!(len < 2usize.pow(14)); // Fits in reserved space
+quinn-proto/src/packet.rs:495:        debug_assert!(
+quinn-proto/src/packet.rs:603:            // TODO: Support long CIDs for compatibility with future QUIC versions
+quinn-proto/src/packet.rs:751:    pub(crate) fn expand(self, expected: u64) -> u64 {
+quinn-proto/src/packet.rs:764:        // The incoming packet number should be greater than expected - hwin and less than or equal
+quinn-proto/src/packet.rs:765:        // to expected + hwin
+quinn-proto/src/packet.rs:767:        // This means we can't just strip the trailing bits from expected and add the truncated
+quinn-proto/src/packet.rs:772:        let candidate = (expected & !mask) | truncated;
+quinn-proto/src/packet.rs:773:        if expected.checked_sub(hwin).is_some_and(|x| candidate <= x) {
+quinn-proto/src/packet.rs:775:        } else if candidate > expected + hwin && candidate > win {
+quinn-proto/src/packet.rs:785:    expected_len: usize,
+quinn-proto/src/packet.rs:790:    pub fn new(expected_len: usize) -> Self {
+quinn-proto/src/packet.rs:791:        Self { expected_len }
+quinn-proto/src/packet.rs:797:        (buffer.remaining() >= self.expected_len)
+quinn-proto/src/packet.rs:798:            .then(|| ConnectionId::from_buf(buffer, self.expected_len))
+quinn-proto/src/packet.rs:820:        debug_assert!(b & LONG_HEADER_FORM != 0, "not a long packet");
+quinn-proto/src/packet.rs:870:impl From<coding::UnexpectedEnd> for PacketDecodeError {
+quinn-proto/src/packet.rs:871:    fn from(_: coding::UnexpectedEnd) -> Self {
+quinn-proto/src/packet.rs:872:        Self::InvalidHeader("unexpected end of packet")
+quinn-proto/src/packet.rs:908:        assert_eq!(&buf[..], encoded);
+quinn-proto/src/packet.rs:909:        let decoded = PacketNumber::decode(typed.len(), &mut io::Cursor::new(&buf)).unwrap();
+quinn-proto/src/packet.rs:910:        assert_eq!(typed, decoded);
+quinn-proto/src/packet.rs:931:        for expected in 0..1024 {
+quinn-proto/src/packet.rs:932:            for actual in expected..1024 {
+quinn-proto/src/packet.rs:933:                assert_eq!(actual, PacketNumber::new(actual, expected).expand(expected));
+quinn-proto/src/packet.rs:952:        let suite = initial_suite_from_provider(&std::sync::Arc::new(provider)).unwrap();
+quinn-proto/src/packet.rs:975:        assert_eq!(
+quinn-proto/src/packet.rs:991:        .unwrap()
+quinn-proto/src/packet.rs:993:        let mut packet = decode.finish(Some(&*server.header.remote)).unwrap();
+quinn-proto/src/packet.rs:994:        assert_eq!(
+quinn-proto/src/packet.rs:1002:            .unwrap();
+quinn-proto/src/packet.rs:1003:        assert_eq!(packet.payload[..], [0; 16]);
+quinn-proto/src/packet.rs:1010:                panic!("unexpected header {:?}", packet.header);
+quinn-proto/src/transport_parameters.rs:23:    coding::{BufExt, BufMutExt, UnexpectedEnd},
+quinn-proto/src/transport_parameters.rs:162:            max_idle_timeout: config.max_idle_timeout.unwrap_or(VarInt(0)),
+quinn-proto/src/transport_parameters.rs:175:                VarInt::from_u64(u64::try_from(TIMER_GRANULARITY.as_micros()).unwrap()).unwrap(),
+quinn-proto/src/transport_parameters.rs:301:impl From<UnexpectedEnd> for Error {
+quinn-proto/src/transport_parameters.rs:302:    fn from(_: UnexpectedEnd) -> Self {
+quinn-proto/src/transport_parameters.rs:313:            .unwrap_or(&std::array::from_fn(|i| i as u8))
+quinn-proto/src/transport_parameters.rs:390:                                        w.write(VarInt::try_from(self.$name.size()).unwrap());
+quinn-proto/src/transport_parameters.rs:472:                    params.max_datagram_frame_size = Some(r.get().unwrap());
+quinn-proto/src/transport_parameters.rs:479:                    params.min_ack_delay = Some(r.get().unwrap())
+quinn-proto/src/transport_parameters.rs:595:        debug_assert!(
+quinn-proto/src/transport_parameters.rs:599:        VarInt::from_u64(id).expect(
+quinn-proto/src/transport_parameters.rs:748:        assert_eq!(
+quinn-proto/src/transport_parameters.rs:749:            TransportParameters::read(Side::Client, &mut buf.as_slice()).unwrap(),
+quinn-proto/src/transport_parameters.rs:782:            assert!(id.0 % 31 == 27)
+quinn-proto/src/transport_parameters.rs:820:        assert!(reserved_parameter.payload_len < ReservedTransportParameter::MAX_PAYLOAD_LEN);
+quinn-proto/src/transport_parameters.rs:821:        assert!(reserved_parameter.id.0 % 31 == 27);
+quinn-proto/src/transport_parameters.rs:824:        assert!(!buf.is_empty());
+quinn-proto/src/transport_parameters.rs:825:        let read_params = TransportParameters::read(Side::Server, &mut buf.as_slice()).unwrap();
+quinn-proto/src/transport_parameters.rs:826:        assert_eq!(read_params, TransportParameters::default());
+quinn-proto/src/transport_parameters.rs:836:                t.min_ack_delay = Some(VarInt::from_u64(min_ack_delay).unwrap())
+quinn-proto/src/transport_parameters.rs:856:            assert_eq!(
+quinn-proto/src/transport_parameters.rs:873:        high_limit.validate_resumption_from(&low_limit).unwrap();
+quinn-proto/src/transport_parameters.rs:874:        low_limit.validate_resumption_from(&high_limit).unwrap_err();
+quinn-proto/src/endpoint.rs:211:                    let config = &self.server_config.as_ref().unwrap();
+quinn-proto/src/endpoint.rs:272:            debug!("ignoring unexpected packet within minimum stateless reset interval");
+quinn-proto/src/endpoint.rs:285:                    "ignoring unexpected {} byte packet: not larger than minimum stateless reset size",
+quinn-proto/src/endpoint.rs:311:        debug_assert!(buf.len() < inciting_dgram_len);
+quinn-proto/src/endpoint.rs:406:                debug_assert_eq!(self.local_cid_generator.cid_len(), 0);
+quinn-proto/src/endpoint.rs:424:        let header = event.first_decode.initial_header().unwrap();
+quinn-proto/src/endpoint.rs:479:        let server_config = self.server_config.as_ref().unwrap().clone();
+quinn-proto/src/endpoint.rs:540:            server_config.unwrap_or_else(|| self.server_config.as_ref().unwrap().clone());
+quinn-proto/src/endpoint.rs:678:        let config = &self.server_config.as_ref().unwrap();
+quinn-proto/src/endpoint.rs:729:        let server_config = self.server_config.as_ref().unwrap();
+quinn-proto/src/endpoint.rs:827:            debug_assert_eq!(cids_issued, 1, "preferred address cid seq must be 1");
+quinn-proto/src/endpoint.rs:840:        debug_assert_eq!(id, ch.0, "connection handle allocation out of sync");
+quinn-proto/src/endpoint.rs:858:        // unexpected response.
+quinn-proto/src/endpoint.rs:903:        debug_assert_eq!(x, self.index.connection_ids_initial.len());
+quinn-proto/src/endpoint.rs:905:        debug_assert!(x >= self.index.connection_reset_tokens.0.len());
+quinn-proto/src/endpoint.rs:907:        debug_assert!(x >= self.index.incoming_connection_remotes.len());
+quinn-proto/src/endpoint.rs:908:        debug_assert!(x >= self.index.outgoing_connection_remotes.len());
+quinn-proto/src/endpoint.rs:1011:        debug_assert!(removed.is_some());
+47 used `unwrap()` on an `Option` value
+43 assert without any message
+38 docs for function returning `Result` missing `# Errors` section
+38 used `unwrap()` on a `Result` value
+12 docs for function which may panic missing `# Panics` section
+5 `map_err(|_|...` wildcard pattern discards the original error
+1 this `impl` can be derived
+1 manual implementation of `Option::filter`
+4 unsafe block missing a safety comment
+1 usage of wildcard import
+26 type does not implement `std::fmt::Debug`; consider adding `#[derive(Debug)]` or a manual implementation
+1 `quinn-proto` (lib) generated 216 warnings (run `cargo clippy --fix --lib -p quinn-proto -- -W missing_docs -W missing_debug_implementations -W clippy::missing_errors_doc -W clippy::missing_panics_doc -W clippy::undocumented_unsafe_blocks -W clippy::unwrap_used -W clippy::allow_attributes_without_reason -W clippy::dbg_macro -W clippy::todo -W clippy::unimplemented -W clippy::wildcard_imports -W clippy::missing_assert_message -W clippy::map_err_ignore -W clippy::too_long_first_doc_paragraph` to apply 2 suggestions)

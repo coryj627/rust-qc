@@ -1,0 +1,678 @@
+use futures::{StreamExt, TryStreamExt};
+use h2_support::prelude::*;
+
+#[tokio::test]
+async fn recv_push_works() {
+    h2_support::trace_init!();
+
+    let (io, mut srv) = mock::new();
+    let mock = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(404)).await;
+        srv.send_frame(
+            frames::push_promise(1, 2).request("GET", "https://http2.akamai.com/style.css"),
+        )
+        .await;
+        srv.send_frame(frames::data(1, "").eos()).await;
+        srv.send_frame(frames::headers(2).response(200)).await;
+        srv.send_frame(frames::data(2, "promised_data").eos()).await;
+    };
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+        let (mut resp, _) = client.send_request(request, true).unwrap();
+        let pushed = resp.push_promises();
+        let check_resp_status = async move {
+            let resp = resp.await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        };
+        let check_pushed_response = async move {
+            let p = pushed.and_then(|headers| async move {
+                let (request, response) = headers.into_parts();
+                assert_eq!(request.into_parts().0.method, Method::GET);
+                let resp = response.await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let b = util::concat(resp.into_body()).await.unwrap();
+                assert_eq!(b, "promised_data");
+                Ok(())
+            });
+            let ps: Vec<_> = p.collect().await;
+            assert_eq!(1, ps.len())
+        };
+
+        h2.drive(join(check_resp_status, check_pushed_response))
+            .await;
+    };
+
+    join(mock, h2).await;
+}
+
+#[tokio::test]
+async fn pushed_streams_arent_dropped_too_early() {
+    // tests that by default, received push promises work
+    h2_support::trace_init!();
+
+    let (io, mut srv) = mock::new();
+    let mock = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(404)).await;
+        srv.send_frame(
+            frames::push_promise(1, 2).request("GET", "https://http2.akamai.com/style.css"),
+        )
+        .await;
+        srv.send_frame(
+            frames::push_promise(1, 4).request("GET", "https://http2.akamai.com/style2.css"),
+        )
+        .await;
+        srv.send_frame(frames::data(1, "").eos()).await;
+        idle_ms(10).await;
+        srv.send_frame(frames::headers(2).response(200)).await;
+        srv.send_frame(frames::headers(4).response(200).eos()).await;
+        srv.send_frame(frames::data(2, "").eos()).await;
+        srv.recv_frame(frames::go_away(4)).await;
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+        let (mut resp, _) = client.send_request(request, true).unwrap();
+        let mut pushed = resp.push_promises();
+        let check_status = async move {
+            let resp = resp.await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        };
+
+        let check_pushed = async move {
+            let mut count = 0;
+            while let Some(headers) = pushed.next().await {
+                let (request, response) = headers.unwrap().into_parts();
+                assert_eq!(request.into_parts().0.method, Method::GET);
+                let resp = response.await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                count += 1;
+            }
+            assert_eq!(2, count);
+        };
+
+        drop(client);
+
+        h2.drive(join(check_pushed, check_status)).await;
+        h2.await.expect("client");
+    };
+
+    join(mock, h2).await;
+}
+
+#[tokio::test]
+async fn recv_push_when_push_disabled_is_conn_error() {
+    h2_support::trace_init!();
+
+    let (io, mut srv) = mock::new();
+    let mock = async move {
+        let _ = srv.assert_client_handshake().await;
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(
+            frames::push_promise(1, 3).request("GET", "https://http2.akamai.com/style.css"),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+        srv.recv_frame(frames::go_away(0).protocol_error()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::Builder::new()
+            .enable_push(false)
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+
+        let req = async move {
+            let res = client.send_request(request, true).unwrap().0.await;
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "connection error detected: unspecific protocol error detected"
+            );
+        };
+
+        // client should see a protocol error
+        let conn = async move {
+            let res = h2.await;
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "connection error detected: unspecific protocol error detected"
+            );
+        };
+
+        join(conn, req).await;
+    };
+
+    join(mock, h2).await;
+}
+
+#[tokio::test]
+async fn pending_push_promises_reset_when_dropped() {
+    h2_support::trace_init!();
+
+    let (io, mut srv) = mock::new();
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(
+            frames::push_promise(1, 2).request("GET", "https://http2.akamai.com/style.css"),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+        srv.recv_frame(frames::reset(2).cancel()).await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+        let req = async {
+            let resp = client
+                .send_request(request, true)
+                .unwrap()
+                .0
+                .await
+                .expect("response");
+            assert_eq!(resp.status(), StatusCode::OK);
+        };
+
+        conn.drive(req).await;
+        conn.await.expect("client");
+        drop(client);
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn recv_push_promise_over_max_header_list_size() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_frame_eq(settings, frames::settings().max_header_list_size(10));
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(
+            frames::push_promise(1, 2).request("GET", "https://http2.akamai.com/style.css"),
+        )
+        .await;
+        srv.recv_frame(frames::reset(2).protocol_error()).await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+        idle_ms(10).await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::Builder::new()
+            .max_header_list_size(10)
+            .handshake::<_, Bytes>(io)
+            .await
+            .expect("handshake");
+        let request = Request::builder()
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+
+        let req = async move {
+            let err = client
+                .send_request(request, true)
+                .expect("send_request")
+                .0
+                .await
+                .expect_err("response");
+            assert_eq!(err.reason(), Some(Reason::PROTOCOL_ERROR));
+        };
+
+        conn.drive(req).await;
+        conn.await.expect("client");
+    };
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn recv_invalid_push_promise_headers_is_stream_protocol_error() {
+    // Unsafe method or content length is stream protocol error
+    h2_support::trace_init!();
+
+    let (io, mut srv) = mock::new();
+    let mock = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(404)).await;
+        srv.send_frame(
+            frames::push_promise(1, 2).request("POST", "https://http2.akamai.com/style.css"),
+        )
+        .await;
+        srv.send_frame(
+            frames::push_promise(1, 4)
+                .request("GET", "https://http2.akamai.com/style.css")
+                .field(http::header::CONTENT_LENGTH, 1),
+        )
+        .await;
+        srv.send_frame(
+            frames::push_promise(1, 6)
+                .request("GET", "https://http2.akamai.com/style.css")
+                .field(http::header::CONTENT_LENGTH, 0),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(404).eos()).await;
+        srv.recv_frame(frames::reset(2).protocol_error()).await;
+        srv.recv_frame(frames::reset(4).protocol_error()).await;
+        srv.send_frame(frames::headers(6).response(200).eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+        let (mut resp, _) = client.send_request(request, true).unwrap();
+        let check_pushed_response = async move {
+            let pushed = resp.push_promises();
+            let p = pushed.and_then(|headers| headers.into_parts().1);
+            let ps: Vec<_> = p.collect().await;
+            // CONTENT_LENGTH = 0 is ok
+            assert_eq!(1, ps.len());
+        };
+        h2.drive(check_pushed_response).await;
+    };
+
+    join(mock, h2).await;
+}
+
+#[test]
+#[ignore]
+fn recv_push_promise_with_wrong_authority_is_stream_error() {
+    // if server is foo.com, :authority = bar.com is stream error
+}
+
+#[tokio::test]
+async fn recv_push_promise_skipped_stream_id() {
+    h2_support::trace_init!();
+
+    let (io, mut srv) = mock::new();
+    let mock = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(
+            frames::push_promise(1, 4).request("GET", "https://http2.akamai.com/style.css"),
+        )
+        .await;
+        srv.send_frame(
+            frames::push_promise(1, 2).request("GET", "https://http2.akamai.com/style.css"),
+        )
+        .await;
+        srv.recv_frame(frames::go_away(0).protocol_error()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+
+        let req = async move {
+            let err = client
+                .send_request(request, true)
+                .unwrap()
+                .0
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "connection error detected: unspecific protocol error detected"
+            );
+        };
+
+        // client should see a protocol error
+        let conn = async move {
+            let res = h2.await;
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "connection error detected: unspecific protocol error detected"
+            );
+        };
+
+        join(conn, req).await;
+    };
+
+    join(mock, h2).await;
+}
+
+#[tokio::test]
+async fn recv_push_promise_dup_stream_id() {
+    h2_support::trace_init!();
+
+    let (io, mut srv) = mock::new();
+    let mock = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(
+            frames::push_promise(1, 2).request("GET", "https://http2.akamai.com/style.css"),
+        )
+        .await;
+        srv.send_frame(
+            frames::push_promise(1, 2).request("GET", "https://http2.akamai.com/style.css"),
+        )
+        .await;
+        srv.recv_frame(frames::go_away(0).protocol_error()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+
+        let req = async move {
+            let res = client.send_request(request, true).unwrap().0.await;
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "connection error detected: unspecific protocol error detected"
+            );
+        };
+
+        // client should see a protocol error
+        let conn = async move {
+            let res = h2.await;
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "connection error detected: unspecific protocol error detected"
+            );
+        };
+
+        join(conn, req).await;
+    };
+
+    join(mock, h2).await;
+}
+}
+
+// ===== impl SendResponse =====
+
+impl<B: Buf> SendResponse<B> {
+    /// Send a response to a client request.
+    ///
+    /// On success, a [`SendStream`] instance is returned. This instance can be
+    /// used to stream the response body and send trailers.
+    ///
+    /// If a body or trailers will be sent on the returned [`SendStream`]
+    /// instance, then `end_of_stream` must be set to `false` when calling this
+    /// function.
+    ///
+    /// The [`SendResponse`] instance is already associated with a received
+    /// request.  This function may only be called once per instance and only if
+    /// [`send_reset`] has not been previously called.
+    ///
+    /// [`SendResponse`]: #
+    /// [`SendStream`]: ../struct.SendStream.html
+    /// [`send_reset`]: #method.send_reset
+    pub fn send_response(
+        &mut self,
+        response: Response<()>,
+        end_of_stream: bool,
+    ) -> Result<SendStream<B>, crate::Error> {
+        self.inner
+            .send_response(response, end_of_stream)
+            .map(|_| SendStream::new(self.inner.clone()))
+            .map_err(Into::into)
+    }
+
+    /// Push a request and response to the client
+    ///
+    /// On success, a [`SendResponse`] instance is returned.
+    ///
+    /// [`SendResponse`]: #
+    pub fn push_request(
+        &mut self,
+        request: Request<()>,
+    ) -> Result<SendPushedResponse<B>, crate::Error> {
+        self.inner
+            .send_push_promise(request)
+            .map(|inner| SendPushedResponse {
+                inner: SendResponse { inner },
+            })
+            .map_err(Into::into)
+    }
+
+    /// Send a stream reset to the peer.
+    ///
+    /// This essentially cancels the stream, including any inbound or outbound
+    /// data streams.
+    ///
+    /// If this function is called before [`send_response`], a call to
+    /// [`send_response`] will result in an error.
+    ///
+    /// If this function is called while a [`SendStream`] instance is active,
+    /// any further use of the instance will result in an error.
+    ///
+    /// This function should only be called once.
+    ///
+    /// [`send_response`]: #method.send_response
+    /// [`SendStream`]: ../struct.SendStream.html
+    pub fn send_reset(&mut self, reason: Reason) {
+        self.inner.send_reset(reason)
+    }
+
+    /// Polls to be notified when the client resets this stream.
+    ///
+    /// If stream is still open, this returns `Poll::Pending`, and
+    /// registers the task to be notified if a `RST_STREAM` is received.
+    ///
+    /// If a `RST_STREAM` frame is received for this stream, calling this
+    /// method will yield the `Reason` for the reset.
+    ///
+    /// # Error
+    ///
+    /// Calling this method after having called `send_response` will return
+    /// a user error.
+    pub fn poll_reset(&mut self, cx: &mut Context) -> Poll<Result<Reason, crate::Error>> {
+        self.inner.poll_reset(cx, proto::PollReset::AwaitingHeaders)
+    }
+
+    /// Returns the stream ID of the response stream.
+    ///
+    /// # Panics
+    ///
+    /// If the lock on the stream store has been poisoned.
+    pub fn stream_id(&self) -> crate::StreamId {
+        crate::StreamId::from_internal(self.inner.stream_id())
+    }
+}
+
+// ===== impl SendPushedResponse =====
+
+
+pub(super) enum Entry<'a> {
+    Occupied(OccupiedEntry<'a>),
+    Vacant(VacantEntry<'a>),
+}
+
+pub(super) struct OccupiedEntry<'a> {
+    ids: indexmap::map::OccupiedEntry<'a, StreamId, SlabIndex>,
+}
+
+pub(super) struct VacantEntry<'a> {
+    ids: indexmap::map::VacantEntry<'a, StreamId, SlabIndex>,
+    slab: &'a mut slab::Slab<Stream>,
+}
+
+pub(super) trait Resolve {
+    fn resolve(&mut self, key: Key) -> Ptr<'_>;
+}
+
+// ===== impl Store =====
+
+impl Store {
+    pub fn new() -> Self {
+        Store {
+            slab: slab::Slab::new(),
+            ids: IndexMap::new(),
+        }
+    }
+
+    pub fn find_mut(&mut self, id: &StreamId) -> Option<Ptr<'_>> {
+        let index = match self.ids.get(id) {
+            Some(key) => *key,
+            None => return None,
+        };
+
+        Some(Ptr {
+            key: Key {
+                index,
+                stream_id: *id,
+            },
+            store: self,
+        })
+    }
+
+    pub fn insert(&mut self, id: StreamId, val: Stream) -> Ptr<'_> {
+        let index = SlabIndex(self.slab.insert(val) as u32);
+        assert!(self.ids.insert(id, index).is_none());
+
+        Ptr {
+            key: Key {
+                index,
+                stream_id: id,
+            },
+            store: self,
+        }
+    }
+
+    pub fn find_entry(&mut self, id: StreamId) -> Entry<'_> {
+        use self::indexmap::map::Entry::*;
+
+        match self.ids.entry(id) {
+            Occupied(e) => Entry::Occupied(OccupiedEntry { ids: e }),
+            Vacant(e) => Entry::Vacant(VacantEntry {
+                ids: e,
+                slab: &mut self.slab,
+            }),
+        }
+    }
+
+    #[allow(clippy::blocks_in_conditions)]
+    pub(crate) fn for_each<F>(&mut self, mut f: F)
+    where
+        F: FnMut(Ptr),
+    {
+        match self.try_for_each(|ptr| {
+            f(ptr);
+            Ok::<_, Infallible>(())
+        }) {
+            Ok(()) => (),
+            #[allow(unused)]
+            Err(infallible) => match infallible {},
+///     }
+///
+///     Ok(())
+/// }
+/// ```
+///
+/// [`Buf`]: bytes::Buf
+/// [`AsyncWrite`]: tokio::io::AsyncWrite
+/// [`File`]: https://docs.rs/tokio/latest/tokio/fs/struct.File.html
+/// [`Cursor`]: std::io::Cursor
+/// [vectored writes]: tokio::io::AsyncWrite::poll_write_vectored
+#[cfg_attr(not(feature = "io"), allow(unreachable_pub))]
+pub fn poll_write_buf<T: AsyncWrite + ?Sized, B: Buf>(
+    io: Pin<&mut T>,
+    cx: &mut Context<'_>,
+    buf: &mut B,
+) -> Poll<io::Result<usize>> {
+    const MAX_BUFS: usize = 64;
+
+    if !buf.has_remaining() {
+        return Poll::Ready(Ok(0));
+    }
+
+    let n = if io.is_write_vectored() {
+        let mut slices = [IoSlice::new(&[]); MAX_BUFS];
+        let cnt = buf.chunks_vectored(&mut slices);
+        ready!(io.poll_write_vectored(cx, &slices[..cnt]))?
+    } else {
+        ready!(io.poll_write(cx, buf.chunk()))?
+    };
+
+    buf.advance(n);
+
+    Poll::Ready(Ok(n))
+}

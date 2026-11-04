@@ -1,0 +1,559 @@
+    pair.step();
+
+    // start sending datagram batches but the first should be a TLP
+    info!("Sending datagram batch");
+    for _ in 0..DGRAM_NUM {
+        pair.client_datagrams(client_ch)
+            .send(vec![0; DGRAM_LEN].into(), false)
+            .unwrap();
+    }
+
+    pair.drive();
+
+    // Finally checking the number of sent udp datagrams match the number of iops
+    let client_stats = pair.client_conn_mut(client_ch).stats();
+    assert_eq!(client_stats.udp_tx.ios, client_stats.udp_tx.datagrams);
+}
+
+#[test]
+fn datagram_send_recv() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
+    assert_matches!(pair.client_datagrams(client_ch).max_size(), Some(x) if x > 0);
+
+    const DATA: &[u8] = b"whee";
+    pair.client_datagrams(client_ch)
+        .send(DATA.into(), true)
+        .unwrap();
+    pair.drive();
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::DatagramReceived)
+    );
+    assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA);
+    assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+}
+
+#[test]
+fn datagram_recv_buffer_overflow() {
+    let _guard = subscribe();
+    const WINDOW: usize = 100;
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            datagram_receive_buffer_size: Some(WINDOW),
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect();
+    assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
+    assert_eq!(
+        pair.client_conn_mut(client_ch).datagrams().max_size(),
+        Some(WINDOW - Datagram::SIZE_BOUND)
+    );
+
+    const DATA1: &[u8] = &[0xAB; (WINDOW / 3) + 1];
+    const DATA2: &[u8] = &[0xBC; (WINDOW / 3) + 1];
+    const DATA3: &[u8] = &[0xCD; (WINDOW / 3) + 1];
+    pair.client_datagrams(client_ch)
+        .send(DATA1.into(), true)
+        .unwrap();
+    pair.client_datagrams(client_ch)
+        .send(DATA2.into(), true)
+        .unwrap();
+    pair.client_datagrams(client_ch)
+        .send(DATA3.into(), true)
+        .unwrap();
+    pair.drive();
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::DatagramReceived)
+    );
+    assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA2);
+    assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA3);
+    assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+
+    pair.client_datagrams(client_ch)
+        .send(DATA1.into(), true)
+        .unwrap();
+    pair.drive();
+    assert_eq!(pair.server_datagrams(server_ch).recv().unwrap(), DATA1);
+    assert_matches!(pair.server_datagrams(server_ch).recv(), None);
+}
+
+#[test]
+fn datagram_unsupported() {
+    let _guard = subscribe();
+    let server = ServerConfig {
+        transport: Arc::new(TransportConfig {
+            datagram_receive_buffer_size: None,
+            ..TransportConfig::default()
+        }),
+        ..server_config()
+    };
+    let mut pair = Pair::new(Default::default(), server);
+    let (client_ch, server_ch) = pair.connect();
+    assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
+    assert_matches!(pair.client_datagrams(client_ch).max_size(), None);
+
+    match pair.client_datagrams(client_ch).send(Bytes::new(), true) {
+        Err(SendDatagramError::UnsupportedByPeer) => {}
+        Err(e) => panic!("unexpected error: {e}"),
+        Ok(_) => panic!("unexpected success"),
+    }
+}
+
+#[test]
+fn large_initial() {
+    let _guard = subscribe();
+    let server_config =
+        ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![vec![0, 0, 0, 42]])));
+
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    let client_crypto =
+        client_crypto_with_alpn((0..1000u32).map(|x| x.to_be_bytes().to_vec()).collect());
+    let cfg = ClientConfig::new(Arc::new(client_crypto));
+    let client_ch = pair.begin_connect(cfg);
+    pair.drive();
+    let server_ch = pair.server.assert_accept();
+use std::{
+    convert::TryInto,
+    mem,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{Arc, Mutex},
+};
+
+use assert_matches::assert_matches;
+#[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
+use aws_lc_rs::hmac;
+use bytes::{Bytes, BytesMut};
+use hex_literal::hex;
+use rand::RngCore;
+#[cfg(feature = "ring")]
+use ring::hmac;
+#[cfg(all(feature = "rustls-aws-lc-rs", not(feature = "rustls-ring")))]
+use rustls::crypto::aws_lc_rs::default_provider;
+#[cfg(feature = "rustls-ring")]
+use rustls::crypto::ring::default_provider;
+use rustls::{
+    AlertDescription, RootCertStore,
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    server::WebPkiClientVerifier,
+};
+use tracing::info;
+
+use super::*;
+use crate::{
+    Duration, Instant,
+    cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
+    crypto::rustls::QuicServerConfig,
+    frame::FrameStruct,
+    transport_parameters::TransportParameters,
+};
+mod util;
+use util::*;
+
+mod token;
+
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasm_bindgen_test::wasm_bindgen_test as test;
+
+// Enable this if you want to run these tests in the browser.
+// Unfortunately it's either-or: Enable this and you can run in the browser, disable to run in nodejs.
+// #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+// wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+#[test]
+fn version_negotiate_server() {
+    let _guard = subscribe();
+    let client_addr = "[::2]:7890".parse().unwrap();
+    let mut server = Endpoint::new(
+        Default::default(),
+        Some(Arc::new(server_config())),
+        true,
+        None,
+    );
+    let now = Instant::now();
+    let mut buf = Vec::with_capacity(server.config().get_max_udp_payload_size() as usize);
+    let event = server.handle(
+        now,
+        client_addr,
+        None,
+        None,
+        // Long-header packet with reserved version number
+        hex!("80 0a1a2a3a 04 00000000 04 00000000 00")[..].into(),
+        &mut buf,
+    );
+    let Some(DatagramEvent::Response(Transmit { .. })) = event else {
+        panic!("expected a response");
+    };
+
+    assert_ne!(buf[0] & 0x80, 0);
+    assert_eq!(&buf[1..15], hex!("00000000 04 00000000 04 00000000"));
+    assert!(buf[15..].chunks(4).any(|x| {
+        DEFAULT_SUPPORTED_VERSIONS.contains(&u32::from_be_bytes(x.try_into().unwrap()))
+    }));
+}
+
+#[test]
+fn version_negotiate_client() {
+    let _guard = subscribe();
+    let server_addr = "[::2]:7890".parse().unwrap();
+    // Configure client to use empty CIDs so we can easily hardcode a server version negotiation
+    // packet
+    let cid_generator_factory: fn() -> Box<dyn ConnectionIdGenerator> =
+        || Box::new(RandomConnectionIdGenerator::new(0));
+    let mut client = Endpoint::new(
+        Arc::new(EndpointConfig {
+            connection_id_generator_factory: Arc::new(cid_generator_factory),
+            ..Default::default()
+        }),
+        None,
+        true,
+        None,
+    );
+    let (_, mut client_ch) = client
+        .connect(Instant::now(), client_config(), server_addr, "localhost")
+        .unwrap();
+    let now = Instant::now();
+    let mut buf = Vec::with_capacity(client.config().get_max_udp_payload_size() as usize);
+    let opt_event = client.handle(
+        now,
+        server_addr,
+        None,
+        None,
+        // Version negotiation packet for reserved version, with empty DCID
+        hex!(
+            "80 00000000 00 04 00000000
+             0a1a2a3a"
+        )[..]
+            .into(),
+        &mut buf,
+    );
+    if let Some(DatagramEvent::ConnectionEvent(_, event)) = opt_event {
+        client_ch.handle_event(event);
+    }
+    assert_matches!(
+        client_ch.poll(),
+        Some(Event::ConnectionLost {
+            reason: ConnectionError::VersionMismatch,
+        })
+    );
+}
+
+#[test]
+fn lifecycle() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+144:    pub fn new(
+195:    pub(crate) fn set_params(&mut self, params: &TransportParameters) {
+212:    fn ensure_remote_streams(&mut self, dir: Dir) {
+223:    pub(crate) fn zero_rtt_rejected(&mut self) {
+253:    pub(crate) fn received(
+304:    pub fn received_reset(
+364:    pub fn received_stop_sending(&mut self, id: StreamId, error_code: VarInt) {
+382:    pub(crate) fn reset_acked(&mut self, id: StreamId) {
+395:    pub(crate) fn can_send_stream_data(&self) -> bool {
+406:    pub(crate) fn can_send_flow_control(&self, id: StreamId) -> bool {
+544:    pub(crate) fn write_stream_frames(
+622:    fn on_stream_frame(&mut self, notify_readable: bool, stream: StreamId) {
+639:    pub(crate) fn received_ack_of(&mut self, frame: frame::StreamMeta) {
+672:    pub(crate) fn retransmit(&mut self, frame: frame::StreamMeta) {
+685:    pub(crate) fn retransmit_all_for_0rtt(&mut self) {
+706:    pub(crate) fn received_max_streams(
+727:    pub(crate) fn received_max_data(&mut self, n: VarInt) {
+731:    pub(crate) fn received_max_stream_data(
+773:    pub(crate) fn write_limit(&self) -> u64 {
+780:    pub(crate) fn poll(&mut self) -> Option<StreamEvent> {
+810:    pub(crate) fn queue_max_stream_id(&mut self, pending: &mut Retransmits) -> bool {
+825:    fn validate_receive_id(&mut self, id: StreamId) -> Result<(), TransportError> {
+850:    pub(crate) fn is_local_unopened(&self, id: StreamId) -> bool {
+854:    pub(crate) fn set_max_concurrent(&mut self, dir: Dir, count: VarInt) {
+860:    pub(crate) fn max_concurrent(&self, dir: Dir) -> u64 {
+864:    pub(crate) fn set_send_window(&mut self, send_window: u64) {
+870:    pub(crate) fn set_receive_window(&mut self, receive_window: VarInt) -> bool {
+995:    fn make(side: Side) -> StreamsState {
+1007:    fn trivial_flow_control() {
+1056:    fn reset_flow_control() {
+1119:    fn reset_after_empty_frame_flow_control() {
+1154:    fn duplicate_reset_flow_control() {
+1182:    fn recv_stopped() {
+1237:    fn stopped_reset() {
+1284:    fn send_stopped() {
+1329:    fn final_offset_flow_control() {
+1345:    fn stream_priority() {
+1401:    fn requeue_stream_priority() {
+1468:    fn same_stream_priority() {
+1549:    fn unfair_priority_bump() {
+1627:    fn stop_finished() {
+1654:    fn reset_stream_cannot_send() {
+1683:    fn stream_limit_fixed() {
+1740:    fn stream_limit_grows() {
+1791:    fn stream_limit_shrinks() {
+1869:    fn remote_stream_capacity() {
+1881:    fn expand_receive_window() {
+1900:    fn shrink_receive_window() {
+1947:    fn expand_send_window() {
+2022:    fn shrink_send_window() {
+
+impl TransportConfig {
+    /// Maximum number of incoming bidirectional streams that may be open concurrently
+    ///
+    /// Must be nonzero for the peer to open any bidirectional streams.
+    ///
+    /// Worst-case memory use is directly proportional to `max_concurrent_bidi_streams *
+    /// stream_receive_window`, with an upper bound proportional to `receive_window`.
+    pub fn max_concurrent_bidi_streams(&mut self, value: VarInt) -> &mut Self {
+        self.max_concurrent_bidi_streams = value;
+        self
+    }
+
+    /// Variant of `max_concurrent_bidi_streams` affecting unidirectional streams
+    pub fn max_concurrent_uni_streams(&mut self, value: VarInt) -> &mut Self {
+        self.max_concurrent_uni_streams = value;
+        self
+    }
+
+    /// Maximum duration of inactivity to accept before timing out the connection.
+    ///
+    /// The true idle timeout is the minimum of this and the peer's own max idle timeout. `None`
+    /// represents an infinite timeout. Defaults to 30 seconds.
+    ///
+    /// **WARNING**: If a peer or its network path malfunctions or acts maliciously, an infinite
+    /// idle timeout can result in permanently hung futures!
+    ///
+    /// ```
+    /// # use std::{convert::TryInto, time::Duration};
+    /// # use quinn_proto::{TransportConfig, VarInt, VarIntBoundsExceeded};
+    /// # fn main() -> Result<(), VarIntBoundsExceeded> {
+    /// let mut config = TransportConfig::default();
+    ///
+    /// // Set the idle timeout as `VarInt`-encoded milliseconds
+    /// config.max_idle_timeout(Some(VarInt::from_u32(10_000).into()));
+    ///
+    /// // Set the idle timeout as a `Duration`
+    /// config.max_idle_timeout(Some(Duration::from_secs(10).try_into()?));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn max_idle_timeout(&mut self, value: Option<IdleTimeout>) -> &mut Self {
+        self.max_idle_timeout = value.map(|t| t.0);
+        self
+    }
+
+    /// Maximum number of bytes the peer may transmit without acknowledgement on any one stream
+    /// before becoming blocked.
+    ///
+    /// This should be set to at least the expected connection latency multiplied by the maximum
+    /// desired throughput. Setting this smaller than `receive_window` helps ensure that a single
+    /// stream doesn't monopolize receive buffers, which may otherwise occur if the application
+    /// chooses not to read from a large stream for a time while still requiring data on other
+    /// streams.
+    pub fn stream_receive_window(&mut self, value: VarInt) -> &mut Self {
+        self.stream_receive_window = value;
+        self
+    }
+
+    /// Maximum number of bytes the peer may transmit across all streams of a connection before
+    /// becoming blocked.
+    ///
+    /// This should be set to at least the expected connection latency multiplied by the maximum
+    /// desired throughput. Larger values can be useful to allow maximum throughput within a
+    /// stream while another is blocked.
+    pub fn receive_window(&mut self, value: VarInt) -> &mut Self {
+        self.receive_window = value;
+        self
+    }
+
+    /// Maximum number of bytes to transmit to a peer without acknowledgment
+    ///
+    /// Provides an upper bound on memory when communicating with peers that issue large amounts of
+    /// flow control credit. Endpoints that wish to handle large numbers of connections robustly
+    /// should take care to set this low enough to guarantee memory exhaustion does not occur if
+    /// every connection uses the entire window.
+    pub fn send_window(&mut self, value: u64) -> &mut Self {
+        self.send_window = value;
+        self
+    }
+
+    /// Whether to implement fair queuing for send streams having the same priority.
+    ///
+    /// When enabled, connections schedule data from outgoing streams having the same priority in a
+    /// round-robin fashion. When disabled, streams are scheduled in the order they are written to.
+    ///
+    /// Note that this only affects streams with the same priority. Higher priority streams always
+    /// take precedence over lower priority streams.
+    ///
+    /// Disabling fairness can reduce fragmentation and protocol overhead for workloads that use
+    /// many small streams.
+    pub fn send_fairness(&mut self, value: bool) -> &mut Self {
+        self.send_fairness = value;
+        self
+    }
+
+    /// Maximum reordering in packet number space before FACK style loss detection considers a
+    /// packet lost. Should not be less than 3, per RFC5681.
+    pub fn packet_threshold(&mut self, value: u32) -> &mut Self {
+        self.packet_threshold = value;
+        self
+    }
+
+    /// Maximum reordering in time space before time based loss detection considers a packet lost,
+    /// as a factor of RTT
+    pub fn time_threshold(&mut self, value: f32) -> &mut Self {
+        self.time_threshold = value;
+        self
+    }
+
+    /// The RTT used before an RTT sample is taken
+    pub fn initial_rtt(&mut self, value: Duration) -> &mut Self {
+        self.initial_rtt = value;
+        self
+    }
+
+    /// The initial value to be used as the maximum UDP payload size before running MTU discovery
+    /// (see [`TransportConfig::mtu_discovery_config`]).
+    ///
+    /// Must be at least 1200, which is the default, and known to be safe for typical internet
+    /// applications. Larger values are more efficient, but increase the risk of packet loss due to
+    /// exceeding the network path's IP MTU. If the provided value is higher than what the network
+    /// path actually supports, packet loss will eventually trigger black hole detection and bring
+    /// it down to [`TransportConfig::min_mtu`].
+    pub fn initial_mtu(&mut self, value: u16) -> &mut Self {
+        self.initial_mtu = value.max(INITIAL_MTU);
+        self
+    }
+
+    pub(crate) fn get_initial_mtu(&self) -> u16 {
+        self.initial_mtu.max(self.min_mtu)
+    }
+
+    /// The maximum UDP payload size guaranteed to be supported by the network.
+    ///
+    /// Must be at least 1200, which is the default, and lower than or equal to
+    /// [`TransportConfig::initial_mtu`].
+    ///
+    /// Real-world MTUs can vary according to ISP, VPN, and properties of intermediate network links
+    /// outside of either endpoint's control. Extreme care should be used when raising this value
+    /// outside of private networks where these factors are fully controlled. If the provided value
+    /// is higher than what the network path actually supports, the result will be unpredictable and
+    /// catastrophic packet loss, without a possibility of repair. Prefer
+    /// [`TransportConfig::initial_mtu`] together with
+    /// [`TransportConfig::mtu_discovery_config`] to set a maximum UDP payload size that robustly
+    /// adapts to the network.
+    pub fn min_mtu(&mut self, value: u16) -> &mut Self {
+        self.min_mtu = value.max(INITIAL_MTU);
+        self
+    }
+
+    /// Specifies the MTU discovery config (see [`MtuDiscoveryConfig`] for details).
+    ///
+    /// Enabled by default.
+    pub fn mtu_discovery_config(&mut self, value: Option<MtuDiscoveryConfig>) -> &mut Self {
+        self.mtu_discovery_config = value;
+        self
+    }
+
+    /// Pad UDP datagrams carrying application data to current maximum UDP payload size
+    ///
+    /// Disabled by default. UDP datagrams containing loss probes are exempt from padding.
+    ///
+    /// Enabling this helps mitigate traffic analysis by network observers, but it increases
+    /// bandwidth usage. Without this mitigation precise plain text size of application datagrams as
+    /// well as the total size of stream write bursts can be inferred by observers under certain
+    /// conditions. This analysis requires either an uncongested connection or application datagrams
+    /// too large to be coalesced.
+    pub fn pad_to_mtu(&mut self, value: bool) -> &mut Self {
+        self.pad_to_mtu = value;
+        self
+    }
+
+    /// Specifies the ACK frequency config (see [`AckFrequencyConfig`] for details)
+    ///
+    /// The provided configuration will be ignored if the peer does not support the acknowledgement
+    /// frequency QUIC extension.
+    ///
+    /// Defaults to `None`, which disables controlling the peer's acknowledgement frequency. Even
+    /// if set to `None`, the local side still supports the acknowledgement frequency QUIC
+    /// extension and may use it in other ways.
+    pub fn ack_frequency_config(&mut self, value: Option<AckFrequencyConfig>) -> &mut Self {
+        self.ack_frequency_config = value;
+        self
+    }
+
+    /// Number of consecutive PTOs after which network is considered to be experiencing persistent congestion.
+    pub fn persistent_congestion_threshold(&mut self, value: u32) -> &mut Self {
+        self.persistent_congestion_threshold = value;
+        self
+    }
+
+    /// Period of inactivity before sending a keep-alive packet
+    ///
+    /// Keep-alive packets prevent an inactive but otherwise healthy connection from timing out.
+    ///
+    /// `None` to disable, which is the default. Only one side of any given connection needs keep-alive
+    /// enabled for the connection to be preserved. Must be set lower than the idle_timeout of both
+    /// peers to be effective.
+    pub fn keep_alive_interval(&mut self, value: Option<Duration>) -> &mut Self {
+        self.keep_alive_interval = value;
+        self
+    }
+
+    /// Maximum quantity of out-of-order crypto layer data to buffer
+    pub fn crypto_buffer_size(&mut self, value: usize) -> &mut Self {
+        self.crypto_buffer_size = value;
+        self
+    }
+
+    /// Whether the implementation is permitted to set the spin bit on this connection
+    ///
+    /// This allows passive observers to easily judge the round trip time of a connection, which can
+    /// be useful for network administration but sacrifices a small amount of privacy.
+    pub fn allow_spin(&mut self, value: bool) -> &mut Self {
+        self.allow_spin = value;
+        self
+    }
+
+    /// Maximum number of incoming application datagram bytes to buffer, or None to disable
+    /// incoming datagrams
+    ///
+    /// The peer is forbidden to send single datagrams larger than this size. If the aggregate size
+    /// of all datagrams that have been received from the peer but not consumed by the application
+    /// exceeds this value, old datagrams are dropped until it is no longer exceeded.
+    pub fn datagram_receive_buffer_size(&mut self, value: Option<usize>) -> &mut Self {
+        self.datagram_receive_buffer_size = value;
+        self
+    }
+
+    /// Maximum number of outgoing application datagram bytes to buffer
+    ///
+    /// While datagrams are sent ASAP, it is possible for an application to generate data faster
+    /// than the link, or even the underlying hardware, can transmit them. This limits the amount of
+    /// memory that may be consumed in that case. When the send buffer is full and a new datagram is
+    /// sent, older datagrams are dropped until sufficient space is available.
+    pub fn datagram_send_buffer_size(&mut self, value: usize) -> &mut Self {
+        self.datagram_send_buffer_size = value;
+        self
+    }
+
+    /// Whether to force every packet number to be used
+    ///
+    /// By default, packet numbers are occasionally skipped to ensure peers aren't ACKing packets
+    /// before they see them.
+    #[cfg(test)]
+    pub(crate) fn deterministic_packet_numbers(&mut self, enabled: bool) -> &mut Self {
+        self.deterministic_packet_numbers = enabled;
+        self
+    }
+
+    /// How to construct new `congestion::Controller`s
+    ///
+    /// Typically the refcounted configuration of a `congestion::Controller`,
+    /// e.g. a `congestion::NewRenoConfig`.
+    ///
+2.4M	/work/crate
+1.0260500000000001 minutes used of 45.0

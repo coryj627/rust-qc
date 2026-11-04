@@ -1,0 +1,1161 @@
+          command.arg(binary);
+          command
+        } else {
+          Command::resolve(binary)
+        };
+
+        command
+          .args(arguments)
+          .current_dir(&search.working_directory);
+
+        self.evaluate_scopes(
+          config,
+          &dotenv_arena,
+          overrides,
+          None,
+          &root,
+          &scope_arena,
+          &mut scopes,
+          search,
+          Some(HashSet::new()).as_ref(),
+        )?;
+
+        let (_module, scope, dotenv) = scopes.get(&self.module_path).unwrap();
+        let scope = scope.child();
+
+        command.export(&self.settings, dotenv, &scope, &self.unexports);
+
+        let (result, caught) = command.status_guard();
+
+        let status = result.map_err(|io_error| Error::CommandInvoke {
+          binary: binary.clone(),
+          arguments: arguments.clone(),
+          io_error,
+        })?;
+
+        if !status.success() {
+          return Err(Error::CommandStatus {
+            binary: binary.clone(),
+            arguments: arguments.clone(),
+            status,
+          });
+        }
+
+        if let Some(signal) = caught {
+          return Err(Error::Interrupted { signal });
+        }
+
+        Ok(())
+      }
+      Subcommand::Evaluate { format, path } => {
+        let (module, variable, variable_references) = self.evaluation_target(path)?;
+
+        self.evaluate_scopes(
+          config,
+          &dotenv_arena,
+          overrides,
+          None,
+          &root,
+          &scope_arena,
+          &mut scopes,
+          search,
+          Some(&variable_references),
+        )?;
+
+        let scope = scopes.get(&module.module_path).unwrap().1;
+
+        if let Some(variable) = variable {
+          print!("{}", scope.value(variable).unwrap());
+        } else {
+          let width = scope.names().fold(0, |max, name| name.len().max(max));
+
+          for binding in scope.bindings() {
+            if !binding.private {
+              match format {
+                EvaluateFormat::Just => {
+                  println!("{0:1$} := \"{2}\"", binding.name, width, binding.value);
+                }
+                EvaluateFormat::Shell => {
+                  if binding.export || module.settings.export {
+                    print!("export ");
+                  }
+                  print!("{}=\"", binding.name.lexeme().replace('-', "_"));
+                  for c in binding.value.chars() {
+                    if matches!(c, '!' | '"' | '$' | '\\' | '`') {
+                      print!("\\");
+                    }
+                    print!("{c}");
+                  }
+                  println!("\"");
+                }
+              }
+            }
+          }
+        }
+
+        Ok(())
+      }
+      _ => unreachable!(),
+    }
+  }
+
+  pub(crate) fn evaluation_target<'a>(
+    &'a self,
+    path: &'a Modulepath,
+  ) -> RunResult<'src, (&'a Justfile<'a>, Option<&'a str>, HashSet<Number>)> {
+    let mut current = self;
+
+    let mut variable = None;
+
+    for (i, component) in path.components.iter().enumerate() {
+      let last = i + 1 == path.components.len();
+
+      if last && current.assignments.contains_key(component) {
+        variable = Some(component.as_ref());
+        break;
+      }
+
+      if let Some(module) = current.modules.get(component) {
+        current = module;
+      } else if last {
+        return Err(Error::EvalUnknownSubmoduleOrVariable {
+          suggestion: current.suggest_variable_or_submodule(component),
+          component: component.into(),
+        });
+      } else {
+        return Err(Error::EvalUnknownSubmodule {
+          suggestion: current.suggest_submodule(component),
+          component: component.into(),
+        });
+      }
+    }
+
+    let variable_references = if let Some(variable) = variable {
+      HashSet::from([current.assignments.get(variable).unwrap().number])
+    } else {
+      current
+        .assignments
+        .values()
+        .filter(|assignment| !assignment.private)
+        .map(|assignment| assignment.number)
+        .collect()
+    };
+
+    Ok((current, variable, variable_references))
+  }
+
+  pub(crate) fn check_unstable(&self, config: &Config) -> RunResult<'src> {
+    if let Some(&unstable_feature) = self.unstable_features.iter().next() {
+      config.require_unstable(self, unstable_feature)?;
+    }
+
+    for module in self.modules.values() {
+      module.check_unstable(config)?;
+    }
+
+    Ok(())
+  }
+
+  pub(crate) fn get_alias(&self, name: &str) -> Option<&Alias<'src>> {
+    self.aliases.get(name)
+  }
+
+  pub(crate) fn get_recipe(&self, name: &str) -> Option<&Recipe<'src>> {
+    self
+      .recipes
+      .get(name)
+      .map(Arc::as_ref)
+      .or_else(|| self.aliases.get(name).map(|alias| alias.target.as_ref()))
+  }
+
+  pub(crate) fn is_submodule(&self) -> bool {
+    self.name.is_some()
+  }
+
+  pub(crate) fn name(&self) -> &'src str {
+    self.name.map(|name| name.lexeme()).unwrap_or_default()
+  }
+
+  fn run_recipe(
+    arguments: &[Vec<String>],
+    config: &Config,
+    is_dependency: bool,
+    ran: &Ran,
+    recipe: &Recipe<'src>,
+    scopes: &Scopes<'src, '_>,
+    search: &Search,
+  ) -> RunResult<'src> {
+    let mutex = ran.mutex(recipe, arguments);
+
+    let mut guard = mutex.lock().unwrap();
+
+    if *guard {
+      return Ok(());
+    }
+
+    let (module, scope, dotenv) = scopes
+      .get(recipe.module_path())
+      .expect("failed to retrieve scope for module");
+
+    let context = ExecutionContext {
+      config,
+      dotenv,
+      module,
+      search,
+    };
+
+    let (outer, positional) = Evaluator::evaluate_parameters(
+      arguments,
+      &context,
+      is_dependency,
+      &recipe.parameters,
+      recipe,
+      scope,
+    )?;
+
+    let scope = outer.child();
+
+    let mut evaluator = Evaluator::new(&context, BTreeMap::new(), true, &scope);
+
+    if !config.yes && !recipe.confirm(&mut evaluator)? {
+      return Err(Error::NotConfirmed {
+        recipe: recipe.name(),
+      });
+    }
+
+    Self::run_dependencies(
+      config,
+      &context,
+      recipe.priors(),
+      &mut evaluator,
+      ran,
+      recipe,
+      scopes,
+      search,
+    )?;
+
+    recipe.run(&context, &scope, &positional, is_dependency)?;
+
+    Self::run_dependencies(
+      config,
+      &context,
+      recipe.subsequents(),
+      &mut evaluator,
+      &Ran::default(),
+      recipe,
+      scopes,
+      search,
+    )?;
+
+    *guard = true;
+
+    Ok(())
+  }
+
+  fn run_dependencies<'run>(
+    config: &Config,
+    context: &ExecutionContext<'src, 'run>,
+    dependencies: &[Dependency<'src>],
+    evaluator: &mut Evaluator<'src, 'run>,
+    ran: &Ran,
+    recipe: &Recipe<'src>,
+    scopes: &Scopes<'src, 'run>,
+    search: &Search,
+  ) -> RunResult<'src> {
+    if context.config.no_dependencies {
+      return Ok(());
+    }
+
+    let mut evaluated = Vec::new();
+    for Dependency { recipe, arguments } in dependencies {
+      let mut grouped = Vec::new();
+      for group in arguments {
+        let evaluated_group = group
+          .iter()
+          .map(|argument| evaluator.evaluate_expression(argument))
+          .collect::<RunResult<Vec<String>>>()?;
+        grouped.push(evaluated_group);
+      }
+      evaluated.push((recipe, grouped));
+    }
+
+    if recipe.is_parallel() {
+      thread::scope::<_, RunResult>(|thread_scope| {
+        let mut handles = Vec::new();
+        for (recipe, arguments) in evaluated {
+          handles.push(thread_scope.spawn(move || {
+            Self::run_recipe(&arguments, config, true, ran, recipe, scopes, search)
+          }));
+        }
+        for handle in handles {
+          handle
+            .join()
+            .map_err(|_| Error::internal("parallel dependency thread panicked"))??;
+        }
+        Ok(())
+      })?;
+    } else {
+      for (recipe, arguments) in evaluated {
+        Self::run_recipe(&arguments, config, true, ran, recipe, scopes, search)?;
+      }
+    }
+
+    Ok(())
+  }
+
+  pub(crate) fn public_modules(&self, config: &Config) -> Vec<&Justfile> {
+    let mut modules = self
+      .modules
+      .values()
+      .filter(|module| !module.private)
+      .collect::<Vec<&Justfile>>();
+
+    if config.unsorted {
+      modules.sort_by_key(|module| {
+        module
+          .name
+          .map(|name| name.token.offset)
+          .unwrap_or_default()
+      });
+    }
+
+    modules
+  }
+
+  pub(crate) fn public_recipes(&self, config: &Config) -> Vec<&Recipe> {
+    let mut recipes = self
+      .recipes
+      .values()
+      .map(AsRef::as_ref)
+      .filter(|recipe| recipe.is_public())
+      .collect::<Vec<&Recipe>>();
+
+    if config.unsorted {
+      recipes.sort_by_key(|recipe| (&recipe.import_offsets, recipe.name.offset));
+    }
+
+    recipes
+  }
+
+  pub(crate) fn public_recipes_recursive(&self, config: &Config) -> Vec<&Recipe> {
+    let mut recipes = Vec::new();
+
+    let mut stack = vec![self];
+    while let Some(current) = stack.pop() {
+      for recipe in current.public_recipes(config) {
+        recipes.push(recipe);
+      }
+
+      for module in current.public_modules(config).into_iter().rev() {
+        stack.push(module);
+      }
+    }
+
+    recipes
+  }
+
+  pub(crate) fn public_aliases_recursive(&self, config: &Config) -> Vec<(&Alias, &Modulepath)> {
+    let mut aliases = Vec::new();
+
+    let mut stack = vec![self];
+    while let Some(current) = stack.pop() {
+    while let Some(current) = stack.pop() {
+      for alias in current.aliases.values() {
+        if alias.is_public() {
+          aliases.push((alias, &current.module_path));
+        }
+      }
+
+      for module in current.public_modules(config).into_iter().rev() {
+        stack.push(module);
+      }
+    }
+
+    aliases
+  }
+
+  pub(crate) fn groups(&self) -> Vec<&str> {
+    self
+      .groups
+      .iter()
+      .map(|group| group.cooked.as_str())
+      .collect()
+  }
+
+  pub(crate) fn public_groups(&self, config: &Config) -> Vec<String> {
+    let mut groups = Vec::new();
+
+    for recipe in self.recipes.values() {
+      if recipe.is_public() {
+        for group in recipe.groups() {
+          groups.push((recipe.import_offsets.as_slice(), recipe.name.offset, group));
+        }
+      }
+    }
+
+    for submodule in self.public_modules(config) {
+      for group in submodule.groups() {
+        groups.push((&[], submodule.name.unwrap().offset, group.to_string()));
+      }
+    }
+
+    if config.unsorted {
+      groups.sort();
+    } else {
+      groups.sort_by(|(_, _, a), (_, _, b)| a.cmp(b));
+    }
+
+    let mut seen = HashSet::new();
+
+    groups.retain(|(_, _, group)| seen.insert(group.clone()));
+
+    groups.into_iter().map(|(_, _, group)| group).collect()
+  }
+}
+
+impl ColorDisplay for Justfile<'_> {
+  fn fmt(&self, f: &mut Formatter, color: Color) -> fmt::Result {
+    let mut items = self.recipes.len() + self.assignments.len() + self.aliases.len();
+    for (name, assignment) in &self.assignments {
+      if assignment.export {
+        write!(f, "export ")?;
+      }
+      write!(f, "{name} := {}", assignment.value)?;
+      items -= 1;
+      if items != 0 {
+        write!(f, "\n\n")?;
+      }
+    }
+    for alias in self.aliases.values() {
+      write!(f, "{alias}")?;
+      items -= 1;
+      if items != 0 {
+        write!(f, "\n\n")?;
+      }
+    }
+    for recipe in self.recipes.values() {
+      write!(f, "{}", recipe.color_display(color))?;
+      items -= 1;
+      if items != 0 {
+        write!(f, "\n\n")?;
+      }
+    }
+    Ok(())
+  }
+}
+
+impl<'src> Keyed<'src> for Justfile<'src> {
+  fn key(&self) -> &'src str {
+    self.name()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use {super::*, Error::*, testing::compile};
+
+  run_error! {
+    name: unknown_recipe_no_suggestion,
+    src: "a:\nb:\nc:",
+    args: ["a", "xyz", "y", "z"],
+    error: UnknownRecipe {
+      recipe,
+      suggestion,
+    },
+    check: {
+      assert_eq!(recipe, "xyz");
+      assert_eq!(suggestion, None);
+    }
+  }
+
+  run_error! {
+    name: unknown_recipe_with_suggestion,
+    src: "a:\nb:\nc:",
+    args: ["a", "x", "y", "z"],
+    error: UnknownRecipe {
+      recipe,
+      suggestion,
+    },
+    check: {
+      assert_eq!(recipe, "x");
+      assert_eq!(suggestion, Some(Suggestion {
+        name: "a",
+        target: None,
+      }));
+    }
+  }
+
+  run_error! {
+    name: unknown_recipe_show_alias_suggestion,
+    src: "
+      foo:
+        echo foo
+
+      alias z := foo
+    ",
+    args: ["zz"],
+    error: UnknownRecipe {
+      recipe,
+      suggestion,
+    },
+    check: {
+      assert_eq!(recipe, "zz");
+      assert_eq!(suggestion, Some(Suggestion {
+        name: "z",
+        target: Some("foo"),
+      }
+    ));
+    }
+  }
+
+  run_error! {
+    name: code_error,
+    src: "
+      fail:
+        @exit 100
+    ",
+    args: ["fail"],
+    error: Code {
+      recipe,
+      line_number,
+      code,
+      print_message,
+    },
+    check: {
+      assert_eq!(recipe, "fail");
+      assert_eq!(code, 100);
+      assert_eq!(line_number, Some(2));
+      assert!(print_message);
+    }
+  }
+
+  run_error! {
+    name: run_args,
+    src: "
+      a return code:
+        @x() { {{return}} {{code + '0'}}; }; x
+    ",
+    args: ["a", "return", "15"],
+    error: Code {
+      recipe,
+      line_number,
+      code,
+      print_message,
+    },
+    check: {
+      assert_eq!(recipe, "a");
+      assert_eq!(code, 150);
+      assert_eq!(line_number, Some(2));
+      assert!(print_message);
+    }
+  }
+
+  run_error! {
+    name: missing_some_arguments,
+    src: "a b c d:",
+    args: ["a", "b", "c"],
+    error: PositionalArgumentCountMismatch {
+      recipe,
+      found,
+      min,
+      max,
+    },
+    check: {
+      assert_eq!(recipe.name(), "a");
+      assert_eq!(found, 2);
+      assert_eq!(min, 3);
+      assert_eq!(max, 3);
+    }
+  }
+
+  run_error! {
+    name: missing_some_arguments_variadic,
+    src: "a b c +d:",
+    args: ["a", "B", "C"],
+    error: PositionalArgumentCountMismatch {
+      recipe,
+      found,
+      min,
+      max,
+    },
+    check: {
+      assert_eq!(recipe.name(), "a");
+      assert_eq!(found, 2);
+      assert_eq!(min, 3);
+      assert_eq!(max, usize::MAX - 1);
+    }
+  }
+
+  run_error! {
+    name: missing_all_arguments,
+    src: "a b c d:\n echo {{b}}{{c}}{{d}}",
+    args: ["a"],
+    error: PositionalArgumentCountMismatch {
+      recipe,
+      found,
+      min,
+      max,
+    },
+    check: {
+      assert_eq!(recipe.name(), "a");
+      assert_eq!(found, 0);
+      assert_eq!(min, 3);
+      assert_eq!(max, 3);
+    }
+  }
+
+  run_error! {
+    name: missing_some_defaults,
+    src: "a b c d='hello':",
+    args: ["a", "b"],
+    error: PositionalArgumentCountMismatch {
+      recipe,
+      found,
+      min,
+      max,
+    },
+    check: {
+      assert_eq!(recipe.name(), "a");
+      assert_eq!(found, 1);
+      assert_eq!(min, 2);
+      assert_eq!(max, 3);
+    }
+  }
+
+  run_error! {
+    name: missing_all_defaults,
+    src: "a b c='r' d='h':",
+    args: ["a"],
+    error: PositionalArgumentCountMismatch {
+      recipe,
+      found,
+      min,
+      max,
+    },
+    check: {
+      assert_eq!(recipe.name(), "a");
+      assert_eq!(found, 0);
+      assert_eq!(min, 1);
+      assert_eq!(max, 3);
+    }
+  }
+
+  run_error! {
+    name: export_failure,
+    src: "
+      export foo := 'a'
+      baz := 'c'
+      export bar := 'b'
+      export abc := foo + bar + baz
+
+      wut:
+        echo $foo $bar $baz
+    ",
+    args: ["--quiet", "wut"],
+    error: Code {
+      recipe,
+      line_number,
+      print_message,
+      ..
+    },
+    check: {
+      assert_eq!(recipe, "wut");
+      assert_eq!(line_number, Some(7));
+      assert!(print_message);
+    }
+  }
+
+  fn case(input: &str, expected: &str) {
+    let justfile = compile(input);
+    let actual = format!("{}", justfile.color_display(Color::never()));
+    assert_eq!(actual, expected);
+    let reparsed = compile(&actual);
+    let redumped = format!("{}", reparsed.color_display(Color::never()));
+    assert_eq!(redumped, actual);
+  }
+
+  #[test]
+  fn parse_empty() {
+    case(
+      "
+
+# hello
+
+
+    ",
+      "",
+    );
+  }
+
+  #[test]
+  fn parse_string_default() {
+    case(
+      r#"
+
+foo a="b\t":
+
+
+  "#,
+      r#"foo a="b\t":"#,
+    );
+  }
+
+  #[test]
+  fn parse_multiple() {
+    case(
+      "
+a:
+b:
+", "a:
+
+b:",
+    );
+  }
+
+  #[test]
+  fn parse_variadic() {
+    case(
+      "
+
+foo +a:
+
+
+  ",
+      "foo +a:",
+    );
+  }
+
+  #[test]
+  fn parse_variadic_string_default() {
+    case(
+      "
+
+foo +a='Hello':
+
+
+  ",
+      "foo +a='Hello':",
+    );
+  }
+
+  #[test]
+  fn parse_raw_string_default() {
+    case(
+      r"
+
+foo a='b\t':
+
+
+  ",
+      r"foo a='b\t':",
+    );
+  }
+
+  #[test]
+  fn parse_export() {
+    case(
+      "
+export a := 'hello'
+
+  ",
+      "export a := 'hello'",
+    );
+use super::*;
+
+pub(crate) struct Compiler;
+
+impl Compiler {
+  pub(crate) fn compile<'src>(
+    config: &Config,
+    loader: &'src Loader,
+    root: &Path,
+  ) -> RunResult<'src, Compilation<'src>> {
+    let mut asts = HashMap::<PathBuf, Ast>::new();
+    let mut loaded = Vec::new();
+    let mut numerator = Numerator::new();
+    let mut paths = HashMap::<PathBuf, PathBuf>::new();
+    let mut stack = Vec::new();
+    stack.push(Source::root(root));
+
+    while let Some(current) = stack.pop() {
+      if paths.contains_key(&current.path) {
+        continue;
+      }
+
+      let (relative, src) = loader.load(config, root, &current.path)?;
+      loaded.push(relative.into());
+      let mut ast = Parser::parse_source(&mut numerator, relative, &current, src)?;
+
+      paths.insert(current.path.clone(), relative.into());
+
+      for item in &mut ast.items {
+        match item {
+          Item::Module {
+            absolute,
+            name,
+            optional,
+            relative,
+            ..
+          } => {
+            let parent = current.path.parent().unwrap();
+
+            let relative = relative
+              .as_ref()
+              .map(|relative| Self::expand_tilde(&relative.cooked))
+              .transpose()?;
+
+            let import = Self::find_module_file(parent, *name, relative.as_deref())?;
+
+            if let Some(import) = import {
+              if current.file_path.contains(&import) {
+                return Err(Error::CircularImport {
+                  current: current.path,
+                  import,
+                });
+              }
+              *absolute = Some(import.clone());
+              stack.push(current.module(*name, import));
+            } else if !*optional {
+              return Err(Error::MissingModuleFile { module: *name });
+            }
+          }
+          Item::Import {
+            relative,
+            absolute,
+            optional,
+          } => {
+            let import = current
+              .path
+              .parent()
+              .unwrap()
+              .join(Self::expand_tilde(&relative.cooked)?)
+              .lexiclean();
+
+            if filesystem::is_file(&import)? {
+              if current.file_path.contains(&import) {
+                return Err(Error::CircularImport {
+                  current: current.path,
+                  import,
+                });
+              }
+              *absolute = Some(import.clone());
+              stack.push(current.import(import, relative.token.offset));
+            } else if !*optional {
+              return Err(Error::MissingImportFile {
+                path: relative.token,
+              });
+            }
+          }
+          _ => {}
+        }
+      }
+
+      asts.insert(current.path, ast.clone());
+    }
+
+    let mut overrides = HashMap::new();
+
+    let justfile = Analyzer::analyze(
+      &asts,
+      config,
+      None,
+      &[],
+      &loaded,
+      None,
+      &mut overrides,
+      &paths,
+      false,
+      root,
+    )?;
+
+    Ok(Compilation {
+      asts,
+      justfile,
+      overrides,
+      root: root.into(),
+    })
+  }
+
+  fn find_module_file<'src>(
+    parent: &Path,
+    module: Name<'src>,
+    path: Option<&Path>,
+  ) -> RunResult<'src, Option<PathBuf>> {
+    let mut candidates = Vec::new();
+
+    if let Some(path) = path {
+      let full = parent.join(path);
+
+      if filesystem::is_file(&full)? {
+        return Ok(Some(full));
+      }
+
+      candidates.push((path.join("mod.just"), true));
+
+      for name in search::JUSTFILE_NAMES {
+        candidates.push((path.join(name), false));
+      }
+    } else {
+      candidates.push((format!("{module}.just").into(), true));
+      candidates.push((format!("{module}/mod.just").into(), true));
+
+      for name in search::JUSTFILE_NAMES {
+        candidates.push((format!("{module}/{name}").into(), false));
+      }
+    }
+
+    let mut grouped = BTreeMap::<PathBuf, Vec<(PathBuf, bool)>>::new();
+
+    for (candidate, case_sensitive) in candidates {
+      let candidate = parent.join(candidate).lexiclean();
+      grouped
+        .entry(candidate.parent().unwrap().into())
+        .or_default()
+        .push((candidate, case_sensitive));
+    }
+
+    let mut found = Vec::new();
+
+    for (directory, candidates) in grouped {
+      let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(io_error) => {
+          if io_error.kind() == io::ErrorKind::NotFound {
+            continue;
+          }
+
+          return Err(
+            SearchError::Io {
+              io_error,
+              directory,
+            }
+            .into(),
+          );
+        }
+      };
+
+      for entry in entries {
+        let entry = entry.map_err(|io_error| SearchError::Io {
+          io_error,
+          directory: directory.clone(),
+        })?;
+
+        if let Some(name) = entry.file_name().to_str() {
+          for (candidate, case_sensitive) in &candidates {
+            let candidate_name = candidate.file_name().unwrap().to_str().unwrap();
+
+            let eq = if *case_sensitive {
+              name == candidate_name
+            } else {
+              name.eq_ignore_ascii_case(candidate_name)
+            };
+
+            if eq {
+              found.push(candidate.parent().unwrap().join(name));
+            }
+          }
+        }
+      }
+    }
+
+    if found.len() > 1 {
+      found.sort();
+      Err(Error::AmbiguousModuleFile {
+        found: found
+          .into_iter()
+          .map(|found| found.strip_prefix(parent).unwrap().into())
+          .collect(),
+        module,
+      })
+    } else {
+      Ok(found.into_iter().next())
+    }
+  }
+
+  fn expand_tilde(path: &str) -> RunResult<'static, PathBuf> {
+    Ok(if let Some(path) = path.strip_prefix("~/") {
+      dirs::home_dir()
+        .ok_or(Error::Homedir)?
+        .join(path.trim_start_matches('/'))
+    } else {
+      PathBuf::from(path)
+    })
+  }
+
+  #[cfg(test)]
+  pub(crate) fn test_compile(src: &str) -> RunResult<Justfile> {
+    let tokens = Lexer::test_lex(src)?;
+    let ast = Parser::parse_tokens(&mut Numerator::new(), &tokens)?;
+    let root = PathBuf::from("justfile");
+    let mut asts: HashMap<PathBuf, Ast> = HashMap::new();
+    asts.insert(root.clone(), ast);
+    let mut paths: HashMap<PathBuf, PathBuf> = HashMap::new();
+    paths.insert(root.clone(), root.clone());
+    Analyzer::analyze(
+      &asts,
+      &Config::new().unwrap(),
+      None,
+      &[],
+      &[],
+      None,
+      &mut HashMap::new(),
+      &paths,
+      false,
+      &root,
+    )
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use {super::*, temptree::temptree};
+
+  #[test]
+  fn recursive_includes_fail() {
+    let tmp = temptree! {
+      justfile: "import './subdir/b'\na: b",
+      subdir: {
+        b: "import '../justfile'\nb:"
+      }
+    };
+
+    let loader = Loader::new();
+
+    let justfile_a_path = tmp.path().join("justfile");
+    let loader_output =
+      Compiler::compile(&Config::new().unwrap(), &loader, &justfile_a_path).unwrap_err();
+
+    assert_matches!(loader_output, Error::CircularImport { current, import }
+      if current == tmp.path().join("subdir").join("b").lexiclean() &&
+      import == tmp.path().join("justfile").lexiclean()
+    );
+  }
+
+  #[test]
+  fn find_module_file() {
+    #[track_caller]
+    fn case(path: Option<&str>, files: &[&str], expected: Result<Option<&str>, &[&str]>) {
+      let module = Name {
+        token: Token {
+          column: 0,
+          kind: TokenKind::Identifier,
+          length: 3,
+          line: 0,
+          offset: 0,
+          path: Path::new(""),
+          src: "foo",
+        },
+      };
+
+      let tempdir = tempfile::tempdir().unwrap();
+
+      for file in files {
+        if let Some(parent) = Path::new(file).parent() {
+          fs::create_dir_all(tempdir.path().join(parent)).unwrap();
+        }
+
+        fs::write(tempdir.path().join(file), "").unwrap();
+      }
+
+      let actual = Compiler::find_module_file(tempdir.path(), module, path.map(Path::new));
+
+      match expected {
+        Err(expected) => match actual.unwrap_err() {
+          Error::AmbiguousModuleFile { found, .. } => {
+            assert_eq!(
+              found,
+              expected
+                .iter()
+                .map(|expected| expected.replace('/', std::path::MAIN_SEPARATOR_STR).into())
+                .collect::<Vec<PathBuf>>()
+            );
+          }
+          _ => panic!("unexpected error"),
+        },
+        Ok(Some(expected)) => assert_eq!(
+          actual.unwrap().unwrap(),
+          tempdir
+            .path()
+            .join(expected.replace('/', std::path::MAIN_SEPARATOR_STR))
+        ),
+        Ok(None) => assert_eq!(actual.unwrap(), None),
+      }
+    }
+
+    case(None, &["foo.just"], Ok(Some("foo.just")));
+    case(None, &["FOO.just"], Ok(None));
+    case(None, &["foo/mod.just"], Ok(Some("foo/mod.just")));
+    case(None, &["foo/MOD.just"], Ok(None));
+    case(None, &["foo/justfile"], Ok(Some("foo/justfile")));
+    case(None, &["foo/JUSTFILE"], Ok(Some("foo/JUSTFILE")));
+    case(None, &["foo/.justfile"], Ok(Some("foo/.justfile")));
+    case(None, &["foo/.JUSTFILE"], Ok(Some("foo/.JUSTFILE")));
+    case(
+      None,
+      &["foo/.justfile", "foo/justfile"],
+      Err(&["foo/.justfile", "foo/justfile"]),
+    );
+    case(None, &["foo/JUSTFILE"], Ok(Some("foo/JUSTFILE")));
+
+    case(Some("bar"), &["bar"], Ok(Some("bar")));
+    case(Some("bar"), &["bar/mod.just"], Ok(Some("bar/mod.just")));
+    case(Some("bar"), &["bar/justfile"], Ok(Some("bar/justfile")));
+    case(Some("bar"), &["bar/JUSTFILE"], Ok(Some("bar/JUSTFILE")));
+    case(Some("bar"), &["bar/.justfile"], Ok(Some("bar/.justfile")));
+    case(Some("bar"), &["bar/.JUSTFILE"], Ok(Some("bar/.JUSTFILE")));
+
+    case(
+      Some("bar"),
+      &["bar/justfile", "bar/mod.just"],
+      Err(&["bar/justfile", "bar/mod.just"]),
+    );
+  }
+}
+use super::*;
+
+pub(crate) struct Loader {
+  paths: Arena<PathBuf>,
+  srcs: Arena<String>,
+}
+
+impl Loader {
+  pub(crate) fn new() -> Self {
+    Self {
+      srcs: Arena::new(),
+      paths: Arena::new(),
+    }
+  }
+
+  pub(crate) fn load<'src>(
+    &'src self,
+    config: &Config,
+    root: &Path,
+    path: &Path,
+  ) -> RunResult<'src, (&'src Path, &'src str)> {
+    Config::warn_non_unicode_path(config.color, "justfile", path);
+
+    let src = fs::read_to_string(path).map_err(|io_error| Error::Load {
+      path: path.into(),
+      io_error,
+    })?;
+
+    let relative = path.strip_prefix(root.parent().unwrap()).unwrap_or(path);
+
+    Ok((self.paths.alloc(relative.into()), self.srcs.alloc(src)))
+  }
+}
+use super::*;
+
+#[derive(Debug)]
+pub(crate) struct Compilation<'src> {
+  pub(crate) asts: HashMap<PathBuf, Ast<'src>>,
+  pub(crate) justfile: Justfile<'src>,
+  pub(crate) overrides: HashMap<Number, String>,
+  pub(crate) root: PathBuf,
+}
+
+impl<'src> Compilation<'src> {
+  pub(crate) fn root_ast(&self) -> &Ast<'src> {
+    self.asts.get(&self.root).unwrap()
+  }
+}

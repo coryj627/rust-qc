@@ -1,0 +1,818 @@
+// Copyright 2017 Google Inc. All rights reserved.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+
+//! Tree-based two pass parser.
+
+use std::cmp::{max, min};
+use std::collections::{HashMap, VecDeque};
+use std::iter::FusedIterator;
+use std::num::NonZeroUsize;
+use std::ops::{Index, Range};
+
+use unicase::UniCase;
+
+use crate::firstpass::run_first_pass;
+use crate::linklabel::{scan_link_label_rest, FootnoteLabel, LinkLabel, ReferenceLabel};
+use crate::scanners::*;
+use crate::strings::CowStr;
+use crate::tree::{Tree, TreeIndex};
+use crate::{
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, LinkType, MetadataBlockKind,
+    Options, Tag, TagEnd,
+};
+
+// Allowing arbitrary depth nested parentheses inside link destinations
+// can create denial of service vulnerabilities if we're not careful.
+// The simplest countermeasure is to limit their depth, which is
+// explicitly allowed by the spec as long as the limit is at least 3:
+// https://spec.commonmark.org/0.29/#link-destination
+pub(crate) const LINK_MAX_NESTED_PARENS: usize = 32;
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Item {
+    pub start: usize,
+    pub end: usize,
+    pub body: ItemBody,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy, Default)]
+pub(crate) enum ItemBody {
+    // These are possible inline items, need to be resolved in second pass.
+
+    // repeats, can_open, can_close
+    MaybeEmphasis(usize, bool, bool),
+    // can_open, can_close, brace context
+    MaybeMath(bool, bool, u8),
+    // quote byte, can_open, can_close
+    MaybeSmartQuote(u8, bool, bool),
+    MaybeCode(usize, bool), // number of backticks, preceded by backslash
+    MaybeHtml,
+    MaybeLinkOpen,
+    // bool indicates whether or not the preceding section could be a reference
+    MaybeLinkClose(bool),
+    MaybeImage,
+
+    // These are inline items after resolution.
+    Emphasis,
+    Strong,
+    Strikethrough,
+    Superscript,
+    Subscript,
+    Math(CowIndex, bool), // true for display math
+    Code(CowIndex),
+    Link(LinkIndex),
+    Image(LinkIndex),
+    FootnoteReference(CowIndex),
+    TaskListMarker(bool), // true for checked
+
+    // These are also inline items.
+    InlineHtml,
+    OwnedInlineHtml(CowIndex),
+    SynthesizeText(CowIndex),
+    SynthesizeChar(char),
+    Html,
+    Text {
+        backslash_escaped: bool,
+    },
+    SoftBreak,
+    // true = is backlash
+    HardBreak(bool),
+
+    // Dummy node at the top of the tree - should not be used otherwise!
+    #[default]
+    Root,
+
+    // These are block items.
+    Paragraph,
+    TightParagraph,
+    Rule,
+    Heading(HeadingLevel, Option<HeadingIndex>), // heading level
+    FencedCodeBlock(CowIndex),
+    IndentCodeBlock,
+    HtmlBlock,
+    BlockQuote(Option<BlockQuoteKind>),
+    List(bool, u8, u64), // is_tight, list character, list start index
+    ListItem(usize),     // indent level
+    FootnoteDefinition(CowIndex),
+    MetadataBlock(MetadataBlockKind),
+
+    // Definition lists
+    DefinitionList(bool), // is_tight
+    // gets turned into either a paragraph or a definition list title,
+    // depending on whether there's a definition after it
+    MaybeDefinitionListTitle,
+    DefinitionListTitle,
+    DefinitionListDefinition(usize),
+
+    // Tables
+    Table(AlignmentIndex),
+    TableHead,
+    TableRow,
+    TableCell,
+}
+
+impl ItemBody {
+    fn is_maybe_inline(&self) -> bool {
+        use ItemBody::*;
+        matches!(
+            *self,
+            MaybeEmphasis(..)
+                | MaybeMath(..)
+                | MaybeSmartQuote(..)
+                | MaybeCode(..)
+                | MaybeHtml
+                | MaybeLinkOpen
+                | MaybeLinkClose(..)
+                | MaybeImage
+        )
+    }
+    fn is_inline(&self) -> bool {
+        use ItemBody::*;
+        matches!(
+            *self,
+            MaybeEmphasis(..)
+                | MaybeMath(..)
+                | MaybeSmartQuote(..)
+                | MaybeCode(..)
+                | MaybeHtml
+                | MaybeLinkOpen
+                | MaybeLinkClose(..)
+                | MaybeImage
+                | Emphasis
+                | Strong
+                | Strikethrough
+                | Math(..)
+                | Code(..)
+                | Link(..)
+                | Image(..)
+                | FootnoteReference(..)
+                | TaskListMarker(..)
+                | InlineHtml
+                | OwnedInlineHtml(..)
+                | SynthesizeText(..)
+                | SynthesizeChar(..)
+                | Html
+                | Text { .. }
+                | SoftBreak
+                | HardBreak(..)
+        )
+    }
+}
+
+#[derive(Debug)]
+pub struct BrokenLink<'a> {
+    pub span: std::ops::Range<usize>,
+    pub link_type: LinkType,
+    pub reference: CowStr<'a>,
+}
+
+/// Markdown event iterator.
+pub struct Parser<'input, F = DefaultBrokenLinkCallback> {
+    text: &'input str,
+    options: Options,
+    tree: Tree<Item>,
+    allocs: Allocations<'input>,
+    broken_link_callback: Option<F>,
+    html_scan_guard: HtmlScanGuard,
+
+    // https://github.com/pulldown-cmark/pulldown-cmark/issues/844
+    // Consider this example:
+    //
+    //     [x]: xxx...
+    //     [x]
+    //     [x]
+    //     [x]
+    //
+    // Which expands to this HTML:
+    //
+    //     <a href="xxx...">x</a>
+    //     <a href="xxx...">x</a>
+    //     <a href="xxx...">x</a>
+    //
+    // This is quadratic growth, because it's filling in the area of a square.
+    // To prevent this, track how much it's expanded and limit it.
+    link_ref_expansion_limit: usize,
+
+    // used by inline passes. store them here for reuse
+    inline_stack: InlineStack,
+    link_stack: LinkStack,
+    wikilink_stack: LinkStack,
+    code_delims: CodeDelims,
+    math_delims: MathDelims,
+}
+
+impl<'input, F> std::fmt::Debug for Parser<'input, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Only print the fields that have public types.
+        f.debug_struct("Parser")
+            .field("text", &self.text)
+            .field("options", &self.options)
+            .field(
+                "broken_link_callback",
+                &self.broken_link_callback.as_ref().map(|_| ..),
+            )
+            .finish()
+    }
+}
+
+impl<'a> BrokenLink<'a> {
+    /// Moves the link into version with a static lifetime.
+    ///
+    /// The `reference` member is cloned to a Boxed or Inline version.
+    pub fn into_static(self) -> BrokenLink<'static> {
+        BrokenLink {
+            span: self.span.clone(),
+            link_type: self.link_type,
+            reference: self.reference.into_string().into(),
+        }
+    }
+}
+
+impl<'input> Parser<'input, DefaultBrokenLinkCallback> {
+    /// Creates a new event iterator for a markdown string without any options enabled.
+    pub fn new(text: &'input str) -> Self {
+        Self::new_ext(text, Options::empty())
+    }
+
+    /// Creates a new event iterator for a markdown string with given options.
+    pub fn new_ext(text: &'input str, options: Options) -> Self {
+        Self::new_with_broken_link_callback(text, options, None)
+    }
+}
+
+impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
+    /// In case the parser encounters any potential links that have a broken
+    /// reference (e.g `[foo]` when there is no `[foo]: ` entry at the bottom)
+    /// the provided callback will be called with the reference name,
+    /// and the returned pair will be used as the link URL and title if it is not
+    /// `None`.
+    pub fn new_with_broken_link_callback(
+        text: &'input str,
+        options: Options,
+        broken_link_callback: Option<F>,
+    ) -> Self {
+        let (mut tree, allocs) = run_first_pass(text, options);
+        tree.reset();
+        let inline_stack = Default::default();
+        let link_stack = Default::default();
+        let wikilink_stack = Default::default();
+        let html_scan_guard = Default::default();
+        Parser {
+            text,
+            options,
+            tree,
+            allocs,
+            broken_link_callback,
+            inline_stack,
+            link_stack,
+            wikilink_stack,
+            html_scan_guard,
+            // always allow 100KiB
+            link_ref_expansion_limit: text.len().max(100_000),
+            code_delims: CodeDelims::new(),
+            math_delims: MathDelims::new(),
+        }
+    }
+
+    /// Returns a reference to the internal `RefDefs` object, which provides access
+    /// to the internal map of reference definitions.
+    pub fn reference_definitions(&self) -> &RefDefs<'_> {
+        &self.allocs.refdefs
+    }
+
+    /// Use a link label to fetch a type, url, and title.
+    ///
+    /// This function enforces the [`link_ref_expansion_limit`].
+    /// If it returns Some, it also consumes some of the fuel.
+    /// If we're out of fuel, it immediately returns None.
+    ///
+    /// The URL and title are found in the [`RefDefs`] map.
+    /// If they're not there, and a callback was provided by the user,
+    /// the [`broken_link_callback`] will be invoked and given the opportunity
+    /// to provide a fallback.
+    ///
+    /// The link type (that's "link" or "image") depends on the usage site, and
+    /// is provided by the caller of this function.
+    /// This function returns a new one because, if it has to invoke a callback
+    /// to find the information, the link type is [mapped to an unknown type].
+    ///
+    /// [mapped to an unknown type]: crate::LinkType::to_unknown
+    /// [`link_ref_expansion_limit`]: Self::link_ref_expansion_limit
+    /// [`broken_link_callback`]: Self::broken_link_callback
+    fn fetch_link_type_url_title(
+        &mut self,
+        link_label: CowStr<'input>,
+        span: Range<usize>,
+        link_type: LinkType,
+    ) -> Option<(LinkType, CowStr<'input>, CowStr<'input>)> {
+        if self.link_ref_expansion_limit == 0 {
+            return None;
+        }
+
+        let (link_type, url, title) = self
+            .allocs
+            .refdefs
+            .get(link_label.as_ref())
+            .map(|matching_def| {
+                // found a matching definition!
+                let title = matching_def
+                    .title
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| "".into());
+                let url = matching_def.dest.clone();
+                (link_type, url, title)
+            })
+            .or_else(|| {
+                match self.broken_link_callback.as_mut() {
+                    Some(callback) => {
+                        // Construct a BrokenLink struct, which will be passed to the callback
+                        let broken_link = BrokenLink {
+                            span,
+                            link_type,
+                            reference: link_label,
+                        };
+
+                        callback
+                            .handle_broken_link(broken_link)
+                            .map(|(url, title)| (link_type.to_unknown(), url, title))
+                    }
+                    None => None,
+                }
+            })?;
+
+        // Limit expansion from link references.
+        // This isn't a problem for footnotes, because multiple references to the same one
+        // reuse the same node, but links/images get their HREF/SRC copied.
+        self.link_ref_expansion_limit = self
+            .link_ref_expansion_limit
+            .saturating_sub(url.len() + title.len());
+
+        Some((link_type, url, title))
+    }
+
+    /// Handle inline markup.
+    ///
+    /// When the parser encounters any item indicating potential inline markup, all
+    /// inline markup passes are run on the remainder of the chain.
+    ///
+    /// Note: there's some potential for optimization here, but that's future work.
+    fn handle_inline(&mut self) {
+        self.handle_inline_pass1();
+        self.handle_emphasis_and_hard_break();
+    }
+
+    /// Handle inline HTML, code spans, and links.
+    ///
+    /// This function handles both inline HTML and code spans, because they have
+    /// the same precedence. It also handles links, even though they have lower
+    /// precedence, because the URL of links must not be processed.
+    fn handle_inline_pass1(&mut self) {
+        let mut cur = self.tree.cur();
+        let mut prev = None;
+
+        let block_end = self.tree[self.tree.peek_up().unwrap()].item.end;
+        let block_text = &self.text[..block_end];
+
+        while let Some(mut cur_ix) = cur {
+            match self.tree[cur_ix].item.body {
+                ItemBody::MaybeHtml => {
+                    let next = self.tree[cur_ix].next;
+                    let autolink = if let Some(next_ix) = next {
+                        scan_autolink(block_text, self.tree[next_ix].item.start)
+                    } else {
+                        None
+                    };
+
+                    if let Some((ix, uri, link_type)) = autolink {
+                        let node = scan_nodes_to_ix(&self.tree, next, ix);
+                        let text_node = self.tree.create_node(Item {
+                            start: self.tree[cur_ix].item.start + 1,
+                            end: ix - 1,
+                            body: ItemBody::Text {
+                                backslash_escaped: false,
+                            },
+                        });
+                        let link_ix =
+                            self.allocs
+                                .allocate_link(link_type, uri, "".into(), "".into());
+                        self.tree[cur_ix].item.body = ItemBody::Link(link_ix);
+                        self.tree[cur_ix].item.end = ix;
+                        self.tree[cur_ix].next = node;
+                        self.tree[cur_ix].child = Some(text_node);
+                        prev = cur;
+                        cur = node;
+                        if let Some(node_ix) = cur {
+                            self.tree[node_ix].item.start = max(self.tree[node_ix].item.start, ix);
+                        }
+                        continue;
+                    } else {
+                        let inline_html = next.and_then(|next_ix| {
+                            self.scan_inline_html(
+                                block_text.as_bytes(),
+                                self.tree[next_ix].item.start,
+                            )
+                        });
+                        if let Some((span, ix)) = inline_html {
+                            let node = scan_nodes_to_ix(&self.tree, next, ix);
+                            self.tree[cur_ix].item.body = if !span.is_empty() {
+                                let converted_string =
+                                    String::from_utf8(span).expect("invalid utf8");
+                                ItemBody::OwnedInlineHtml(
+                                    self.allocs.allocate_cow(converted_string.into()),
+                                )
+                            } else {
+                                ItemBody::InlineHtml
+                            };
+                            self.tree[cur_ix].item.end = ix;
+                            self.tree[cur_ix].next = node;
+                            prev = cur;
+                            cur = node;
+                            if let Some(node_ix) = cur {
+                                self.tree[node_ix].item.start =
+                                    max(self.tree[node_ix].item.start, ix);
+                            }
+                            continue;
+                        }
+                    }
+                    self.tree[cur_ix].item.body = ItemBody::Text {
+                        backslash_escaped: false,
+                    };
+                }
+                ItemBody::MaybeMath(can_open, _can_close, brace_context) => {
+                    if !can_open {
+pulldown-cmark/src/parse.rs:50:    pub start: usize,
+pulldown-cmark/src/parse.rs:51:    pub end: usize,
+pulldown-cmark/src/parse.rs:52:    pub body: ItemBody,
+pulldown-cmark/src/parse.rs:180:pub struct BrokenLink<'a> {
+pulldown-cmark/src/parse.rs:181:    pub span: std::ops::Range<usize>,
+pulldown-cmark/src/parse.rs:182:    pub link_type: LinkType,
+pulldown-cmark/src/parse.rs:183:    pub reference: CowStr<'a>,
+pulldown-cmark/src/parse.rs:187:pub struct Parser<'input, F = DefaultBrokenLinkCallback> {
+pulldown-cmark/src/parse.rs:239:    pub fn into_static(self) -> BrokenLink<'static> {
+pulldown-cmark/src/parse.rs:250:    pub fn new(text: &'input str) -> Self {
+pulldown-cmark/src/parse.rs:255:    pub fn new_ext(text: &'input str, options: Options) -> Self {
+pulldown-cmark/src/parse.rs:266:    pub fn new_with_broken_link_callback(
+pulldown-cmark/src/parse.rs:296:    pub fn reference_definitions(&self) -> &RefDefs<'_> {
+pulldown-cmark/src/parse.rs:391:        let block_end = self.tree[self.tree.peek_up().unwrap()].item.end;
+pulldown-cmark/src/parse.rs:486:                            scan = self.tree[scan.unwrap()].next;
+pulldown-cmark/src/parse.rs:652:                                self.tree[self.tree.peek_up().unwrap()].item.body,
+pulldown-cmark/src/parse.rs:735:                            // FIXME: references and labels are mixed in the naming of variables
+pulldown-cmark/src/parse.rs:875:        let next_ix = self.tree[cur_ix].next.unwrap();
+pulldown-cmark/src/parse.rs:1051:                                cur_ix = cur.unwrap();
+pulldown-cmark/src/parse.rs:1268:            // This unwrap() can't panic, because if the next variable were None, end_is_display would be None
+pulldown-cmark/src/parse.rs:1269:            close = self.tree[close].next.unwrap();
+pulldown-cmark/src/parse.rs:1434:    pub fn into_offset_iter(self) -> OffsetIter<'input, F> {
+pulldown-cmark/src/parse.rs:1751:        // TODO: this unwrap is sus and should be looked at closer
+pulldown-cmark/src/parse.rs:1752:        let closing_node = tree[cur_ix].next.unwrap();
+pulldown-cmark/src/parse.rs:1811:pub struct LinkDef<'a> {
+pulldown-cmark/src/parse.rs:1812:    pub dest: CowStr<'a>,
+pulldown-cmark/src/parse.rs:1813:    pub title: Option<CowStr<'a>>,
+pulldown-cmark/src/parse.rs:1814:    pub span: Range<usize>,
+pulldown-cmark/src/parse.rs:1818:    pub fn into_static(self) -> LinkDef<'static> {
+pulldown-cmark/src/parse.rs:1829:pub struct FootnoteDef {
+pulldown-cmark/src/parse.rs:1830:    pub use_count: usize,
+pulldown-cmark/src/parse.rs:1953:    pub refdefs: RefDefs<'a>,
+pulldown-cmark/src/parse.rs:1954:    pub footdefs: FootnoteDefs<'a>,
+pulldown-cmark/src/parse.rs:1964:    pub id: Option<CowStr<'a>>,
+pulldown-cmark/src/parse.rs:1965:    pub classes: Vec<CowStr<'a>>,
+pulldown-cmark/src/parse.rs:1966:    pub attrs: Vec<(CowStr<'a>, Option<CowStr<'a>>)>,
+pulldown-cmark/src/parse.rs:1971:pub struct RefDefs<'input>(pub(crate) HashMap<LinkLabel<'input>, LinkDef<'input>>);
+pulldown-cmark/src/parse.rs:1975:pub struct FootnoteDefs<'input>(pub(crate) HashMap<FootnoteLabel<'input>, FootnoteDef>);
+pulldown-cmark/src/parse.rs:1982:    pub fn get(&'s self, key: &'b str) -> Option<&'b LinkDef<'input>> {
+pulldown-cmark/src/parse.rs:1987:    pub fn iter(&'s self) -> impl Iterator<Item = (&'s str, &'s LinkDef<'input>)> {
+pulldown-cmark/src/parse.rs:1997:    pub fn contains(&'s self, key: &'b str) -> bool {
+pulldown-cmark/src/parse.rs:2001:    pub fn get_mut(&'s mut self, key: CowStr<'input>) -> Option<&'s mut FootnoteDef> {
+pulldown-cmark/src/parse.rs:2007:    pub fn new() -> Self {
+pulldown-cmark/src/parse.rs:2018:    pub fn allocate_cow(&mut self, cow: CowStr<'a>) -> CowIndex {
+pulldown-cmark/src/parse.rs:2024:    pub fn allocate_link(
+pulldown-cmark/src/parse.rs:2036:    pub fn allocate_alignment(&mut self, alignment: Vec<Alignment>) -> AlignmentIndex {
+pulldown-cmark/src/parse.rs:2042:    pub fn allocate_heading(&mut self, attrs: HeadingAttributes<'a>) -> HeadingIndex {
+pulldown-cmark/src/parse.rs:2051:    pub fn take_cow(&mut self, ix: CowIndex) -> CowStr<'a> {
+pulldown-cmark/src/parse.rs:2055:    pub fn take_link(&mut self, ix: LinkIndex) -> (LinkType, CowStr<'a>, CowStr<'a>, CowStr<'a>) {
+pulldown-cmark/src/parse.rs:2060:    pub fn take_alignment(&mut self, ix: AlignmentIndex) -> Vec<Alignment> {
+pulldown-cmark/src/parse.rs:2104:    pub cdata: usize,
+pulldown-cmark/src/parse.rs:2105:    pub processing: usize,
+pulldown-cmark/src/parse.rs:2106:    pub declaration: usize,
+pulldown-cmark/src/parse.rs:2107:    pub comment: usize,
+pulldown-cmark/src/parse.rs:2114:pub trait BrokenLinkCallback<'input> {
+pulldown-cmark/src/parse.rs:2144:pub struct DefaultBrokenLinkCallback;
+pulldown-cmark/src/parse.rs:2163:pub struct OffsetIter<'a, F = DefaultBrokenLinkCallback> {
+pulldown-cmark/src/parse.rs:2169:    pub fn reference_definitions(&self) -> &RefDefs<'_> {
+pulldown-cmark/src/parse.rs:2191:                debug_assert!(span.start <= span.end);
+pulldown-cmark/src/parse.rs:2199:                        self.inner.tree.cur().unwrap()
+pulldown-cmark/src/parse.rs:2215:                debug_assert!(item.start <= item.end);
+pulldown-cmark/src/parse.rs:2250:        _ => panic!("unexpected item body {:?}", body),
+pulldown-cmark/src/parse.rs:2339:        _ => panic!("unexpected item body {:?}", item.body),
+pulldown-cmark/src/parse.rs:2367:                    self.tree.cur().unwrap()
+pulldown-cmark/src/parse.rs:2396:    // TODO: move these tests to tests/html.rs?
+pulldown-cmark/src/parse.rs:2478:        let input = std::str::from_utf8(b"\xf0\x9b\xb2\x9f<td:^\xf0\x9b\xb2\x9f").unwrap();
+pulldown-cmark/src/parse.rs:2533:                .unwrap();
+pulldown-cmark/src/parse.rs:2546:            .unwrap();
+pulldown-cmark/src/parse.rs:2563:            .unwrap();
+pulldown-cmark/src/parse.rs:2566:            immediately_before_footnote.as_ref().unwrap()
+pulldown-cmark/src/parse.rs:2571:            panic!("what came first, then? {immediately_before_footnote:?}");
+pulldown-cmark/src/parse.rs:2582:            .unwrap();
+pulldown-cmark/src/parse.rs:2597:            .unwrap();
+pulldown-cmark/src/parse.rs:2625:    // FIXME: add this one regression suite
+pulldown-cmark/src/parse.rs:2731:        assert!(link_tag_count > 0);
+pulldown-cmark/src/parse.rs:2776:        assert!(parser.reference_definitions().get("a b c").is_some());
+pulldown-cmark/src/parse.rs:2777:        assert!(parser.reference_definitions().get("nope").is_none());
+pulldown-cmark/src/parse.rs:2782:            let link_def = parser.reference_definitions().get(&s).unwrap();
+pulldown-cmark/src/parse.rs:2794:        // TODO: why is the `'b` lifetime required at all? Changing it to `'_` breaks things :(
+pulldown-cmark/src/firstpass.rs:195:                        let list_idx = self.tree.cur().unwrap();
+pulldown-cmark/src/firstpass.rs:711:            let parent_ix = self.tree.peek_up().unwrap();
+pulldown-cmark/src/firstpass.rs:797:                    let eol_bytes = scan_eol(&bytes[ix..]).unwrap();
+pulldown-cmark/src/firstpass.rs:1331:            // TODO(spec clarification): should we synthesize newline at EOF?
+pulldown-cmark/src/firstpass.rs:1374:        // TODO: info strings are typically very short. wouldn't it be faster
+pulldown-cmark/src/firstpass.rs:1419:            _ => panic!("Erroneous metadata block character when parsing metadata block"),
+pulldown-cmark/src/firstpass.rs:1505:        let cur_ix = self.tree.pop().unwrap();
+pulldown-cmark/src/firstpass.rs:1572:            // TODO: this is not the best choice for end; maybe get end from last list item.
+pulldown-cmark/src/firstpass.rs:1732:            // TODO: check whether the label here is strictly necessary
+pulldown-cmark/src/firstpass.rs:1846:                        linebuf.as_mut().unwrap()
+pulldown-cmark/src/firstpass.rs:2012:                    next_line_ix = i + scan_eol(&bytes[i..]).unwrap();
+pulldown-cmark/src/firstpass.rs:2161:                std::str::from_utf8(&bytes[2..]).unwrap(),
+pulldown-cmark/src/firstpass.rs:2280:    let delim = suffix.bytes().next().unwrap();
+pulldown-cmark/src/firstpass.rs:2288:    let prev_char = s[..ix].chars().last().unwrap();
+pulldown-cmark/src/firstpass.rs:2310:    let prev_char = s[..ix].chars().last().unwrap();
+pulldown-cmark/src/firstpass.rs:2327:    let delim = suffix.bytes().next().unwrap();
+pulldown-cmark/src/firstpass.rs:2645:        debug_assert!(bytes.len() >= ix + VECTOR_SIZE);
+pulldown-cmark/src/firstpass.rs:2742:        debug_assert!(bytes.len() >= VECTOR_SIZE);
+fn main() {
+    generate_tests_from_spec()
+}
+
+// If the "gen-tests" feature is absent,
+// this function will be compiled down to nothing
+#[cfg(not(feature = "gen-tests"))]
+fn generate_tests_from_spec() {}
+
+// If the feature is present, generate tests
+// from any .txt file present in the specs/ directory
+//
+// Test cases are present in the files in the
+// following format:
+//
+// ```````````````````````````````` example
+// markdown
+// .
+// expected html output
+// ````````````````````````````````
+#[cfg(feature = "gen-tests")]
+fn generate_tests_from_spec() {
+    use std::fs::{self, File};
+    use std::io::{Read, Write};
+    use std::path::PathBuf;
+
+    // This is a hardcoded path to the CommonMark spec because it is not situated in
+    // the specs/ directory. It's in an array to easily chain it to the other iterator
+    // and make it easy to eventually add other hardcoded paths in the future if needed
+    let hardcoded = [
+        "./third_party/CommonMark/spec.txt",
+        "./third_party/CommonMark/smart_punct.txt",
+        "./third_party/GitHub/gfm_table.txt",
+        "./third_party/GitHub/gfm_strikethrough.txt",
+        "./third_party/GitHub/gfm_tasklist.txt",
+    ];
+    let hardcoded_iter = hardcoded.iter().map(PathBuf::from);
+
+    // Create an iterator over the files in the specs/ directory that have a .txt extension
+    let mut spec_files = fs::read_dir("./specs")
+        .expect("Could not find the 'specs' directory")
+        .filter_map(Result::ok)
+        .map(|d| d.path())
+        .filter(|p| p.extension().map(|e| e.to_owned()).is_some())
+        .chain(hardcoded_iter)
+        .collect::<Vec<_>>();
+    // Sort by spec names
+    spec_files.sort_by(|p, q| p.file_stem().cmp(&q.file_stem()));
+    let spec_files = spec_files;
+
+    for file_path in &spec_files {
+        let mut raw_spec = String::new();
+
+        File::open(&file_path)
+            .and_then(|mut f| f.read_to_string(&mut raw_spec))
+            .expect("Could not read the spec file");
+
+        let rs_test_file = PathBuf::from("./tests/suite/")
+            .join(file_path.file_name().expect("Invalid filename"))
+            .with_extension("rs");
+
+        let mut spec_rs =
+            File::create(&rs_test_file).expect(&format!("Could not create {:?}", rs_test_file));
+
+        let spec_name = file_path.file_stem().unwrap().to_str().unwrap();
+
+        let spec = Spec::new(&raw_spec);
+        let mut n_tests = 0;
+
+        spec_rs
+            .write_all(b"// This file is auto-generated by the build script\n")
+            .unwrap();
+        spec_rs
+            .write_all(b"// Please, do not modify it manually\n")
+            .unwrap();
+        spec_rs
+            .write_all(b"\nuse super::test_markdown_html;\n")
+            .unwrap();
+
+        for (i, testcase) in spec.enumerate() {
+            spec_rs
+                .write_fmt(format_args!(
+                    r###"
+#[test]
+fn {}_test_{i}() {{
+    let original = r##"{original}"##;
+    let expected = r##"{expected}"##;
+
+    test_markdown_html(original, expected, {smart_punct}, {metadata_blocks}, {old_footnotes}, {subscript}, {wikilinks});
+}}
+"###,
+                    spec_name,
+                    i = i + 1,
+                    original = testcase.original,
+                    expected = testcase.expected,
+                    smart_punct = testcase.smart_punct,
+                    metadata_blocks = testcase.metadata_blocks,
+                    old_footnotes = testcase.old_footnotes,
+                    subscript = testcase.subscript,
+                    wikilinks = testcase.wikilinks,
+                ))
+                .unwrap();
+
+            n_tests += 1;
+        }
+
+        println!(
+            "cargo:warning=Generated {} tests in {:?}",
+            n_tests, rs_test_file
+        );
+    }
+
+    // write mods to suite/mod.rs
+    let suite_mod_file = PathBuf::from("./tests/suite/mod").with_extension("rs");
+
+    let mut mod_rs =
+        File::create(&suite_mod_file).expect(&format!("Could not create {:?}", &suite_mod_file));
+
+    mod_rs
+        .write_all(b"// This file is auto-generated by the build script\n")
+        .unwrap();
+    mod_rs
+        .write_all(b"// Please, do not modify it manually\n")
+        .unwrap();
+    mod_rs
+        .write_all(b"\npub use super::test_markdown_html;\n\n")
+        .unwrap();
+
+    for file_path in &spec_files {
+        let mod_name = file_path.file_stem().unwrap().to_str().unwrap();
+        mod_rs.write_all(b"mod ").unwrap();
+        mod_rs.write_all(mod_name.as_bytes()).unwrap();
+        mod_rs.write_all(b";\n").unwrap();
+    }
+}
+
+#[cfg(feature = "gen-tests")]
+pub struct Spec<'a> {
+    spec: &'a str,
+}
+
+#[cfg(feature = "gen-tests")]
+impl<'a> Spec<'a> {
+    pub fn new(spec: &'a str) -> Self {
+        Spec { spec }
+    }
+}
+
+#[cfg(feature = "gen-tests")]
+pub struct TestCase {
+    pub original: String,
+    pub expected: String,
+    pub smart_punct: bool,
+    pub metadata_blocks: bool,
+    pub old_footnotes: bool,
+    pub subscript: bool,
+    pub wikilinks: bool,
+}
+
+#[cfg(feature = "gen-tests")]
+impl<'a> Iterator for Spec<'a> {
+    type Item = TestCase;
+
+    fn next(&mut self) -> Option<TestCase> {
+        let spec = self.spec;
+        let prefix = "```````````````````````````````` example";
+
+        let (i_start, smart_punct, metadata_blocks, old_footnotes, subscript, wikilinks) =
+            self.spec.find(prefix).and_then(|pos| {
+                let smartpunct_suffix = "_smartpunct\n";
+                let metadata_blocks_suffix = "_metadata_blocks\n";
+                let old_footnotes_suffix = "_old_footnotes\n";
+                let super_sub_suffix = "_super_sub\n";
+                let wikilinks_suffix = "_wikilinks\n";
+                if spec[(pos + prefix.len())..].starts_with(smartpunct_suffix) {
+                    Some((
+                        pos + prefix.len() + smartpunct_suffix.len(),
+                        true,
+                        false,
+                        false,
+                        false,
+                        false,
+                    ))
+                } else if spec[(pos + prefix.len())..].starts_with(metadata_blocks_suffix) {
+                    Some((
+                        pos + prefix.len() + metadata_blocks_suffix.len(),
+                        false,
+                        true,
+                        false,
+                        false,
+                        false,
+                    ))
+                } else if spec[(pos + prefix.len())..].starts_with(old_footnotes_suffix) {
+                    Some((
+                        pos + prefix.len() + old_footnotes_suffix.len(),
+                        false,
+                        false,
+                        true,
+                        false,
+                        false,
+                    ))
+                } else if spec[(pos + prefix.len())..].starts_with(super_sub_suffix) {
+                    Some((
+                        pos + prefix.len() + super_sub_suffix.len(),
+                        false,
+                        false,
+                        false,
+                        true,
+                        false,
+                    ))
+                } else if spec[(pos + prefix.len())..].starts_with(wikilinks_suffix) {
+                    Some((
+                        pos + prefix.len() + wikilinks_suffix.len(),
+                        false,
+                        false,
+                        false,
+                        false,
+                        true,
+                    ))
+                } else if spec[(pos + prefix.len())..].starts_with('\n') {
+                    Some((pos + prefix.len() + 1, false, false, false, false, false))
+                } else {
+                    None
+                }
+            })?;
+
+        let i_end = self.spec[i_start..]
+            .find("\n.\n")
+            .map(|pos| (pos + 1) + i_start)?;
+
+        let e_end = self.spec[i_end + 2..]
+            .find("````````````````````````````````\n")
+            .map(|pos| pos + i_end + 2)?;
+
+        self.spec = &self.spec[e_end + 33..];
+
+        let test_case = TestCase {
+            original: spec[i_start..i_end].to_string().replace("→", "\t"),
+            expected: spec[i_end + 2..e_end].to_string().replace("→", "\t"),
+            smart_punct,
+            metadata_blocks,
+            old_footnotes,
+            subscript,
+            wikilinks,
+        };
+
+        Some(test_case)
+    }
+}
+pulldown-cmark/specs/old_footnotes.txt
+pulldown-cmark/specs/strikethrough.txt
+pulldown-cmark/specs/super_sub.txt
+pulldown-cmark/specs/heading_attrs.txt
+pulldown-cmark/specs/wikilinks.txt
+pulldown-cmark/specs/blockquotes_tags.txt
+pulldown-cmark/specs/regression.txt
+pulldown-cmark/specs/metadata_blocks.txt
+pulldown-cmark/specs/footnotes.txt
+pulldown-cmark/specs/table.txt
+pulldown-cmark/specs/definition_lists.txt
+pulldown-cmark/specs/math.txt

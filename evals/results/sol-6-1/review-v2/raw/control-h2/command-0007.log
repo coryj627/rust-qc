@@ -1,0 +1,914 @@
+use crate::SendFrame;
+
+use h2::frame::{self, Frame};
+use h2::proto::Error;
+use h2::SendError;
+
+use futures::future::poll_fn;
+use futures::{ready, Stream, StreamExt};
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+use super::assert::assert_frame_eq;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
+use std::{cmp, io, usize};
+
+/// A mock I/O
+#[derive(Debug)]
+pub struct Mock {
+    pipe: Pipe,
+}
+
+#[derive(Debug)]
+pub struct Handle {
+    codec: crate::Codec<Pipe>,
+}
+
+#[derive(Debug)]
+pub struct Pipe {
+    inner: Arc<Mutex<Inner>>,
+}
+
+#[derive(Debug)]
+struct Inner {
+    /// Data written by the test case to the h2 lib.
+    rx: Vec<u8>,
+
+    /// Notify when data is ready to be received.
+    rx_task: Option<Waker>,
+
+    /// Data written by the `h2` library to be read by the test case.
+    tx: Vec<u8>,
+
+    /// Notify when data is written. This notifies the test case waiters.
+    tx_task: Option<Waker>,
+
+    /// Number of bytes that can be written before `write` returns `Poll::Pending`.
+    tx_rem: usize,
+
+    /// Task to notify when write capacity becomes available.
+    tx_rem_task: Option<Waker>,
+
+    /// True when the pipe is closed.
+    closed: bool,
+
+    /// Trigger an `UnexpectedEof` error on read
+    unexpected_eof: bool,
+}
+
+const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Create a new mock and handle
+pub fn new() -> (Mock, Handle) {
+    new_with_write_capacity(usize::MAX)
+}
+
+/// Create a new mock and handle allowing up to `cap` bytes to be written.
+pub fn new_with_write_capacity(cap: usize) -> (Mock, Handle) {
+    let inner = Arc::new(Mutex::new(Inner {
+        rx: vec![],
+        rx_task: None,
+        tx: vec![],
+        tx_task: None,
+        tx_rem: cap,
+        tx_rem_task: None,
+        closed: false,
+        unexpected_eof: false,
+    }));
+
+    let mock = Mock {
+        pipe: Pipe {
+            inner: inner.clone(),
+        },
+    };
+
+    let handle = Handle {
+        codec: h2::Codec::new(Pipe { inner }),
+    };
+
+    (mock, handle)
+}
+
+// ===== impl Handle =====
+
+impl Handle {
+    /// Get a mutable reference to inner Codec.
+    pub fn codec_mut(&mut self) -> &mut crate::Codec<Pipe> {
+        &mut self.codec
+    }
+
+    pub fn close_without_notify(&mut self) {
+        let mut me = self.codec.get_mut().inner.lock().unwrap();
+        me.unexpected_eof = true;
+    }
+
+    /// Send a frame
+    pub async fn send(&mut self, item: SendFrame) -> Result<(), SendError> {
+        // Queue the frame
+        self.codec.buffer(item).unwrap();
+
+        // Flush the frame
+        poll_fn(|cx| {
+            let p = self.codec.flush(cx);
+            assert!(p.is_ready());
+            p
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Writes the client preface
+    pub async fn write_preface(&mut self) {
+        self.codec.get_mut().write_all(PREFACE).await.unwrap();
+    }
+
+    /// Read the client preface
+    pub async fn read_preface(&mut self) -> io::Result<()> {
+        let mut buf = vec![0u8; PREFACE.len()];
+        self.read_exact(&mut buf).await?;
+        assert_eq!(buf, PREFACE);
+        Ok(())
+    }
+
+    pub async fn recv_frame<F: Into<Frame>>(&mut self, expected: F) {
+        let frame = self.next().await.unwrap().unwrap();
+        assert_frame_eq(frame, expected);
+    }
+
+    pub async fn send_frame<F: Into<SendFrame>>(&mut self, frame: F) {
+        self.send(frame.into()).await.unwrap();
+    }
+
+    pub async fn recv_eof(&mut self) {
+        let frame = self.next().await;
+        assert!(frame.is_none());
+    }
+
+    pub async fn send_bytes(&mut self, data: &[u8]) {
+        use bytes::Buf;
+        use std::io::Cursor;
+
+        let buf: Vec<_> = data.into();
+        let mut buf = Cursor::new(buf);
+
+        poll_fn(move |cx| {
+            while buf.has_remaining() {
+                let res = Pin::new(self.codec.get_mut())
+                    .poll_write(cx, buf.chunk())
+                    .map_err(|e| panic!("write err={:?}", e));
+
+                let n = ready!(res).unwrap();
+                buf.advance(n);
+            }
+
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    /// Perform the H2 handshake
+    pub async fn assert_client_handshake(&mut self) -> frame::Settings {
+        self.assert_client_handshake_with_settings(frame::Settings::default())
+            .await
+    }
+
+    /// Perform the H2 handshake
+    pub async fn assert_client_handshake_with_settings<T>(&mut self, settings: T) -> frame::Settings
+    where
+        T: Into<frame::Settings>,
+    {
+        let settings = settings.into();
+        // Send a settings frame
+        self.send(settings.into()).await.unwrap();
+        self.read_preface().await.unwrap();
+
+        let settings = match self.next().await {
+            Some(frame) => match frame.unwrap() {
+                Frame::Settings(settings) => {
+                    // Send the ACK
+                    let ack = frame::Settings::ack();
+
+                    // TODO: Don't unwrap?
+                    self.send(ack.into()).await.unwrap();
+
+                    settings
+                }
+                frame => {
+                    panic!("unexpected frame; frame={:?}", frame);
+                }
+            },
+            None => {
+                panic!("unexpected EOF");
+            }
+        };
+
+        let frame = self.next().await.unwrap().unwrap();
+        let f = assert_settings!(frame);
+
+        // Is ACK
+        assert!(f.is_ack());
+
+        settings
+    }
+
+    /// Perform the H2 handshake
+    pub async fn assert_server_handshake(&mut self) -> frame::Settings {
+        self.assert_server_handshake_with_settings(frame::Settings::default())
+            .await
+    }
+
+    /// Perform the H2 handshake
+    pub async fn assert_server_handshake_with_settings<T>(&mut self, settings: T) -> frame::Settings
+    where
+        T: Into<frame::Settings>,
+    {
+        self.write_preface().await;
+
+        let settings = settings.into();
+        self.send(settings.into()).await.unwrap();
+
+        let frame = self.next().await.expect("unexpected EOF").unwrap();
+        let settings = assert_settings!(frame);
+
+        // Send the ACK
+        let ack = frame::Settings::ack();
+
+        // TODO: Don't unwrap?
+        self.send(ack.into()).await.unwrap();
+
+        let frame = self.next().await;
+        let f = assert_settings!(frame.unwrap().unwrap());
+
+        // Is ACK
+        assert!(f.is_ack());
+
+        settings
+    }
+
+    pub async fn ping_pong(&mut self, payload: [u8; 8]) {
+        self.send_frame(crate::frames::ping(payload)).await;
+        self.recv_frame(crate::frames::ping(payload).pong()).await;
+    }
+
+    pub async fn buffer_bytes(&mut self, num: usize) {
+        // Set tx_rem to num
+        {
+            let mut i = self.codec.get_mut().inner.lock().unwrap();
+            i.tx_rem = num;
+        }
+
+        poll_fn(move |cx| {
+            {
+                let mut inner = self.codec.get_mut().inner.lock().unwrap();
+                if inner.tx_rem == 0 {
+                    inner.tx_rem = usize::MAX;
+                } else {
+                    inner.tx_task = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+            }
+
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    pub async fn unbounded_bytes(&mut self) {
+        let mut i = self.codec.get_mut().inner.lock().unwrap();
+        // Decrement in-flight data
+        self.in_flight_data -= capacity;
+
+        // Assign capacity to connection
+        // TODO: proper error handling
+        let _res = self.flow.assign_capacity(capacity);
+        debug_assert!(_res.is_ok());
+
+        if self.flow.unclaimed_capacity().is_some() {
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+        }
+    }
+
+    /// Releases capacity back to the connection & stream
+    pub fn release_capacity(
+        &mut self,
+        capacity: WindowSize,
+        stream: &mut store::Ptr,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError> {
+        tracing::trace!("release_capacity; size={}", capacity);
+
+        if capacity > stream.in_flight_recv_data {
+            return Err(UserError::ReleaseCapacityTooBig);
+        }
+
+        self.release_connection_capacity(capacity, task);
+
+        // Decrement in-flight data
+        stream.in_flight_recv_data -= capacity;
+
+        // Assign capacity to stream
+        // TODO: proper error handling
+        let _res = stream.recv_flow.assign_capacity(capacity);
+        debug_assert!(_res.is_ok());
+
+        if stream.recv_flow.unclaimed_capacity().is_some() {
+            // Queue the stream for sending the WINDOW_UPDATE frame.
+            self.pending_window_updates.push(stream);
+
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Release any unclaimed capacity for a closed stream.
+    pub fn release_closed_capacity(&mut self, stream: &mut store::Ptr, task: &mut Option<Waker>) {
+        debug_assert_eq!(stream.ref_count, 0);
+
+        if stream.in_flight_recv_data == 0 {
+            return;
+        }
+
+        tracing::trace!(
+            "auto-release closed stream ({:?}) capacity: {:?}",
+            stream.id,
+                Some(stream) => stream,
+                None => return Poll::Ready(Ok(())),
+            };
+
+            counts.transition(stream, |_, stream| {
+                tracing::trace!("pending_window_updates -- pop; stream={:?}", stream.id);
+                debug_assert!(!stream.is_pending_window_update);
+
+                if !stream.state.is_recv_streaming() {
+                    // No need to send window updates on the stream if the stream is
+                    // no longer receiving data.
+                    //
+                    // TODO: is this correct? We could possibly send a window
+                    // update on a ReservedRemote stream if we already know
+                    // we want to stream the data faster...
+                    return;
+                }
+
+                // TODO: de-dup
+                if let Some(incr) = stream.recv_flow.unclaimed_capacity() {
+                    // Create the WINDOW_UPDATE frame
+                    let frame = frame::WindowUpdate::new(stream.id, incr);
+
+                    // Buffer it
+                    dst.buffer(frame.into())
+                        .expect("invalid WINDOW_UPDATE frame");
+
+                    // Update flow control
+                    stream
+                        .recv_flow
+                        .inc_window(incr)
+                        .expect("unexpected flow control state");
+                }
+            })
+        }
+    }
+
+    pub fn next_incoming(&mut self, store: &mut Store) -> Option<store::Key> {
+        self.pending_accept.pop(store).map(|ptr| ptr.key())
+    }
+
+    pub fn poll_data(
+        &mut self,
+        cx: &Context,
+        stream: &mut Stream,
+    ) -> Poll<Option<Result<Bytes, proto::Error>>> {
+        match stream.pending_recv.pop_front(&mut self.buffer) {
+            Some(Event::Data(payload)) => Poll::Ready(Some(Ok(payload))),
+            Some(event) => {
+                // Frame is trailer
+                stream.pending_recv.push_front(&mut self.buffer, event);
+
+                // Notify the recv task. This is done just in case
+                // `poll_trailers` was called.
+                //
+                // It is very likely that `notify_recv` will just be a no-op (as
+                // the task will be None), so this isn't really much of a
+                // performance concern. It also means we don't have to track
+                // state to see if `poll_trailers` was called before `poll_data`
+                // returned `None`.
+                stream.notify_recv();
+
+                // No more data frames
+                Poll::Ready(None)
+            }
+            None => self.schedule_recv(cx, stream),
+        }
+    }
+
+    pub fn poll_trailers(
+        &mut self,
+        cx: &Context,
+        stream: &mut Stream,
+    ) -> Poll<Option<Result<HeaderMap, proto::Error>>> {
+        match stream.pending_recv.pop_front(&mut self.buffer) {
+            Some(Event::Trailers(trailers)) => Poll::Ready(Some(Ok(trailers))),
+            Some(event) => {
+                // Frame is not trailers.. not ready to poll trailers yet.
+                stream.pending_recv.push_front(&mut self.buffer, event);
+
+                Poll::Pending
+            }
+            None => self.schedule_recv(cx, stream),
+        }
+    }
+
+    fn schedule_recv<T>(
+        &mut self,
+        cx: &Context,
+        stream: &mut Stream,
+    ) -> Poll<Option<Result<T, proto::Error>>> {
+        if stream.state.ensure_recv_open()? {
+            // Request to get notified once more frames arrive
+            stream.recv_task = Some(cx.waker().clone());
+            Poll::Pending
+        } else {
+            // No more frames will be received
+            Poll::Ready(None)
+        }
+    }
+}
+
+// ===== impl Open =====
+
+impl Open {
+    pub fn is_push_promise(&self) -> bool {
+        matches!(*self, Self::PushPromise)
+    }
+}
+
+// ===== impl RecvHeaderBlockError =====
+
+impl<T> From<Error> for RecvHeaderBlockError<T> {
+    fn from(err: Error) -> Self {
+        RecvHeaderBlockError::State(err)
+    }
+}
+        counts: &mut Counts,
+    ) -> Result<Option<StreamId>, Error> {
+        assert!(self.refused.is_none());
+
+        counts.peer().ensure_can_open(id, mode)?;
+
+        let next_id = self.next_stream_id()?;
+        if id < next_id {
+            proto_err!(conn: "id ({:?}) < next_id ({:?})", id, next_id);
+            return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+        }
+
+        self.next_stream_id = id.next_id();
+
+        if !counts.can_inc_num_recv_streams() {
+            self.refused = Some(id);
+            return Ok(None);
+        }
+
+        Ok(Some(id))
+    }
+
+    /// Transition the stream state based on receiving headers
+    ///
+    /// The caller ensures that the frame represents headers and not trailers.
+    pub fn recv_headers(
+        &mut self,
+        frame: frame::Headers,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) -> Result<(), RecvHeaderBlockError<Option<frame::Headers>>> {
+        tracing::trace!("opening stream; init_window={}", self.init_window_sz);
+        let is_initial = stream.state.recv_open(&frame)?;
+
+        if is_initial {
+            // TODO: be smarter about this logic
+            if frame.stream_id() > self.last_processed_id {
+                self.last_processed_id = frame.stream_id();
+            }
+
+            // Increment the number of concurrent streams
+            counts.inc_num_recv_streams(stream);
+        }
+
+        if !stream.content_length.is_head() {
+            use super::stream::ContentLength;
+            use http::header;
+
+            if let Some(content_length) = frame.fields().get(header::CONTENT_LENGTH) {
+                let content_length = match frame::parse_u64(content_length.as_bytes()) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        proto_err!(stream: "could not parse content-length; stream={:?}", stream.id);
+                        return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+                    }
+                };
+
+                stream.content_length = ContentLength::Remaining(content_length);
+                // END_STREAM on headers frame with non-zero content-length is malformed.
+                // https://datatracker.ietf.org/doc/html/rfc9113#section-8.1.1
+                if frame.is_end_stream()
+                    && content_length > 0
+                    && frame
+                        .pseudo()
+                        .status
+                        .map_or(true, |status| status != 204 && status != 304)
+                {
+                    proto_err!(stream: "recv_headers with END_STREAM: content-length is not zero; stream={:?};", stream.id);
+                    return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+                }
+            }
+        }
+
+        if frame.is_over_size() {
+            // A frame is over size if the decoded header block was bigger than
+            // SETTINGS_MAX_HEADER_LIST_SIZE.
+            //
+            // > A server that receives a larger header block than it is willing
+            // > to handle can send an HTTP 431 (Request Header Fields Too
+            // > Large) status code [RFC6585]. A client can discard responses
+            // > that it cannot process.
+            //
+            // So, if peer is a server, we'll send a 431. In either case,
+            // an error is recorded, which will send a REFUSED_STREAM,
+            // since we don't want any of the data frames either.
+            tracing::debug!(
+                "stream error REQUEST_HEADER_FIELDS_TOO_LARGE -- \
+                 recv_headers: frame is over size; stream={:?}",
+                stream.id
+            );
+            return if counts.peer().is_server() && is_initial {
+                let mut res = frame::Headers::new(
+                    stream.id,
+                    frame::Pseudo::response(::http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE),
+                    HeaderMap::new(),
+                );
+                res.set_end_stream();
+                Err(RecvHeaderBlockError::Oversize(Some(res)))
+            } else {
+                Err(RecvHeaderBlockError::Oversize(None))
+            };
+        }
+
+        let stream_id = frame.stream_id();
+        let (pseudo, fields) = frame.into_parts();
+
+        if pseudo.protocol.is_some()
+            && counts.peer().is_server()
+            && !self.is_extended_connect_protocol_enabled
+        {
+            proto_err!(stream: "cannot use :protocol if extended connect protocol is disabled; stream={:?}", stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+        }
+
+        if pseudo.status.is_some() && counts.peer().is_server() {
+            proto_err!(stream: "cannot use :status header for requests; stream={:?}", stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
+        }
+
+        if !pseudo.is_informational() {
+            let message = counts
+                .peer()
+                .convert_poll_message(pseudo, fields, stream_id)?;
+
+            // Push the frame onto the stream's recv buffer
+            stream
+                .pending_recv
+                .push_back(&mut self.buffer, Event::Headers(message));
+            stream.notify_recv();
+
+            // Only servers can receive a headers frame that initiates the stream.
+            // This is verified in `Streams` before calling this function.
+            if counts.peer().is_server() {
+                // Correctness: never push a stream to `pending_accept` without having the
+                // corresponding headers frame pushed to `stream.pending_recv`.
+                self.pending_accept.push(stream);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Called by the server to get the request
+    ///
+    /// # Panics
+    ///
+    /// Panics if `stream.pending_recv` has no `Event::Headers` queued.
+    ///
+    pub fn take_request(&mut self, stream: &mut store::Ptr) -> Request<()> {
+        use super::peer::PollMessage::*;
+
+        match stream.pending_recv.pop_front(&mut self.buffer) {
+            Some(Event::Headers(Server(request))) => request,
+            _ => unreachable!("server stream queue must start with Headers"),
+        }
+    }
+use futures::{FutureExt, TryFuture};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
+
+/// Future extension helpers that are useful for tests
+pub trait TestFuture: Future {
+    /// Drive `other` by polling `self`.
+    ///
+    /// `self` must not resolve before `other` does.
+    fn drive<T>(&mut self, other: T) -> Drive<'_, Self, T>
+    where
+        T: Future,
+        Self: Future + Sized,
+    {
+        Drive {
+            driver: self,
+            future: other.wakened(),
+        }
+    }
+
+    fn wakened(self) -> Wakened<Self>
+    where
+        Self: Sized,
+    {
+        Wakened {
+            future: Box::pin(self),
+            woken: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
+
+/// Wraps futures::future::join to ensure that the futures are only polled if they are woken.
+pub fn join<Fut1, Fut2>(
+    future1: Fut1,
+    future2: Fut2,
+) -> futures::future::Join<Wakened<Fut1>, Wakened<Fut2>>
+where
+    Fut1: Future,
+    Fut2: Future,
+{
+    futures::future::join(future1.wakened(), future2.wakened())
+}
+
+/// Wraps futures::future::join3 to ensure that the futures are only polled if they are woken.
+pub fn join3<Fut1, Fut2, Fut3>(
+    future1: Fut1,
+    future2: Fut2,
+    future3: Fut3,
+) -> futures::future::Join3<Wakened<Fut1>, Wakened<Fut2>, Wakened<Fut3>>
+where
+    Fut1: Future,
+    Fut2: Future,
+    Fut3: Future,
+{
+    futures::future::join3(future1.wakened(), future2.wakened(), future3.wakened())
+}
+
+/// Wraps futures::future::join4 to ensure that the futures are only polled if they are woken.
+pub fn join4<Fut1, Fut2, Fut3, Fut4>(
+    future1: Fut1,
+    future2: Fut2,
+    future3: Fut3,
+    future4: Fut4,
+) -> futures::future::Join4<Wakened<Fut1>, Wakened<Fut2>, Wakened<Fut3>, Wakened<Fut4>>
+where
+    Fut1: Future,
+    Fut2: Future,
+    Fut3: Future,
+    Fut4: Future,
+{
+    futures::future::join4(
+        future1.wakened(),
+        future2.wakened(),
+        future3.wakened(),
+        future4.wakened(),
+    )
+}
+
+/// Wraps futures::future::try_join to ensure that the futures are only polled if they are woken.
+pub fn try_join<Fut1, Fut2>(
+    future1: Fut1,
+    future2: Fut2,
+) -> futures::future::TryJoin<Wakened<Fut1>, Wakened<Fut2>>
+where
+    Fut1: futures::future::TryFuture + Future,
+    Fut2: Future,
+    Wakened<Fut1>: futures::future::TryFuture,
+    Wakened<Fut2>: futures::future::TryFuture<Error = <Wakened<Fut1> as TryFuture>::Error>,
+{
+    futures::future::try_join(future1.wakened(), future2.wakened())
+}
+
+/// Wraps futures::future::select to ensure that the futures are only polled if they are woken.
+pub fn select<A, B>(future1: A, future2: B) -> futures::future::Select<Wakened<A>, Wakened<B>>
+where
+    A: Future + Unpin,
+    B: Future + Unpin,
+{
+    futures::future::select(future1.wakened(), future2.wakened())
+}
+
+/// Wraps futures::future::join_all to ensure that the futures are only polled if they are woken.
+pub fn join_all<I>(iter: I) -> futures::future::JoinAll<Wakened<I::Item>>
+where
+    I: IntoIterator,
+    I::Item: Future,
+{
+    futures::future::join_all(iter.into_iter().map(|f| f.wakened()))
+}
+
+/// A future that only polls the inner future if it has been woken (after the initial poll).
+pub struct Wakened<T> {
+    future: Pin<Box<T>>,
+    woken: Arc<AtomicBool>,
+}
+
+/// A future that only polls the inner future if it has been woken (after the initial poll).
+impl<T> Future for Wakened<T>
+where
+    T: Future,
+{
+    type Output = T::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if !this.woken.load(std::sync::atomic::Ordering::SeqCst) {
+            return Poll::Pending;
+        }
+        this.woken.store(false, std::sync::atomic::Ordering::SeqCst);
+        let my_waker = IfWokenWaker {
+            inner: cx.waker().clone(),
+            wakened: this.woken.clone(),
+        };
+        let my_waker = Arc::new(my_waker).into();
+        let mut cx = Context::from_waker(&my_waker);
+        this.future.as_mut().poll(&mut cx)
+    }
+}
+
+impl Wake for IfWokenWaker {
+    fn wake(self: Arc<Self>) {
+        self.wakened
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.wake_by_ref();
+    }
+}
+
+use futures::{StreamExt, TryStreamExt};
+use h2_support::prelude::*;
+use h2_support::util::yield_once;
+
+// In this case, the stream & connection both have capacity, but capacity is not
+// explicitly requested.
+#[tokio::test]
+async fn send_data_without_requesting_capacity() {
+    h2_support::trace_init!();
+
+    let payload = vec![0; 1024];
+
+    let mock = mock_io::Builder::new()
+        .handshake()
+        .write(&[
+            // POST /
+            0, 0, 16, 1, 4, 0, 0, 0, 1, 131, 135, 65, 139, 157, 41, 172, 75, 143, 168, 233, 25, 151,
+            33, 233, 132,
+        ])
+        .write(&[
+            // DATA
+            0, 4, 0, 0, 1, 0, 0, 0, 1,
+        ])
+        .write(&payload[..])
+        .write(frames::SETTINGS_ACK)
+        // Read response
+        .read(&[0, 0, 1, 1, 5, 0, 0, 0, 1, 0x89])
+        .build();
+
+    let (mut client, mut h2) = client::handshake(mock).await.unwrap();
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("https://http2.akamai.com/")
+        .body(())
+        .unwrap();
+
+    let (response, mut stream) = client.send_request(request, false).unwrap();
+
+    // The capacity should be immediately allocated
+    assert_eq!(stream.capacity(), 0);
+
+    // Send the data
+    stream.send_data(payload.into(), true).unwrap();
+
+    // Get the response
+    let resp = h2.run(response).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    h2.await.unwrap();
+}
+
+#[tokio::test]
+async fn release_capacity_sends_window_update() {
+    h2_support::trace_init!();
+
+    let payload = vec![0u8; 16_384];
+    let payload_len = payload.len();
+
+    let (io, mut srv) = mock::new();
+
+    let mock = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200)).await;
+        srv.send_frame(frames::data(1, &payload[..])).await;
+        srv.send_frame(frames::data(1, &payload[..])).await;
+        srv.send_frame(frames::data(1, &payload[..])).await;
+        srv.recv_frame(frames::window_update(0, 32_768)).await;
+        srv.recv_frame(frames::window_update(1, 32_768)).await;
+        srv.send_frame(frames::data(1, &payload[..]).eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+
+        let req = async move {
+            let resp = client.send_request(request, true).unwrap().0.await.unwrap();
+            // Get the response
+            assert_eq!(resp.status(), StatusCode::OK);
+            let mut body = resp.into_parts().1;
+
+            // read some body to use up window size to below half
+            let buf = body.data().await.unwrap().unwrap();
+            assert_eq!(buf.len(), payload_len);
+
+            let buf = body.data().await.unwrap().unwrap();
+            assert_eq!(buf.len(), payload_len);
+
+            let buf = body.data().await.unwrap().unwrap();
+            assert_eq!(buf.len(), payload_len);
+            body.flow_control().release_capacity(buf.len() * 2).unwrap();
+
+            let buf = body.data().await.unwrap().unwrap();
+            assert_eq!(buf.len(), payload_len);
+        };
+
+        join(
+            async move {
+                h2.await.unwrap();
+            },
+            req,
+        )
+        .await
+    };
+    join(mock, h2).await;
+}
+
+#[tokio::test]
+async fn release_capacity_of_small_amount_does_not_send_window_update() {
+    h2_support::trace_init!();
+
+    let payload = [0; 16];
+
+    let (io, mut srv) = mock::new();
+
+    let mock = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200)).await;
+        srv.send_frame(frames::data(1, &payload[..]).eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+
+        let req = async move {
+            let resp = client.send_request(request, true).unwrap().0.await.unwrap();

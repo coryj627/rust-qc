@@ -1,0 +1,104 @@
+Found **seven correctness issues and one documentation issue**. The existing test suite passes, but targeted regressions reproduce the correctness failures.
+
+1. **Concurrent async entry updates lose writes.**  
+   [src/future/value_initializer.rs:350](/work/crate/src/future/value_initializer.rs:350) releases the waiter guard before applying the computed operation.
+
+   The documented contract serializes same-key `and_upsert_with` and compute calls. With an async eviction listener that yields, later calls can read the same value while preceding writes wait for the key lock. **Ten concurrent increments produce `2` instead of `10`.** This makes concurrent counters and read-modify-write updates incorrect.
+
+   Executed evidence: [review_async_compute.rs](/work/tmp/review/tests/review_async_compute.rs). Source inspection identifies the premature guard release as the cause.
+
+2. **A cached borrowed-key entry can panic when its key is accessed.**  
+   [src/sync/cache.rs:1422](/work/crate/src/sync/cache.rs:1422) passes `false` instead of `need_key` when reading an existing entry.
+
+   `entry_by_ref(...).or_try_insert_with(...)` should return an `Entry` containing both key and value. On a cache hit, the synchronous implementation omits the key. Calling `entry.key()` panics with **`Bug: Key is None`**; formatting the entry through `Debug` also calls `key()`.
+
+   Executed evidence: [review_entry_key.rs](/work/tmp/review/tests/review_entry_key.rs). The sync test fails; the equivalent async control passes. The existing doctest checks the key after insertion but omits that assertion on its cache-hit path.
+
+3. **Mixing fallible and infallible initialization can cause an internal panic.**  
+   [src/sync/value_initializer.rs:348](/work/crate/src/sync/value_initializer.rs:348), [src/future/value_initializer.rs:592](/work/crate/src/future/value_initializer.rs:592).
+
+   `get_with` uses `TypeId::of::<()>()` to identify its initializer state. `try_get_with::<_, ()>` uses the same identifier. If a concurrent fallible initializer returns `Err(())`, the infallible caller receives that error and reaches `unreachable!()` at [sync/cache.rs:1053](/work/crate/src/sync/cache.rs:1053) or [future/cache.rs:1597](/work/crate/src/future/cache.rs:1597).
+
+   Ordinary callers using the valid unit error type can therefore panic without either initializer panicking. Executed evidence: both tests in [review_initializer_types.rs](/work/tmp/review/tests/review_initializer_types.rs) fail with the internal panic.
+
+4. **Removal returns values that are already logically absent.**  
+   [src/sync/cache.rs:1619](/work/crate/src/sync/cache.rs:1619), [src/future/cache.rs:1964](/work/crate/src/future/cache.rs:1964).
+
+   Removal clones the physical map value without applying expiration or invalidation checks. After `invalidate_all()`, `get` returns `None`, but `remove` returns **`Some(old_value)`**. This also affects `SegmentedCache`.
+
+   The entry-compute contract is contradicted directly: after TTL expiration, its callback receives `None`, requests `Op::Remove`, and receives **`CompResult::Removed(old_value)` instead of `StillNone`**. Callers can consequently consume invalidated values or misinterpret compute results.
+
+   Executed evidence: public tests in [review_public_api.rs](/work/tmp/review/tests/review_public_api.rs), plus deterministic expiration tests appended to both scratch cache modules.
+
+5. **Returning `None` from an expiry update can leave the replacement expired.**  
+   [src/sync/base_cache.rs:689](/work/crate/src/sync/base_cache.rs:689), [src/future/base_cache.rs:819](/work/crate/src/future/base_cache.rs:819).
+
+   `Expiry::expire_after_update` documents that `None` clears expiration. For an elapsed deadline, `checked_duration_since` produces `None`; when the callback also returns `None`, the equality optimization skips clearing the stored deadline.
+
+   Both caches then return **`None` after inserting a replacement that should have no expiration**. Successful writes can effectively disappear until the expired physical entry is removed.
+
+   Executed evidence: deterministic mocked-clock tests and public zero-duration boundary tests in [review_public_api.rs](/work/tmp/review/tests/review_public_api.rs).
+
+6. **Generation-counter wraparound breaks eviction of frequently updated keys.**  
+   [src/common/concurrent/entry_info.rs:97](/work/crate/src/common/concurrent/entry_info.rs:97).
+
+   Entry generations explicitly wrap, but `current >= value` prevents the policy generation from advancing from `65535` to `0`. The policy generation freezes, leaving subsequent versions marked dirty even after their writes have been processed.
+
+   In both cache variants, after 65,535 replacements of one key, a capacity-two LRU cache retains that oldest key when two newer keys are inserted. The expected oldest entry remains **`Some(65535)`**, so newer entries lose capacity to it.
+
+   Executed evidence: `review_lru_after_generation_wrap` tests appended to both scratch cache modules, with maintenance run after every write.
+
+7. **Conditional replacements report incorrect entry metadata.**  
+   [src/sync/cache.rs:1050](/work/crate/src/sync/cache.rs:1050), [src/future/cache.rs:1594](/work/crate/src/future/cache.rs:1594).
+
+   `or_insert_with_if` successfully replaces an existing value but constructs the resulting entry with `is_old_value_replaced = false`. That contradicts [Entry’s documented contract](/work/crate/src/common/entry.rs:84).
+
+   Callers using this flag to distinguish insertion from replacement receive the wrong result. Executed evidence: both tests in [review_replacement_flag.rs](/work/tmp/review/tests/review_replacement_flag.rs) confirm the value changed from `10` to `20`, then fail because the replacement flag is false.
+
+8. **Two public API documentation links are unresolved.**  
+   [src/sync/entry_selector.rs:201](/work/crate/src/sync/entry_selector.rs:201), [src/sync/entry_selector.rs:743](/work/crate/src/sync/entry_selector.rs:743).
+
+   Both references to `try_append_value_async.rs` are interpreted as intra-doc item links and resolve to no item. Readers cannot follow the example links, and documentation builds fail when warnings are denied.
+
+   Executed evidence: stable and nightly documentation builds emit both warnings; the strict stable documentation build fails on them.
+
+All commands used `RUSTUP_AUTO_INSTALL=0`. Checks against the unmodified release in `/work/crate`:
+
+| Command | Outcome |
+|---|---|
+| `cargo test --locked --features sync,future` | Passed: 150 unit, 12 integration, 67 doctests; seven ignored |
+| `cargo test --locked --all-features` | Same passing totals |
+| `cargo clippy --locked --all-targets --features sync,future -- -D warnings` | Passed |
+| `cargo clippy --locked --lib --tests --all-features --all-targets -- -D warnings` | Passed |
+| `cargo fmt --all -- --check` | Passed |
+| `cargo check --locked --no-default-features --features sync` | Passed |
+| `cargo check --locked --no-default-features --features future` | Passed |
+| `cargo doc --locked --no-deps --features sync,future` | Succeeded with the two warnings above |
+| `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --features sync,future` | Failed on those two links |
+| `RUSTFLAGS='--cfg trybuild' cargo test --locked --all-features --lib trybuild` | Two test functions failed: all three diagnostic snapshots mismatch Rust 1.99.1 output |
+
+The trybuild failures are **pre-existing diagnostic-format/span mismatches**. The invalid programs still produce the expected trait-bound errors; these failures do not establish a public API correctness defect.
+
+The documented docs.rs configuration was also executed successfully, with the same two warnings:
+
+```sh
+cargo +nightly-2026-10-01 -Z unstable-options \
+  --config 'build.rustdocflags="--cfg docsrs"' \
+  doc --locked --no-deps --features sync,future
+```
+
+Targeted commands ran from `/work/tmp/review`, each beginning with `cargo test --locked --features sync,future`:
+
+| Additional arguments | Outcome |
+|---|---|
+| `--lib review_regressions -- --nocapture` | Six failures |
+| `--lib review_lru_after_generation_wrap -- --nocapture` | Two failures |
+| `--test review_async_compute -- --nocapture` | One failure |
+| `--test review_entry_key -- --nocapture` | One failure, one passing async control |
+| `--test review_initializer_types -- --nocapture` | Two failures |
+| `--test review_public_api -- --nocapture` | Five failures |
+| `--test review_replacement_flag -- --nocapture` | Two failures |
+
+Only the scratch copy was edited: test modules were appended to its two cache implementation files, and five integration-test files were added. No production fixes were made. `rg` was unavailable; subsequent inspection used `grep` and `find`.
+
+**Finding count: 8.** Coverage includes sync, future, segmented-cache delegation, initialization, entry operations, expiration, invalidation, eviction, and build/documentation checks on Rust 1.99.1, aarch64 Linux. Miri, Loom, MSRV, cross-target and release-profile checks were not run. No dedicated security assessment was performed. Last clock reading: **12.0596 of 45 minutes used**.

@@ -1,0 +1,942 @@
+        let bw = self.max_bandwidth.get_estimate();
+        let bdp = self.min_rtt.as_micros() as u64 * bw;
+        let bdpf = bdp as f64;
+        let cwnd = ((gain as f64 * bdpf) / 1_000_000f64) as u64;
+        // BDP estimate will be zero if no bandwidth samples are available yet.
+        if cwnd == 0 {
+            return self.init_cwnd;
+        }
+        cwnd.max(self.min_cwnd)
+    }
+
+    fn get_probe_rtt_cwnd(&self) -> u64 {
+        const K_MODERATE_PROBE_RTT_MULTIPLIER: f32 = 0.75;
+        if PROBE_RTT_BASED_ON_BDP {
+            return self.get_target_cwnd(K_MODERATE_PROBE_RTT_MULTIPLIER);
+        }
+        self.min_cwnd
+    }
+
+    fn calculate_pacing_rate(&mut self) {
+        let bw = self.max_bandwidth.get_estimate();
+        if bw == 0 {
+            return;
+        }
+        let target_rate = (bw as f64 * self.pacing_gain as f64) as u64;
+        if self.is_at_full_bandwidth {
+            self.pacing_rate = target_rate;
+            return;
+        }
+
+        // Pace at the rate of initial_window / RTT as soon as RTT measurements are
+        // available.
+        if self.pacing_rate == 0 && self.min_rtt.as_nanos() != 0 {
+            self.pacing_rate =
+                BandwidthEstimation::bw_from_delta(self.init_cwnd, self.min_rtt).unwrap();
+            return;
+        }
+
+        // Do not decrease the pacing rate during startup.
+        if self.pacing_rate < target_rate {
+            self.pacing_rate = target_rate;
+        }
+    }
+
+    fn calculate_cwnd(&mut self, bytes_acked: u64, excess_acked: u64) {
+        if self.mode == Mode::ProbeRtt {
+            return;
+        }
+        let mut target_window = self.get_target_cwnd(self.cwnd_gain);
+        if self.is_at_full_bandwidth {
+            // Add the max recently measured ack aggregation to CWND.
+            target_window += self.ack_aggregation.max_ack_height.get();
+        } else {
+            // Add the most recent excess acked.  Because CWND never decreases in
+            // STARTUP, this will automatically create a very localized max filter.
+            target_window += excess_acked;
+        }
+        // Instead of immediately setting the target CWND as the new one, BBR grows
+        // the CWND towards |target_window| by only increasing it |bytes_acked| at a
+        // time.
+        if self.is_at_full_bandwidth {
+            self.cwnd = target_window.min(self.cwnd + bytes_acked);
+        } else if (self.cwnd_gain < target_window as f32) || (self.acked_bytes < self.init_cwnd) {
+            // If the connection is not yet out of startup phase, do not decrease
+            // the window.
+            self.cwnd += bytes_acked;
+        }
+
+        // Enforce the limits on the congestion window.
+        if self.cwnd < self.min_cwnd {
+            self.cwnd = self.min_cwnd;
+        }
+    }
+
+    fn calculate_recovery_window(&mut self, bytes_acked: u64, bytes_lost: u64, in_flight: u64) {
+        if !self.recovery_state.in_recovery() {
+            return;
+        }
+        // Set up the initial recovery window.
+        if self.recovery_window == 0 {
+            self.recovery_window = self.min_cwnd.max(in_flight + bytes_acked);
+            return;
+        }
+
+        // Remove losses from the recovery window, while accounting for a potential
+        // integer underflow.
+        if self.recovery_window >= bytes_lost {
+            self.recovery_window -= bytes_lost;
+        } else {
+            // k_max_segment_size = current_mtu
+            self.recovery_window = self.current_mtu;
+        }
+        // In CONSERVATION mode, just subtracting losses is sufficient.  In GROWTH,
+        // release additional |bytes_acked| to achieve a slow-start-like behavior.
+        if self.recovery_state == RecoveryState::Growth {
+            self.recovery_window += bytes_acked;
+        }
+
+        // Sanity checks.  Ensure that we always allow to send at least an MSS or
+        // |bytes_acked| in response, whichever is larger.
+        self.recovery_window = self
+            .recovery_window
+            .max(in_flight + bytes_acked)
+            .max(self.min_cwnd);
+    }
+
+    /// <https://datatracker.ietf.org/doc/html/draft-cardwell-iccrg-bbr-congestion-control#section-4.3.2.2>
+    fn check_if_full_bw_reached(&mut self, app_limited: bool) {
+        if app_limited {
+            return;
+        }
+        let target = (self.bw_at_last_round as f64 * K_STARTUP_GROWTH_TARGET as f64) as u64;
+        let bw = self.max_bandwidth.get_estimate();
+        if bw >= target {
+            self.bw_at_last_round = bw;
+            self.round_wo_bw_gain = 0;
+            self.ack_aggregation.max_ack_height.reset();
+            return;
+        }
+
+        self.round_wo_bw_gain += 1;
+        if self.round_wo_bw_gain >= K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP as u64
+            || (self.recovery_state.in_recovery())
+        {
+            self.is_at_full_bandwidth = true;
+        }
+    }
+}
+
+impl Controller for Bbr {
+    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
+        self.max_sent_packet_number = last_packet_number;
+        self.max_bandwidth.on_sent(now, bytes);
+    }
+
+    fn on_ack(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        bytes: u64,
+        app_limited: bool,
+        rtt: &RttEstimator,
+    ) {
+        self.max_bandwidth
+            .on_ack(now, sent, bytes, self.round_count, app_limited);
+        self.acked_bytes += bytes;
+        if self.is_min_rtt_expired(now, app_limited) || self.min_rtt > rtt.min() {
+            self.min_rtt = rtt.min();
+        }
+    }
+
+    fn on_end_acks(
+        &mut self,
+        now: Instant,
+        in_flight: u64,
+        app_limited: bool,
+        largest_packet_num_acked: Option<u64>,
+    ) {
+        let bytes_acked = self.max_bandwidth.bytes_acked_this_window();
+        let excess_acked = self.ack_aggregation.update_ack_aggregation_bytes(
+            bytes_acked,
+            now,
+            self.round_count,
+            self.max_bandwidth.get_estimate(),
+        );
+        self.max_bandwidth.end_acks(self.round_count, app_limited);
+        if let Some(largest_acked_packet) = largest_packet_num_acked {
+            self.max_acked_packet_number = largest_acked_packet;
+        }
+
+        let mut is_round_start = false;
+        if bytes_acked > 0 {
+            is_round_start =
+                self.max_acked_packet_number > self.current_round_trip_end_packet_number;
+            if is_round_start {
+                self.current_round_trip_end_packet_number = self.max_sent_packet_number;
+                self.round_count += 1;
+            }
+        }
+
+        self.update_recovery_state(is_round_start);
+
+        if self.mode == Mode::ProbeBw {
+            self.update_gain_cycle_phase(now, in_flight);
+        }
+
+        if is_round_start && !self.is_at_full_bandwidth {
+            self.check_if_full_bw_reached(app_limited);
+        }
+
+        self.maybe_exit_startup_or_drain(now, in_flight);
+
+        self.maybe_enter_or_exit_probe_rtt(now, is_round_start, in_flight, app_limited);
+
+        // After the model is updated, recalculate the pacing rate and congestion window.
+        self.calculate_pacing_rate();
+        self.calculate_cwnd(bytes_acked, excess_acked);
+        self.calculate_recovery_window(bytes_acked, self.loss_state.lost_bytes, in_flight);
+
+        self.prev_in_flight_count = in_flight;
+        self.loss_state.reset();
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        _is_persistent_congestion: bool,
+        lost_bytes: u64,
+    ) {
+        self.loss_state.lost_bytes += lost_bytes;
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.current_mtu = new_mtu as u64;
+        self.min_cwnd = calculate_min_window(self.current_mtu);
+        self.init_cwnd = self.config.initial_window.max(self.min_cwnd);
+        self.cwnd = self.cwnd.max(self.min_cwnd);
+    }
+
+    fn window(&self) -> u64 {
+        if self.mode == Mode::ProbeRtt {
+            return self.get_probe_rtt_cwnd();
+        } else if self.recovery_state.in_recovery() && self.mode != Mode::Startup {
+            return self.cwnd.min(self.recovery_window);
+        }
+        self.cwnd
+    }
+
+    fn metrics(&self) -> ControllerMetrics {
+        ControllerMetrics {
+            congestion_window: self.window(),
+            ssthresh: None,
+            pacing_rate: Some(self.pacing_rate * 8),
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.config.initial_window
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+/// Configuration for the [`Bbr`] congestion controller
+#[derive(Debug, Clone)]
+pub struct BbrConfig {
+    initial_window: u64,
+}
+
+impl BbrConfig {
+    /// Default limit on the amount of outstanding data in bytes.
+    ///
+    /// Recommended value: `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`
+    pub fn initial_window(&mut self, value: u64) -> &mut Self {
+        self.initial_window = value;
+        self
+    }
+}
+
+impl Default for BbrConfig {
+    fn default() -> Self {
+        Self {
+            initial_window: K_MAX_INITIAL_CONGESTION_WINDOW * BASE_DATAGRAM_SIZE,
+        }
+    }
+}
+
+impl ControllerFactory for BbrConfig {
+    fn build(self: Arc<Self>, _now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        Box::new(Bbr::new(self, current_mtu))
+    }
+}
+
+#[derive(Debug, Default, Copy, Clone)]
+struct AckAggregationState {
+    max_ack_height: MinMax,
+    aggregation_epoch_start_time: Option<Instant>,
+    aggregation_epoch_bytes: u64,
+}
+
+impl AckAggregationState {
+    fn update_ack_aggregation_bytes(
+        &mut self,
+        newly_acked_bytes: u64,
+        now: Instant,
+        round: u64,
+        max_bandwidth: u64,
+    ) -> u64 {
+        // Compute how many bytes are expected to be delivered, assuming max
+        // bandwidth is correct.
+        let expected_bytes_acked = max_bandwidth
+            * now
+                .saturating_duration_since(self.aggregation_epoch_start_time.unwrap_or(now))
+                .as_micros() as u64
+            / 1_000_000;
+
+        // Reset the current aggregation epoch as soon as the ack arrival rate is
+        // less than or equal to the max bandwidth.
+        if self.aggregation_epoch_bytes <= expected_bytes_acked {
+            // Reset to start measuring a new aggregation epoch.
+            self.aggregation_epoch_bytes = newly_acked_bytes;
+            self.aggregation_epoch_start_time = Some(now);
+            return 0;
+        }
+
+        // Compute how many extra bytes were delivered vs max bandwidth.
+        // Include the bytes most recently acknowledged to account for stretch acks.
+        self.aggregation_epoch_bytes += newly_acked_bytes;
+        let diff = self.aggregation_epoch_bytes - expected_bytes_acked;
+        self.max_ack_height.update_max(round, diff);
+        diff
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum Mode {
+    // Startup phase of the connection.
+    Startup,
+    // After achieving the highest possible bandwidth during the startup, lower
+    // the pacing rate in order to drain the queue.
+    Drain,
+    // Cruising mode.
+    ProbeBw,
+    // Temporarily slow down sending in order to empty the buffer and measure
+    // the real minimum RTT.
+    ProbeRtt,
+}
+
+// Indicates how the congestion control limits the amount of bytes in flight.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RecoveryState {
+    // Do not limit.
+    NotInRecovery,
+    // Allow an extra outstanding byte for each byte acknowledged.
+    Conservation,
+    // Allow two extra outstanding bytes for each byte acknowledged (slow
+    // start).
+    Growth,
+}
+
+impl RecoveryState {
+    pub(super) fn in_recovery(&self) -> bool {
+        !matches!(self, Self::NotInRecovery)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct LossState {
+    lost_bytes: u64,
+}
+
+impl LossState {
+    pub(super) fn reset(&mut self) {
+        self.lost_bytes = 0;
+        self.lost_bytes = 0;
+    }
+
+    pub(super) fn has_losses(&self) -> bool {
+        self.lost_bytes != 0
+    }
+}
+
+fn calculate_min_window(current_mtu: u64) -> u64 {
+    4 * current_mtu
+}
+
+// The gain used for the STARTUP, equal to 2/ln(2).
+const K_DEFAULT_HIGH_GAIN: f32 = 2.885;
+// The newly derived CWND gain for STARTUP, 2.
+const K_DERIVED_HIGH_CWNDGAIN: f32 = 2.0;
+// The cycle of gains used during the ProbeBw stage.
+const K_PACING_GAIN: [f32; 8] = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+
+const K_STARTUP_GROWTH_TARGET: f32 = 1.25;
+const K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP: u8 = 3;
+
+// Do not allow initial congestion window to be greater than 200 packets.
+const K_MAX_INITIAL_CONGESTION_WINDOW: u64 = 200;
+
+const PROBE_RTT_BASED_ON_BDP: bool = true;
+const DRAIN_TO_TARGET: bool = true;
+use std::{
+    collections::HashSet,
+    f64::consts::LN_2,
+    hash::{BuildHasher, Hasher},
+    mem::{size_of, take},
+    sync::Mutex,
+};
+
+use fastbloom::BloomFilter;
+use rustc_hash::FxBuildHasher;
+use tracing::{trace, warn};
+
+use crate::{Duration, SystemTime, TokenLog, TokenReuseError, UNIX_EPOCH};
+
+/// Bloom filter-based [`TokenLog`]
+///
+/// Parameterizable over an approximate maximum number of bytes to allocate. Starts out by storing
+/// used tokens in a hash set. Once the hash set becomes too large, converts it to a bloom filter.
+/// This achieves a memory profile of linear growth with an upper bound.
+///
+/// Divides time into periods based on `lifetime` and stores two filters at any given moment, for
+/// each of the two periods currently non-expired tokens could expire in. As such, turns over
+/// filters as time goes on to avoid bloom filter false positive rate increasing infinitely over
+/// time.
+pub struct BloomTokenLog(Mutex<State>);
+
+impl BloomTokenLog {
+    /// Construct with an approximate maximum memory usage and expected number of validation token
+    /// usages per expiration period
+    ///
+    /// Calculates the optimal bloom filter k number automatically.
+    pub fn new_expected_items(max_bytes: usize, expected_hits: u64) -> Self {
+        Self::new(max_bytes, optimal_k_num(max_bytes, expected_hits))
+    }
+
+    /// Construct with an approximate maximum memory usage and a [bloom filter k number][bloom]
+    ///
+    /// [bloom]: https://en.wikipedia.org/wiki/Bloom_filter
+    ///
+    /// If choosing a custom k number, note that `BloomTokenLog` always maintains two filters
+    /// between them and divides the allocation budget of `max_bytes` evenly between them. As such,
+    /// each bloom filter will contain `max_bytes * 4` bits.
+    pub fn new(max_bytes: usize, k_num: u32) -> Self {
+        Self(Mutex::new(State {
+            config: FilterConfig {
+                filter_max_bytes: max_bytes / 2,
+                k_num,
+            },
+            period_1_start: UNIX_EPOCH,
+            filter_1: Filter::default(),
+            filter_2: Filter::default(),
+        }))
+    }
+}
+
+impl TokenLog for BloomTokenLog {
+    fn check_and_insert(
+        &self,
+        nonce: u128,
+        issued: SystemTime,
+        lifetime: Duration,
+    ) -> Result<(), TokenReuseError> {
+        trace!(%nonce, "check_and_insert");
+
+        if lifetime.is_zero() {
+            // avoid divide-by-zero if lifetime is zero
+            return Err(TokenReuseError);
+        }
+
+        let mut guard = self.0.lock().unwrap();
+        let state = &mut *guard;
+
+        // calculate how many periods past period 1 the token expires
+        let expires_at = issued + lifetime;
+        let Ok(periods_forward) = expires_at
+            .duration_since(state.period_1_start)
+            .map(|duration| duration.as_nanos() / lifetime.as_nanos())
+        else {
+            // shouldn't happen unless time travels backwards or lifetime changes or the current
+            // system time is before the Unix epoch
+            warn!("BloomTokenLog presented with token too far in past");
+            return Err(TokenReuseError);
+        };
+
+        // get relevant filter
+        let filter = match periods_forward {
+            0 => &mut state.filter_1,
+            1 => &mut state.filter_2,
+            2 => {
+                // turn over filter 1
+                state.filter_1 = take(&mut state.filter_2);
+                state.period_1_start += lifetime;
+                &mut state.filter_2
+            }
+            _ => {
+                // turn over both filters
+                state.filter_1 = Filter::default();
+                state.filter_2 = Filter::default();
+                state.period_1_start = expires_at;
+                &mut state.filter_1
+            }
+        };
+
+        // insert into the filter
+        //
+        // the token's nonce needs to guarantee uniqueness because of the role it plays in the
+        // encryption of the tokens, so it is 128 bits. but since the token log can tolerate false
+        // positives, we trim it down to 64 bits, which would still only have a small collision
+        // rate even at significant amounts of usage, while allowing us to store twice as many in
+        // the hash set variant.
+        //
+        // token nonce values are uniformly randomly generated server-side and cryptographically
+        // integrity-checked, so we don't need to employ secure hashing to trim it down to 64 bits,
+        // we can simply truncate.
+        //
+        // per the Rust reference, we can truncate by simply casting:
+        // https://doc.rust-lang.org/stable/reference/expressions/operator-expr.html#numeric-cast
+        filter.check_and_insert(nonce as u64, &state.config)
+    }
+}
+
+/// Default to 20 MiB max memory consumption and expected one million hits
+///
+/// With the default validation token lifetime of 2 weeks, this corresponds to one token usage per
+/// 1.21 seconds.
+impl Default for BloomTokenLog {
+    fn default() -> Self {
+        Self::new_expected_items(DEFAULT_MAX_BYTES, DEFAULT_EXPECTED_HITS)
+    }
+}
+
+/// Lockable state of [`BloomTokenLog`]
+struct State {
+    config: FilterConfig,
+    // filter_1 covers tokens that expire in the period starting at period_1_start and extending
+    // lifetime after. filter_2 covers tokens for the next lifetime after that.
+    period_1_start: SystemTime,
+    filter_1: Filter,
+    filter_2: Filter,
+}
+
+/// Unchanging parameters governing [`Filter`] behavior
+struct FilterConfig {
+    filter_max_bytes: usize,
+    k_num: u32,
+}
+
+/// Period filter within [`State`]
+enum Filter {
+    Set(HashSet<u64, IdentityBuildHasher>),
+    Bloom(BloomFilter<FxBuildHasher>),
+}
+
+impl Filter {
+    fn check_and_insert(
+        &mut self,
+        fingerprint: u64,
+        config: &FilterConfig,
+    ) -> Result<(), TokenReuseError> {
+        match self {
+            Self::Set(hset) => {
+                if !hset.insert(fingerprint) {
+                    return Err(TokenReuseError);
+                }
+
+                if hset.capacity() * size_of::<u64>() <= config.filter_max_bytes {
+                    return Ok(());
+                }
+
+                // convert to bloom
+                // avoid panicking if user passed in filter_max_bytes of 0. we document that this
+                // limit is approximate, so just fudge it up to 1.
+                let mut bloom = BloomFilter::with_num_bits((config.filter_max_bytes * 8).max(1))
+                    .hasher(FxBuildHasher)
+                    .hashes(config.k_num);
+                for item in &*hset {
+                    bloom.insert(item);
+                }
+                *self = Self::Bloom(bloom);
+            }
+            Self::Bloom(bloom) => {
+                if bloom.insert(&fingerprint) {
+                    return Err(TokenReuseError);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for Filter {
+    fn default() -> Self {
+        Self::Set(HashSet::default())
+    }
+}
+
+/// `BuildHasher` of `IdentityHasher`
+#[derive(Default)]
+struct IdentityBuildHasher;
+
+impl BuildHasher for IdentityBuildHasher {
+    type Hasher = IdentityHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        IdentityHasher::default()
+    }
+}
+
+/// Hasher that is the identity operation--it assumes that exactly 8 bytes will be hashed, and the
+/// resultant hash is those bytes as a `u64`
+#[derive(Default)]
+struct IdentityHasher {
+    data: [u8; 8],
+    #[cfg(debug_assertions)]
+    wrote_8_byte_slice: bool,
+}
+
+impl Hasher for IdentityHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        #[cfg(debug_assertions)]
+        {
+            assert!(!self.wrote_8_byte_slice);
+            assert_eq!(bytes.len(), 8);
+            self.wrote_8_byte_slice = true;
+        }
+        self.data.copy_from_slice(bytes);
+    }
+
+    fn finish(&self) -> u64 {
+        #[cfg(debug_assertions)]
+    pub fn read<R: Buf>(side: Side, r: &mut R) -> Result<Self, Error> {
+        // Initialize to protocol-specified defaults
+        let mut params = Self::default();
+
+        // State to check for duplicate transport parameters.
+        macro_rules! param_state {
+            {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {{
+                struct ParamState {
+                    $($name: bool,)*
+                }
+
+                ParamState {
+                    $($name: false,)*
+                }
+            }}
+        }
+        let mut got = apply_params!(param_state);
+
+        while r.has_remaining() {
+            let id = r.get_var()?;
+            let len = r.get_var()?;
+            if (r.remaining() as u64) < len {
+                return Err(Error::Malformed);
+            }
+            let len = len as usize;
+            let Ok(id) = TransportParameterId::try_from(id) else {
+                // unknown transport parameters are ignored
+                r.advance(len);
+                continue;
+            };
+
+            match id {
+                TransportParameterId::OriginalDestinationConnectionId => {
+                    decode_cid(len, &mut params.original_dst_cid, r)?
+                }
+                TransportParameterId::StatelessResetToken => {
+                    if len != 16 || params.stateless_reset_token.is_some() {
+                        return Err(Error::Malformed);
+                    }
+                    let mut tok = [0; RESET_TOKEN_SIZE];
+                    r.copy_to_slice(&mut tok);
+                    params.stateless_reset_token = Some(tok.into());
+                }
+                TransportParameterId::DisableActiveMigration => {
+                    if len != 0 || params.disable_active_migration {
+                        return Err(Error::Malformed);
+                    }
+                    params.disable_active_migration = true;
+                }
+                TransportParameterId::PreferredAddress => {
+                    if params.preferred_address.is_some() {
+                        return Err(Error::Malformed);
+                    }
+                    params.preferred_address = Some(PreferredAddress::read(&mut r.take(len))?);
+                }
+                TransportParameterId::InitialSourceConnectionId => {
+                    decode_cid(len, &mut params.initial_src_cid, r)?
+                }
+                TransportParameterId::RetrySourceConnectionId => {
+                    decode_cid(len, &mut params.retry_src_cid, r)?
+                }
+                TransportParameterId::MaxDatagramFrameSize => {
+                    if len > 8 || params.max_datagram_frame_size.is_some() {
+                        return Err(Error::Malformed);
+                    }
+                    params.max_datagram_frame_size = Some(r.get().unwrap());
+                }
+                TransportParameterId::GreaseQuicBit => match len {
+                    0 => params.grease_quic_bit = true,
+                    _ => return Err(Error::Malformed),
+                },
+                TransportParameterId::MinAckDelayDraft07 => {
+                    params.min_ack_delay = Some(r.get().unwrap())
+                }
+                _ => {
+                    macro_rules! parse {
+                        {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {
+                            match id {
+                                $(TransportParameterId::$id => {
+                                    let value = r.get::<VarInt>()?;
+                                    if len != value.size() || got.$name { return Err(Error::Malformed); }
+                                    params.$name = value.into();
+                                    got.$name = true;
+                                })*
+                                _ => r.advance(len),
+                            }
+                        }
+                    }
+                    apply_params!(parse);
+                }
+            }
+        }
+
+        // Semantic validation
+
+        // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-4.26.1
+        if params.ack_delay_exponent.0 > 20
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-4.28.1
+            || params.max_ack_delay.0 >= 1 << 14
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-6.2.1
+            || params.active_connection_id_limit.0 < 2
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-4.10.1
+            || params.max_udp_payload_size.0 < 1200
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-4.6-2
+            || params.initial_max_streams_bidi.0 > MAX_STREAM_COUNT
+            || params.initial_max_streams_uni.0 > MAX_STREAM_COUNT
+            // https://www.ietf.org/archive/id/draft-ietf-quic-ack-frequency-08.html#section-3-4
+            || params.min_ack_delay.is_some_and(|min_ack_delay| {
+                // min_ack_delay uses microseconds, whereas max_ack_delay uses milliseconds
+                min_ack_delay.0 > params.max_ack_delay.0 * 1_000
+            })
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-8
+            || (side.is_server()
+                && (params.original_dst_cid.is_some()
+                    || params.preferred_address.is_some()
+                    || params.retry_src_cid.is_some()
+                    || params.stateless_reset_token.is_some()))
+            // https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-4.38.1
+            || params
+                .preferred_address.is_some_and(|x| x.connection_id.is_empty())
+        {
+            return Err(Error::IllegalValue);
+        }
+
+        Ok(params)
+    }
+}
+
+/// A reserved transport parameter.
+///
+/// It has an identifier of the form 31 * N + 27 for the integer value of N.
+/// Such identifiers are reserved to exercise the requirement that unknown transport parameters be ignored.
+/// The reserved transport parameter has no semantics and can carry arbitrary values.
+/// It may be included in transport parameters sent to the peer, and should be ignored when received.
+use std::{
+    collections::{HashMap, hash_map},
+    convert::TryFrom,
+    fmt, mem,
+    net::{IpAddr, SocketAddr},
+    ops::{Index, IndexMut},
+    sync::Arc,
+};
+
+use bytes::{BufMut, Bytes, BytesMut};
+use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
+use rustc_hash::FxHashMap;
+use slab::Slab;
+use thiserror::Error;
+use tracing::{debug, error, trace, warn};
+
+use crate::{
+    Duration, INITIAL_MTU, Instant, MAX_CID_SIZE, MIN_INITIAL_SIZE, RESET_TOKEN_SIZE, ResetToken,
+    Side, Transmit, TransportConfig, TransportError,
+    cid_generator::ConnectionIdGenerator,
+    coding::BufMutExt,
+    config::{ClientConfig, EndpointConfig, ServerConfig},
+    connection::{Connection, ConnectionError, SideArgs},
+    crypto::{self, Keys, UnsupportedVersion},
+    frame,
+    packet::{
+        FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, PacketDecodeError,
+        PacketNumber, PartialDecode, ProtectedInitialHeader,
+    },
+    shared::{
+        ConnectionEvent, ConnectionEventInner, ConnectionId, DatagramConnectionEvent, EcnCodepoint,
+        EndpointEvent, EndpointEventInner, IssuedCid,
+    },
+    token::{IncomingToken, InvalidRetryTokenError, Token, TokenPayload},
+    transport_parameters::{PreferredAddress, TransportParameters},
+};
+
+/// The main entry point to the library
+///
+/// This object performs no I/O whatsoever. Instead, it consumes incoming packets and
+/// connection-generated events via `handle` and `handle_event`.
+pub struct Endpoint {
+    rng: StdRng,
+    index: ConnectionIndex,
+    connections: Slab<ConnectionMeta>,
+    local_cid_generator: Box<dyn ConnectionIdGenerator>,
+    config: Arc<EndpointConfig>,
+    server_config: Option<Arc<ServerConfig>>,
+    /// Whether the underlying UDP socket promises not to fragment packets
+    allow_mtud: bool,
+    /// Time at which a stateless reset was most recently sent
+    last_stateless_reset: Option<Instant>,
+    /// Buffered Initial and 0-RTT messages for pending incoming connections
+    incoming_buffers: Slab<IncomingBuffer>,
+    all_incoming_buffers_total_bytes: u64,
+}
+
+impl Endpoint {
+    /// Create a new endpoint
+    ///
+    /// `allow_mtud` enables path MTU detection when requested by `Connection` configuration for
+    /// better performance. This requires that outgoing packets are never fragmented, which can be
+    /// achieved via e.g. the `IPV6_DONTFRAG` socket option.
+    ///
+    /// If `rng_seed` is provided, it will be used to initialize the endpoint's rng (having priority
+    /// over the rng seed configured in [`EndpointConfig`]). Note that the `rng_seed` parameter will
+    /// be removed in a future release, so prefer setting it to `None` and configuring rng seeds
+    /// using [`EndpointConfig::rng_seed`].
+    pub fn new(
+        config: Arc<EndpointConfig>,
+        server_config: Option<Arc<ServerConfig>>,
+        allow_mtud: bool,
+        rng_seed: Option<[u8; 32]>,
+    ) -> Self {
+        let rng_seed = rng_seed.or(config.rng_seed);
+        Self {
+            rng: rng_seed.map_or(StdRng::from_os_rng(), StdRng::from_seed),
+            index: ConnectionIndex::default(),
+            connections: Slab::new(),
+            local_cid_generator: (config.connection_id_generator_factory.as_ref())(),
+            config,
+            server_config,
+            allow_mtud,
+            last_stateless_reset: None,
+            incoming_buffers: Slab::new(),
+            all_incoming_buffers_total_bytes: 0,
+        }
+    }
+
+    /// Replace the server configuration, affecting new incoming connections only
+    pub fn set_server_config(&mut self, server_config: Option<Arc<ServerConfig>>) {
+        self.server_config = server_config;
+    }
+
+    /// Process `EndpointEvent`s emitted from related `Connection`s
+    ///
+    /// In turn, processing this event may return a `ConnectionEvent` for the same `Connection`.
+    pub fn handle_event(
+        &mut self,
+        ch: ConnectionHandle,
+        event: EndpointEvent,
+    ) -> Option<ConnectionEvent> {
+        use EndpointEventInner::*;
+        match event.0 {
+            NeedIdentifiers(now, n) => {
+                return Some(self.send_new_identifiers(now, ch, n));
+            }
+            ResetToken(remote, token) => {
+                if let Some(old) = self.connections[ch].reset_token.replace((remote, token)) {
+                    self.index.connection_reset_tokens.remove(old.0, old.1);
+                }
+                if self.index.connection_reset_tokens.insert(remote, token, ch) {
+                    warn!("duplicate reset token");
+                }
+            }
+            RetireConnectionId(now, seq, allow_more_cids) => {
+                if let Some(cid) = self.connections[ch].loc_cids.remove(&seq) {
+                    trace!("peer retired CID {}: {}", seq, cid);
+                    self.index.retire(cid);
+                    if allow_more_cids {
+                        return Some(self.send_new_identifiers(now, ch, 1));
+                    }
+                }
+            }
+            Drained => {
+                if let Some(conn) = self.connections.try_remove(ch.0) {
+                    self.index.remove(&conn);
+                } else {
+                    // This indicates a bug in downstream code, which could cause spurious
+                    // connection loss instead of this error if the CID was (re)allocated prior to
+                    // the illegal call.
+                    error!(id = ch.0, "unknown connection drained");
+                }
+            }
+        }
+        None
+    }
+
+    /// Process an incoming UDP datagram
+    pub fn handle(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+        ecn: Option<EcnCodepoint>,
+        data: BytesMut,
+        buf: &mut Vec<u8>,
+    ) -> Option<DatagramEvent> {
+        // Partially decode packet or short-circuit if unable
+        let datagram_len = data.len();
+        let event = match PartialDecode::new(
+            data,
+            &FixedLengthConnectionIdParser::new(self.local_cid_generator.cid_len()),
+            &self.config.supported_versions,
+            self.config.grease_quic_bit,
+        ) {
+            Ok((first_decode, remaining)) => DatagramConnectionEvent {
+                now,
+                remote,
+                ecn,
+                first_decode,
+                remaining,
+            },
+            Err(PacketDecodeError::UnsupportedVersion {
+                src_cid,
+                dst_cid,
+                version,
+            }) => {
+                if self.server_config.is_none() {
+                    debug!("dropping packet with unsupported version");
+                    return None;
+                }
+                trace!("sending version negotiation");
+                // Negotiate versions
+                Header::VersionNegotiate {
+                    random: self.rng.random::<u8>() | 0x40,
+                    src_cid: dst_cid,
+                    dst_cid: src_cid,
+                }
+                .encode(buf);
+                // Grease with a reserved version
+                buf.write::<u32>(match version {
+                    0x0a1a_2a3a => 0x0a1a_2a4a,
+                    _ => 0x0a1a_2a3a,
+                });
+                for &version in &self.config.supported_versions {
+                    buf.write(version);
+                }
+                return Some(DatagramEvent::Response(Transmit {
+                    destination: remote,

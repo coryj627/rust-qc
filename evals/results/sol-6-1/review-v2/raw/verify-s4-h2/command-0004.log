@@ -1,0 +1,1303 @@
+use futures::future::{ready, Either};
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
+use h2_support::prelude::*;
+use std::pin::Pin;
+use std::task::Context;
+use std::{io, panic};
+
+#[tokio::test]
+async fn handshake() {
+    h2_support::trace_init!();
+
+    let mock = mock_io::Builder::new()
+        .handshake()
+        .write(SETTINGS_ACK)
+        .build();
+
+    let (_client, h2) = client::handshake(mock).await.unwrap();
+
+    tracing::trace!("hands have been shook");
+
+    // At this point, the connection should be closed
+    h2.await.unwrap();
+}
+
+#[tokio::test]
+async fn client_other_thread() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::handshake(io).await.unwrap();
+        tokio::spawn(async move {
+            let request = Request::builder()
+                .uri("https://http2.akamai.com/")
+                .body(())
+                .unwrap();
+            let _res = client
+                .send_request(request, true)
+                .unwrap()
+                .0
+                .await
+                .expect("request");
+        });
+        h2.await.expect("h2");
+    };
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn recv_invalid_server_stream_id() {
+    h2_support::trace_init!();
+
+    let mock = mock_io::Builder::new()
+        .handshake()
+        // Write GET /
+        .write(&[
+            0, 0, 0x10, 1, 5, 0, 0, 0, 1, 0x82, 0x87, 0x41, 0x8B, 0x9D, 0x29, 0xAC, 0x4B, 0x8F,
+            0xA8, 0xE9, 0x19, 0x97, 0x21, 0xE9, 0x84,
+        ])
+        .write(SETTINGS_ACK)
+        // Read response
+        .read(&[0, 0, 1, 1, 5, 0, 0, 0, 2, 137])
+        // Write GO_AWAY
+        .write(&[0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+        .build();
+
+    let (mut client, h2) = client::handshake(mock).await.unwrap();
+
+    // Send the request
+    let request = Request::builder()
+        .uri("https://http2.akamai.com/")
+        .body(())
+        .unwrap();
+
+    tracing::info!("sending request");
+    let (response, _) = client.send_request(request, true).unwrap();
+
+    // The connection errors
+    assert!(h2.await.is_err());
+
+    // The stream errors
+    assert!(response.await.is_err());
+}
+
+#[tokio::test]
+async fn request_stream_id_overflows() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::Builder::new()
+            .initial_stream_id(::std::u32::MAX >> 1)
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+
+        // first request is allowed
+        let (response, _) = client.send_request(request, true).unwrap();
+        let _x = h2.drive(response).await.unwrap();
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+        // second cannot use the next stream id, it's over
+        let poll_err = poll_fn(|cx| client.poll_ready(cx)).await.unwrap_err();
+        assert_eq!(poll_err.to_string(), "user error: stream ID overflowed");
+
+        let err = client.send_request(request, true).unwrap_err();
+        assert_eq!(err.to_string(), "user error: stream ID overflowed");
+
+        h2.await.unwrap();
+    };
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(::std::u32::MAX >> 1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(::std::u32::MAX >> 1).response(200).eos())
+            .await;
+        idle_ms(10).await;
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn client_builder_max_concurrent_streams() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let mut settings = frame::Settings::default();
+    settings.set_max_concurrent_streams(Some(1));
+
+    let srv = async move {
+        let rcvd_settings = srv.assert_client_handshake().await;
+        assert_frame_eq(settings, rcvd_settings);
+
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+    };
+
+    let mut builder = client::Builder::new();
+    builder.max_concurrent_streams(1);
+
+    let h2 = async move {
+        let (mut client, mut h2) = builder.handshake::<_, Bytes>(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        h2.drive(response).await.unwrap();
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn request_over_max_concurrent_streams_errors() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv
+            .assert_client_handshake_with_settings(
+                frames::settings()
+                    // super tiny server
+                    .max_concurrent_streams(1),
+            )
+use futures::{StreamExt, TryStreamExt};
+use h2_support::prelude::*;
+
+#[tokio::test]
+async fn recv_push_works() {
+    h2_support::trace_init!();
+
+    let (io, mut srv) = mock::new();
+    let mock = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(404)).await;
+        srv.send_frame(
+            frames::push_promise(1, 2).request("GET", "https://http2.akamai.com/style.css"),
+        )
+        .await;
+        srv.send_frame(frames::data(1, "").eos()).await;
+        srv.send_frame(frames::headers(2).response(200)).await;
+        srv.send_frame(frames::data(2, "promised_data").eos()).await;
+    };
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+        let (mut resp, _) = client.send_request(request, true).unwrap();
+        let pushed = resp.push_promises();
+        let check_resp_status = async move {
+            let resp = resp.await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        };
+        let check_pushed_response = async move {
+            let p = pushed.and_then(|headers| async move {
+                let (request, response) = headers.into_parts();
+                assert_eq!(request.into_parts().0.method, Method::GET);
+                let resp = response.await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let b = util::concat(resp.into_body()).await.unwrap();
+                assert_eq!(b, "promised_data");
+                Ok(())
+            });
+            let ps: Vec<_> = p.collect().await;
+            assert_eq!(1, ps.len())
+        };
+
+        h2.drive(join(check_resp_status, check_pushed_response))
+            .await;
+    };
+
+    join(mock, h2).await;
+}
+
+#[tokio::test]
+async fn pushed_streams_arent_dropped_too_early() {
+    // tests that by default, received push promises work
+    h2_support::trace_init!();
+
+    let (io, mut srv) = mock::new();
+    let mock = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(404)).await;
+        srv.send_frame(
+            frames::push_promise(1, 2).request("GET", "https://http2.akamai.com/style.css"),
+        )
+        .await;
+        srv.send_frame(
+            frames::push_promise(1, 4).request("GET", "https://http2.akamai.com/style2.css"),
+        )
+        .await;
+        srv.send_frame(frames::data(1, "").eos()).await;
+        idle_ms(10).await;
+        srv.send_frame(frames::headers(2).response(200)).await;
+        srv.send_frame(frames::headers(4).response(200).eos()).await;
+        srv.send_frame(frames::data(2, "").eos()).await;
+        srv.recv_frame(frames::go_away(4)).await;
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+        let (mut resp, _) = client.send_request(request, true).unwrap();
+        let mut pushed = resp.push_promises();
+        let check_status = async move {
+            let resp = resp.await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        };
+
+        let check_pushed = async move {
+            let mut count = 0;
+            while let Some(headers) = pushed.next().await {
+                let (request, response) = headers.unwrap().into_parts();
+                assert_eq!(request.into_parts().0.method, Method::GET);
+                let resp = response.await.unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                count += 1;
+            }
+            assert_eq!(2, count);
+        };
+
+        drop(client);
+
+        h2.drive(join(check_pushed, check_status)).await;
+        h2.await.expect("client");
+    };
+
+    join(mock, h2).await;
+}
+
+#[tokio::test]
+async fn recv_push_when_push_disabled_is_conn_error() {
+    h2_support::trace_init!();
+
+    let (io, mut srv) = mock::new();
+    let mock = async move {
+        let _ = srv.assert_client_handshake().await;
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(
+            frames::push_promise(1, 3).request("GET", "https://http2.akamai.com/style.css"),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+        srv.recv_frame(frames::go_away(0).protocol_error()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::Builder::new()
+            .enable_push(false)
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+
+        let req = async move {
+            let res = client.send_request(request, true).unwrap().0.await;
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "connection error detected: unspecific protocol error detected"
+            );
+        };
+
+        // client should see a protocol error
+        let conn = async move {
+            let res = h2.await;
+            let err = res.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "connection error detected: unspecific protocol error detected"
+            );
+        };
+
+        join(conn, req).await;
+use futures::{StreamExt, TryStreamExt};
+use h2_support::prelude::*;
+use h2_support::util::yield_once;
+
+// In this case, the stream & connection both have capacity, but capacity is not
+// explicitly requested.
+#[tokio::test]
+async fn send_data_without_requesting_capacity() {
+    h2_support::trace_init!();
+
+    let payload = vec![0; 1024];
+
+    let mock = mock_io::Builder::new()
+        .handshake()
+        .write(&[
+            // POST /
+            0, 0, 16, 1, 4, 0, 0, 0, 1, 131, 135, 65, 139, 157, 41, 172, 75, 143, 168, 233, 25, 151,
+            33, 233, 132,
+        ])
+        .write(&[
+            // DATA
+            0, 4, 0, 0, 1, 0, 0, 0, 1,
+        ])
+        .write(&payload[..])
+        .write(frames::SETTINGS_ACK)
+        // Read response
+        .read(&[0, 0, 1, 1, 5, 0, 0, 0, 1, 0x89])
+        .build();
+
+    let (mut client, mut h2) = client::handshake(mock).await.unwrap();
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("https://http2.akamai.com/")
+        .body(())
+        .unwrap();
+
+    let (response, mut stream) = client.send_request(request, false).unwrap();
+
+    // The capacity should be immediately allocated
+    assert_eq!(stream.capacity(), 0);
+
+    // Send the data
+    stream.send_data(payload.into(), true).unwrap();
+
+    // Get the response
+    let resp = h2.run(response).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    h2.await.unwrap();
+}
+
+#[tokio::test]
+async fn release_capacity_sends_window_update() {
+    h2_support::trace_init!();
+
+    let payload = vec![0u8; 16_384];
+    let payload_len = payload.len();
+
+    let (io, mut srv) = mock::new();
+
+    let mock = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200)).await;
+        srv.send_frame(frames::data(1, &payload[..])).await;
+        srv.send_frame(frames::data(1, &payload[..])).await;
+        srv.send_frame(frames::data(1, &payload[..])).await;
+        srv.recv_frame(frames::window_update(0, 32_768)).await;
+        srv.recv_frame(frames::window_update(1, 32_768)).await;
+        srv.send_frame(frames::data(1, &payload[..]).eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+
+        let req = async move {
+            let resp = client.send_request(request, true).unwrap().0.await.unwrap();
+            // Get the response
+            assert_eq!(resp.status(), StatusCode::OK);
+            let mut body = resp.into_parts().1;
+
+            // read some body to use up window size to below half
+            let buf = body.data().await.unwrap().unwrap();
+            assert_eq!(buf.len(), payload_len);
+
+            let buf = body.data().await.unwrap().unwrap();
+            assert_eq!(buf.len(), payload_len);
+
+            let buf = body.data().await.unwrap().unwrap();
+            assert_eq!(buf.len(), payload_len);
+            body.flow_control().release_capacity(buf.len() * 2).unwrap();
+
+            let buf = body.data().await.unwrap().unwrap();
+            assert_eq!(buf.len(), payload_len);
+        };
+
+        join(
+            async move {
+                h2.await.unwrap();
+            },
+            req,
+        )
+        .await
+    };
+    join(mock, h2).await;
+}
+
+#[tokio::test]
+async fn release_capacity_of_small_amount_does_not_send_window_update() {
+    h2_support::trace_init!();
+
+    let payload = [0; 16];
+
+    let (io, mut srv) = mock::new();
+
+    let mock = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200)).await;
+        srv.send_frame(frames::data(1, &payload[..]).eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://http2.akamai.com/")
+            .body(())
+            .unwrap();
+
+        let req = async move {
+            let resp = client.send_request(request, true).unwrap().0.await.unwrap();
+            // Get the response
+            assert_eq!(resp.status(), StatusCode::OK);
+            let mut body = resp.into_parts().1;
+            assert!(!body.is_end_stream());
+            let buf = body.data().await.unwrap().unwrap();
+            // read the small body and then release it
+            assert_eq!(buf.len(), 16);
+            body.flow_control().release_capacity(buf.len()).unwrap();
+            let buf = body.data().await;
+            assert!(buf.is_none());
+        };
+        join(async move { h2.await.unwrap() }, req).await;
+    };
+    join(mock, h2).await;
+}
+
+#[test]
+#[ignore]
+fn expand_window_sends_window_update() {}
+
+#[test]
+#[ignore]
+fn expand_window_calls_are_coalesced() {}
+
+#[tokio::test]
+async fn recv_data_overflows_connection_window() {
+    h2_support::trace_init!();
+
+    let (io, mut srv) = mock::new();
+
+//! Utilities to support tests.
+
+#[macro_use]
+pub mod assert;
+
+pub mod raw;
+
+pub mod frames;
+pub mod mock;
+pub mod prelude;
+pub mod trace;
+pub mod util;
+
+mod client_ext;
+mod future_ext;
+
+pub use crate::client_ext::SendRequestExt;
+pub use crate::future_ext::TestFuture;
+
+pub type WindowSize = usize;
+pub const DEFAULT_WINDOW_SIZE: WindowSize = (1 << 16) - 1;
+
+// This is our test Codec type
+pub type Codec<T> = h2::Codec<T, bytes::Bytes>;
+
+// This is the frame type that is sent
+pub type SendFrame = h2::frame::Frame<bytes::Bytes>;
+
+#[macro_export]
+macro_rules! trace_init {
+    () => {
+        let _guard = $crate::trace::init();
+        let span = $crate::prelude::tracing::info_span!(
+            "test",
+            "{}",
+            // get the name of the test thread to generate a unique span for the test
+            std::thread::current()
+                .name()
+                .expect("test threads must be named")
+        );
+        let _e = span.enter();
+    };
+}
+use crate::SendFrame;
+
+use h2::frame::{self, Frame};
+use h2::proto::Error;
+use h2::SendError;
+
+use futures::future::poll_fn;
+use futures::{ready, Stream, StreamExt};
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+use super::assert::assert_frame_eq;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
+use std::time::Duration;
+use std::{cmp, io, usize};
+
+/// A mock I/O
+#[derive(Debug)]
+pub struct Mock {
+    pipe: Pipe,
+}
+
+#[derive(Debug)]
+pub struct Handle {
+    codec: crate::Codec<Pipe>,
+}
+
+#[derive(Debug)]
+pub struct Pipe {
+    inner: Arc<Mutex<Inner>>,
+}
+
+#[derive(Debug)]
+struct Inner {
+    /// Data written by the test case to the h2 lib.
+    rx: Vec<u8>,
+
+    /// Notify when data is ready to be received.
+    rx_task: Option<Waker>,
+
+    /// Data written by the `h2` library to be read by the test case.
+    tx: Vec<u8>,
+
+    /// Notify when data is written. This notifies the test case waiters.
+    tx_task: Option<Waker>,
+
+    /// Number of bytes that can be written before `write` returns `Poll::Pending`.
+    tx_rem: usize,
+
+    /// Task to notify when write capacity becomes available.
+    tx_rem_task: Option<Waker>,
+
+    /// True when the pipe is closed.
+    closed: bool,
+
+    /// Trigger an `UnexpectedEof` error on read
+    unexpected_eof: bool,
+}
+
+const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Create a new mock and handle
+pub fn new() -> (Mock, Handle) {
+    new_with_write_capacity(usize::MAX)
+}
+
+/// Create a new mock and handle allowing up to `cap` bytes to be written.
+pub fn new_with_write_capacity(cap: usize) -> (Mock, Handle) {
+    let inner = Arc::new(Mutex::new(Inner {
+        rx: vec![],
+        rx_task: None,
+        tx: vec![],
+        tx_task: None,
+        tx_rem: cap,
+        tx_rem_task: None,
+        closed: false,
+        unexpected_eof: false,
+    }));
+
+    let mock = Mock {
+        pipe: Pipe {
+            inner: inner.clone(),
+        },
+    };
+
+    let handle = Handle {
+        codec: h2::Codec::new(Pipe { inner }),
+    };
+
+    (mock, handle)
+}
+
+// ===== impl Handle =====
+
+impl Handle {
+    /// Get a mutable reference to inner Codec.
+    pub fn codec_mut(&mut self) -> &mut crate::Codec<Pipe> {
+        &mut self.codec
+    }
+
+    pub fn close_without_notify(&mut self) {
+        let mut me = self.codec.get_mut().inner.lock().unwrap();
+        me.unexpected_eof = true;
+    }
+
+    /// Send a frame
+    pub async fn send(&mut self, item: SendFrame) -> Result<(), SendError> {
+        // Queue the frame
+        self.codec.buffer(item).unwrap();
+
+        // Flush the frame
+        poll_fn(|cx| {
+            let p = self.codec.flush(cx);
+            assert!(p.is_ready());
+            p
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Writes the client preface
+    pub async fn write_preface(&mut self) {
+        self.codec.get_mut().write_all(PREFACE).await.unwrap();
+    }
+
+    /// Read the client preface
+    pub async fn read_preface(&mut self) -> io::Result<()> {
+        let mut buf = vec![0u8; PREFACE.len()];
+        self.read_exact(&mut buf).await?;
+        assert_eq!(buf, PREFACE);
+        Ok(())
+    }
+
+    pub async fn recv_frame<F: Into<Frame>>(&mut self, expected: F) {
+        let frame = self.next().await.unwrap().unwrap();
+        assert_frame_eq(frame, expected);
+    }
+
+    pub async fn send_frame<F: Into<SendFrame>>(&mut self, frame: F) {
+        self.send(frame.into()).await.unwrap();
+    }
+
+    pub async fn recv_eof(&mut self) {
+        let frame = self.next().await;
+        assert!(frame.is_none());
+    }
+
+    pub async fn send_bytes(&mut self, data: &[u8]) {
+        use bytes::Buf;
+        use std::io::Cursor;
+
+        let buf: Vec<_> = data.into();
+        let mut buf = Cursor::new(buf);
+
+        poll_fn(move |cx| {
+            while buf.has_remaining() {
+                let res = Pin::new(self.codec.get_mut())
+                    .poll_write(cx, buf.chunk())
+                    .map_err(|e| panic!("write err={:?}", e));
+
+                let n = ready!(res).unwrap();
+                buf.advance(n);
+            }
+
+            Poll::Ready(())
+        })
+        .await;
+    }
+
+    /// Perform the H2 handshake
+    pub async fn assert_client_handshake(&mut self) -> frame::Settings {
+        self.assert_client_handshake_with_settings(frame::Settings::default())
+            .await
+    }
+
+    /// Perform the H2 handshake
+    pub async fn assert_client_handshake_with_settings<T>(&mut self, settings: T) -> frame::Settings
+    where
+        T: Into<frame::Settings>,
+    {
+        let settings = settings.into();
+        // Send a settings frame
+        self.send(settings.into()).await.unwrap();
+        self.read_preface().await.unwrap();
+
+        let settings = match self.next().await {
+            Some(frame) => match frame.unwrap() {
+                Frame::Settings(settings) => {
+                    // Send the ACK
+                    let ack = frame::Settings::ack();
+
+                    // TODO: Don't unwrap?
+                    self.send(ack.into()).await.unwrap();
+
+                    settings
+                }
+                frame => {
+                    panic!("unexpected frame; frame={:?}", frame);
+                }
+            },
+            None => {
+                panic!("unexpected EOF");
+            }
+        };
+
+        let frame = self.next().await.unwrap().unwrap();
+        let f = assert_settings!(frame);
+
+        // Is ACK
+        assert!(f.is_ack());
+
+        settings
+    }
+
+    /// Perform the H2 handshake
+    pub async fn assert_server_handshake(&mut self) -> frame::Settings {
+        self.assert_server_handshake_with_settings(frame::Settings::default())
+            .await
+    }
+
+    /// Perform the H2 handshake
+    pub async fn assert_server_handshake_with_settings<T>(&mut self, settings: T) -> frame::Settings
+    where
+        T: Into<frame::Settings>,
+    {
+        self.write_preface().await;
+
+        let settings = settings.into();
+                chain_threshold,
+                min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
+            },
+        }
+    }
+
+    /// Returns `Ready` when `send` is able to accept a frame
+    ///
+    /// Calling this function may result in the current contents of the buffer
+    /// to be flushed to `T`.
+    pub fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        if !self.encoder.has_capacity() {
+            // Try flushing
+            ready!(self.flush(cx))?;
+
+            if !self.encoder.has_capacity() {
+                return Poll::Pending;
+            }
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
+    /// Buffer a frame.
+    ///
+    /// `poll_ready` must be called first to ensure that a frame may be
+    /// accepted.
+    pub fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
+        self.encoder.buffer(item)
+    }
+
+    /// Flush buffered data to the wire
+    pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        let span = tracing::trace_span!("FramedWrite::flush");
+        let _e = span.enter();
+
+        loop {
+            while !self.encoder.is_empty() {
+                match self.encoder.next {
+                    Some(Next::Data(ref mut frame)) => {
+                        tracing::trace!(queued_data_frame = true);
+                        let mut buf = (&mut self.encoder.buf).chain(frame.payload_mut());
+                        ready!(poll_write_buf(Pin::new(&mut self.inner), cx, &mut buf))?
+                    }
+                    _ => {
+                        tracing::trace!(queued_data_frame = false);
+                        ready!(poll_write_buf(
+                            Pin::new(&mut self.inner),
+                            cx,
+                            &mut self.encoder.buf
+                        ))?
+                    }
+                };
+            }
+
+            match self.encoder.unset_frame() {
+                ControlFlow::Continue => (),
+                ControlFlow::Break => break,
+            }
+        }
+
+        tracing::trace!("flushing buffer");
+        // Flush the upstream
+        ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
+
+        Poll::Ready(Ok(()))
+    }
+
+    /// Close the codec
+    pub fn shutdown(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+        if !self.final_flush_done {
+            ready!(self.flush(cx))?;
+            self.final_flush_done = true;
+        }
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[must_use]
+enum ControlFlow {
+    Continue,
+        }
+
+        // Update the buffered data counter
+        stream.buffered_send_data += sz as usize;
+
+        let span =
+            tracing::trace_span!("send_data", sz, requested = stream.requested_send_capacity);
+        let _e = span.enter();
+        tracing::trace!(buffered = stream.buffered_send_data);
+
+        // Implicitly request more send capacity if not enough has been
+        // requested yet.
+        if (stream.requested_send_capacity as usize) < stream.buffered_send_data {
+            // Update the target requested capacity
+            stream.requested_send_capacity =
+                cmp::min(stream.buffered_send_data, WindowSize::MAX as usize) as WindowSize;
+
+            // `try_assign_capacity` will queue the stream to `pending_capacity` if the capcaity
+            // cannot be assigned at the time it is called.
+            //
+            // Streams over the max concurrent count will still call `send_data` so we should be
+            // careful not to put it into `pending_capacity` as it will starve the connection
+            // capacity for other streams
+            if !stream.is_pending_open {
+                self.try_assign_capacity(stream);
+            }
+        }
+
+        if frame.is_end_stream() {
+            stream.state.send_close();
+            self.reserve_capacity(0, stream, counts);
+        }
+
+        tracing::trace!(
+            available = %stream.send_flow.available(),
+            buffered = stream.buffered_send_data,
+        );
+
+        // The `stream.buffered_send_data == 0` check is here so that, if a zero
+        // length data frame is queued to the front (there is no previously
+        // queued data), it gets sent out immediately even if there is no
+        // available send window.
+        //
+        // Sending out zero length data frames can be done to signal
+        // end-of-stream.
+        //
+        if stream.send_flow.available() > 0 || stream.buffered_send_data == 0 {
+            // The stream currently has capacity to send the data frame, so
+            // queue it up and notify the connection task.
+            self.queue_frame(frame.into(), buffer, stream, task);
+        } else {
+            // The stream has no capacity to send the frame now, save it but
+            // don't notify the connection task. Once additional capacity
+            // becomes available, the frame will be flushed.
+            stream.pending_send.push_back(buffer, frame.into());
+        }
+
+        Ok(())
+    }
+
+    /// Request capacity to send data
+    pub fn reserve_capacity(
+        &mut self,
+        capacity: WindowSize,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) {
+        let span = tracing::trace_span!(
+            "reserve_capacity",
+            ?stream.id,
+            requested = capacity,
+            effective = (capacity as usize) + stream.buffered_send_data,
+            curr = stream.requested_send_capacity
+        );
+        let _e = span.enter();
+
+        // Actual capacity is `capacity` + the current amount of buffered data.
+        // If it were less, then we could never send out the buffered data.
+        let capacity = (capacity as usize) + stream.buffered_send_data;
+
+        match capacity.cmp(&(stream.requested_send_capacity as usize)) {
+            Ordering::Equal => {
+                // Nothing to do
+            }
+            Ordering::Less => {
+                // Update the target requested capacity
+                stream.requested_send_capacity = capacity as WindowSize;
+
+                // Currently available capacity assigned to the stream
+                let available = stream.send_flow.available().as_size();
+
+                // If the stream has more assigned capacity than requested, reclaim
+                // some for the connection
+                if available as usize > capacity {
+                    let diff = available - capacity as WindowSize;
+
+                    // TODO: proper error handling
+                    let _res = stream.send_flow.claim_capacity(diff);
+                    debug_assert!(_res.is_ok());
+
+                    self.assign_connection_capacity(diff, stream, counts);
+                }
+            }
+            Ordering::Greater => {
+                // If trying to *add* capacity, but the stream send side is closed,
+                // there's nothing to be done.
+                if stream.state.is_send_closed() {
+                    return;
+                }
+
+                // Update the target requested capacity
+                stream.requested_send_capacity =
+                    cmp::min(capacity, WindowSize::MAX as usize) as WindowSize;
+
+                // Try to assign additional capacity to the stream. If none is
+                // currently available, the stream will be queued to receive some
+                // when more becomes available.
+                self.try_assign_capacity(stream);
+            }
+        }
+    }
+
+    pub fn recv_stream_window_update(
+        &mut self,
+        inc: WindowSize,
+        stream: &mut store::Ptr,
+    ) -> Result<(), Reason> {
+        let span = tracing::trace_span!(
+            "recv_stream_window_update",
+            ?stream.id,
+            ?stream.state,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) {
+        if stream.state.is_closed() {
+            // Stream is already closed, nothing more to do
+            return;
+        }
+
+        stream.state.set_scheduled_reset(reason);
+
+        self.prioritize.reclaim_reserved_capacity(stream, counts);
+        self.prioritize.schedule_send(stream, task);
+    }
+
+    pub fn send_data<B>(
+        &mut self,
+        frame: frame::Data<B>,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError>
+    where
+        B: Buf,
+    {
+        self.prioritize
+            .send_data(frame, buffer, stream, counts, task)
+    }
+
+    pub fn send_trailers<B>(
+        &mut self,
+        frame: frame::Headers,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError> {
+        // TODO: Should this logic be moved into state.rs?
+        if !stream.state.is_send_streaming() {
+            return Err(UserError::UnexpectedFrameType);
+        }
+
+        stream.state.send_close();
+
+        tracing::trace!("send_trailers -- queuing; frame={:?}", frame);
+        self.prioritize
+            .queue_frame(frame.into(), buffer, stream, task);
+
+        // Release any excess capacity
+        self.prioritize.reserve_capacity(0, stream, counts);
+
+        Ok(())
+    }
+
+    pub fn poll_complete<T, B>(
+        &mut self,
+        cx: &mut Context,
+        buffer: &mut Buffer<Frame<B>>,
+        store: &mut Store,
+        counts: &mut Counts,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        self.prioritize
+            .poll_complete(cx, buffer, store, counts, dst)
+    }
+
+    /// Request capacity to send data
+    pub fn reserve_capacity(
+        &mut self,
+        capacity: WindowSize,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) {
+        self.prioritize.reserve_capacity(capacity, stream, counts)
+    }
+
+    pub fn poll_capacity(
+        &mut self,
+        cx: &Context,
+        stream: &mut store::Ptr,
+    ) -> Poll<Option<Result<WindowSize, UserError>>> {
+        if !stream.state.is_send_streaming() {
+            return Poll::Ready(None);
+        }
+
+        if !stream.send_capacity_inc {
+            stream.wait_send(cx);
+
+    /// Loads the push promise frame but doesn't actually do HPACK decoding.
+    ///
+    /// HPACK decoding is done in the `load_hpack` step.
+    pub fn load(head: Head, mut src: BytesMut) -> Result<(Self, BytesMut), Error> {
+        let flags = PushPromiseFlag(head.flag());
+        let mut pad = 0;
+
+        if head.stream_id().is_zero() {
+            return Err(Error::InvalidStreamId);
+        }
+
+        // Read the padding length
+        if flags.is_padded() {
+            if src.is_empty() {
+                return Err(Error::MalformedMessage);
+            }
+
+            // TODO: Ensure payload is sized correctly
+            pad = src[0] as usize;
+
+            // Drop the padding
+            src.advance(1);
+        }
+
+        if src.len() < 5 {
+            return Err(Error::MalformedMessage);
+        }
+
+        let (promised_id, _) = StreamId::parse(&src[..4]);
+        // Drop promised_id bytes
+        src.advance(4);
+
+        if pad > 0 {
+            if pad > src.len() {
+                return Err(Error::TooMuchPadding);
+            }
+
+            let len = src.len() - pad;
+            src.truncate(len);
+        }
+
+        let frame = PushPromise {
+            flags,
+            header_block: HeaderBlock {
+                fields: HeaderMap::new(),
+                field_size: 0,
+                is_over_size: false,
+                pseudo: Pseudo::default(),
+            },
+            promised_id,
+            stream_id: head.stream_id(),
+        };
+        Ok((frame, src))
+    }
+
+    pub fn load_hpack(
+        &mut self,
+        src: &mut BytesMut,
+        max_header_list_size: usize,
+        decoder: &mut hpack::Decoder,
+        PushPromiseFlag(END_HEADERS)
+    }
+}
+
+impl From<PushPromiseFlag> for u8 {
+    fn from(src: PushPromiseFlag) -> u8 {
+        src.0
+    }
+}
+
+impl fmt::Debug for PushPromiseFlag {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        util::debug_flags(fmt, self.0)
+            .flag_if(self.is_end_headers(), "END_HEADERS")
+            .flag_if(self.is_padded(), "PADDED")
+            .finish()
+    }
+}
+
+// ===== HeaderBlock =====
+
+impl HeaderBlock {
+    fn load(
+        &mut self,
+        src: &mut BytesMut,
+        max_header_list_size: usize,
+        decoder: &mut hpack::Decoder,
+    ) -> Result<(), Error> {
+        let mut reg = !self.fields.is_empty();
+        let mut malformed = false;
+        let mut headers_size = self.calculate_header_list_size();
+
+        macro_rules! set_pseudo {
+            ($field:ident, $val:expr) => {{
+                if reg {
+                    tracing::trace!("load_hpack; header malformed -- pseudo not at head of block");
+                    malformed = true;
+                } else if self.pseudo.$field.is_some() {
+                    tracing::trace!("load_hpack; header malformed -- repeated pseudo");
+                    malformed = true;
+                } else {
+                    let __val = $val;
+                    headers_size +=
+                        decoded_header_size(stringify!($field).len() + 1, __val.as_str().len());
+                    if headers_size < max_header_list_size {
+                        self.pseudo.$field = Some(__val);
+                    } else if !self.is_over_size {
+                        tracing::trace!("load_hpack; header list size over max");
+                        self.is_over_size = true;
+                    }
+                }
+            }};
+        }
+
+        let mut cursor = Cursor::new(src);
+
+        // If the header frame is malformed, we still have to continue decoding
+        // the headers. A malformed header frame is a stream level error, but
+        // the hpack state is connection level. In order to maintain correct
+        // state for other streams, the hpack decoding process must complete.
+        let res = decoder.decode(&mut cursor, |header| {
+            use crate::hpack::Header::*;
+
+            match header {
+                Field { name, value } => {
+                    // Connection level header fields are not supported and must
+                    // result in a protocol error.
+
+                    if name == header::CONNECTION
+                        || name == header::TRANSFER_ENCODING
+                        || name == header::UPGRADE
+                        || name == "keep-alive"
+                        || name == "proxy-connection"
+                    {
+                        tracing::trace!("load_hpack; connection level header");
+                        malformed = true;
+                    } else if name == header::TE && value != "trailers" {
+                        tracing::trace!(
+                            "load_hpack; TE header not set to trailers; val={:?}",
+                            value
+                        );
+                        malformed = true;
+                    } else {
+                        reg = true;
+
+                        headers_size += decoded_header_size(name.as_str().len(), value.len());
+                        if headers_size < max_header_list_size {
+                            self.field_size +=
+                                decoded_header_size(name.as_str().len(), value.len());
+                            self.fields.append(name, value);
+                        } else if !self.is_over_size {
+                            tracing::trace!("load_hpack; header list size over max");
+                            self.is_over_size = true;
+                        }
+                    }
+                }
+                Authority(v) => set_pseudo!(authority, v),
+                Method(v) => set_pseudo!(method, v),
+                Scheme(v) => set_pseudo!(scheme, v),
+                Path(v) => set_pseudo!(path, v),
+                Protocol(v) => set_pseudo!(protocol, v),
+                Status(v) => set_pseudo!(status, v),
+            }
+        });
+
+        if let Err(e) = res {

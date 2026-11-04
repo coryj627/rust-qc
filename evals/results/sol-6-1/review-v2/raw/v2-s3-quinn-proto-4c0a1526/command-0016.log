@@ -1,0 +1,1037 @@
+            trace!("dropping unrecognized short packet without ID");
+            None
+        } else {
+            // If we got this far, we're receiving a seemingly valid packet for an unknown
+            // connection. Send a stateless reset if possible.
+            self.stateless_reset(now, datagram_len, addresses, *dst_cid, buf)
+                .map(DatagramEvent::Response)
+        }
+    }
+
+    fn stateless_reset(
+        &mut self,
+        now: Instant,
+        inciting_dgram_len: usize,
+        addresses: FourTuple,
+        dst_cid: ConnectionId,
+        buf: &mut Vec<u8>,
+    ) -> Option<Transmit> {
+        if self
+            .last_stateless_reset
+            .is_some_and(|last| last + self.config.min_reset_interval > now)
+        {
+            debug!("ignoring unexpected packet within minimum stateless reset interval");
+            return None;
+        }
+
+        /// Minimum amount of padding for the stateless reset to look like a short-header packet
+        const MIN_PADDING_LEN: usize = 5;
+
+        // Prevent amplification attacks and reset loops by ensuring we pad to at most 1 byte
+        // smaller than the inciting packet.
+        let max_padding_len = match inciting_dgram_len.checked_sub(RESET_TOKEN_SIZE) {
+            Some(headroom) if headroom > MIN_PADDING_LEN => headroom - 1,
+            _ => {
+                debug!(
+                    "ignoring unexpected {} byte packet: not larger than minimum stateless reset size",
+                    inciting_dgram_len
+                );
+                return None;
+            }
+        };
+
+        debug!(
+            "sending stateless reset for {} to {}",
+            dst_cid, addresses.remote
+        );
+        self.last_stateless_reset = Some(now);
+        // Resets with at least this much padding can't possibly be distinguished from real packets
+        const IDEAL_MIN_PADDING_LEN: usize = MIN_PADDING_LEN + MAX_CID_SIZE;
+        let padding_len = if max_padding_len <= IDEAL_MIN_PADDING_LEN {
+            max_padding_len
+        } else {
+            self.rng
+                .random_range(IDEAL_MIN_PADDING_LEN..max_padding_len)
+        };
+        buf.reserve(padding_len + RESET_TOKEN_SIZE);
+        buf.resize(padding_len, 0);
+        self.rng.fill_bytes(&mut buf[0..padding_len]);
+        buf[0] = 0b0100_0000 | (buf[0] >> 2);
+        buf.extend_from_slice(&ResetToken::new(&*self.config.reset_key, dst_cid));
+
+        debug_assert!(buf.len() < inciting_dgram_len);
+
+        Some(Transmit {
+            destination: addresses.remote,
+            ecn: None,
+            size: buf.len(),
+            segment_size: None,
+            src_ip: addresses.local_ip,
+        })
+    }
+
+    /// Initiate a connection
+    pub fn connect(
+        &mut self,
+        now: Instant,
+        config: ClientConfig,
+        remote: SocketAddr,
+        server_name: &str,
+    ) -> Result<(ConnectionHandle, Connection), ConnectError> {
+        if self.cids_exhausted() {
+            return Err(ConnectError::CidsExhausted);
+        }
+        if remote.port() == 0 || remote.ip().is_unspecified() {
+            return Err(ConnectError::InvalidRemoteAddress(remote));
+        }
+        if !self.config.supported_versions.contains(&config.version) {
+            return Err(ConnectError::UnsupportedVersion);
+        }
+
+        let remote_id = (config.initial_dst_cid_provider)();
+        trace!(initial_dcid = %remote_id);
+
+        let ch = ConnectionHandle(self.connections.vacant_key());
+        let loc_cid = self.new_cid(ch);
+        let params = TransportParameters::new(
+            &config.transport,
+            &self.config,
+            self.local_cid_generator.as_ref(),
+            loc_cid,
+            None,
+            &mut self.rng,
+        );
+        let tls = config
+            .crypto
+            .start_session(config.version, server_name, &params)?;
+
+        let conn = self.add_connection(
+            ch,
+            config.version,
+            remote_id,
+            loc_cid,
+            remote_id,
+            FourTuple {
+                remote,
+                local_ip: None,
+            },
+            now,
+            tls,
+            config.transport,
+            SideArgs::Client {
+                token_store: config.token_store,
+                server_name: server_name.into(),
+            },
+        );
+        Ok((ch, conn))
+    }
+
+    fn send_new_identifiers(
+        &mut self,
+        now: Instant,
+        ch: ConnectionHandle,
+        num: u64,
+    ) -> ConnectionEvent {
+        let mut ids = vec![];
+        for _ in 0..num {
+            let id = self.new_cid(ch);
+            let meta = &mut self.connections[ch];
+            let sequence = meta.cids_issued;
+            meta.cids_issued += 1;
+            meta.loc_cids.insert(sequence, id);
+            ids.push(IssuedCid {
+                sequence,
+                id,
+                reset_token: ResetToken::new(&*self.config.reset_key, id),
+            });
+        }
+        ConnectionEvent(ConnectionEventInner::NewIdentifiers(ids, now))
+    }
+
+    /// Generate a connection ID for `ch`
+    fn new_cid(&mut self, ch: ConnectionHandle) -> ConnectionId {
+        loop {
+            let cid = self.local_cid_generator.generate_cid();
+            if cid.is_empty() {
+                // Zero-length CID; nothing to track
+                debug_assert_eq!(self.local_cid_generator.cid_len(), 0);
+                return cid;
+            }
+            if let hash_map::Entry::Vacant(e) = self.index.connection_ids.entry(cid) {
+                e.insert(ch);
+                break cid;
+            }
+        }
+    }
+
+    fn handle_first_packet(
+        &mut self,
+        datagram_len: usize,
+        event: DatagramConnectionEvent,
+        addresses: FourTuple,
+        buf: &mut Vec<u8>,
+    ) -> Option<DatagramEvent> {
+        let dst_cid = event.first_decode.dst_cid();
+        let header = event.first_decode.initial_header().unwrap();
+
+        let Some(server_config) = &self.server_config else {
+            debug!("packet for unrecognized connection {}", dst_cid);
+            return self
+                .stateless_reset(event.now, datagram_len, addresses, *dst_cid, buf)
+                .map(DatagramEvent::Response);
+        };
+
+        if datagram_len < MIN_INITIAL_SIZE as usize {
+            debug!("ignoring short initial for connection {}", dst_cid);
+            return None;
+        }
+
+        let crypto = match server_config.crypto.initial_keys(header.version, dst_cid) {
+            Ok(keys) => keys,
+            Err(UnsupportedVersion) => {
+                // This probably indicates that the user set supported_versions incorrectly in
+                // `EndpointConfig`.
+                debug!(
+                    "ignoring initial packet version {:#x} unsupported by cryptographic layer",
+                    header.version
+                );
+                return None;
+            }
+        };
+
+        if let Err(reason) = self.early_validate_first_packet(header) {
+            return Some(DatagramEvent::Response(self.initial_close(
+                header.version,
+                addresses,
+                &crypto,
+                &header.src_cid,
+                reason,
+                buf,
+            )));
+        }
+
+        let packet = match event.first_decode.finish(Some(&*crypto.header.remote)) {
+            Ok(packet) => packet,
+            Err(e) => {
+                trace!("unable to decode initial packet: {}", e);
+                return None;
+            }
+        };
+
+        if !packet.reserved_bits_valid() {
+            debug!("dropping connection attempt with invalid reserved bits");
+            return None;
+        }
+
+        let Header::Initial(header) = packet.header else {
+            panic!("non-initial packet in handle_first_packet()");
+        };
+
+        let server_config = self.server_config.as_ref().unwrap().clone();
+
+        let token = match IncomingToken::from_header(&header, &server_config, addresses.remote) {
+            Ok(token) => token,
+            Err(InvalidRetryTokenError) => {
+                debug!("rejecting invalid retry token");
+                return Some(DatagramEvent::Response(self.initial_close(
+                    header.version,
+                    addresses,
+                    &crypto,
+                    &header.src_cid,
+                    TransportError::INVALID_TOKEN(""),
+                    buf,
+                )));
+            }
+        };
+
+        let incoming_idx = self.incoming_buffers.insert(IncomingBuffer::default());
+        self.index
+            .insert_initial_incoming(header.dst_cid, incoming_idx);
+
+        Some(DatagramEvent::NewConnection(Incoming {
+            received_at: event.now,
+            addresses,
+            ecn: event.ecn,
+            packet: InitialPacket {
+                header,
+                header_data: packet.header_data,
+                payload: packet.payload,
+            },
+            rest: event.remaining,
+            crypto,
+            token,
+            incoming_idx,
+            improper_drop_warner: IncomingImproperDropWarner,
+        }))
+    }
+
+    /// Attempt to accept this incoming connection (an error may still occur)
+    // AcceptError cannot be made smaller without semver breakage
+    #[allow(clippy::result_large_err)]
+    pub fn accept(
+        &mut self,
+        mut incoming: Incoming,
+        now: Instant,
+        buf: &mut Vec<u8>,
+        server_config: Option<Arc<ServerConfig>>,
+    ) -> Result<(ConnectionHandle, Connection), AcceptError> {
+        let remote_address_validated = incoming.remote_address_validated();
+        incoming.improper_drop_warner.dismiss();
+        let incoming_buffer = self.incoming_buffers.remove(incoming.incoming_idx);
+        self.all_incoming_buffers_total_bytes -= incoming_buffer.total_bytes;
+
+        let packet_number = incoming.packet.header.number.expand(0);
+        let InitialHeader {
+            src_cid,
+            dst_cid,
+            version,
+            ..
+        } = incoming.packet.header;
+        let server_config =
+            server_config.unwrap_or_else(|| self.server_config.as_ref().unwrap().clone());
+
+        if server_config
+            .transport
+            .max_idle_timeout
+            .is_some_and(|timeout| {
+                incoming.received_at + Duration::from_millis(timeout.into()) <= now
+            })
+        {
+            debug!("abandoning accept of stale initial");
+            self.index.remove_initial(dst_cid);
+            return Err(AcceptError {
+                cause: ConnectionError::TimedOut,
+                response: None,
+            });
+        }
+
+        if self.cids_exhausted() {
+            debug!("refusing connection");
+            self.index.remove_initial(dst_cid);
+            return Err(AcceptError {
+                cause: ConnectionError::CidsExhausted,
+                response: Some(self.initial_close(
+                    version,
+                    incoming.addresses,
+                    &incoming.crypto,
+                    &src_cid,
+                    TransportError::CONNECTION_REFUSED(""),
+                    buf,
+                )),
+            });
+        }
+
+        if incoming
+            .crypto
+            .packet
+            .remote
+            .decrypt(
+                packet_number,
+                &incoming.packet.header_data,
+                &mut incoming.packet.payload,
+            )
+            .is_err()
+        {
+            debug!(packet_number, "failed to authenticate initial packet");
+            self.index.remove_initial(dst_cid);
+            return Err(AcceptError {
+                cause: TransportError::PROTOCOL_VIOLATION("authentication failed").into(),
+                response: None,
+            });
+        };
+
+        let ch = ConnectionHandle(self.connections.vacant_key());
+        let loc_cid = self.new_cid(ch);
+        let mut params = TransportParameters::new(
+            &server_config.transport,
+            &self.config,
+            self.local_cid_generator.as_ref(),
+            loc_cid,
+            Some(&server_config),
+            &mut self.rng,
+        );
+        params.stateless_reset_token = Some(ResetToken::new(&*self.config.reset_key, loc_cid));
+        params.original_dst_cid = Some(incoming.token.orig_dst_cid);
+        params.retry_src_cid = incoming.token.retry_src_cid;
+        let mut pref_addr_cid = None;
+        if server_config.has_preferred_address() {
+            let cid = self.new_cid(ch);
+            pref_addr_cid = Some(cid);
+            params.preferred_address = Some(PreferredAddress {
+                address_v4: server_config.preferred_address_v4,
+                address_v6: server_config.preferred_address_v6,
+                connection_id: cid,
+                stateless_reset_token: ResetToken::new(&*self.config.reset_key, cid),
+            });
+        }
+
+        let tls = server_config.crypto.clone().start_session(version, &params);
+        let transport_config = server_config.transport.clone();
+        let mut conn = self.add_connection(
+            ch,
+    }
+
+    pub(super) fn server_recv(&mut self, ch: ConnectionHandle, s: StreamId) -> RecvStream<'_> {
+        self.server_conn_mut(ch).recv_stream(s)
+    }
+
+    pub(super) fn server_datagrams(&mut self, ch: ConnectionHandle) -> Datagrams<'_> {
+        self.server_conn_mut(ch).datagrams()
+    }
+}
+
+impl Default for Pair {
+    fn default() -> Self {
+        Self::new(Default::default(), server_config())
+    }
+}
+
+pub(super) struct TestEndpoint {
+    pub(super) endpoint: Endpoint,
+    pub(super) addr: SocketAddr,
+    socket: Option<UdpSocket>,
+    timeout: Option<Instant>,
+    pub(super) outbound: VecDeque<(Transmit, Bytes)>,
+    delayed: VecDeque<(Transmit, Bytes)>,
+    pub(super) inbound: VecDeque<(Instant, Option<EcnCodepoint>, BytesMut)>,
+    accepted: Option<Result<ConnectionHandle, ConnectionError>>,
+    pub(super) connections: HashMap<ConnectionHandle, Connection>,
+    conn_events: HashMap<ConnectionHandle, VecDeque<ConnectionEvent>>,
+    pub(super) captured_packets: Vec<Vec<u8>>,
+    pub(super) capture_inbound_packets: bool,
+    pub(super) handle_incoming: Box<dyn FnMut(&Incoming) -> IncomingConnectionBehavior>,
+    pub(super) waiting_incoming: Vec<Incoming>,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub(super) enum IncomingConnectionBehavior {
+    Accept,
+    Reject,
+    Retry,
+    Wait,
+}
+
+pub(super) fn validate_incoming(incoming: &Incoming) -> IncomingConnectionBehavior {
+    if incoming.remote_address_validated() {
+        IncomingConnectionBehavior::Accept
+    } else {
+        IncomingConnectionBehavior::Retry
+    }
+}
+
+impl TestEndpoint {
+    fn new(endpoint: Endpoint, addr: SocketAddr) -> Self {
+        let socket = if env::var_os("SSLKEYLOGFILE").is_some() {
+            let socket = UdpSocket::bind(addr).expect("failed to bind UDP socket");
+            socket
+                .set_read_timeout(Some(Duration::from_millis(10)))
+                .unwrap();
+            Some(socket)
+        } else {
+            None
+        };
+        Self {
+            endpoint,
+            addr,
+            socket,
+            timeout: None,
+            outbound: VecDeque::new(),
+            delayed: VecDeque::new(),
+            inbound: VecDeque::new(),
+            accepted: None,
+            connections: HashMap::default(),
+            conn_events: HashMap::default(),
+            captured_packets: Vec::new(),
+            capture_inbound_packets: false,
+            handle_incoming: Box::new(|_| IncomingConnectionBehavior::Accept),
+            waiting_incoming: Vec::new(),
+        }
+    }
+
+    pub(super) fn drive(&mut self, now: Instant, remote: SocketAddr) {
+        self.drive_incoming(now, remote);
+        self.drive_outgoing(now);
+    }
+
+    pub(super) fn drive_incoming(&mut self, now: Instant, remote: SocketAddr) {
+        if let Some(ref socket) = self.socket {
+            loop {
+                let mut buf = [0; 8192];
+                if socket.recv_from(&mut buf).is_err() {
+                    break;
+                }
+            }
+        }
+        let buffer_size = self.endpoint.config().get_max_udp_payload_size() as usize;
+        let mut buf = Vec::with_capacity(buffer_size);
+
+        while self.inbound.front().is_some_and(|x| x.0 <= now) {
+            let (recv_time, ecn, packet) = self.inbound.pop_front().unwrap();
+            if let Some(event) = self
+                .endpoint
+                .handle(recv_time, remote, None, ecn, packet, &mut buf)
+            {
+                match event {
+                    DatagramEvent::NewConnection(incoming) => {
+                        match (self.handle_incoming)(&incoming) {
+                            IncomingConnectionBehavior::Accept => {
+                                let _ = self.try_accept(incoming, now);
+                            }
+                            IncomingConnectionBehavior::Reject => {
+                                self.reject(incoming);
+                            }
+                            IncomingConnectionBehavior::Retry => {
+                                self.retry(incoming);
+                            }
+                            IncomingConnectionBehavior::Wait => {
+                                self.waiting_incoming.push(incoming);
+                            }
+                        }
+                    }
+                    DatagramEvent::ConnectionEvent(ch, event) => {
+                        if self.capture_inbound_packets {
+                            let packet = self.connections[&ch].decode_packet(&event);
+                            self.captured_packets.extend(packet);
+                        }
+
+                        self.conn_events.entry(ch).or_default().push_back(event);
+                    }
+                    DatagramEvent::Response(transmit) => {
+                        let size = transmit.size;
+                        self.outbound.extend(split_transmit(transmit, &buf[..size]));
+                        buf.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn drive_outgoing(&mut self, now: Instant) {
+        let buffer_size = self.endpoint.config().get_max_udp_payload_size() as usize;
+        let mut buf = Vec::with_capacity(buffer_size);
+
+        loop {
+            let mut endpoint_events: Vec<(ConnectionHandle, EndpointEvent)> = vec![];
+            for (ch, conn) in self.connections.iter_mut() {
+                if self.timeout.is_some_and(|x| x <= now) {
+                    self.timeout = None;
+                    conn.handle_timeout(now);
+                }
+
+                for (_, mut events) in self.conn_events.drain() {
+                    for event in events.drain(..) {
+                        conn.handle_event(event);
+                    }
+                }
+
+                while let Some(event) = conn.poll_endpoint_events() {
+                    endpoint_events.push((*ch, event));
+                }
+                while let Some(transmit) = conn.poll_transmit(now, MAX_DATAGRAMS, &mut buf) {
+                    let size = transmit.size;
+                    self.outbound.extend(split_transmit(transmit, &buf[..size]));
+                    buf.clear();
+                }
+                self.timeout = conn.poll_timeout();
+            }
+
+            if endpoint_events.is_empty() {
+                break;
+            }
+
+            for (ch, event) in endpoint_events {
+                if let Some(event) = self.handle_event(ch, event) {
+                    if let Some(conn) = self.connections.get_mut(&ch) {
+                        conn.handle_event(event);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(super) fn next_wakeup(&self) -> Option<Instant> {
+        let next_inbound = self.inbound.front().map(|x| x.0);
+        min_opt(self.timeout, next_inbound)
+    }
+
+    fn is_idle(&self) -> bool {
+        self.connections.values().all(|x| x.is_idle())
+    }
+
+    pub(super) fn delay_outbound(&mut self) {
+        assert!(self.delayed.is_empty());
+        mem::swap(&mut self.delayed, &mut self.outbound);
+    }
+
+    pub(super) fn finish_delay(&mut self) {
+        self.outbound.extend(self.delayed.drain(..));
+    }
+
+    pub(super) fn try_accept(
+        &mut self,
+        incoming: Incoming,
+        now: Instant,
+    ) -> Result<ConnectionHandle, ConnectionError> {
+        let mut buf = Vec::new();
+        match self.endpoint.accept(incoming, now, &mut buf, None) {
+            Ok((ch, conn)) => {
+                self.connections.insert(ch, conn);
+                self.accepted = Some(Ok(ch));
+                Ok(ch)
+            }
+            Err(error) => {
+                if let Some(transmit) = error.response {
+                    let size = transmit.size;
+                    self.outbound.extend(split_transmit(transmit, &buf[..size]));
+                }
+                self.accepted = Some(Err(error.cause.clone()));
+                Err(error.cause)
+            }
+        }
+    }
+
+    pub(super) fn retry(&mut self, incoming: Incoming) {
+        let mut buf = Vec::new();
+        let transmit = self.endpoint.retry(incoming, &mut buf).unwrap();
+        let size = transmit.size;
+        self.outbound.extend(split_transmit(transmit, &buf[..size]));
+    }
+
+    pub(super) fn reject(&mut self, incoming: Incoming) {
+        let mut buf = Vec::new();
+        let transmit = self.endpoint.refuse(incoming, &mut buf);
+        let size = transmit.size;
+        self.outbound.extend(split_transmit(transmit, &buf[..size]));
+    }
+
+    pub(super) fn assert_accept(&mut self) -> ConnectionHandle {
+        self.accepted
+            .take()
+            .expect("server didn't try connecting")
+            .expect("server experienced error connecting")
+    }
+
+    pub(super) fn assert_accept_error(&mut self) -> ConnectionError {
+        self.accepted
+            .take()
+            .expect("server didn't try connecting")
+            .expect_err("server did unexpectedly connect without error")
+    }
+
+    pub(super) fn assert_no_accept(&self) {
+        assert!(self.accepted.is_none(), "server did unexpectedly connect")
+    }
+}
+
+impl ::std::ops::Deref for TestEndpoint {
+    type Target = Endpoint;
+    fn deref(&self) -> &Endpoint {
+        &self.endpoint
+    }
+}
+
+impl ::std::ops::DerefMut for TestEndpoint {
+    fn deref_mut(&mut self) -> &mut Endpoint {
+        &mut self.endpoint
+    }
+}
+
+pub(super) fn subscribe() -> tracing::subscriber::DefaultGuard {
+    let builder = tracing_subscriber::FmtSubscriber::builder()
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(|| TestWriter);
+    // tracing uses std::time to trace time, which panics in wasm.
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    let builder = builder.without_time();
+    tracing::subscriber::set_default(builder.finish())
+}
+
+struct TestWriter;
+
+impl Write for TestWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        print!(
+            "{}",
+            str::from_utf8(buf).expect("tried to log invalid UTF-8")
+        );
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().flush()
+    }
+}
+
+pub(super) fn server_config() -> ServerConfig {
+    let mut config = ServerConfig::with_crypto(Arc::new(server_crypto()));
+    if !cfg!(feature = "bloom") {
+        config
+use std::{fmt, net::SocketAddr};
+
+use bytes::{Buf, BufMut, BytesMut};
+
+use crate::{Instant, MAX_CID_SIZE, ResetToken, coding::BufExt, packet::PartialDecode};
+
+/// Events sent from an Endpoint to a Connection
+#[derive(Debug)]
+pub struct ConnectionEvent(pub(crate) ConnectionEventInner);
+
+#[derive(Debug)]
+pub(crate) enum ConnectionEventInner {
+    /// A datagram has been received for the Connection
+    Datagram(DatagramConnectionEvent),
+    /// New connection identifiers have been issued for the Connection
+    NewIdentifiers(Vec<IssuedCid>, Instant),
+}
+
+/// Variant of [`ConnectionEventInner`].
+#[derive(Debug)]
+pub(crate) struct DatagramConnectionEvent {
+    pub(crate) now: Instant,
+    pub(crate) remote: SocketAddr,
+    pub(crate) ecn: Option<EcnCodepoint>,
+    pub(crate) first_decode: PartialDecode,
+    pub(crate) remaining: Option<BytesMut>,
+}
+
+/// Events sent from a Connection to an Endpoint
+#[derive(Debug)]
+pub struct EndpointEvent(pub(crate) EndpointEventInner);
+
+impl EndpointEvent {
+    /// Construct an event that indicating that a `Connection` will no longer emit events
+    ///
+    /// Useful for notifying an `Endpoint` that a `Connection` has been destroyed outside of the
+    /// usual state machine flow, e.g. when being dropped by the user.
+    pub fn drained() -> Self {
+        Self(EndpointEventInner::Drained)
+    }
+
+    /// Determine whether this is the last event a `Connection` will emit
+    ///
+    /// Useful for determining when connection-related event loop state can be freed.
+    pub fn is_drained(&self) -> bool {
+        self.0 == EndpointEventInner::Drained
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum EndpointEventInner {
+    /// The connection has been drained
+    Drained,
+    /// The reset token and/or address eligible for generating resets has been updated
+    ResetToken(SocketAddr, ResetToken),
+    /// The connection needs connection identifiers
+    NeedIdentifiers(Instant, u64),
+    /// Stop routing connection ID for this sequence number to the connection
+    /// When `bool == true`, a new connection ID will be issued to peer
+    RetireConnectionId(Instant, u64, bool),
+}
+
+/// Protocol-level identifier for a connection.
+///
+/// Mainly useful for identifying this connection's packets on the wire with tools like Wireshark.
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ConnectionId {
+    /// length of CID
+    len: u8,
+    /// CID in byte array
+    bytes: [u8; MAX_CID_SIZE],
+}
+
+impl ConnectionId {
+    /// Construct cid from byte array
+    pub fn new(bytes: &[u8]) -> Self {
+        debug_assert!(bytes.len() <= MAX_CID_SIZE);
+        let mut res = Self {
+            len: bytes.len() as u8,
+            bytes: [0; MAX_CID_SIZE],
+        };
+        res.bytes[..bytes.len()].copy_from_slice(bytes);
+        res
+    }
+
+    /// Constructs cid by reading `len` bytes from a `Buf`
+    ///
+    /// Callers need to assure that `buf.remaining() >= len`
+    pub fn from_buf(buf: &mut (impl Buf + ?Sized), len: usize) -> Self {
+        debug_assert!(len <= MAX_CID_SIZE);
+        let mut res = Self {
+            len: len as u8,
+            bytes: [0; MAX_CID_SIZE],
+        };
+        buf.copy_to_slice(&mut res[..len]);
+        res
+    }
+
+    /// Decode from long header format
+    pub(crate) fn decode_long(buf: &mut impl Buf) -> Option<Self> {
+        let len = buf.get::<u8>().ok()? as usize;
+        match len > MAX_CID_SIZE || buf.remaining() < len {
+            false => Some(Self::from_buf(buf, len)),
+            true => None,
+        }
+    }
+
+    /// Encode in long header format
+    pub(crate) fn encode_long(&self, buf: &mut impl BufMut) {
+        buf.put_u8(self.len() as u8);
+        buf.put_slice(self);
+    }
+}
+
+impl ::std::ops::Deref for ConnectionId {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes[0..self.len as usize]
+    }
+}
+
+impl ::std::ops::DerefMut for ConnectionId {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes[0..self.len as usize]
+    }
+}
+
+impl fmt::Debug for ConnectionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.bytes[0..self.len as usize].fmt(f)
+    }
+}
+
+impl fmt::Display for ConnectionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.iter() {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Explicit congestion notification codepoint
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum EcnCodepoint {
+    /// The ECT(0) codepoint, indicating that an endpoint is ECN-capable
+    Ect0 = 0b10,
+    /// The ECT(1) codepoint, indicating that an endpoint is ECN-capable
+    Ect1 = 0b01,
+    /// The CE codepoint, signalling that congestion was experienced
+    Ce = 0b11,
+}
+
+impl EcnCodepoint {
+    /// Create new object from the given bits
+    pub fn from_bits(x: u8) -> Option<Self> {
+        use EcnCodepoint::*;
+        Some(match x & 0b11 {
+            0b10 => Ect0,
+            0b01 => Ect1,
+            0b11 => Ce,
+            _ => {
+                return None;
+            }
+        })
+    }
+
+    /// Returns whether the codepoint is a CE, signalling that congestion was experienced
+    pub fn is_ce(self) -> bool {
+        matches!(self, Self::Ce)
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct IssuedCid {
+    pub(crate) sequence: u64,
+    pub(crate) id: ConnectionId,
+    pub(crate) reset_token: ResetToken,
+}
+// Function bodies in this module are regularly cfg'd out
+#![allow(unused_variables)]
+
+#[cfg(feature = "qlog")]
+use std::sync::{Arc, Mutex};
+
+#[cfg(feature = "qlog")]
+use qlog::{
+    events::{
+        Event, EventData,
+        quic::{
+            PacketHeader, PacketLost, PacketLostTrigger, PacketReceived, PacketSent, PacketType,
+        },
+    },
+    streamer::QlogStreamer,
+};
+#[cfg(feature = "qlog")]
+use tracing::warn;
+
+use crate::{
+    ConnectionId, Instant,
+    connection::{PathData, SentPacket},
+    packet::SpaceId,
+};
+
+/// Shareable handle to a single qlog output stream
+#[cfg(feature = "qlog")]
+#[derive(Clone)]
+pub struct QlogStream(pub(crate) Arc<Mutex<QlogStreamer>>);
+
+#[cfg(feature = "qlog")]
+impl QlogStream {
+    fn emit_event(&self, orig_rem_cid: ConnectionId, event: EventData, now: Instant) {
+        // Time will be overwritten by `add_event_with_instant`
+        let mut event = Event::with_time(0.0, event);
+        event.group_id = Some(orig_rem_cid.to_string());
+
+        let mut qlog_streamer = self.0.lock().unwrap();
+        if let Err(e) = qlog_streamer.add_event_with_instant(event, now) {
+            warn!("could not emit qlog event: {e}");
+        }
+    }
+}
+
+/// A [`QlogStream`] that may be either dynamically disabled or compiled out entirely
+#[derive(Clone, Default)]
+pub(crate) struct QlogSink {
+    #[cfg(feature = "qlog")]
+    stream: Option<QlogStream>,
+}
+
+impl QlogSink {
+    pub(crate) fn is_enabled(&self) -> bool {
+        #[cfg(feature = "qlog")]
+        {
+            self.stream.is_some()
+        }
+        #[cfg(not(feature = "qlog"))]
+        {
+            false
+        }
+    }
+
+    pub(super) fn emit_recovery_metrics(
+        &self,
+        pto_count: u32,
+        path: &mut PathData,
+        now: Instant,
+        orig_rem_cid: ConnectionId,
+    ) {
+        #[cfg(feature = "qlog")]
+        {
+            let Some(stream) = self.stream.as_ref() else {
+                return;
+            };
+
+            let Some(metrics) = path.qlog_recovery_metrics(pto_count) else {
+                return;
+            };
+
+            stream.emit_event(orig_rem_cid, EventData::MetricsUpdated(metrics), now);
+        }
+    }
+
+    pub(super) fn emit_packet_lost(
+        &self,
+        pn: u64,
+        info: &SentPacket,
+        lost_send_time: Instant,
+        space: SpaceId,
+        now: Instant,
+        orig_rem_cid: ConnectionId,
+    ) {
+        #[cfg(feature = "qlog")]
+        {
+            let Some(stream) = self.stream.as_ref() else {
+                return;
+            };
+
+            let event = PacketLost {
+                header: Some(PacketHeader {
+                    packet_number: Some(pn),
+                    packet_type: packet_type(space, false),
+                    length: Some(info.size),
+                    ..Default::default()
+                }),
+                frames: None,
+                trigger: Some(match info.time_sent <= lost_send_time {
+                    true => PacketLostTrigger::TimeThreshold,
+                    false => PacketLostTrigger::ReorderingThreshold,
+                }),
+            };
+
+            stream.emit_event(orig_rem_cid, EventData::PacketLost(event), now);
+        }
+    }
+
+    pub(super) fn emit_packet_sent(
+        &self,
+        pn: u64,
+        len: usize,
+        space: SpaceId,
+        is_0rtt: bool,
+        now: Instant,
+        orig_rem_cid: ConnectionId,
+    ) {
+        #[cfg(feature = "qlog")]
+        {
+            let Some(stream) = self.stream.as_ref() else {
+                return;
+            };
+
+            let event = PacketSent {
+                header: PacketHeader {
+                    packet_number: Some(pn),
+                    packet_type: packet_type(space, is_0rtt),
+                    length: Some(len as u16),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            stream.emit_event(orig_rem_cid, EventData::PacketSent(event), now);
+        }
+    }
+
+    pub(super) fn emit_packet_received(
+        &self,
+        pn: u64,
+        space: SpaceId,
+        is_0rtt: bool,
+        now: Instant,
+        orig_rem_cid: ConnectionId,
+    ) {
+        #[cfg(feature = "qlog")]
+        {
+            let Some(stream) = self.stream.as_ref() else {
+                return;
+            };
+
+            let event = PacketReceived {
+                header: PacketHeader {
+                    packet_number: Some(pn),
+                    packet_type: packet_type(space, is_0rtt),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            stream.emit_event(orig_rem_cid, EventData::PacketReceived(event), now);
+        }
+    }
+}
+
+#[cfg(feature = "qlog")]
+impl From<Option<QlogStream>> for QlogSink {
+    fn from(stream: Option<QlogStream>) -> Self {
+        Self { stream }
+    }
+}
+
+#[cfg(feature = "qlog")]
+fn packet_type(space: SpaceId, is_0rtt: bool) -> PacketType {
+    match space {
+        SpaceId::Initial => PacketType::Initial,
+        SpaceId::Handshake => PacketType::Handshake,
+        SpaceId::Data if is_0rtt => PacketType::ZeroRtt,
+        SpaceId::Data => PacketType::OneRtt,
+    }
+}

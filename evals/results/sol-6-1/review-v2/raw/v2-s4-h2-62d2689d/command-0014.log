@@ -1,0 +1,978 @@
+7.228066666666667 minutes used of 15.0
+   125	    /// `poll_ready` must be called first to ensure that a frame may be
+   126	    /// accepted.
+   127	    pub fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
+   128	        self.encoder.buffer(item)
+   129	    }
+   130	
+   131	    /// Flush buffered data to the wire
+   132	    pub fn flush(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
+   133	        let span = tracing::trace_span!("FramedWrite::flush");
+   134	        let _e = span.enter();
+   135	
+   136	        loop {
+   137	            while !self.encoder.is_empty() {
+   138	                match self.encoder.next {
+   139	                    Some(Next::Data(ref mut frame)) => {
+   140	                        tracing::trace!(queued_data_frame = true);
+   141	                        let mut buf = (&mut self.encoder.buf).chain(frame.payload_mut());
+   142	                        ready!(poll_write_buf(Pin::new(&mut self.inner), cx, &mut buf))?
+   143	                    }
+   144	                    _ => {
+   145	                        tracing::trace!(queued_data_frame = false);
+   146	                        ready!(poll_write_buf(
+   147	                            Pin::new(&mut self.inner),
+   148	                            cx,
+   149	                            &mut self.encoder.buf
+   150	                        ))?
+   151	                    }
+   152	                };
+   153	            }
+   154	
+   155	            match self.encoder.unset_frame() {
+   156	                ControlFlow::Continue => (),
+   157	                ControlFlow::Break => break,
+   158	            }
+   159	        }
+   160	
+   278	    /// // additional 5 bytes.
+   279	    /// send_stream.reserve_capacity(100);
+   280	    /// # }
+   281	    /// ```
+   282	    ///
+   283	    /// See [Flow control](struct.SendStream.html#flow-control) for an overview
+   284	    /// of how send flow control works.
+   285	    pub fn reserve_capacity(&mut self, capacity: usize) {
+   286	        // TODO: Check for overflow
+   287	        self.inner.reserve_capacity(capacity as WindowSize)
+   288	    }
+   289	
+   290	    /// Returns the stream's current send capacity.
+   291	    ///
+   292	    /// This allows the caller to check the current amount of available capacity
+   265	        self.prioritize
+   266	            .send_data(frame, buffer, stream, counts, task)
+   267	    }
+   268	
+   269	    pub fn send_trailers<B>(
+   270	        &mut self,
+   271	        frame: frame::Headers,
+   272	        buffer: &mut Buffer<Frame<B>>,
+   273	        stream: &mut store::Ptr,
+   274	        counts: &mut Counts,
+   275	        task: &mut Option<Waker>,
+   276	    ) -> Result<(), UserError> {
+   277	        // TODO: Should this logic be moved into state.rs?
+   278	        if !stream.state.is_send_streaming() {
+   279	            return Err(UserError::UnexpectedFrameType);
+   280	        }
+   281	
+   282	        stream.state.send_close();
+   283	
+   284	        tracing::trace!("send_trailers -- queuing; frame={:?}", frame);
+   285	        self.prioritize
+   286	            .queue_frame(frame.into(), buffer, stream, task);
+   287	
+   288	        // Release any excess capacity
+   289	        self.prioritize.reserve_capacity(0, stream, counts);
+   290	
+   291	        Ok(())
+   292	    }
+   293	
+   294	    pub fn poll_complete<T, B>(
+   295	        &mut self,
+   835	impl fmt::Debug for PushPromiseFlag {
+   836	    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+   837	        util::debug_flags(fmt, self.0)
+   838	            .flag_if(self.is_end_headers(), "END_HEADERS")
+   839	            .flag_if(self.is_padded(), "PADDED")
+   840	            .finish()
+   841	    }
+   842	}
+   843	
+   844	// ===== HeaderBlock =====
+   845	
+   846	impl HeaderBlock {
+   847	    fn load(
+   848	        &mut self,
+   849	        src: &mut BytesMut,
+   850	        max_header_list_size: usize,
+   851	        decoder: &mut hpack::Decoder,
+   852	    ) -> Result<(), Error> {
+   853	        let mut reg = !self.fields.is_empty();
+   854	        let mut malformed = false;
+   855	        let mut headers_size = self.calculate_header_list_size();
+   856	
+   857	        macro_rules! set_pseudo {
+   858	            ($field:ident, $val:expr) => {{
+   859	                if reg {
+   860	                    tracing::trace!("load_hpack; header malformed -- pseudo not at head of block");
+   861	                    malformed = true;
+   862	                } else if self.pseudo.$field.is_some() {
+   863	                    tracing::trace!("load_hpack; header malformed -- repeated pseudo");
+   864	                    malformed = true;
+   865	                } else {
+   866	                    let __val = $val;
+   867	                    headers_size +=
+   868	                        decoded_header_size(stringify!($field).len() + 1, __val.as_str().len());
+   869	                    if headers_size < max_header_list_size {
+   870	                        self.pseudo.$field = Some(__val);
+   871	                    } else if !self.is_over_size {
+   872	                        tracing::trace!("load_hpack; header list size over max");
+   873	                        self.is_over_size = true;
+   874	                    }
+   875	                }
+   876	            }};
+   877	        }
+   878	
+   879	        let mut cursor = Cursor::new(src);
+   880	
+   881	        // If the header frame is malformed, we still have to continue decoding
+   882	        // the headers. A malformed header frame is a stream level error, but
+   883	        // the hpack state is connection level. In order to maintain correct
+   884	        // state for other streams, the hpack decoding process must complete.
+   885	        let res = decoder.decode(&mut cursor, |header| {
+   886	            use crate::hpack::Header::*;
+   887	
+   888	            match header {
+   889	                Field { name, value } => {
+   890	                    // Connection level header fields are not supported and must
+   891	                    // result in a protocol error.
+   892	
+   893	                    if name == header::CONNECTION
+   894	                        || name == header::TRANSFER_ENCODING
+   895	                        || name == header::UPGRADE
+   896	                        || name == "keep-alive"
+   897	                        || name == "proxy-connection"
+   898	                    {
+   899	                        tracing::trace!("load_hpack; connection level header");
+   900	                        malformed = true;
+   901	                    } else if name == header::TE && value != "trailers" {
+   902	                        tracing::trace!(
+   903	                            "load_hpack; TE header not set to trailers; val={:?}",
+   904	                            value
+   905	                        );
+   906	                        malformed = true;
+   907	                    } else {
+   908	                        reg = true;
+   909	
+   910	                        headers_size += decoded_header_size(name.as_str().len(), value.len());
+   911	                        if headers_size < max_header_list_size {
+   912	                            self.field_size +=
+   913	                                decoded_header_size(name.as_str().len(), value.len());
+   914	                            self.fields.append(name, value);
+   915	                        } else if !self.is_over_size {
+   916	                            tracing::trace!("load_hpack; header list size over max");
+   917	                            self.is_over_size = true;
+   918	                        }
+   919	                    }
+   920	                }
+   921	                Authority(v) => set_pseudo!(authority, v),
+   922	                Method(v) => set_pseudo!(method, v),
+   923	                Scheme(v) => set_pseudo!(scheme, v),
+   924	                Path(v) => set_pseudo!(path, v),
+   925	                Protocol(v) => set_pseudo!(protocol, v),
+   926	                Status(v) => set_pseudo!(status, v),
+   927	            }
+   928	        });
+   929	
+   930	        if let Err(e) = res {
+  1600	                headers,
+  1601	                version,
+  1602	                ..
+  1603	            },
+  1604	            _,
+  1605	        ) = request.into_parts();
+  1606	
+  1607	        let is_connect = method == Method::CONNECT;
+  1608	
+  1609	        // Build the set pseudo header set. All requests will include `method`
+  1610	        // and `path`.
+  1611	        let mut pseudo = Pseudo::request(method, uri, protocol);
+  1612	
+  1613	        if pseudo.scheme.is_none() {
+  1614	            // If the scheme is not set, then there are a two options.
+  1615	            //
+  1616	            // 1) Authority is not set. In this case, a request was issued with
+  1617	            //    a relative URI. This is permitted **only** when forwarding
+  1618	            //    HTTP 1.x requests. If the HTTP version is set to 2.0, then
+  1619	            //    this is an error.
+  1620	            //
+  1621	            // 2) Authority is set, then the HTTP method *must* be CONNECT.
+  1622	            //
+  1623	            // It is not possible to have a scheme but not an authority set (the
+  1624	            // `http` crate does not allow it).
+  1625	            //
+  1626	            if pseudo.authority.is_none() {
+  1627	                if version == Version::HTTP_2 {
+  1628	                    return Err(UserError::MissingUriSchemeAndAuthority.into());
+  1629	                } else {
+  1630	                    // This is acceptable as per the above comment. However,
+  1631	                    // HTTP/2 requires that a scheme is set. Since we are
+  1632	                    // forwarding an HTTP 1.1 request, the scheme is set to
+  1633	                    // "http".
+  1634	                    pseudo.set_scheme(uri::Scheme::HTTP);
+  1635	                }
+  1636	            } else if !is_connect {
+  1637	                // TODO: Error
+  1638	            }
+  1639	        }
+  1640	
+  1641	        // Create the HEADERS frame
+  1642	        let mut frame = Headers::new(id, pseudo, headers);
+  1643	
+  1644	        if end_of_stream {
+  1645	            frame.set_end_stream()
+  1646	        }
+  1647	
+  1648	        Ok(frame)
+  1649	    }
+  1650	}
+  1651	
+  1652	impl proto::Peer for Peer {
+  1653	    type Poll = Response<()>;
+  1654	
+  1655	    const NAME: &'static str = "Client";
+  1656	
+  1657	    fn r#dyn() -> proto::DynPeer {
+  1658	        proto::DynPeer::Client
+  1659	    }
+  1660	
+  1661	    /*
+  1662	    fn is_server() -> bool {
+  1663	        false
+  1664	    }
+  1665	    */
+  1666	
+  1667	    fn convert_poll_message(
+  1668	        pseudo: Pseudo,
+  1669	        fields: HeaderMap,
+  1670	        stream_id: StreamId,
+  1671	    ) -> Result<Self::Poll, Error> {
+  1672	        let mut b = Response::builder();
+  1673	
+  1674	        b = b.version(Version::HTTP_2);
+  1675	
+  1676	        if let Some(status) = pseudo.status {
+  1677	            b = b.status(status);
+  1678	        }
+  1679	
+  1680	        let mut response = match b.body(()) {
+  1681	            Ok(response) => response,
+  1682	            Err(_) => {
+  1683	                // TODO: Should there be more specialized handling for different
+  1684	                // kinds of errors
+  1685	                return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
+  1686	            }
+  1687	        };
+  1688	
+  1689	        *response.headers_mut() = fields;
+  1690	
+  1691	        Ok(response)
+  1692	    }
+  1693	}
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn data_padding() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let mut body = Vec::new();
+    body.push(5);
+    body.extend_from_slice(&[b'z'; 100][..]);
+    body.extend_from_slice(&[b'0'; 5][..]);
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "http://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(
+            frames::headers(1)
+                .response(200)
+                .field("content-length", 100),
+        )
+        .await;
+        srv.send_frame(frames::data(1, body).padded().eos()).await;
+    };
+    let h2 = async move {
+        let (mut client, conn) = client::handshake(io).await.expect("handshake");
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("http://example.com/")
+            .body(())
+            .unwrap();
+
+        // first request is allowed
+        let (response, _) = client.send_request(request, true).unwrap();
+        let fut = async move {
+            let resp = response.await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = resp.into_body();
+            let bytes = util::concat(body).await.unwrap();
+            assert_eq!(bytes.len(), 100);
+        };
+        join(async move { conn.await.expect("client") }, fut).await;
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn poll_capacity_after_send_data_and_reserve() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv
+            .assert_client_handshake_with_settings(frames::settings().initial_window_size(5))
+            .await;
+        assert_default_settings!(settings);
+        srv.recv_frame(frames::headers(1).request("POST", "https://www.example.com/"))
+            .await;
+        srv.send_frame(frames::headers(1).response(200)).await;
+        srv.recv_frame(frames::data(1, &b"abcde"[..])).await;
+        srv.send_frame(frames::window_update(1, 5)).await;
+        srv.recv_frame(frames::data(1, &b""[..]).eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://www.example.com/")
+            .body(())
+            .unwrap();
+
+        let (response, mut stream) = client.send_request(request, false).unwrap();
+
+        let response = h2.drive(response).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        stream.send_data("abcde".into(), false).unwrap();
+
+        stream.reserve_capacity(5);
+
+        // Initial window size was 5 so current capacity is 0 even if we just reserved.
+        assert_eq!(stream.capacity(), 0);
+
+        // This will panic if there is a bug causing h2 to return Ok(0) from poll_capacity.
+        let mut stream = h2.drive(util::wait_for_capacity(stream, 5)).await;
+
+        stream.send_data("".into(), true).unwrap();
+use crate::codec::Codec;
+use crate::frame::{self, Reason, StreamId};
+
+use bytes::Buf;
+use std::io;
+use std::task::{Context, Poll};
+use tokio::io::AsyncWrite;
+
+/// Manages our sending of GOAWAY frames.
+#[derive(Debug)]
+pub(super) struct GoAway {
+    /// Whether the connection should close now, or wait until idle.
+    close_now: bool,
+    /// Records if we've sent any GOAWAY before.
+    going_away: Option<GoingAway>,
+    /// Whether the user started the GOAWAY by calling `abrupt_shutdown`.
+    is_user_initiated: bool,
+    /// A GOAWAY frame that must be buffered in the Codec immediately.
+    pending: Option<frame::GoAway>,
+}
+
+/// Keeps a memory of any GOAWAY frames we've sent before.
+///
+/// This looks very similar to a `frame::GoAway`, but is a separate type. Why?
+/// Mostly for documentation purposes. This type is to record status. If it
+/// were a `frame::GoAway`, it might appear like we eventually wanted to
+/// serialize it. We **only** want to be able to look up these fields at a
+/// later time.
+#[derive(Debug)]
+pub(crate) struct GoingAway {
+    /// Stores the highest stream ID of a GOAWAY that has been sent.
+    ///
+    /// It's illegal to send a subsequent GOAWAY with a higher ID.
+    last_processed_id: StreamId,
+
+    /// Records the error code of any GOAWAY frame sent.
+    reason: Reason,
+}
+
+impl GoAway {
+    pub fn new() -> Self {
+        GoAway {
+            close_now: false,
+            going_away: None,
+            is_user_initiated: false,
+            pending: None,
+        }
+    }
+
+    /// Enqueue a GOAWAY frame to be written.
+    ///
+    /// The connection is expected to continue to run until idle.
+    pub fn go_away(&mut self, f: frame::GoAway) {
+        if let Some(ref going_away) = self.going_away {
+            assert!(
+                f.last_stream_id() <= going_away.last_processed_id,
+                "GOAWAY stream IDs shouldn't be higher; \
+                 last_processed_id = {:?}, f.last_stream_id() = {:?}",
+                going_away.last_processed_id,
+                f.last_stream_id(),
+            );
+        }
+
+        self.going_away = Some(GoingAway {
+            last_processed_id: f.last_stream_id(),
+            reason: f.reason(),
+        });
+        self.pending = Some(f);
+    }
+
+    pub fn go_away_now(&mut self, f: frame::GoAway) {
+        self.close_now = true;
+        if let Some(ref going_away) = self.going_away {
+            // Prevent sending the same GOAWAY twice.
+            if going_away.last_processed_id == f.last_stream_id() && going_away.reason == f.reason()
+            {
+                return;
+            }
+        }
+        self.go_away(f);
+    }
+
+    pub fn go_away_from_user(&mut self, f: frame::GoAway) {
+        self.is_user_initiated = true;
+        self.go_away_now(f);
+    }
+
+    /// Return if a GOAWAY has ever been scheduled.
+    pub fn is_going_away(&self) -> bool {
+        self.going_away.is_some()
+    }
+
+    pub fn is_user_initiated(&self) -> bool {
+        self.is_user_initiated
+    }
+
+    /// Returns the going away info, if any.
+    pub fn going_away(&self) -> Option<&GoingAway> {
+        self.going_away.as_ref()
+    }
+
+    /// Returns if the connection should close now, or wait until idle.
+    pub fn should_close_now(&self) -> bool {
+        self.pending.is_none() && self.close_now
+    }
+
+    /// Returns if the connection should be closed when idle.
+    pub fn should_close_on_idle(&self) -> bool {
+        !self.close_now
+            && self
+                .going_away
+                .as_ref()
+                .map(|g| g.last_processed_id != StreamId::MAX)
+                .unwrap_or(false)
+    }
+
+    /// Try to write a pending GOAWAY frame to the buffer.
+    ///
+    /// If a frame is written, the `Reason` of the GOAWAY is returned.
+    pub fn send_pending_go_away<T, B>(
+        &mut self,
+        cx: &mut Context,
+        dst: &mut Codec<T, B>,
+    ) -> Poll<Option<io::Result<Reason>>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        if let Some(frame) = self.pending.take() {
+            if !dst.poll_ready(cx)?.is_ready() {
+                self.pending = Some(frame);
+                return Poll::Pending;
+            }
+
+            let reason = frame.reason();
+            dst.buffer(frame.into()).expect("invalid GOAWAY frame");
+
+            return Poll::Ready(Some(Ok(reason)));
+        } else if self.should_close_now() {
+            return match self.going_away().map(|going_away| going_away.reason) {
+                Some(reason) => Poll::Ready(Some(Ok(reason))),
+                None => Poll::Ready(None),
+            };
+        }
+
+        Poll::Ready(None)
+    }
+}
+
+impl GoingAway {
+    pub(crate) fn reason(&self) -> Reason {
+        self.reason
+    }
+}
+use super::table::{Index, Table};
+use super::{huffman, Header};
+
+use bytes::{BufMut, BytesMut};
+use http::header::{HeaderName, HeaderValue};
+
+#[derive(Debug)]
+pub struct Encoder {
+    table: Table,
+    size_update: Option<SizeUpdate>,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum SizeUpdate {
+    One(usize),
+    Two(usize, usize), // min, max
+}
+
+impl Encoder {
+    pub fn new(max_size: usize, capacity: usize) -> Encoder {
+        Encoder {
+            table: Table::new(max_size, capacity),
+            size_update: None,
+        }
+    }
+
+    /// Queues a max size update.
+    ///
+    /// The next call to `encode` will include a dynamic size update frame.
+    pub fn update_max_size(&mut self, val: usize) {
+        match self.size_update {
+            Some(SizeUpdate::One(old)) => {
+                if val > old {
+                    if old > self.table.max_size() {
+                        self.size_update = Some(SizeUpdate::One(val));
+                    } else {
+                        self.size_update = Some(SizeUpdate::Two(old, val));
+                    }
+                } else {
+                    self.size_update = Some(SizeUpdate::One(val));
+                }
+            }
+            Some(SizeUpdate::Two(min, _)) => {
+                if val < min {
+                    self.size_update = Some(SizeUpdate::One(val));
+                } else {
+                    self.size_update = Some(SizeUpdate::Two(min, val));
+                }
+            }
+            None => {
+                if val != self.table.max_size() {
+                    // Don't bother writing a frame if the value already matches
+                    // the table's max size.
+                    self.size_update = Some(SizeUpdate::One(val));
+                }
+            }
+        }
+    }
+
+    /// Encode a set of headers into the provide buffer
+    pub fn encode<I>(&mut self, headers: I, dst: &mut BytesMut)
+    where
+        I: IntoIterator<Item = Header<Option<HeaderName>>>,
+    {
+        let span = tracing::trace_span!("hpack::encode");
+        let _e = span.enter();
+
+        self.encode_size_updates(dst);
+
+        let mut last_index = None;
+
+        for header in headers {
+            match header.reify() {
+                // The header has an associated name. In which case, try to
+                // index it in the table.
+                Ok(header) => {
+                    let index = self.table.index(header);
+                    self.encode_header(&index, dst);
+
+                    last_index = Some(index);
+                }
+                // The header does not have an associated name. This means that
+                // the name is the same as the previously yielded header. In
+                // which case, we skip table lookup and just use the same index
+                // as the previous entry.
+                Err(value) => {
+                    self.encode_header_without_name(
+                        last_index.as_ref().unwrap_or_else(|| {
+                            panic!("encoding header without name, but no previous index to use for name");
+                        }),
+                        &value,
+                        dst,
+                    );
+                }
+            }
+        }
+    }
+
+    fn encode_size_updates(&mut self, dst: &mut BytesMut) {
+        match self.size_update.take() {
+            Some(SizeUpdate::One(val)) => {
+                self.table.resize(val);
+                encode_size_update(val, dst);
+            }
+            Some(SizeUpdate::Two(min, max)) => {
+                self.table.resize(min);
+                self.table.resize(max);
+                encode_size_update(min, dst);
+                encode_size_update(max, dst);
+            }
+            None => {}
+        }
+    }
+
+    fn encode_header(&mut self, index: &Index, dst: &mut BytesMut) {
+        match *index {
+            Index::Indexed(idx, _) => {
+                encode_int(idx, 7, 0x80, dst);
+            }
+            Index::Name(idx, _) => {
+                let header = self.table.resolve(index);
+
+                encode_not_indexed(idx, header.value_slice(), header.is_sensitive(), dst);
+            }
+            Index::Inserted(_) => {
+                let header = self.table.resolve(index);
+
+                assert!(!header.is_sensitive());
+
+                dst.put_u8(0b0100_0000);
+
+                encode_str(header.name().as_slice(), dst);
+                encode_str(header.value_slice(), dst);
+            }
+            Index::InsertedValue(idx, _) => {
+                let header = self.table.resolve(index);
+
+                assert!(!header.is_sensitive());
+
+                encode_int(idx, 6, 0b0100_0000, dst);
+                encode_str(header.value_slice(), dst);
+            }
+            Index::NotIndexed(_) => {
+                let header = self.table.resolve(index);
+
+                encode_not_indexed2(
+                    header.name().as_slice(),
+                    header.value_slice(),
+                    header.is_sensitive(),
+                    dst,
+                );
+            }
+        }
+    }
+
+    fn encode_header_without_name(
+        &mut self,
+        last: &Index,
+        value: &HeaderValue,
+        dst: &mut BytesMut,
+    ) {
+        match *last {
+            Index::Indexed(..)
+            | Index::Name(..)
+            | Index::Inserted(..)
+            | Index::InsertedValue(..) => {
+                let idx = self.table.resolve_idx(last);
+
+                encode_not_indexed(idx, value.as_ref(), value.is_sensitive(), dst);
+            }
+            Index::NotIndexed(_) => {
+                let last = self.table.resolve(last);
+
+                encode_not_indexed2(
+                    last.name().as_slice(),
+                    value.as_ref(),
+                    value.is_sensitive(),
+                    dst,
+                );
+            }
+        }
+    }
+}
+
+impl Default for Encoder {
+    fn default() -> Encoder {
+        Encoder::new(4096, 0)
+    }
+}
+
+fn encode_size_update(val: usize, dst: &mut BytesMut) {
+    encode_int(val, 5, 0b0010_0000, dst)
+}
+
+fn encode_not_indexed(name: usize, value: &[u8], sensitive: bool, dst: &mut BytesMut) {
+    if sensitive {
+        encode_int(name, 4, 0b10000, dst);
+    } else {
+        encode_int(name, 4, 0, dst);
+    }
+
+    encode_str(value, dst);
+}
+
+fn encode_not_indexed2(name: &[u8], value: &[u8], sensitive: bool, dst: &mut BytesMut) {
+    if sensitive {
+        dst.put_u8(0b10000);
+    } else {
+        dst.put_u8(0);
+    }
+
+    encode_str(name, dst);
+    encode_str(value, dst);
+}
+
+fn encode_str(val: &[u8], dst: &mut BytesMut) {
+    if !val.is_empty() {
+        let idx = position(dst);
+
+        // Push a placeholder byte for the length header
+        dst.put_u8(0);
+
+        // Encode with huffman
+        huffman::encode(val, dst);
+
+        let huff_len = position(dst) - (idx + 1);
+
+        if encode_int_one_byte(huff_len, 7) {
+            // Write the string head
+            dst[idx] = 0x80 | huff_len as u8;
+        } else {
+            // Write the head to a placeholder
+            const PLACEHOLDER_LEN: usize = 8;
+            let mut buf = [0u8; PLACEHOLDER_LEN];
+
+            let head_len = {
+                let mut head_dst = &mut buf[..];
+                encode_int(huff_len, 7, 0x80, &mut head_dst);
+                PLACEHOLDER_LEN - head_dst.remaining_mut()
+            };
+
+            // This is just done to reserve space in the destination
+            dst.put_slice(&buf[1..head_len]);
+
+            // Shift the header forward
+use super::{header::BytesStr, huffman, Header};
+use crate::frame;
+
+use bytes::{Buf, Bytes, BytesMut};
+use http::header;
+use http::method::{self, Method};
+use http::status::{self, StatusCode};
+
+use std::cmp;
+use std::collections::VecDeque;
+use std::io::Cursor;
+use std::str::Utf8Error;
+
+/// Decodes headers using HPACK
+#[derive(Debug)]
+pub struct Decoder {
+    // Protocol indicated that the max table size will update
+    max_size_update: Option<usize>,
+    last_max_update: usize,
+    table: Table,
+    buffer: BytesMut,
+}
+
+/// Represents all errors that can be encountered while performing the decoding
+/// of an HPACK header set.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum DecoderError {
+    InvalidRepresentation,
+    InvalidIntegerPrefix,
+    InvalidTableIndex,
+    InvalidHuffmanCode,
+    InvalidUtf8,
+    InvalidStatusCode,
+    InvalidPseudoheader,
+    InvalidMaxDynamicSize,
+    IntegerOverflow,
+    NeedMore(NeedMore),
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum NeedMore {
+    UnexpectedEndOfStream,
+    IntegerUnderflow,
+    StringUnderflow,
+}
+
+enum Representation {
+    /// Indexed header field representation
+    ///
+    /// An indexed header field representation identifies an entry in either the
+    /// static table or the dynamic table (see Section 2.3).
+    ///
+    /// # Header encoding
+    ///
+    /// ```text
+    ///   0   1   2   3   4   5   6   7
+    /// +---+---+---+---+---+---+---+---+
+    /// | 1 |        Index (7+)         |
+    /// +---+---------------------------+
+    /// ```
+    Indexed,
+
+    /// Literal Header Field with Incremental Indexing
+    ///
+    /// A literal header field with incremental indexing representation results
+    /// in appending a header field to the decoded header list and inserting it
+    /// as a new entry into the dynamic table.
+    ///
+    /// # Header encoding
+    ///
+    /// ```text
+    ///   0   1   2   3   4   5   6   7
+    /// +---+---+---+---+---+---+---+---+
+    /// | 0 | 1 |      Index (6+)       |
+    /// +---+---+-----------------------+
+    /// | H |     Value Length (7+)     |
+    /// +---+---------------------------+
+    /// | Value String (Length octets)  |
+    /// +-------------------------------+
+    /// ```
+    LiteralWithIndexing,
+
+    /// Literal Header Field without Indexing
+    ///
+    /// A literal header field without indexing representation results in
+    /// appending a header field to the decoded header list without altering the
+    /// dynamic table.
+    ///
+    /// # Header encoding
+    ///
+    /// ```text
+    ///   0   1   2   3   4   5   6   7
+    /// +---+---+---+---+---+---+---+---+
+    /// | 0 | 0 | 0 | 0 |  Index (4+)   |
+    /// +---+---+-----------------------+
+    /// | H |     Value Length (7+)     |
+    /// +---+---------------------------+
+    /// | Value String (Length octets)  |
+    /// +-------------------------------+
+    /// ```
+    LiteralWithoutIndexing,
+
+    /// Literal Header Field Never Indexed
+    ///
+    /// A literal header field never-indexed representation results in appending
+    /// a header field to the decoded header list without altering the dynamic
+    /// table. Intermediaries MUST use the same representation for encoding this
+    /// header field.
+    ///
+    /// ```text
+    ///   0   1   2   3   4   5   6   7
+    /// +---+---+---+---+---+---+---+---+
+    /// | 0 | 0 | 0 | 1 |  Index (4+)   |
+    /// +---+---+-----------------------+
+    /// | H |     Value Length (7+)     |
+    /// +---+---------------------------+
+    /// | Value String (Length octets)  |
+    /// +-------------------------------+
+    /// ```
+    LiteralNeverIndexed,
+
+    /// Dynamic Table Size Update
+    ///
+    /// A dynamic table size update signals a change to the size of the dynamic
+    /// table.
+    ///
+    /// # Header encoding
+    ///
+    /// ```text
+    ///   0   1   2   3   4   5   6   7
+    /// +---+---+---+---+---+---+---+---+
+    /// | 0 | 0 | 1 |   Max size (5+)   |
+    /// +---+---------------------------+
+    /// ```
+    SizeUpdate,
+}
+
+#[derive(Debug)]
+struct Table {
+    entries: VecDeque<Header>,
+    size: usize,
+    max_size: usize,
+}
+
+struct StringMarker {
+    offset: usize,
+    len: usize,
+    string: Option<Bytes>,
+}
+
+// ===== impl Decoder =====
+
+impl Decoder {
+    /// Creates a new `Decoder` with all settings set to default values.
+    pub fn new(size: usize) -> Decoder {
+        Decoder {
+            max_size_update: None,
+            last_max_update: size,
+            table: Table::new(size),
+            buffer: BytesMut::with_capacity(4096),
+        }
+    }
+
+    /// Queues a potential size update
+    #[allow(dead_code)]
+    pub fn queue_size_update(&mut self, size: usize) {
+        let size = match self.max_size_update {
+            Some(v) => cmp::max(v, size),
+            None => size,
+        };
+
+        self.max_size_update = Some(size);
+    }
+
+    /// Decodes the headers found in the given buffer.
+    pub fn decode<F>(
+        &mut self,
+        src: &mut Cursor<&mut BytesMut>,
+        mut f: F,
+    ) -> Result<(), DecoderError>
+    where
+        F: FnMut(Header),
+    {
+        use self::Representation::*;
+
+        let mut can_resize = true;
+
+        if let Some(size) = self.max_size_update.take() {
+            self.last_max_update = size;
+        }
+
+        let span = tracing::trace_span!("hpack::decode");
+        let _e = span.enter();
+
+        tracing::trace!("decode");
+
+        while let Some(ty) = peek_u8(src) {
+            // At this point we are always at the beginning of the next block
+            // within the HPACK data. The type of the block can always be
+            // determined from the first byte.
+            match Representation::load(ty)? {
+                Indexed => {
+                    tracing::trace!(rem = src.remaining(), kind = %"Indexed");
+                    can_resize = false;
+                    let entry = self.decode_indexed(src)?;
+                    consume(src);
+                    f(entry);
+                }
+                LiteralWithIndexing => {
+                    tracing::trace!(rem = src.remaining(), kind = %"LiteralWithIndexing");

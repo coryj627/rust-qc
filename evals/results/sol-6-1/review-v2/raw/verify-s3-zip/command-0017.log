@@ -1,0 +1,378 @@
+            dir_info.number_of_files
+        };
+
+        if dir_info.disk_number != dir_info.disk_with_central_directory {
+            return unsupported_zip_error("Support for multi-disk files is not implemented");
+        }
+
+        if file_capacity.saturating_mul(size_of::<ZipFileData>()) > isize::MAX as usize {
+            return unsupported_zip_error("Oversized central directory");
+        }
+
+        let mut files = Vec::with_capacity(file_capacity);
+        reader.seek(SeekFrom::Start(dir_info.directory_start))?;
+        for _ in 0..dir_info.number_of_files {
+            let file = central_header_to_zip_file(reader, &dir_info)?;
+            files.push(file);
+        }
+
+        Ok(SharedBuilder {
+            files,
+            offset: dir_info.archive_offset,
+            dir_start: dir_info.directory_start,
+            config,
+        })
+    }
+
+    /// Returns the verification value and salt for the AES encryption of the file
+    ///
+    /// It fails if the file number is invalid.
+    ///
+    /// # Returns
+    ///
+    /// - None if the file is not encrypted with AES
+    #[cfg(feature = "aes-crypto")]
+    pub fn get_aes_verification_key_and_salt(
+        &mut self,
+        file_number: usize,
+    ) -> ZipResult<Option<AesInfo>> {
+        let (_, data) = self
+            .shared
+            .files
+            .get_index(file_number)
+            .ok_or(ZipError::FileNotFound)?;
+
+        let limit_reader = find_content(data, &mut self.reader)?;
+        match data.aes_mode {
+            None => Ok(None),
+            Some((aes_mode, _, _)) => {
+                let (verification_value, salt) =
+                    AesReader::new(limit_reader, aes_mode, data.compressed_size)
+                        .get_verification_value_and_salt()?;
+                let aes_info = AesInfo {
+                    aes_mode,
+                    verification_value,
+                    salt,
+                };
+                Ok(Some(aes_info))
+            }
+        }
+    }
+
+    /// Read a ZIP archive, collecting the files it contains.
+    ///
+    /// This uses the central directory record of the ZIP file, and ignores local file headers.
+    ///
+    /// A default [`Config`] is used.
+    pub fn new(reader: R) -> ZipResult<ZipArchive<R>> {
+        Self::with_config(Default::default(), reader)
+    }
+
+    /// Read a ZIP archive providing a read configuration, collecting the files it contains.
+    ///
+    /// This uses the central directory record of the ZIP file, and ignores local file headers.
+    pub fn with_config(config: Config, mut reader: R) -> ZipResult<ZipArchive<R>> {
+        let shared = Self::get_metadata(config, &mut reader)?;
+
+    end_exclusive: u64,
+    file_len: u64,
+) -> ZipResult<CentralDirectoryEndInfo> {
+    const EOCD_SIG_BYTES: [u8; mem::size_of::<Magic>()] =
+        Magic::CENTRAL_DIRECTORY_END_SIGNATURE.to_le_bytes();
+
+    const EOCD64_SIG_BYTES: [u8; mem::size_of::<Magic>()] =
+        Magic::ZIP64_CENTRAL_DIRECTORY_END_SIGNATURE.to_le_bytes();
+
+    const CDFH_SIG_BYTES: [u8; mem::size_of::<Magic>()] =
+        Magic::CENTRAL_DIRECTORY_HEADER_SIGNATURE.to_le_bytes();
+
+    // Instantiate the mandatory finder
+    let mut eocd_finder = MagicFinder::<Backwards<'static>>::new(&EOCD_SIG_BYTES, 0, end_exclusive);
+    let mut subfinder: Option<OptimisticMagicFinder<Forward<'static>>> = None;
+
+    // Keep the last errors for cases of improper EOCD instances.
+    let mut parsing_error = None;
+
+    while let Some(eocd_offset) = eocd_finder.next(reader)? {
+        // Attempt to parse the EOCD block
+        let eocd = match Zip32CentralDirectoryEnd::parse(reader) {
+            Ok(eocd) => eocd,
+            Err(e) => {
+                if parsing_error.is_none() {
+                    parsing_error = Some(e);
+                }
+                continue;
+            }
+        };
+
+        // ! Relaxed (inequality) due to garbage-after-comment Python files
+        // Consistency check: the EOCD comment must terminate before the end of file
+        if eocd.zip_file_comment.len() as u64 + eocd_offset + 22 > file_len {
+            parsing_error = Some(invalid!("Invalid EOCD comment length"));
+            continue;
+        }
+
+        let zip64_metadata = if eocd.may_be_zip64() {
+            fn try_read_eocd64_locator(
+                reader: &mut (impl Read + Seek),
+                eocd_offset: u64,
+            ) -> ZipResult<(u64, Zip64CentralDirectoryEndLocator)> {
+                if eocd_offset < mem::size_of::<Zip64CDELocatorBlock>() as u64 {
+                    return Err(invalid!("EOCD64 Locator does not fit in file"));
+                }
+
+                let locator64_offset = eocd_offset - mem::size_of::<Zip64CDELocatorBlock>() as u64;
+
+                reader.seek(io::SeekFrom::Start(locator64_offset))?;
+                Ok((
+                    locator64_offset,
+                    Zip64CentralDirectoryEndLocator::parse(reader)?,
+                ))
+            }
+
+            try_read_eocd64_locator(reader, eocd_offset).ok()
+        } else {
+            None
+        };
+
+        let Some((locator64_offset, locator64)) = zip64_metadata else {
+            // Branch out for zip32
+            let relative_cd_offset = eocd.central_directory_offset as u64;
+
+            // If the archive is empty, there is nothing more to be checked, the archive is correct.
+            if eocd.number_of_files == 0 {
+                return Ok(CentralDirectoryEndInfo {
+                    eocd: (eocd, eocd_offset).into(),
+                    eocd64: None,
+                    archive_offset: eocd_offset.saturating_sub(relative_cd_offset),
+                });
+            }
+
+            // Consistency check: the CD relative offset cannot be after the EOCD
+            if relative_cd_offset >= eocd_offset {
+                parsing_error = Some(invalid!("Invalid CDFH offset in EOCD"));
+                continue;
+            }
+
+            // Attempt to find the first CDFH
+            let subfinder = subfinder
+                .get_or_insert_with(OptimisticMagicFinder::new_empty)
+                .repurpose(
+                    &CDFH_SIG_BYTES,
+                    // The CDFH must be before the EOCD and after the relative offset,
+                    // because prepended junk can only move it forward.
+                    (relative_cd_offset, eocd_offset),
+                    match archive_offset {
+                        ArchiveOffset::Known(n) => {
+                            Some((relative_cd_offset.saturating_add(n).min(eocd_offset), true))
+                        }
+                        _ => Some((relative_cd_offset, false)),
+                    },
+                );
+
+            // Consistency check: find the first CDFH
+            if let Some(cd_offset) = subfinder.next(reader)? {
+                // The first CDFH will define the archive offset
+                let archive_offset = cd_offset - relative_cd_offset;
+
+                return Ok(CentralDirectoryEndInfo {
+                    eocd: (eocd, eocd_offset).into(),
+                    eocd64: None,
+                    archive_offset,
+                });
+            }
+
+            parsing_error = Some(invalid!("No CDFH found"));
+            continue;
+        };
+
+        // Consistency check: the EOCD64 offset must be before EOCD64 Locator offset */
+        if locator64.end_of_central_directory_offset >= locator64_offset {
+            parsing_error = Some(invalid!("Invalid EOCD64 Locator CD offset"));
+            continue;
+        }
+
+        if locator64.number_of_disks > 1 {
+            parsing_error = Some(invalid!("Multi-disk ZIP files are not supported"));
+            continue;
+        }
+
+        // This was hidden inside a function to collect errors in a single place.
+        // Once try blocks are stabilized, this can go away.
+        fn try_read_eocd64<R: Read + Seek>(
+            reader: &mut R,
+            locator64: &Zip64CentralDirectoryEndLocator,
+            expected_length: u64,
+        ) -> ZipResult<Zip64CentralDirectoryEnd> {
+            let z64 = Zip64CentralDirectoryEnd::parse(reader, expected_length)?;
+
+            // Consistency check: EOCD64 locator should agree with the EOCD64
+            if z64.disk_with_central_directory != locator64.disk_with_central_directory {
+                return Err(invalid!("Invalid EOCD64: inconsistency with Locator data"));
+            }
+
+            // Consistency check: the EOCD64 must have the expected length
+            if z64.record_size + 12 != expected_length {
+                return Err(invalid!("Invalid EOCD64: inconsistent length"));
+            }
+
+            Ok(z64)
+        }
+
+        // Attempt to find the EOCD64 with an initial guess
+        let subfinder = subfinder
+            .get_or_insert_with(OptimisticMagicFinder::new_empty)
+            .repurpose(
+                &EOCD64_SIG_BYTES,
+                (locator64.end_of_central_directory_offset, locator64_offset),
+                match archive_offset {
+                    ArchiveOffset::Known(n) => Some((
+                        locator64
+                            .end_of_central_directory_offset
+                            .saturating_add(n)
+                            .min(locator64_offset),
+                        true,
+                    )),
+                    _ => Some((locator64.end_of_central_directory_offset, false)),
+                },
+            );
+
+        // Consistency check: Find the EOCD64
+        let mut local_error = None;
+        while let Some(eocd64_offset) = subfinder.next(reader)? {
+use std::io::{Read, Seek, SeekFrom};
+
+use memchr::memmem::{Finder, FinderRev};
+
+use crate::result::ZipResult;
+
+pub trait FinderDirection<'a> {
+    fn new(needle: &'a [u8]) -> Self;
+    fn reset_cursor(bounds: (u64, u64), window_size: usize) -> u64;
+    fn scope_window(window: &[u8], mid_window_offset: usize) -> (&[u8], usize);
+
+    fn needle(&self) -> &[u8];
+    fn find(&self, haystack: &[u8]) -> Option<usize>;
+    fn move_cursor(&self, cursor: u64, bounds: (u64, u64), window_size: usize) -> Option<u64>;
+    fn move_scope(&self, offset: usize) -> usize;
+}
+
+pub struct Forward<'a>(Finder<'a>);
+impl<'a> FinderDirection<'a> for Forward<'a> {
+    fn new(needle: &'a [u8]) -> Self {
+        Self(Finder::new(needle))
+    }
+
+    fn reset_cursor((start_inclusive, _): (u64, u64), _: usize) -> u64 {
+        start_inclusive
+    }
+
+    fn scope_window(window: &[u8], mid_window_offset: usize) -> (&[u8], usize) {
+        (&window[mid_window_offset..], mid_window_offset)
+    }
+
+    fn find(&self, haystack: &[u8]) -> Option<usize> {
+        self.0.find(haystack)
+    }
+
+    fn needle(&self) -> &[u8] {
+        self.0.needle()
+    }
+
+    fn move_cursor(&self, cursor: u64, bounds: (u64, u64), window_size: usize) -> Option<u64> {
+        let magic_overlap = self.needle().len().saturating_sub(1) as u64;
+        let next = cursor.saturating_add(window_size as u64 - magic_overlap);
+
+        if next >= bounds.1 {
+            None
+        } else {
+            Some(next)
+        }
+    }
+
+    fn move_scope(&self, offset: usize) -> usize {
+        offset + self.needle().len()
+    }
+}
+
+pub struct Backwards<'a>(FinderRev<'a>);
+impl<'a> FinderDirection<'a> for Backwards<'a> {
+    fn new(needle: &'a [u8]) -> Self {
+        Self(FinderRev::new(needle))
+    }
+
+    fn reset_cursor(bounds: (u64, u64), window_size: usize) -> u64 {
+        bounds
+            .1
+            .saturating_sub(window_size as u64)
+            .clamp(bounds.0, bounds.1)
+    }
+
+    fn scope_window(window: &[u8], mid_window_offset: usize) -> (&[u8], usize) {
+        (&window[..mid_window_offset], 0)
+    }
+
+    fn find(&self, haystack: &[u8]) -> Option<usize> {
+        self.0.rfind(haystack)
+    }
+
+    fn needle(&self) -> &[u8] {
+        self.0.needle()
+    }
+
+    fn move_cursor(&self, cursor: u64, bounds: (u64, u64), window_size: usize) -> Option<u64> {
+        let magic_overlap = self.needle().len().saturating_sub(1) as u64;
+
+        if cursor <= bounds.0 {
+            None
+        } else {
+            Some(
+                cursor
+                    .saturating_add(magic_overlap)
+                    .saturating_sub(window_size as u64)
+                    .clamp(bounds.0, bounds.1),
+            )
+        }
+    }
+
+    fn move_scope(&self, offset: usize) -> usize {
+        offset
+    }
+}
+
+/// A utility for finding magic symbols from the end of a seekable reader.
+///
+/// Can be repurposed to recycle the internal buffer.
+pub struct MagicFinder<Direction> {
+    buffer: Box<[u8]>,
+    pub(self) finder: Direction,
+    cursor: u64,
+    mid_buffer_offset: Option<usize>,
+    bounds: (u64, u64),
+}
+/work/crate/src/aes.rs
+/work/crate/src/aes_ctr.rs
+/work/crate/src/compression.rs
+/work/crate/src/cp437.rs
+/work/crate/src/crc32.rs
+/work/crate/src/extra_fields/extended_timestamp.rs
+/work/crate/src/extra_fields/mod.rs
+/work/crate/src/extra_fields/ntfs.rs
+/work/crate/src/extra_fields/zipinfo_utf8.rs
+/work/crate/src/legacy/huffman.rs
+/work/crate/src/legacy/implode.rs
+/work/crate/src/legacy/mod.rs
+/work/crate/src/legacy/reduce.rs
+/work/crate/src/legacy/shrink.rs
+/work/crate/src/lib.rs
+/work/crate/src/path.rs
+/work/crate/src/read.rs
+/work/crate/src/read/config.rs
+/work/crate/src/read/magic_finder.rs
+/work/crate/src/read/stream.rs
+/work/crate/src/result.rs
+/work/crate/src/spec.rs
+/work/crate/src/types.rs
+/work/crate/src/unstable.rs
+/work/crate/src/write.rs
+/work/crate/src/zipcrypto.rs

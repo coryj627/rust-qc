@@ -1,0 +1,814 @@
+    ///
+    /// Returns whether a `MAX_DATA` frame should be enqueued as soon as possible.
+    /// This will only be the case if the window update would is significant
+    /// enough. As soon as a window update with a `MAX_DATA` frame has been
+    /// queued, the [`Recv::record_sent_max_stream_data`] function should be called to
+    /// suppress sending further updates until the window increases significantly
+    /// again.
+    pub(super) fn add_read_credits(&mut self, credits: u64) -> ShouldTransmit {
+        if credits > self.receive_window_shrink_debt {
+            let net_credits = credits - self.receive_window_shrink_debt;
+            self.local_max_data = self.local_max_data.saturating_add(net_credits);
+            self.receive_window_shrink_debt = 0;
+        } else {
+            self.receive_window_shrink_debt -= credits;
+        }
+
+        if self.local_max_data > VarInt::MAX.into_inner() {
+            return ShouldTransmit(false);
+        }
+
+        // Only announce a window update if it's significant enough
+        // to make it worthwhile sending a MAX_DATA frame.
+        // We use a fraction of the configured connection receive window to make
+        // the decision, to accommodate for connection using bigger windows requiring
+        // less updates.
+        let diff = self.local_max_data - self.sent_max_data.into_inner();
+        ShouldTransmit(diff >= (self.receive_window / 8))
+    }
+
+    /// Update counters for removal of a stream
+    pub(super) fn stream_freed(&mut self, id: StreamId, half: StreamHalf) {
+        if id.initiator() != self.side {
+            let fully_free = id.dir() == Dir::Uni
+                || match half {
+                    StreamHalf::Send => !self.recv.contains_key(&id),
+                    StreamHalf::Recv => !self.send.contains_key(&id),
+                };
+            if fully_free {
+                self.allocated_remote_count[id.dir() as usize] -= 1;
+                self.ensure_remote_streams(id.dir());
+            }
+        }
+        if half == StreamHalf::Send {
+            self.send_streams -= 1;
+        }
+    }
+
+    pub(super) fn stream_recv_freed(&mut self, id: StreamId, recv: StreamRecv) {
+        self.free_recv.push(recv.free(self.stream_receive_window));
+        self.stream_freed(id, StreamHalf::Recv);
+    }
+
+    pub(super) fn max_send_data(&self, id: StreamId) -> VarInt {
+        let remote = self.side != id.initiator();
+        match id.dir() {
+            Dir::Uni => self.initial_max_stream_data_uni,
+            // Remote/local appear reversed here because the transport parameters are named from
+            // the perspective of the peer.
+            Dir::Bi if remote => self.initial_max_stream_data_bidi_local,
+            Dir::Bi => self.initial_max_stream_data_bidi_remote,
+        }
+    }
+}
+
+#[inline]
+pub(super) fn get_or_insert_send(
+    max_data: VarInt,
+) -> impl Fn(&mut Option<Box<Send>>) -> &mut Box<Send> {
+    move |opt| opt.get_or_insert_with(|| Send::new(max_data))
+}
+
+#[inline]
+pub(super) fn get_or_insert_recv(
+    initial_max_data: u64,
+) -> impl FnMut(&mut Option<StreamRecv>) -> &mut Recv {
+    move |opt| {
+        *opt = opt.take().map(|s| match s {
+            StreamRecv::Free(recv) => StreamRecv::Open(recv),
+            s => s,
+        });
+        opt.get_or_insert_with(|| StreamRecv::Open(Recv::new(initial_max_data)))
+            .as_open_recv_mut()
+            .unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ReadableError, RecvStream, SendStream, TransportErrorCode, WriteError,
+        connection::State as ConnState, connection::Streams,
+    };
+    use bytes::Bytes;
+
+    fn make(side: Side) -> StreamsState {
+        StreamsState::new(
+            side,
+            128u32.into(),
+            128u32.into(),
+            1024 * 1024,
+            (1024 * 1024u32).into(),
+            (1024 * 1024u32).into(),
+        )
+    }
+
+    #[test]
+    fn trivial_flow_control() {
+        let mut client = StreamsState::new(
+            Side::Client,
+            1u32.into(),
+            1u32.into(),
+            1024 * 1024,
+            (1024 * 1024u32).into(),
+            (1024 * 1024u32).into(),
+        );
+        let id = StreamId::new(Side::Server, Dir::Uni, 0);
+        let initial_max = client.local_max_data;
+        const MESSAGE_SIZE: usize = 2048;
+        assert_eq!(
+            client
+                .received(
+                    frame::Stream {
+                        id,
+                        offset: 0,
+                        fin: true,
+                        data: Bytes::from_static(&[0; MESSAGE_SIZE]),
+                    },
+                    2048
+                )
+                .unwrap(),
+            ShouldTransmit(false)
+        );
+        assert_eq!(client.data_recvd, 2048);
+        assert_eq!(client.local_max_data - initial_max, 0);
+
+        let mut pending = Retransmits::default();
+        let mut recv = RecvStream {
+            id,
+            state: &mut client,
+            pending: &mut pending,
+        };
+
+        let mut chunks = recv.read(true).unwrap();
+        assert_eq!(
+            chunks.next(MESSAGE_SIZE).unwrap().unwrap().bytes.len(),
+            MESSAGE_SIZE
+        );
+        assert!(chunks.next(0).unwrap().is_none());
+        let should_transmit = chunks.finalize();
+        assert!(should_transmit.0);
+    /// Returns the next time at which `handle_timeout` should be called
+    ///
+    /// The value returned may change after:
+    /// - the application performed some I/O on the connection
+    /// - a call was made to `handle_event`
+    /// - a call to `poll_transmit` returned `Some`
+    /// - a call was made to `handle_timeout`
+    #[must_use]
+    pub fn poll_timeout(&mut self) -> Option<Instant> {
+        self.timers.next_timeout()
+    }
+
+    /// Returns application-facing events
+    ///
+    /// Connections should be polled for events after:
+    /// - a call was made to `handle_event`
+    /// - a call was made to `handle_timeout`
+    #[must_use]
+    pub fn poll(&mut self) -> Option<Event> {
+        if let Some(x) = self.events.pop_front() {
+            return Some(x);
+        }
+
+        if let Some(event) = self.streams.poll() {
+            return Some(Event::Stream(event));
+        }
+
+        if let Some(err) = self.error.take() {
+            return Some(Event::ConnectionLost { reason: err });
+        }
+
+        None
+    }
+
+    /// Return endpoint-facing events
+    #[must_use]
+    pub fn poll_endpoint_events(&mut self) -> Option<EndpointEvent> {
+        self.endpoint_events.pop_front().map(EndpointEvent)
+    }
+
+    /// Provide control over streams
+    #[must_use]
+    pub fn streams(&mut self) -> Streams<'_> {
+        Streams {
+            state: &mut self.streams,
+            conn_state: &self.state,
+        }
+    }
+
+    /// Provide control over streams
+    #[must_use]
+    pub fn recv_stream(&mut self, id: StreamId) -> RecvStream<'_> {
+        assert!(id.dir() == Dir::Bi || id.initiator() != self.side.side());
+        RecvStream {
+            id,
+            state: &mut self.streams,
+            pending: &mut self.spaces[SpaceId::Data].pending,
+        }
+    }
+
+    /// Provide control over streams
+    #[must_use]
+    pub fn send_stream(&mut self, id: StreamId) -> SendStream<'_> {
+        assert!(id.dir() == Dir::Bi || id.initiator() == self.side.side());
+        SendStream {
+            id,
+            state: &mut self.streams,
+            pending: &mut self.spaces[SpaceId::Data].pending,
+            conn_state: &self.state,
+        }
+    }
+
+    /// Returns packets to transmit
+    ///
+    /// Connections should be polled for transmit after:
+    /// - the application performed some I/O on the connection
+    /// - a call was made to `handle_event`
+    /// - a call was made to `handle_timeout`
+    ///
+    /// `max_datagrams` specifies how many datagrams can be returned inside a
+    /// single Transmit using GSO. This must be at least 1.
+    #[must_use]
+    pub fn poll_transmit(
+        &mut self,
+        now: Instant,
+        max_datagrams: usize,
+        buf: &mut Vec<u8>,
+    ) -> Option<Transmit> {
+        assert!(max_datagrams != 0);
+        let max_datagrams = match self.config.enable_segmentation_offload {
+            false => 1,
+            true => max_datagrams,
+        };
+
+        let mut num_datagrams = 0;
+        // Position in `buf` of the first byte of the current UDP datagram. When coalescing QUIC
+        // packets, this can be earlier than the start of the current QUIC packet.
+        let mut datagram_start = 0;
+        let mut segment_size = usize::from(self.path.current_mtu());
+
+        if let Some(challenge) = self.send_path_challenge(now, buf) {
+    pub fn rtt(&self) -> Duration {
+        self.path.rtt.get()
+    }
+
+    /// Current state of this connection's congestion controller, for debugging purposes
+    pub fn congestion_state(&self) -> &dyn Controller {
+        self.path.congestion.as_ref()
+    }
+
+    /// Resets path-specific settings.
+    ///
+    /// This will force-reset several subsystems related to a specific network path.
+    /// Currently this is the congestion controller, round-trip estimator, and the MTU
+    /// discovery.
+    ///
+    /// This is useful when it is known the underlying network path has changed and the old
+    /// state of these subsystems is no longer valid or optimal. In this case it might be
+    /// faster or reduce loss to settle on optimal values by restarting from the initial
+    /// configuration in the [`TransportConfig`].
+    pub fn path_changed(&mut self, now: Instant) {
+        self.path.reset(now, &self.config);
+    }
+
+    /// Modify the number of remotely initiated streams that may be concurrently open
+    ///
+    /// No streams may be opened by the peer unless fewer than `count` are already open. Large
+    /// `count`s increase both minimum and worst-case memory consumption.
+    pub fn set_max_concurrent_streams(&mut self, dir: Dir, count: VarInt) {
+        self.streams.set_max_concurrent(dir, count);
+        // If the limit was reduced, then a flow control update previously deemed insignificant may
+        // now be significant.
+        let pending = &mut self.spaces[SpaceId::Data].pending;
+        self.streams.queue_max_stream_id(pending);
+    }
+
+    /// Current number of remotely initiated streams that may be concurrently open
+    ///
+    /// If the target for this limit is reduced using [`set_max_concurrent_streams`](Self::set_max_concurrent_streams),
+    /// it will not change immediately, even if fewer streams are open. Instead, it will
+    /// decrement by one for each time a remotely initiated stream of matching directionality is closed.
+    pub fn max_concurrent_streams(&self, dir: Dir) -> u64 {
+        self.streams.max_concurrent(dir)
+    }
+
+    /// See [`TransportConfig::send_window()`]
+    pub fn set_send_window(&mut self, send_window: u64) {
+        self.streams.set_send_window(send_window);
+    }
+
+    /// See [`TransportConfig::receive_window()`]
+    pub fn set_receive_window(&mut self, receive_window: VarInt) {
+        if self.streams.set_receive_window(receive_window) {
+            self.spaces[SpaceId::Data].pending.max_data = true;
+        }
+    }
+
+    fn on_ack_received(
+        &mut self,
+        now: Instant,
+        space: SpaceId,
+        ack: frame::Ack,
+    ) -> Result<(), TransportError> {
+        if ack.largest >= self.spaces[space].next_packet_number {
+            return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
+        }
+        let new_largest = {
+//! Storing tokens sent from servers in NEW_TOKEN frames and using them in subsequent connections
+
+use std::{
+    collections::{HashMap, VecDeque, hash_map},
+    sync::{Arc, Mutex},
+};
+
+use bytes::Bytes;
+use lru_slab::LruSlab;
+use tracing::trace;
+
+use crate::token::TokenStore;
+
+/// `TokenStore` implementation that stores up to `N` tokens per server name for up to a
+/// limited number of server names, in-memory
+#[derive(Debug)]
+pub struct TokenMemoryCache(Mutex<State>);
+
+impl TokenMemoryCache {
+    /// Construct empty
+    pub fn new(max_server_names: u32, max_tokens_per_server: usize) -> Self {
+        Self(Mutex::new(State::new(
+            max_server_names,
+            max_tokens_per_server,
+        )))
+    }
+}
+
+impl TokenStore for TokenMemoryCache {
+    fn insert(&self, server_name: &str, token: Bytes) {
+        trace!(%server_name, "storing token");
+        self.0.lock().unwrap().store(server_name, token)
+    }
+
+    fn take(&self, server_name: &str) -> Option<Bytes> {
+        let token = self.0.lock().unwrap().take(server_name);
+        trace!(%server_name, found=%token.is_some(), "taking token");
+        token
+    }
+}
+
+/// Defaults to a maximum of 256 servers and 2 tokens per server
+impl Default for TokenMemoryCache {
+    fn default() -> Self {
+        Self::new(256, 2)
+    }
+}
+
+/// Lockable inner state of `TokenMemoryCache`
+#[derive(Debug)]
+struct State {
+    max_server_names: u32,
+    max_tokens_per_server: usize,
+    // map from server name to index in lru
+    lookup: HashMap<Arc<str>, u32>,
+    lru: LruSlab<CacheEntry>,
+}
+
+impl State {
+    fn new(max_server_names: u32, max_tokens_per_server: usize) -> Self {
+        Self {
+            max_server_names,
+            max_tokens_per_server,
+            lookup: HashMap::new(),
+            lru: LruSlab::default(),
+        }
+    }
+
+    fn store(&mut self, server_name: &str, token: Bytes) {
+        if self.max_server_names == 0 {
+            // the rest of this method assumes that we can always insert a new entry so long as
+            // we're willing to evict a pre-existing entry. thus, an entry limit of 0 is an edge
+            // case we must short-circuit on now.
+            return;
+        }
+        if self.max_tokens_per_server == 0 {
+            // similarly to above, the rest of this method assumes that we can always push a new
+            // token to a queue so long as we're willing to evict a pre-existing token, so we
+            // short-circuit on the edge case of a token limit of 0.
+            return;
+        }
+
+        let server_name = Arc::<str>::from(server_name);
+        match self.lookup.entry(server_name.clone()) {
+            hash_map::Entry::Occupied(hmap_entry) => {
+                // key already exists, push the new token to its token queue
+                let tokens = &mut self.lru.get_mut(*hmap_entry.get()).tokens;
+                if tokens.len() >= self.max_tokens_per_server {
+                    debug_assert!(tokens.len() == self.max_tokens_per_server);
+                    tokens.pop_front().unwrap();
+                }
+                tokens.push_back(token);
+            }
+            hash_map::Entry::Vacant(hmap_entry) => {
+                // key does not yet exist, create a new one, evicting the oldest if necessary
+                let removed_key = if self.lru.len() >= self.max_server_names {
+                    // unwrap safety: max_server_names is > 0, so there's at least one entry, so
+                    //                lru() is some
+                    Some(self.lru.remove(self.lru.lru().unwrap()).server_name)
+                } else {
+                    None
+                };
+
+                hmap_entry.insert(self.lru.insert(CacheEntry::new(server_name, token)));
+
+                // for borrowing reasons, we must defer removing the evicted hmap entry to here
+                if let Some(removed_slot) = removed_key {
+                    let removed = self.lookup.remove(&removed_slot);
+                    debug_assert!(removed.is_some());
+                }
+            }
+        };
+    }
+
+    fn take(&mut self, server_name: &str) -> Option<Bytes> {
+        let slab_key = *self.lookup.get(server_name)?;
+
+        // pop from entry's token queue
+        let entry = self.lru.get_mut(slab_key);
+        // unwrap safety: we never leave tokens empty
+        let token = entry.tokens.pop_front().unwrap();
+
+        if entry.tokens.is_empty() {
+            // token stack emptied, remove entry
+            self.lru.remove(slab_key);
+            self.lookup.remove(server_name);
+        }
+
+        Some(token)
+    }
+}
+
+/// Cache entry within `TokenMemoryCache`'s LRU slab
+#[derive(Debug)]
+struct CacheEntry {
+    server_name: Arc<str>,
+    // invariant: tokens is never empty
+    tokens: VecDeque<Bytes>,
+}
+
+impl CacheEntry {
+    /// Construct with a single token
+    fn new(server_name: Arc<str>, token: Bytes) -> Self {
+        let mut tokens = VecDeque::new();
+        tokens.push_back(token);
+        Self {
+            server_name,
+            tokens,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use super::*;
+    use rand::prelude::*;
+    use rand_pcg::Pcg32;
+
+    fn new_rng() -> impl Rng {
+        Pcg32::from_seed(0xdeadbeefdeadbeefdeadbeefdeadbeefu128.to_le_bytes())
+    }
+
+    #[test]
+    fn cache_test() {
+        let mut rng = new_rng();
+        const N: usize = 2;
+
+        for _ in 0..10 {
+            let mut cache_1: Vec<(u32, VecDeque<Bytes>)> = Vec::new(); // keep it sorted oldest to newest
+            let cache_2 = TokenMemoryCache::new(20, 2);
+
+            for i in 0..200 {
+                let server_name = rng.random::<u32>() % 10;
+                if rng.random_bool(0.666) {
+                    // store
+                    let token = Bytes::from(vec![i]);
+                    println!("STORE {server_name} {token:?}");
+                    if let Some((j, _)) = cache_1
+                        .iter()
+                        .enumerate()
+                        .find(|&(_, &(server_name_2, _))| server_name_2 == server_name)
+                    {
+                        let (_, mut queue) = cache_1.remove(j);
+                        queue.push_back(token.clone());
+                        if queue.len() > N {
+                            queue.pop_front();
+                        }
+                        cache_1.push((server_name, queue));
+                    } else {
+                        let mut queue = VecDeque::new();
+                        queue.push_back(token.clone());
+                        cache_1.push((server_name, queue));
+                        if cache_1.len() > 20 {
+                            cache_1.remove(0);
+                        }
+                    }
+                    cache_2.insert(&server_name.to_string(), token);
+                } else {
+                    // take
+                    println!("TAKE {server_name}");
+                    let expecting = cache_1
+                        .iter()
+                        .enumerate()
+                        .find(|&(_, &(server_name_2, _))| server_name_2 == server_name)
+                        .map(|(j, _)| j)
+                        .map(|j| {
+                            let (_, mut queue) = cache_1.remove(j);
+                            let token = queue.pop_front().unwrap();
+                            if !queue.is_empty() {
+                                cache_1.push((server_name, queue));
+                            }
+                            token
+                        });
+                    println!("EXPECTING {expecting:?}");
+                    assert_eq!(cache_2.take(&server_name.to_string()), expecting);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_max_server_names() {
+        // test that this edge case doesn't panic
+        let cache = TokenMemoryCache::new(0, 2);
+        for i in 0..10 {
+            cache.insert(&i.to_string(), Bytes::from(vec![i]));
+            for j in 0..10 {
+                assert!(cache.take(&j.to_string()).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn zero_queue_length() {
+        // test that this edge case doesn't panic
+        let cache = TokenMemoryCache::new(256, 0);
+        for i in 0..10 {
+            cache.insert(&i.to_string(), Bytes::from(vec![i]));
+            for j in 0..10 {
+                assert!(cache.take(&j.to_string()).is_none());
+            }
+        }
+    }
+}
+use bytes::Bytes;
+use thiserror::Error;
+
+use crate::{VarInt, connection::send_buffer::SendBuffer, frame};
+
+#[derive(Debug)]
+pub(super) struct Send {
+    pub(super) max_data: u64,
+    pub(super) state: SendState,
+    pub(super) pending: SendBuffer,
+    pub(super) priority: i32,
+    /// Whether a frame containing a FIN bit must be transmitted, even if we don't have any new data
+    pub(super) fin_pending: bool,
+    /// Whether this stream is in the `connection_blocked` list of `Streams`
+    pub(super) connection_blocked: bool,
+    /// The reason the peer wants us to stop, if `STOP_SENDING` was received
+    pub(super) stop_reason: Option<VarInt>,
+}
+
+impl Send {
+    pub(super) fn new(max_data: VarInt) -> Box<Self> {
+        Box::new(Self {
+            max_data: max_data.into(),
+            state: SendState::Ready,
+            pending: SendBuffer::new(),
+            priority: 0,
+            fin_pending: false,
+            connection_blocked: false,
+            stop_reason: None,
+        })
+    }
+
+    /// Whether the stream has been reset
+    pub(super) fn is_reset(&self) -> bool {
+        matches!(self.state, SendState::ResetSent)
+    }
+
+    pub(super) fn finish(&mut self) -> Result<(), FinishError> {
+        if let Some(error_code) = self.stop_reason {
+            Err(FinishError::Stopped(error_code))
+        } else if self.state == SendState::Ready {
+            self.state = SendState::DataSent {
+                finish_acked: false,
+            };
+            self.fin_pending = true;
+            Ok(())
+        } else {
+            Err(FinishError::ClosedStream)
+        }
+    }
+
+    pub(super) fn write<S: BytesSource>(
+        &mut self,
+        source: &mut S,
+        limit: u64,
+    ) -> Result<Written, WriteError> {
+        if !self.is_writable() {
+            return Err(WriteError::ClosedStream);
+        }
+        if let Some(error_code) = self.stop_reason {
+            return Err(WriteError::Stopped(error_code));
+        }
+        let budget = self.max_data - self.pending.offset();
+        if budget == 0 {
+            return Err(WriteError::Blocked);
+        }
+        let mut limit = limit.min(budget) as usize;
+
+        let mut result = Written::default();
+        loop {
+            let (chunk, chunks_consumed) = source.pop_chunk(limit);
+            result.chunks += chunks_consumed;
+            result.bytes += chunk.len();
+
+            if chunk.is_empty() {
+                break;
+            }
+
+            limit -= chunk.len();
+            self.pending.write(chunk);
+        }
+
+        Ok(result)
+    }
+
+    /// Update stream state due to a reset sent by the local application
+    pub(super) fn reset(&mut self) {
+        use SendState::*;
+        if let DataSent { .. } | Ready = self.state {
+            self.state = ResetSent;
+        }
+    }
+
+    /// Handle STOP_SENDING
+    ///
+    /// Returns true if the stream was stopped due to this frame, and false
+    /// if it had been stopped before
+    pub(super) fn try_stop(&mut self, error_code: VarInt) -> bool {
+        if self.stop_reason.is_none() {
+            self.stop_reason = Some(error_code);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns whether the stream has been finished and all data has been acknowledged by the peer
+    pub(super) fn ack(&mut self, frame: frame::StreamMeta) -> bool {
+        self.pending.ack(frame.offsets);
+        match self.state {
+            SendState::DataSent {
+                ref mut finish_acked,
+            } => {
+                *finish_acked |= frame.fin;
+                *finish_acked && self.pending.is_fully_acked()
+            }
+            _ => false,
+        }
+    }
+
+    /// Handle increase to stream-level flow control limit
+    ///
+    /// Returns whether the stream was unblocked
+    pub(super) fn increase_max_data(&mut self, offset: u64) -> bool {
+        if offset <= self.max_data || self.state != SendState::Ready {
+            return false;
+        }
+        let was_blocked = self.pending.offset() == self.max_data;
+        self.max_data = offset;
+        was_blocked
+    }
+
+    pub(super) fn offset(&self) -> u64 {
+        self.pending.offset()
+    }
+
+    pub(super) fn is_pending(&self) -> bool {
+        self.pending.has_unsent_data() || self.fin_pending
+    }
+
+    pub(super) fn is_writable(&self) -> bool {
+        matches!(self.state, SendState::Ready)
+    }
+}
+
+/// A [`BytesSource`] implementation for `&'a mut [Bytes]`
+///
+/// The type allows to dequeue [`Bytes`] chunks from an array of chunks, up to
+/// a configured limit.
+pub(crate) struct BytesArray<'a> {
+    /// The wrapped slice of `Bytes`
+    chunks: &'a mut [Bytes],
+    /// The amount of chunks consumed from this source
+    consumed: usize,
+}
+
+impl<'a> BytesArray<'a> {
+    pub(crate) fn from_chunks(chunks: &'a mut [Bytes]) -> Self {
+        Self {
+            chunks,
+            consumed: 0,
+        }
+    }
+}
+
+impl BytesSource for BytesArray<'_> {
+    fn pop_chunk(&mut self, limit: usize) -> (Bytes, usize) {
+        // The loop exists to skip empty chunks while still marking them as
+        // consumed
+        let mut chunks_consumed = 0;
+
+        while self.consumed < self.chunks.len() {
+            let chunk = &mut self.chunks[self.consumed];
+
+            if chunk.len() <= limit {
+                let chunk = std::mem::take(chunk);
+                self.consumed += 1;
+                chunks_consumed += 1;
+                if chunk.is_empty() {
+                    continue;
+                }
+                return (chunk, chunks_consumed);
+            } else if limit > 0 {
+                let chunk = chunk.split_to(limit);
+                return (chunk, chunks_consumed);
+            } else {
+                break;
+            }
+        }
+
+        (Bytes::new(), chunks_consumed)
+    }
+}
+
+/// A [`BytesSource`] implementation for `&[u8]`
+///
+/// The type allows to dequeue a single [`Bytes`] chunk, which will be lazily
+/// created from a reference. This allows to defer the allocation until it is
+/// known how much data needs to be copied.
+pub(crate) struct ByteSlice<'a> {
+    /// The wrapped byte slice
+    data: &'a [u8],
+}
+
+impl<'a> ByteSlice<'a> {
+    pub(crate) fn from_slice(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+}
+
+impl BytesSource for ByteSlice<'_> {
+    fn pop_chunk(&mut self, limit: usize) -> (Bytes, usize) {
+        let limit = limit.min(self.data.len());
+        if limit == 0 {
+            return (Bytes::new(), 0);
+        }
+
+        let chunk = Bytes::from(self.data[..limit].to_owned());
+        self.data = &self.data[chunk.len()..];
+
+        let chunks_consumed = usize::from(self.data.is_empty());
+        (chunk, chunks_consumed)
+    }
+}
+
+/// A source of one or more buffers which can be converted into `Bytes` buffers on demand
+///
+/// The purpose of this data type is to defer conversion as long as possible,
+/// so that no heap allocation is required in case no data is writable.
+pub(super) trait BytesSource {
+    /// Returns the next chunk from the source of owned chunks.
+    ///
+    /// This method will consume parts of the source.
+    /// Calling it will yield `Bytes` elements up to the configured `limit`.
+    ///
+    /// The method returns a tuple:
+    /// - The first item is the yielded `Bytes` element. The element will be
+    ///   empty if the limit is zero or no more data is available.
+    /// - The second item returns how many complete chunks inside the source had
+    ///   had been consumed. This can be less than 1, if a chunk inside the
+    ///   source had been truncated in order to adhere to the limit. It can also
+    ///   be more than 1, if zero-length chunks had been skipped.
+    fn pop_chunk(&mut self, limit: usize) -> (Bytes, usize);
+}
+
+/// Indicates how many bytes and chunks had been transferred in a write operation
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub struct Written {
+    /// The amount of bytes which had been written
+    pub bytes: usize,

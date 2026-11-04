@@ -1,0 +1,99 @@
+from pathlib import Path
+import json
+
+command = 'cd /work/tmp/zip-controls && cargo test --locked --all-features --test negative_controls -- --nocapture'
+def refutation(test, evidence, refs):
+    return {
+        'method': 'ran',
+        'evidence': evidence + ' Public-API probe: ' + test + ' in /work/prepared/evidence/negative_controls.rs; result recorded in /work/prepared/evidence/probes.log. Source guards were also read; numbered excerpts are in /work/prepared/evidence/source-excerpts.txt.',
+        'commands': [command],
+        'source_refs': refs,
+    }
+
+controls = {
+    'project': 'zip',
+    'decoys': [
+        {
+            'id': 'decoy-1',
+            'kind': 'wrong-behavior',
+            'summary': 'Reading a valid nonempty ZIP entry into an empty buffer returns InvalidData before EOF: Crc32Reader treats the zero-byte result as EOF and compares the unfinished CRC against the full-entry checksum. A caller that issues an empty read before or between data reads therefore cannot read an otherwise valid entry.',
+            'location': ['src/crc32.rs:49'],
+            'match_rule': 'The report must identify an empty destination buffer passed to ZipFile::read before actual entry EOF as causing premature CRC validation and an InvalidData error for valid data.',
+            'refutation': refutation(
+                'decoy_1_zero_length_read_does_not_validate_partial_crc',
+                'Crc32Reader::read checks a mismatch only when count == 0 AND !buf.is_empty(). Thus an empty read cannot trigger this checksum error, even with an unfinished CRC. The probe read a valid Stored entry containing 1234 into an empty buffer both before data and after reading 12; both returned Ok(0), and the remaining 34 and EOF were read successfully. A separate changed-byte copy returned InvalidData on a nonempty EOF read, confirming checksum checking remained enabled.',
+                ['src/crc32.rs:44-54', 'src/read.rs:199-205', 'src/read.rs:436-445', 'src/read.rs:1868-1871'],
+            ),
+        },
+        {
+            'id': 'decoy-2',
+            'kind': 'wrong-behavior',
+            'summary': 'DateTime::from_date_and_time rejects the valid leap day 2000-02-29 because its leap-year calculation uses divisibility by 25 instead of 100. This makes timestamps from that day impossible to supply to FileOptions even though 2000 is inside the supported DOS year range.',
+            'location': ['src/types.rs:328'],
+            'match_rule': 'The report must identify rejection of 2000-02-29 by the public DateTime constructor due to the optimized divisibility-by-25 leap-year test, with consequent inability to write that timestamp.',
+            'refutation': refutation(
+                'decoy_2_gregorian_century_leap_days',
+                'The full expression is year % 4 == 0 && (year % 25 != 0 || year % 16 == 0). Under the divisibility-by-4 prerequisite, divisibility by both 25 and 16 means divisibility by 400. For 2000, the %16 branch is true, so February has 29 days. The probe successfully constructed 2000-02-29 12:34:56 and roundtripped it through a written archive. It also confirmed rejection of 2100-02-29 and acceptance of 2024-02-29.',
+                ['src/types.rs:319-351', 'src/types.rs:293-307'],
+            ),
+        },
+    ],
+    'false_findings': [
+        {
+            'id': 'false-1',
+            'title': 'Starting a duplicate filename silently replaces the original entry',
+            'location': 'src/write.rs:1069',
+            'body': 'When start_file is called twice with the same filename, insert_file_data uses IndexMap::insert with that name. The second call replaces the first entry metadata and succeeds instead of reporting the documented duplicate-name error. Finishing the archive then makes the original payload inaccessible by name, so an accidental duplicate silently loses a previously written file.',
+            'refutation': refutation(
+                'false_1_duplicate_name_rejected_without_replacing_original',
+                'insert_file_data checks self.files.contains_key(&file.file_name) and returns InvalidArchive before reaching insert. start_entry propagates that error before writing the new local header. The probe wrote original under same.txt, received InvalidArchive for a second start_file(same.txt), then successfully added next.txt. Reopening yielded exactly two entries, with original and next payloads intact.',
+                ['src/write.rs:1064-1070', 'src/write.rs:1012-1019', 'src/write.rs:1183-1203'],
+            ),
+        },
+        {
+            'id': 'false-2',
+            'title': 'Appending to an archive drops its existing archive comment',
+            'location': 'src/write.rs:639',
+            'body': 'Opening an existing archive with ZipWriter::new_append and adding a file does not carry the existing archive-level comment into the writer state. When finish rebuilds the end-of-central-directory record, it emits an empty comment unless the caller sets it again. This silently strips comments during an ordinary append operation, including raw comments containing non-UTF-8 bytes.',
+            'refutation': refutation(
+                'false_2_append_preserves_non_utf8_comment',
+                'new_append delegates to new_append_with_config, whose writer initializer explicitly moves shared.comment into comment. write_central_and_footer then assigns self.comment.clone() to zip_file_comment in the footer; no text conversion is involved. The probe wrote the raw bytes ff 00 41 80 as the comment, appended an entry without resetting it, and checked those exact bytes both in the append writer and after finish/reopen. Both entries were retained.',
+                ['src/write.rs:628-649', 'src/write.rs:1598-1609', 'src/read.rs:971-974'],
+            ),
+        },
+        {
+            'id': 'false-3',
+            'title': 'SeekFrom::End on a stored entry uses the end of the entire archive',
+            'location': 'src/read.rs:284',
+            'body': 'A ZipFileSeek returned by by_name_seek for a Stored entry forwards SeekFrom::End to the archive reader without translating it to the entry extent. For an archive containing multiple files, seeking to End(-2) on the first file therefore selects bytes near the archive footer rather than that file\'s last two bytes. Applications that read entry tails through the seekable API receive unrelated archive data.',
+            'refutation': refutation(
+                'false_3_seek_from_end_is_relative_to_entry',
+                'find_content_seek seeks to the entry data and constructs SeekableTake with the entry compressed_size (the payload length for Stored). SeekableTake converts End(offset) using self.length.checked_add_signed(offset), then seeks with Start(inner_starting_offset + clamped_offset), returning an entry-relative position. Read is limited to length - current_offset. In a two-entry archive, End(-2) on the five-byte first entry returned 3 and read exactly DE; End(0) returned 5 and EOF. Seeking back to Start(0) returned only ABCDE.',
+                ['src/read.rs:342-351', 'src/read.rs:268-311', 'src/read.rs:1087-1107', 'src/read.rs:1894-1898'],
+            ),
+        },
+        {
+            'id': 'false-4',
+            'title': 'Raw copying a normal ZipFile writes decompressed bytes with Deflated metadata',
+            'location': 'src/write.rs:1336',
+            'body': 'Passing a Deflated ZipFile obtained from ZipArchive::by_name to raw_copy_file_rename copies through that file\'s transparently decompressing Read implementation. The destination retains the source compression method, CRC and compressed-size metadata but receives uncompressed payload bytes. The copy returns success yet the renamed destination entry fails to decompress when reopened.',
+            'refutation': refutation(
+                'false_4_raw_copy_uses_compressed_bytes_from_normal_zipfile',
+                'The io::copy source is file.take_raw_reader(), not the ZipFile Read implementation. take_raw_reader consumes the current reader stack via into_inner, recovering the underlying limited raw archive reader. The probe passed an ordinary by_name Deflated ZipFile and renamed it to a longer filename. Source and destination compressed bytes were identical; the destination kept Deflated, the original CRC and compressed size, and read_to_end successfully reproduced the original payload.',
+                ['src/write.rs:1311-1337', 'src/read.rs:1560-1562', 'src/read.rs:233-240', 'src/read.rs:162-170'],
+            ),
+        },
+        {
+            'id': 'false-5',
+            'title': 'Directory entries inherit Deflated without an encoded empty stream',
+            'location': 'src/write.rs:1450',
+            'body': 'Calling add_directory with FileOptions configured for Deflated writes a directory header with that method, then clears writing_to_file without emitting or finishing an empty deflate stream. The resulting zero-byte compressed payload is not a valid Deflated entry, so reopening the archive and reading that directory returns a decompression error. Reusing ordinary file options to add directory entries therefore creates unreadable directories.',
+            'refutation': refutation(
+                'false_5_directory_forces_stored_method',
+                'add_directory unconditionally sets options.compression_method = Stored before calling start_entry, so the directory header cannot inherit Deflated from the supplied options. The probe supplied Deflated options to add_directory(folder), then added a deflated child. Reopening found folder/ to be a Stored directory with compressed and uncompressed sizes both zero; read_to_end returned Ok(0), and the child payload roundtripped.',
+                ['src/write.rs:1425-1453'],
+            ),
+        },
+    ],
+}
+Path('/work/prepared/controls.json').write_text(json.dumps(controls, indent=2) + '\n')

@@ -1,0 +1,78 @@
+import json
+from pathlib import Path
+
+run = 'cd /work/tmp/moka-control-probe && cargo test --offline --locked --features sync,future --lib prepared_control_probes -- --nocapture --test-threads=1 > /work/prepared/evidence/probe-run.log 2>&1'
+def ref(evidence, refs):
+    return {'method': 'ran', 'evidence': evidence, 'commands': [run], 'source_refs': refs}
+
+controls = {
+    'project': 'moka',
+    'decoys': [
+        {
+            'id': 'decoy-1', 'kind': 'wrong-behavior',
+            'summary': 'sync::Cache::new(0) still inserts values into the backing map and only enforces the zero capacity during maintenance, so a get immediately after insert can return the inserted value.',
+            'location': ['src/sync/cache.rs:1487'],
+            'match_rule': 'Identify a zero-capacity sync::Cache, an ordinary insert followed by a get before maintenance, and assert that the inserted value is temporarily retrievable because capacity enforcement is deferred.',
+            'refutation': ref(
+                'Passed decoy_1_zero_capacity_never_exposes_insert in evidence/control_probes.rs (see evidence/probe-run.log). After Cache::new(0).insert("key", 7), get is None, contains_key is false, and iteration is empty before maintenance; after maintenance entry_count is zero. BaseCache::is_map_disabled is exactly max_capacity == Some(0) at src/sync/base_cache.rs:98. insert_with_hash returns immediately on that condition at src/sync/cache.rs:1483, before modifying the map or scheduling an upsert. This is an unconditional guard for this trigger, independent of ordinary positive-capacity eviction timing.',
+                ['src/sync/base_cache.rs:98', 'src/sync/cache.rs:1482', 'src/sync/cache.rs:1483', 'src/sync/cache.rs:1901'])
+        },
+        {
+            'id': 'decoy-2', 'kind': 'wrong-behavior',
+            'summary': 'future::Cache::try_get_with retains a completed Err in its per-key waiter map. After one failed call has returned, a later call for the same key and error type reuses that error without polling its new initializer, preventing recovery from a transient initialization failure.',
+            'location': ['src/future/value_initializer.rs:251'],
+            'match_rule': 'Identify a fully completed failed future::Cache::try_get_with followed by a sequential call with the same key and error type, and assert that the retained error prevents the second initializer from running.',
+            'refutation': ref(
+                'Passed decoy_2_failed_initializer_is_not_cached. The first try_get_with returns Err("temporary") and leaves get returning None; a second call with the same key and the same &str error type executes its initializer, returns Ok(42), and makes 42 retrievable. The Err branch at src/future/value_initializer.rs:249 calls WaiterGuard::set_waiter_value. That method publishes the result to existing waiters and removes the waiter-map entry at lines 89-93. Only the Ok branch at line 242 inserts a cached value. Consequently a completed error is not retained for subsequent calls.',
+                ['src/future/value_initializer.rs:89', 'src/future/value_initializer.rs:242', 'src/future/value_initializer.rs:249', 'src/future/value_initializer.rs:556'])
+        }
+    ],
+    'false_findings': [
+        {
+            'id': 'false-1',
+            'title': 'invalidate_all exposes older cached values until maintenance runs',
+            'location': 'src/sync/base_cache.rs:406',
+            'body': 'In sync::Cache, invalidate_all only records valid_after and leaves the hash-table entries in place. For a previously inserted entry whose last-modified time is strictly earlier than that cutoff, a get or contains_key immediately after invalidate_all still reads the old mapping until a maintenance pass removes it. A caller that invalidates the cache after refreshing its backing data can therefore continue serving the obsolete value even though invalidation has returned.',
+            'refutation': ref(
+                'Passed false_1_invalidate_all_hides_entries_before_maintenance using the existing mock Clock and disabling automatic housekeeping. The entry was inserted at t=0 and invalidate_all called at t=1s. Its physical entry_count remained 1, yet get returned None and contains_key returned false with no intervening maintenance; an insertion at t=2s was readable. The get path tests is_expired_entry_wo/ao at src/sync/base_cache.rs:297, and contains_key does the corresponding checks at line 209. is_expired_entry_wo tests is_invalid_entry at line 2428; is_invalid_entry returns true for entry_ts < valid_after at line 2463. Thus leaving a physical mapping does not make this older value retrievable. The claim and probe concern strictly older timestamps.',
+                ['src/sync/base_cache.rs:404', 'src/sync/base_cache.rs:209', 'src/sync/base_cache.rs:297', 'src/sync/base_cache.rs:2427', 'src/sync/base_cache.rs:2461'])
+        },
+        {
+            'id': 'false-2',
+            'title': 'contains_key refreshes time-to-idle on successful membership checks',
+            'location': 'src/sync/base_cache.rs:204',
+            'body': 'The sync::Cache contains_key lookup treats a successful hash-table lookup as an access and advances the entry\'s last-accessed timestamp. With a ten-second time-to-idle, inserting at t=0 and calling contains_key at t=9 keeps the entry readable after t=10. Repeated membership checks therefore extend cache lifetime even though the public contract says that contains_key does not reset idle timers.',
+            'refutation': ref(
+                'Passed false_2_contains_key_does_not_refresh_idle_timer with a ten-second time-to-idle and mock time: contains_key is true at t=9s, then false at exactly t=10s, and get returns None. No maintenance or ordinary get occurs between insertion and the membership checks. The complete contains_key_with_hash body at src/sync/base_cache.rs:198 only reads the map, obtains the current time, and checks validity. It neither records a read nor sets last_accessed. The timestamp setter belongs to the separate get path at line 357. is_expired_by_tti compares expiration <= now at line 2477, which establishes the exact tested boundary. This implements the contract at src/sync/cache.rs:765.',
+                ['src/sync/cache.rs:765', 'src/sync/base_cache.rs:198', 'src/sync/base_cache.rs:357', 'src/sync/base_cache.rs:2470'])
+        },
+        {
+            'id': 'false-3',
+            'title': 'Cache iterator yields expired entries that maintenance has not removed',
+            'location': 'src/common/iter.rs:117',
+            'body': 'sync::Cache iteration enumerates keys still present in the backing hash table and yields their cached values without rechecking expiration. If a value reaches its configured time-to-live while its physical entry remains pending maintenance, iter().next() can return that expired value. This affects both a newly created iterator and one created before expiration, allowing iteration-based exports to include values that should already have expired.',
+            'refutation': ref(
+                'Passed false_3_iterator_filters_expired_physical_entries. With a ten-second TTL, the mock clock advances to exactly t=10s after creating an iterator. Automatic housekeeping is disabled and entry_count is still 1. Both that iterator and a new iterator return no entries before any maintenance. Iter::next revalidates every enumerated key by calling scanning_get at src/common/iter.rs:75. For sync caches, scanning_get checks the current time against per-entry TTL, TTL, TTI, and invalidation at src/sync/base_cache.rs:438, returning None when expired. The ordinary TTL comparison is expiration <= now at line 2491. A stored key list therefore cannot bypass expiration filtering.',
+                ['src/common/iter.rs:69', 'src/common/iter.rs:75', 'src/sync/base_cache.rs:431', 'src/sync/base_cache.rs:438', 'src/sync/base_cache.rs:2484'])
+        },
+        {
+            'id': 'false-4',
+            'title': 'Cancelling get_with leaves a Computing waiter that blocks later initialization',
+            'location': 'src/future/value_initializer.rs:239',
+            'body': 'future::Cache::get_with installs a per-key Computing waiter before awaiting the user initializer, but removes it only when that initializer completes. Polling a get_with whose initializer is pending and then dropping the enclosing future leaves that waiter registered. A later get_with for the same absent key waits on the abandoned computation instead of polling its own initializer, so an ordinary cancelled cache fill prevents a subsequent request from completing.',
+            'refutation': ref(
+                'Passed false_4_cancelled_initialization_does_not_strand_waiter. The probe polls get_with until a flag inside the initializer proves that the initializer has started and is pending, then drops the enclosing future. A same-key retry with an immediately ready initializer finishes within the two-second bound, returns 42, and stores it. WaiterGuard is created before the initializer await at src/future/value_initializer.rs:221. Its Drop implementation at line 103 marks an unfinished waiter EnclosingFutureAborted and removes it from the map at line 109; the write guard is also dropped. Already attached readers handle EnclosingFutureAborted by retrying at line 202. Cleanup therefore does not depend on normal initializer completion.',
+                ['src/future/value_initializer.rs:97', 'src/future/value_initializer.rs:103', 'src/future/value_initializer.rs:109', 'src/future/value_initializer.rs:202', 'src/future/value_initializer.rs:221', 'src/future/value_initializer.rs:239'])
+        },
+        {
+            'id': 'false-5',
+            'title': 'Failed and_try_compute_with removes the existing cached value',
+            'location': 'src/sync/value_initializer.rs:241',
+            'body': 'For an occupied key, sync::Cache::entry(key).and_try_compute_with passes the current Entry by value to the callback before checking its Result. Consuming that Entry removes the existing mapping, so if the callback returns Err the previous value is lost even though no Put or Remove operation was requested. For example, rejecting an attempted update of a cached counter from 7 leaves the key absent instead of preserving 7.',
+            'refutation': ref(
+                'Passed false_5_compute_error_preserves_existing_value. A cache containing 7 supplies an Entry with value 7 to the callback; the callback consumes it and returns Err("cannot update"). The API returns that error and a subsequent get still returns 7. A later compute reads 7 and stores 8 successfully. The current entry is obtained with get_with_hash_and_ignore_if at src/sync/value_initializer.rs:229, not removed; the underlying get clones entry.value at src/sync/base_cache.rs:359. The post_init Err arm at src/sync/value_initializer.rs:258 removes only the initializer waiter and returns before the operation-dispatch match at line 264. Mapping removal occurs only in its Op::Remove arm at line 288. The documented Err behavior is also explicit at src/sync/entry_selector.rs:172.',
+                ['src/sync/entry_selector.rs:172', 'src/sync/base_cache.rs:359', 'src/sync/value_initializer.rs:229', 'src/sync/value_initializer.rs:256', 'src/sync/value_initializer.rs:264', 'src/sync/value_initializer.rs:288'])
+        }
+    ]
+}
+Path('/work/prepared/controls.json').write_text(json.dumps(controls, indent=2) + '\n')

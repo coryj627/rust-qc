@@ -1,0 +1,757 @@
+        let file_name: Box<str> = name.to_string().into_boxed_str();
+        let file_name_raw: Box<[u8]> = file_name.bytes().collect();
+        let mut local_block = ZipFileData {
+            system: System::Unix,
+            version_made_by: DEFAULT_VERSION,
+            flags: 0,
+            encrypted: options.encrypt_with.is_some() || {
+                #[cfg(feature = "aes-crypto")]
+                {
+                    options.aes_mode.is_some()
+                }
+                #[cfg(not(feature = "aes-crypto"))]
+                {
+                    false
+                }
+            },
+            using_data_descriptor: false,
+            is_utf8: !file_name.is_ascii(),
+            compression_method,
+            compression_level: options.compression_level,
+            last_modified_time: Some(options.last_modified_time),
+            crc32: raw_values.crc32,
+            compressed_size: raw_values.compressed_size,
+            uncompressed_size: raw_values.uncompressed_size,
+            file_name, // Never used for saving, but used as map key in insert_file_data()
+            file_name_raw,
+            extra_field: Some(extra_field.to_vec().into()),
+            central_extra_field: options.extended_options.central_extra_data().cloned(),
+            file_comment: String::with_capacity(0).into_boxed_str(),
+            header_start,
+            data_start: OnceLock::new(),
+            central_header_start: 0,
+            external_attributes: permissions << 16,
+            large_file: options.large_file,
+            aes_mode,
+            extra_fields: Vec::new(),
+            extra_data_start,
+            aes_extra_data_start,
+        };
+        local_block.version_made_by = local_block.version_needed() as u8;
+        local_block
+    }
+
+    pub(crate) fn from_local_block<R: std::io::Read>(
+        block: ZipLocalEntryBlock,
+        reader: &mut R,
+    ) -> ZipResult<Self> {
+        let ZipLocalEntryBlock {
+            // magic,
+            version_made_by,
+            flags,
+            compression_method,
+            last_mod_time,
+            last_mod_date,
+            crc32,
+            compressed_size,
+            uncompressed_size,
+            file_name_length,
+            extra_field_length,
+            ..
+        } = block;
+
+        let encrypted: bool = flags & 1 == 1;
+        if encrypted {
+            return Err(ZipError::UnsupportedArchive(
+                "Encrypted files are not supported",
+            ));
+        }
+
+        /* FIXME: these were previously incorrect: add testing! */
+        /* flags & (1 << 3) != 0 */
+        let using_data_descriptor: bool = flags & (1 << 3) == 1 << 3;
+        if using_data_descriptor {
+            return Err(ZipError::UnsupportedArchive(
+                "The file length is not available in the local header",
+            ));
+        }
+
+        /* flags & (1 << 1) != 0 */
+        let is_utf8: bool = flags & (1 << 11) != 0;
+        let compression_method = crate::CompressionMethod::parse_from_u16(compression_method);
+        let file_name_length: usize = file_name_length.into();
+        let extra_field_length: usize = extra_field_length.into();
+
+        let mut file_name_raw = vec![0u8; file_name_length];
+        reader.read_exact(&mut file_name_raw)?;
+        let mut extra_field = vec![0u8; extra_field_length];
+        reader.read_exact(&mut extra_field)?;
+
+        let file_name: Box<str> = match is_utf8 {
+            true => String::from_utf8_lossy(&file_name_raw).into(),
+            false => file_name_raw.clone().from_cp437().into(),
+        };
+
+        let system: u8 = (version_made_by >> 8).try_into().unwrap();
+        Ok(ZipFileData {
+            system: System::from(system),
+            /* NB: this strips the top 8 bits! */
+            version_made_by: version_made_by as u8,
+            flags,
+            encrypted,
+            using_data_descriptor,
+            is_utf8,
+            compression_method,
+            compression_level: None,
+            last_modified_time: DateTime::try_from_msdos(last_mod_date, last_mod_time).ok(),
+            crc32,
+            compressed_size: compressed_size.into(),
+            uncompressed_size: uncompressed_size.into(),
+            file_name,
+            file_name_raw: file_name_raw.into(),
+            extra_field: Some(Arc::new(extra_field)),
+            central_extra_field: None,
+            file_comment: String::with_capacity(0).into_boxed_str(), // file comment is only available in the central directory
+            // header_start and data start are not available, but also don't matter, since seeking is
+            // not available.
+            header_start: 0,
+            data_start: OnceLock::new(),
+            central_header_start: 0,
+            // The external_attributes field is only available in the central directory.
+            // We set this to zero, which should be valid as the docs state 'If input came
+            // from standard input, this field is set to zero.'
+            external_attributes: 0,
+            large_file: false,
+            aes_mode: None,
+            extra_fields: Vec::new(),
+            extra_data_start: None,
+            aes_extra_data_start: 0,
+        })
+    }
+
+    fn is_utf8(&self) -> bool {
+        std::str::from_utf8(&self.file_name_raw).is_ok()
+    }
+
+    fn is_ascii(&self) -> bool {
+        self.file_name_raw.is_ascii()
+    }
+
+    fn flags(&self) -> u16 {
+        let utf8_bit: u16 = if self.is_utf8() && !self.is_ascii() {
+            1u16 << 11
+        } else {
+            0
+        };
+
+        let using_data_descriptor_bit = if self.using_data_descriptor {
+            1u16 << 3
+        } else {
+            0
+        };
+
+        let encrypted_bit: u16 = if self.encrypted { 1u16 << 0 } else { 0 };
+
+        utf8_bit | using_data_descriptor_bit | encrypted_bit
+    }
+
+    fn clamp_size_field(&self, field: u64) -> u32 {
+        if self.large_file {
+            spec::ZIP64_BYTES_THR as u32
+        } else {
+            field.min(spec::ZIP64_BYTES_THR).try_into().unwrap()
+        }
+    }
+
+    pub(crate) fn local_block(&self) -> ZipResult<ZipLocalEntryBlock> {
+        let (compressed_size, uncompressed_size) = if self.using_data_descriptor {
+            (0, 0)
+        } else {
+            (
+                self.clamp_size_field(self.compressed_size),
+                self.clamp_size_field(self.uncompressed_size),
+            )
+        };
+        let extra_field_length: u16 = self
+            .extra_field_len()
+            .try_into()
+            .map_err(|_| invalid!("Extra data field is too large"))?;
+
+        let last_modified_time = self
+            .last_modified_time
+            .unwrap_or_else(DateTime::default_for_write);
+        Ok(ZipLocalEntryBlock {
+            magic: ZipLocalEntryBlock::MAGIC,
+            version_made_by: self.version_needed(),
+            flags: self.flags(),
+            compression_method: self.compression_method.serialize_to_u16(),
+            last_mod_time: last_modified_time.timepart(),
+            last_mod_date: last_modified_time.datepart(),
+            crc32: self.crc32,
+            compressed_size,
+            uncompressed_size,
+            file_name_length: self.file_name_raw.len().try_into().unwrap(),
+            extra_field_length,
+        })
+    }
+
+    pub(crate) fn block(&self) -> ZipResult<ZipCentralEntryBlock> {
+        let extra_field_len: u16 = self.extra_field_len().try_into().unwrap();
+        let central_extra_field_len: u16 = self.central_extra_field_len().try_into().unwrap();
+        let last_modified_time = self
+            .last_modified_time
+            .unwrap_or_else(DateTime::default_for_write);
+        let version_to_extract = self.version_needed();
+        let version_made_by = (self.version_made_by as u16).max(version_to_extract);
+        Ok(ZipCentralEntryBlock {
+            magic: ZipCentralEntryBlock::MAGIC,
+            version_made_by: ((self.system as u16) << 8) | version_made_by,
+            version_to_extract,
+            flags: self.flags(),
+            compression_method: self.compression_method.serialize_to_u16(),
+            last_mod_time: last_modified_time.timepart(),
+            last_mod_date: last_modified_time.datepart(),
+            crc32: self.crc32,
+            compressed_size: self
+                .compressed_size
+                .min(spec::ZIP64_BYTES_THR)
+                .try_into()
+                .unwrap(),
+            uncompressed_size: self
+                .uncompressed_size
+                .min(spec::ZIP64_BYTES_THR)
+                .try_into()
+                .unwrap(),
+            file_name_length: self.file_name_raw.len().try_into().unwrap(),
+            extra_field_length: extra_field_len.checked_add(central_extra_field_len).ok_or(
+                invalid!("Extra field length in central directory exceeds 64KiB"),
+            )?,
+            file_comment_length: self.file_comment.len().try_into().unwrap(),
+            disk_number: 0,
+            internal_file_attributes: 0,
+            external_file_attributes: self.external_attributes,
+            offset: self
+                .header_start
+                .min(spec::ZIP64_BYTES_THR)
+                .try_into()
+                .unwrap(),
+        })
+    }
+
+    pub(crate) fn zip64_extra_field_block(&self) -> Option<Zip64ExtraFieldBlock> {
+        Zip64ExtraFieldBlock::maybe_new(
+            self.large_file,
+            self.uncompressed_size,
+            self.compressed_size,
+            self.header_start,
+        )
+    }
+
+    pub(crate) fn data_descriptor_block(&self) -> Option<ZipDataDescriptorBlock> {
+        if self.large_file {
+            return None;
+        }
+
+        Some(ZipDataDescriptorBlock {
+            magic: ZipDataDescriptorBlock::MAGIC,
+            crc32: self.crc32,
+            compressed_size: self.compressed_size as u32,
+            uncompressed_size: self.uncompressed_size as u32,
+        })
+    }
+
+    pub(crate) fn zip64_data_descriptor_block(&self) -> Zip64DataDescriptorBlock {
+        Zip64DataDescriptorBlock {
+            magic: Zip64DataDescriptorBlock::MAGIC,
+            crc32: self.crc32,
+            compressed_size: self.compressed_size,
+            uncompressed_size: self.uncompressed_size,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+#[repr(packed, C)]
+pub(crate) struct ZipCentralEntryBlock {
+    magic: spec::Magic,
+    pub version_made_by: u16,
+    pub version_to_extract: u16,
+    pub flags: u16,
+    pub compression_method: u16,
+    pub last_mod_time: u16,
+    pub last_mod_date: u16,
+    pub crc32: u32,
+    pub compressed_size: u32,
+    pub uncompressed_size: u32,
+    pub file_name_length: u16,
+    pub extra_field_length: u16,
+    pub file_comment_length: u16,
+    pub disk_number: u16,
+    pub internal_file_attributes: u16,
+    pub external_file_attributes: u32,
+    pub offset: u32,
+}
+
+unsafe impl Pod for ZipCentralEntryBlock {}
+
+impl FixedSizeBlock for ZipCentralEntryBlock {
+    const MAGIC: spec::Magic = spec::Magic::CENTRAL_DIRECTORY_HEADER_SIGNATURE;
+
+    #[inline(always)]
+    fn magic(self) -> spec::Magic {
+        self.magic
+    }
+
+    const WRONG_MAGIC_ERROR: ZipError = invalid!("Invalid Central Directory header");
+
+    to_and_from_le![
+        (magic, spec::Magic),
+        (version_made_by, u16),
+        (version_to_extract, u16),
+        (flags, u16),
+        (compression_method, u16),
+        (last_mod_time, u16),
+        (last_mod_date, u16),
+        (crc32, u32),
+        (compressed_size, u32),
+        (uncompressed_size, u32),
+        (file_name_length, u16),
+        (extra_field_length, u16),
+        (file_comment_length, u16),
+        (disk_number, u16),
+use crate::result::{invalid, ZipResult};
+use crate::unstable::LittleEndianReadExt;
+use core::mem::size_of;
+use std::io::Read;
+
+/// Info-ZIP Unicode Path Extra Field (0x7075) or Unicode Comment Extra Field (0x6375), as
+/// specified in APPNOTE 4.6.8 and 4.6.9
+#[derive(Clone, Debug)]
+pub struct UnicodeExtraField {
+    crc32: u32,
+    content: Box<[u8]>,
+}
+
+impl UnicodeExtraField {
+    /// Verifies the checksum and returns the content.
+    pub fn unwrap_valid(self, ascii_field: &[u8]) -> ZipResult<Box<[u8]>> {
+        let mut crc32 = crc32fast::Hasher::new();
+        crc32.update(ascii_field);
+        let actual_crc32 = crc32.finalize();
+        if self.crc32 != actual_crc32 {
+            return Err(invalid!("CRC32 checksum failed on Unicode extra field"));
+        }
+        Ok(self.content)
+    }
+}
+
+impl UnicodeExtraField {
+    pub(crate) fn try_from_reader<R: Read>(reader: &mut R, len: u16) -> ZipResult<Self> {
+        // Read and discard version byte
+        reader.read_exact(&mut [0u8])?;
+
+        let crc32 = reader.read_u32_le()?;
+        let content_len = (len as usize)
+            .checked_sub(size_of::<u8>() + size_of::<u32>())
+            .ok_or(invalid!("Unicode extra field is too small"))?;
+        let mut content = vec![0u8; content_len].into_boxed_slice();
+        reader.read_exact(&mut content)?;
+        Ok(Self { crc32, content })
+    }
+}
+use crate::result::invalid;
+use crate::result::{ZipError, ZipResult};
+use crate::unstable::LittleEndianReadExt;
+use std::io::Read;
+
+/// extended timestamp, as described in <https://libzip.org/specifications/extrafld.txt>
+
+#[derive(Debug, Clone)]
+pub struct ExtendedTimestamp {
+    mod_time: Option<u32>,
+    ac_time: Option<u32>,
+    cr_time: Option<u32>,
+}
+
+impl ExtendedTimestamp {
+    /// creates an extended timestamp struct by reading the required bytes from the reader.
+    ///
+    /// This method assumes that the length has already been read, therefore
+    /// it must be passed as an argument
+    pub fn try_from_reader<R>(reader: &mut R, len: u16) -> ZipResult<Self>
+    where
+        R: Read,
+    {
+        if len == 0 {
+            return Err(invalid!("Extended timestamp field is empty"));
+        }
+        let mut flags = [0u8];
+        let mut bytes_to_read = len as usize;
+        reader.read_exact(&mut flags)?;
+        bytes_to_read -= flags.len();
+        let flags = flags[0];
+
+        // the `flags` field refers to the local headers and might not correspond
+        // to the len field. If the length field is 1+4, we assume that only
+        // the modification time has been set
+
+        // > Those times that are present will appear in the order indicated, but
+        // > any combination of times may be omitted.  (Creation time may be
+        // > present without access time, for example.)  TSize should equal
+        // > (1 + 4*(number of set bits in Flags)), as the block is currently
+        // > defined.
+        if len != 5 && len as u32 != 1 + 4 * flags.count_ones() {
+            //panic!("found len {len} and flags {flags:08b}");
+            return Err(ZipError::UnsupportedArchive(
+                "flags and len don't match in extended timestamp field",
+            ));
+        }
+
+        // allow unsupported/undocumented flags
+
+        let mod_time = if (flags & 0b00000001u8 == 0b00000001u8) || len == 5 {
+            bytes_to_read -= size_of::<u32>();
+            Some(reader.read_u32_le()?)
+        } else {
+            None
+        };
+
+        let ac_time = if flags & 0b00000010u8 == 0b00000010u8 && len > 5 {
+            bytes_to_read -= size_of::<u32>();
+            Some(reader.read_u32_le()?)
+        } else {
+            None
+        };
+
+        let cr_time = if flags & 0b00000100u8 == 0b00000100u8 && len > 5 {
+            bytes_to_read -= size_of::<u32>();
+            Some(reader.read_u32_le()?)
+        } else {
+            None
+        };
+
+        if bytes_to_read > 0 {
+            // ignore undocumented bytes
+            reader.read_exact(&mut vec![0; bytes_to_read])?
+        }
+
+        Ok(Self {
+            mod_time,
+            ac_time,
+            cr_time,
+        })
+    }
+
+    /// returns the last modification timestamp, if defined, as UNIX epoch seconds
+    pub fn mod_time(&self) -> Option<u32> {
+        self.mod_time
+    }
+
+    /// returns the last access timestamp, if defined, as UNIX epoch seconds
+    pub fn ac_time(&self) -> Option<u32> {
+        self.ac_time
+    }
+
+    /// returns the creation timestamp, if defined, as UNIX epoch seconds
+    pub fn cr_time(&self) -> Option<u32> {
+        self.cr_time
+    }
+}
+
+#[test]
+/// Ensure we don't panic or read garbage data if the field body is empty
+pub fn test_bad_extended_timestamp() -> ZipResult<()> {
+    use crate::ZipArchive;
+    use std::io::Cursor;
+
+    assert!(ZipArchive::new(Cursor::new(include_bytes!(
+        "../../tests/data/extended_timestamp_bad.zip"
+    )))
+    .is_err());
+    Ok(())
+}
+//! Helper module to compute a CRC32 checksum
+
+use std::io;
+use std::io::prelude::*;
+
+use crc32fast::Hasher;
+
+/// Reader that validates the CRC32 when it reaches the EOF.
+pub struct Crc32Reader<R> {
+    inner: R,
+    hasher: Hasher,
+    check: u32,
+    /// Signals if `inner` stores aes encrypted data.
+    /// AE-2 encrypted data doesn't use crc and sets the value to 0.
+    enabled: bool,
+}
+
+impl<R> Crc32Reader<R> {
+    /// Get a new Crc32Reader which checks the inner reader against checksum.
+    /// The check is disabled if `ae2_encrypted == true`.
+    pub(crate) fn new(inner: R, checksum: u32, ae2_encrypted: bool) -> Crc32Reader<R> {
+        Crc32Reader {
+            inner,
+            hasher: Hasher::new(),
+            check: checksum,
+            enabled: !ae2_encrypted,
+        }
+    }
+
+    fn check_matches(&self) -> bool {
+        self.check == self.hasher.clone().finalize()
+    }
+
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+#[cold]
+fn invalid_checksum() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "Invalid checksum")
+}
+
+impl<R: Read> Read for Crc32Reader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let count = self.inner.read(buf)?;
+
+        if self.enabled {
+            if count == 0 && !buf.is_empty() && !self.check_matches() {
+                return Err(invalid_checksum());
+            }
+            self.hasher.update(&buf[..count]);
+        }
+        Ok(count)
+    }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        let start = buf.len();
+        let n = self.inner.read_to_end(buf)?;
+
+        if self.enabled {
+            self.hasher.update(&buf[start..]);
+            if !self.check_matches() {
+                return Err(invalid_checksum());
+            }
+        }
+
+        Ok(n)
+    }
+
+    fn read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
+        let start = buf.len();
+        let n = self.inner.read_to_string(buf)?;
+
+        if self.enabled {
+            self.hasher.update(&buf.as_bytes()[start..]);
+            if !self.check_matches() {
+                return Err(invalid_checksum());
+            }
+        }
+
+        Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_empty_reader() {
+        let data: &[u8] = b"";
+        let mut buf = [0; 1];
+
+        let mut reader = Crc32Reader::new(data, 0, false);
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+
+        let mut reader = Crc32Reader::new(data, 1, false);
+        assert!(reader
+            .read(&mut buf)
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid checksum"));
+    }
+
+    #[test]
+    fn test_byte_by_byte() {
+        let data: &[u8] = b"1234";
+        let mut buf = [0; 1];
+
+        let mut reader = Crc32Reader::new(data, 0x9be3e0a3, false);
+        assert_eq!(reader.read(&mut buf).unwrap(), 1);
+        assert_eq!(reader.read(&mut buf).unwrap(), 1);
+        assert_eq!(reader.read(&mut buf).unwrap(), 1);
+        assert_eq!(reader.read(&mut buf).unwrap(), 1);
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+        // Can keep reading 0 bytes after the end
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_zero_read() {
+        let data: &[u8] = b"1234";
+        let mut buf = [0; 5];
+
+        let mut reader = Crc32Reader::new(data, 0x9be3e0a3, false);
+        assert_eq!(reader.read(&mut buf[..0]).unwrap(), 0);
+        assert_eq!(reader.read(&mut buf).unwrap(), 4);
+    }
+}
+src/write.rs:57:    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+src/write.rs:69:    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+src/write.rs:77:    fn flush(&mut self) -> io::Result<()> {
+src/write.rs:107:    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+src/write.rs:175:        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+src/write.rs:210:        fn extra_data(&self) -> Option<&Arc<Vec<u8>>>;
+src/write.rs:212:        fn central_extra_data(&self) -> Option<&Arc<Vec<u8>>>;
+src/write.rs:216:        fn extra_data(&self) -> Option<&Arc<Vec<u8>>> {
+src/write.rs:219:        fn central_extra_data(&self) -> Option<&Arc<Vec<u8>>> {
+src/write.rs:226:        fn extra_data(&self) -> Option<&Arc<Vec<u8>>> {
+src/write.rs:229:        fn central_extra_data(&self) -> Option<&Arc<Vec<u8>>> {
+src/write.rs:247:    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+src/write.rs:292:    pub fn add_extra_data(
+src/write.rs:333:    fn validate_extra_data(data: &[u8], disallow_zip64: bool) -> ZipResult<()> {
+src/write.rs:372:    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
+src/write.rs:380:    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+src/write.rs:435:    pub const fn compression_method(mut self, method: CompressionMethod) -> Self {
+src/write.rs:451:    pub const fn compression_level(mut self, level: Option<i64>) -> Self {
+src/write.rs:461:    pub const fn last_modified_time(mut self, mod_time: DateTime) -> Self {
+src/write.rs:476:    pub const fn unix_permissions(mut self, mode: u32) -> Self {
+src/write.rs:487:    pub const fn large_file(mut self, large: bool) -> Self {
+src/write.rs:504:    pub fn with_aes_encryption(self, mode: AesMode, password: &str) -> FileOptions<'_, T> {
+src/write.rs:517:    pub const fn with_zopfli_buffer(mut self, size: Option<usize>) -> Self {
+src/write.rs:523:    pub const fn get_compression_level(&self) -> Option<i64> {
+src/write.rs:528:    pub const fn with_alignment(mut self, alignment: u16) -> Self {
+src/write.rs:535:    pub fn add_extra_data(
+src/write.rs:547:    pub fn clear_extra_data(mut self) -> Self {
+src/write.rs:559:    fn default() -> Self {
+src/write.rs:578:    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+src/write.rs:606:    fn flush(&mut self) -> io::Result<()> {
+src/write.rs:618:    fn update(&mut self, buf: &[u8]) {
+src/write.rs:628:    pub fn new_append(readwriter: A) -> ZipResult<ZipWriter<A>> {
+src/write.rs:635:    pub fn new_append_with_config(config: Config, mut readwriter: A) -> ZipResult<ZipWriter<A>> {
+src/write.rs:665:    pub fn set_flush_on_finish_file(&mut self, flush_on_finish_file: bool) {
+src/write.rs:673:    pub fn deep_copy_file(&mut self, src_name: &str, dest_name: &str) -> ZipResult<()> {
+src/write.rs:740:    pub fn deep_copy_file_from_path<T: AsRef<Path>, U: AsRef<Path>>(
+src/write.rs:777:    pub fn finish_into_readable(mut self) -> ZipResult<ZipArchive<A>> {
+src/write.rs:796:    pub fn new(inner: W) -> ZipWriter<W> {
+src/write.rs:811:    pub const fn is_writing_file(&self) -> bool {
+src/write.rs:816:    pub fn set_comment<S>(&mut self, comment: S)
+src/write.rs:827:    pub fn set_raw_comment(&mut self, comment: Box<[u8]>) {
+src/write.rs:832:    pub fn get_comment(&mut self) -> Result<&str, Utf8Error> {
+src/write.rs:840:    pub const fn get_raw_comment(&self) -> &[u8] {
+src/write.rs:845:    pub fn set_zip64_comment<S>(&mut self, comment: Option<S>)
+src/write.rs:856:    pub fn set_raw_zip64_comment(&mut self, comment: Option<Box<[u8]>>) {
+src/write.rs:861:    pub fn get_zip64_comment(&mut self) -> Option<Result<&str, Utf8Error>> {
+src/write.rs:869:    pub fn get_raw_zip64_comment(&self) -> Option<&[u8]> {
+src/write.rs:879:    pub unsafe fn set_file_metadata(&mut self, length: u64, crc32: u32) -> ZipResult<()> {
+src/write.rs:888:    fn ok_or_abort_file<T, E: Into<ZipError>>(&mut self, result: Result<T, E>) -> ZipResult<T> {
+src/write.rs:899:    fn start_entry<S: ToString, T: FileOptionExtension>(
+src/write.rs:1064:    fn insert_file_data(&mut self, file: ZipFileData) -> ZipResult<usize> {
+src/write.rs:1073:    fn finish_file(&mut self) -> ZipResult<()> {
+src/write.rs:1134:    fn switch_to_non_encrypting_writer(&mut self) -> Result<(), ZipError> {
+src/write.rs:1154:    pub fn abort_file(&mut self) -> ZipResult<()> {
+src/write.rs:1187:    pub fn start_file<S: ToString, T: FileOptionExtension>(
+src/write.rs:1251:    pub fn merge_archive<R>(&mut self, mut source: ZipArchive<R>) -> ZipResult<()>
+src/write.rs:1277:    pub fn start_file_from_path<E: FileOptionExtension, P: AsRef<Path>>(
+src/write.rs:1311:    pub fn raw_copy_file_rename<R: Read, S: ToString>(
+src/write.rs:1320:    fn raw_copy_file_rename_internal<R: Read, S: ToString>(
+src/write.rs:1345:    pub fn raw_copy_file_to_path<R: Read, P: AsRef<Path>>(
+src/write.rs:1376:    pub fn raw_copy_file<R: Read>(&mut self, file: ZipFile<R>) -> ZipResult<()> {
+src/write.rs:1404:    pub fn raw_copy_file_touch<R: Read>(
+src/write.rs:1428:    pub fn add_directory<S, T: FileOptionExtension>(
+src/write.rs:1461:    pub fn add_directory_from_path<T: FileOptionExtension, P: AsRef<Path>>(
+src/write.rs:1473:    pub fn finish(mut self) -> ZipResult<W> {
+src/write.rs:1491:    pub fn add_symlink<N: ToString, T: ToString, E: FileOptionExtension>(
+src/write.rs:1520:    pub fn add_symlink_from_path<P: AsRef<Path>, T: AsRef<Path>, E: FileOptionExtension>(
+src/write.rs:1529:    fn finalize(&mut self) -> ZipResult<u64> {
+src/write.rs:1557:    fn write_central_and_footer(&mut self) -> Result<u64, ZipError> {
+src/write.rs:1613:    fn index_by_name(&self, name: &str) -> ZipResult<usize> {
+src/write.rs:1622:    pub fn shallow_copy_file(&mut self, src_name: &str, dest_name: &str) -> ZipResult<()> {
+src/write.rs:1642:    pub fn shallow_copy_file_from_path<T: AsRef<Path>, U: AsRef<Path>>(
+src/write.rs:1655:    pub fn new_stream(inner: W) -> ZipWriter<StreamWriter<W>> {
+src/write.rs:1671:    fn drop(&mut self) {
+src/write.rs:1683:    fn prepare_next_writer(
+src/write.rs:1897:    fn switch_to(&mut self, make_new_self: SwitchWriterFunction<W>) -> ZipResult<()> {
+src/write.rs:1932:    fn ref_mut(&mut self) -> Option<&mut dyn Write> {
+src/write.rs:1957:    fn get_plain(&mut self) -> &mut W {
+src/write.rs:1964:    fn unwrap(self) -> W {
+src/write.rs:1973:fn deflate_compression_level_range() -> std::ops::RangeInclusive<i64> {
+src/write.rs:1988:fn bzip2_compression_level_range() -> std::ops::RangeInclusive<i64> {
+src/write.rs:2001:fn clamp_opt<T: Ord + Copy, U: Ord + Copy + TryFrom<T>>(
+src/write.rs:2012:fn update_aes_extra_data<W: Write + Seek>(writer: &mut W, file: &mut ZipFileData) -> ZipResult<()> {
+src/write.rs:2048:fn write_data_descriptor<T: Write>(writer: &mut T, file: &ZipFileData) -> ZipResult<()> {
+src/write.rs:2065:fn update_local_file_header<T: Write + Seek>(
+src/write.rs:2094:fn write_central_directory_header<T: Write>(writer: &mut T, file: &ZipFileData) -> ZipResult<()> {
+src/write.rs:2112:fn update_local_zip64_extra_field<T: Write + Seek>(
+src/write.rs:2143:    pub fn new(inner: W) -> StreamWriter<W> {
+src/write.rs:2151:    pub fn into_inner(self) -> W {
+src/write.rs:2157:    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+src/write.rs:2163:    fn flush(&mut self) -> io::Result<()> {
+src/write.rs:2169:    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+src/write.rs:2215:    fn write_empty_zip() {
+src/write.rs:2227:    fn unix_permissions_bitmask() {
+src/write.rs:2234:    fn write_zip_dir() {
+src/write.rs:2262:    fn write_symlink_simple() {
+src/write.rs:2291:    fn test_path_normalization() {
+src/write.rs:2307:    fn write_symlink_wonky_paths() {
+src/write.rs:2339:    fn write_mimetype_zip() {
+src/write.rs:2382:    fn write_non_utf8() {
+src/write.rs:2421:    fn path_to_string() {
+src/write.rs:2437:    fn test_shallow_copy() {
+src/write.rs:2490:    fn test_deep_copy() {
+src/write.rs:2542:    fn duplicate_filenames() {
+src/write.rs:2556:    fn test_filename_looks_like_zip64_locator() {
+src/write.rs:2569:    fn test_filename_looks_like_zip64_locator_2() {
+src/write.rs:2582:    fn test_filename_looks_like_zip64_locator_2a() {
+src/write.rs:2595:    fn test_filename_looks_like_zip64_locator_3() {
+src/write.rs:2611:    fn test_filename_looks_like_zip64_locator_4() {
+src/write.rs:2637:    fn test_filename_looks_like_zip64_locator_5() -> ZipResult<()> {
+src/write.rs:2664:    fn remove_shallow_copy_keeps_original() -> ZipResult<()> {
+src/write.rs:2683:    fn remove_encrypted_file() -> ZipResult<()> {
+src/write.rs:2697:    fn remove_encrypted_aligned_symlink() -> ZipResult<()> {
+src/write.rs:2712:    fn zopfli_empty_write() -> ZipResult<()> {
+src/write.rs:2725:    fn crash_with_no_features() -> ZipResult<()> {
+src/write.rs:2739:    fn test_alignment() {
+src/write.rs:2755:    fn test_alignment_2() {
+src/write.rs:2777:    fn test_crash_short_read() {
+src/write.rs:2796:    fn test_fuzz_failure_2024_05_08() -> ZipResult<()> {
+src/write.rs:2823:    fn test_fuzz_failure_2024_06_08() -> ZipResult<()> {
+src/write.rs:2862:    fn test_short_extra_data() {
+src/write.rs:2877:    fn test_invalid_extra_data() -> ZipResult<()> {
+src/write.rs:2905:    fn test_invalid_extra_data_unreserved() {
+src/write.rs:2930:    fn test_fuzz_crash_2024_06_13a() -> ZipResult<()> {
+src/write.rs:2956:    fn test_fuzz_crash_2024_06_13b() -> ZipResult<()> {
+src/write.rs:2987:    fn test_fuzz_crash_2024_06_14() -> ZipResult<()> {
+src/write.rs:3011:    fn test_fuzz_crash_2024_06_14a() -> ZipResult<()> {
+src/write.rs:3051:    fn test_fuzz_crash_2024_06_14b() -> ZipResult<()> {
+src/write.rs:3091:    fn test_fuzz_crash_2024_06_14c() -> ZipResult<()> {
+src/write.rs:3125:    fn test_fuzz_crash_2024_06_14d() -> ZipResult<()> {
+src/write.rs:3157:    fn test_fuzz_crash_2024_06_14e() -> ZipResult<()> {
+src/write.rs:3185:    fn test_fuzz_crash_2024_06_17() -> ZipResult<()> {
+src/write.rs:3377:    fn test_fuzz_crash_2024_06_17a() -> ZipResult<()> {
+src/write.rs:3453:    fn test_fuzz_crash_2024_06_17b() -> ZipResult<()> {
+src/write.rs:3553:    fn test_fuzz_crash_2024_06_18() -> ZipResult<()> {
+src/write.rs:3572:    fn test_fuzz_crash_2024_06_18a() -> ZipResult<()> {
+src/write.rs:3645:    fn test_fuzz_crash_2024_06_18b() -> ZipResult<()> {
+src/write.rs:3686:    fn test_fuzz_crash_2024_06_19() -> ZipResult<()> {
+src/write.rs:3743:    fn fuzz_crash_2024_06_21() -> ZipResult<()> {
+src/write.rs:3771:    fn fuzz_crash_2024_07_17() -> ZipResult<()> {
+src/write.rs:3796:    fn fuzz_crash_2024_07_19() -> ZipResult<()> {
+src/write.rs:3823:    fn fuzz_crash_2024_07_19a() -> ZipResult<()> {
+src/write.rs:3851:    fn fuzz_crash_2024_07_20() -> ZipResult<()> {
+src/write.rs:3913:    fn fuzz_crash_2024_07_21() -> ZipResult<()> {
+tests/end_to_end.rs:14:fn end_to_end() {
+tests/end_to_end.rs:44:fn copy() {
+tests/end_to_end.rs:97:fn append() {
+tests/end_to_end.rs:140:fn write_test_archive(file: &mut Cursor<Vec<u8>>, method: CompressionMethod, shallow_copy: bool) {
+tests/end_to_end.rs:176:fn check_test_archive<R: Read + Seek>(zip_file: R) -> ZipResult<zip::ZipArchive<R>> {
+tests/end_to_end.rs:210:fn read_archive_file<R: Read + Seek>(
+tests/end_to_end.rs:223:fn check_archive_file(
+tests/end_to_end.rs:246:fn check_archive_file_contents<R: Read + Seek>(
+tests/zip_crypto.rs:40:fn encrypting_file() {
+tests/zip_crypto.rs:60:fn encrypted_file() {
+tests/zip_crypto.rs:107:fn buffered_read() {

@@ -1,0 +1,452 @@
+            // Types 1-5 are all detected by one function and all end with the same
+            // pattern
+            if let Some(html_end_tag) = get_html_end_tag(&bytes[(ix + 1)..]) {
+                self.finish_list(start_ix);
+                return self.parse_html_block_type_1_to_5(
+                    ix,
+                    html_end_tag,
+                    remaining_space,
+                    indent,
+                );
+            }
+
+            // Detect type 6
+            if starts_html_block_type_6(&bytes[(ix + 1)..]) {
+                self.finish_list(start_ix);
+                return self.parse_html_block_type_6_or_7(ix, remaining_space, indent);
+            }
+
+            // Detect type 7
+            if let Some(_html_bytes) = scan_html_type_7(&bytes[ix..]) {
+                self.finish_list(start_ix);
+                return self.parse_html_block_type_6_or_7(ix, remaining_space, indent);
+            }
+        }
+
+        if let Ok(n) = scan_hrule(&bytes[ix..]) {
+            self.finish_list(start_ix);
+            return self.parse_hrule(n, ix);
+        }
+
+        if let Some(atx_size) = scan_atx_heading(&bytes[ix..]) {
+            self.finish_list(start_ix);
+            return self.parse_atx_heading(ix, atx_size);
+        }
+
+        if let Some((n, fence_ch)) = scan_code_fence(&bytes[ix..]) {
+            self.finish_list(start_ix);
+            return self.parse_fenced_code_block(ix, indent, fence_ch, n);
+        }
+
+        // parse refdef
+        while let Some((bytecount, label, link_def)) =
+            self.parse_refdef_total(start_ix + line_start.bytes_scanned())
+        {
+            self.allocs.refdefs.0.entry(label).or_insert(link_def);
+            let container_start = start_ix + line_start.bytes_scanned();
+            let mut ix = container_start + bytecount;
+            // Refdefs act as if they were contained within a paragraph, for purposes of lazy
+            // continuations. For example:
+            //
+            // ```
+            // > [foo]: http://example.com
+            // bar
+            // ```
+            //
+            // is equivalent to
+            //
+            // ```
+            // > bar
+            //
+            // [foo]: http://example.com
+            None
+        } else {
+            line_start.scan_all_space();
+            Some(line_start)
+        }
+    }
+
+    /// Returns the offset of the first line after the table.
+    /// Assumptions: current focus is a table element and the table header
+    /// matches the separator line (same number of columns).
+    fn parse_table(
+        &mut self,
+        table_cols: usize,
+        head_start: usize,
+        body_start: usize,
+    ) -> Option<usize> {
+        // filled empty cells are limited to protect against quadratic growth
+        // https://github.com/raphlinus/pulldown-cmark/issues/832
+        let mut missing_empty_cells = 0;
+        // parse header. this shouldn't fail because we made sure the table header is ok
+        let (_sep_start, thead_ix) =
+            self.parse_table_row_inner(head_start, table_cols, &mut missing_empty_cells)?;
+        self.tree[thead_ix].item.body = ItemBody::TableHead;
+
+        // parse body
+        let mut ix = body_start;
+        while let Some((next_ix, _row_ix)) =
+            self.parse_table_row(ix, table_cols, &mut missing_empty_cells)
+        {
+            ix = next_ix;
+        }
+
+        self.pop(ix);
+        Some(ix)
+    }
+
+    /// Call this when containers are taken care of.
+    /// Returns bytes scanned, row_ix
+    fn parse_table_row_inner(
+        &mut self,
+        mut ix: usize,
+        row_cells: usize,
+        missing_empty_cells: &mut usize,
+    ) -> Option<(usize, TreeIndex)> {
+        // Limit to prevent a malicious input from causing a denial of service.
+        const MAX_AUTOCOMPLETED_CELLS: usize = 1 << 18; // = 0x40000
+
+        let bytes = self.text.as_bytes();
+        let mut cells = 0;
+        let mut final_cell_ix = None;
+
+        let old_cur = self.tree.cur();
+        let row_ix = self.tree.append(Item {
+            start: ix,
+            end: 0, // set at end of this function
+            body: ItemBody::TableRow,
+        });
+        self.tree.push();
+
+        loop {
+            ix += scan_ch(&bytes[ix..], b'|');
+            let start_ix = ix;
+            ix += scan_whitespace_no_nl(&bytes[ix..]);
+
+            if let Some(eol_bytes) = scan_eol(&bytes[ix..]) {
+                ix += eol_bytes;
+                break;
+            }
+
+            let cell_ix = self.tree.append(Item {
+                start: start_ix,
+                end: ix,
+                body: ItemBody::TableCell,
+            });
+            self.tree.push();
+            let (next_ix, _brk) = self.parse_line(ix, None, TableParseMode::Active);
+
+            self.tree[cell_ix].item.end = next_ix;
+            self.tree.pop();
+
+            ix = next_ix;
+            cells += 1;
+
+            if cells == row_cells {
+                final_cell_ix = Some(cell_ix);
+            }
+        }
+
+        if let (Some(cur), 0) = (old_cur, cells) {
+            self.pop(ix);
+            self.tree[cur].next = None;
+            return None;
+        }
+
+        // fill empty cells if needed
+        // note: this is where GFM and commonmark-extra diverge. we follow
+        // GFM here
+        for _ in cells..row_cells {
+            if *missing_empty_cells >= MAX_AUTOCOMPLETED_CELLS {
+                return None;
+            }
+            *missing_empty_cells += 1;
+            self.tree.append(Item {
+                start: ix,
+                end: ix,
+                body: ItemBody::TableCell,
+            });
+        }
+
+        // drop excess cells
+        if let Some(cell_ix) = final_cell_ix {
+            self.tree[cell_ix].next = None;
+        }
+
+        self.pop(ix);
+
+        Some((ix, row_ix))
+    }
+
+    /// Returns first offset after the row and the tree index of the row.
+    fn parse_table_row(
+        &mut self,
+        mut ix: usize,
+        row_cells: usize,
+        missing_empty_cells: &mut usize,
+    ) -> Option<(usize, TreeIndex)> {
+        let bytes = self.text.as_bytes();
+        let mut line_start = LineStart::new(&bytes[ix..]);
+        let tree_position = scan_containers(&self.tree, &mut line_start, self.options);
+        let current_container = tree_position == self.tree.spine_len();
+        if !current_container {
+            return None;
+        }
+        line_start.scan_all_space();
+        ix += line_start.bytes_scanned();
+        if scan_paragraph_interrupt_no_table(
+            &bytes[ix..],
+            current_container,
+            self.options.contains(Options::ENABLE_FOOTNOTES),
+            self.options.contains(Options::ENABLE_DEFINITION_LIST),
+            &self.tree,
+            tree_position,
+        ) {
+            return None;
+        }
+
+        let (ix, row_ix) = self.parse_table_row_inner(ix, row_cells, missing_empty_cells)?;
+        Some((ix, row_ix))
+    }
+
+    /// Returns offset of line start after paragraph.
+    fn parse_paragraph(&mut self, start_ix: usize, tasklist_marker: Option<Item>) -> usize {
+        let body = if let Some(ItemBody::DefinitionList(_)) =
+            self.tree.peek_up().map(|idx| self.tree[idx].item.body)
+        {
+            if self.tree.cur().map_or(true, |idx| {
+                matches!(
+                    &self.tree[idx].item.body,
+                    ItemBody::DefinitionListDefinition(..)
+                )
+
+        self.tree[open].item.body = ItemBody::Math(self.allocs.allocate_cow(cow), is_display);
+        self.tree[open].item.end = self.tree[close].item.end;
+        self.tree[open].next = self.tree[close].next;
+    }
+
+    /// Make a code span.
+    ///
+    /// Both `open` and `close` are matching MaybeCode items.
+    fn make_code_span(&mut self, open: TreeIndex, close: TreeIndex, preceding_backslash: bool) {
+        let span_start = self.tree[open].item.end;
+        let span_end = self.tree[close].item.start;
+        let mut buf: Option<String> = None;
+
+        let spanned_text = &self.text[span_start..span_end];
+        let spanned_bytes = spanned_text.as_bytes();
+        let mut start_ix = 0;
+        let mut ix = 0;
+        while ix < spanned_bytes.len() {
+            let c = spanned_bytes[ix];
+            if c == b'\r' || c == b'\n' {
+                let buf = buf.get_or_insert_with(|| String::with_capacity(spanned_bytes.len()));
+                buf.push_str(&spanned_text[start_ix..ix]);
+                buf.push(' ');
+                ix += 1;
+                ix += skip_container_prefixes(&self.tree, &spanned_bytes[ix..], self.options);
+                start_ix = ix;
+            } else if c == b'\\'
+                && spanned_bytes.get(ix + 1) == Some(&b'|')
+                && self.tree.is_in_table()
+            {
+                let buf = buf.get_or_insert_with(|| String::with_capacity(spanned_bytes.len()));
+                buf.push_str(&spanned_text[start_ix..ix]);
+                buf.push('|');
+                ix += 2;
+                start_ix = ix;
+            } else {
+                ix += 1;
+            }
+        }
+
+        let (opening, closing, all_spaces) = {
+            let s = if let Some(buf) = &mut buf {
+                buf.push_str(&spanned_text[start_ix..]);
+                &buf[..]
+            } else {
+                spanned_text
+            };
+            (
+                s.as_bytes().first() == Some(&b' '),
+                s.as_bytes().last() == Some(&b' '),
+                s.bytes().all(|b| b == b' '),
+            )
+        };
+
+        let cow: CowStr<'input> = if !all_spaces && opening && closing {
+            if let Some(mut buf) = buf {
+                if !buf.is_empty() {
+                    buf.remove(0);
+                    buf.pop();
+                }
+                buf.into()
+            } else {
+                spanned_text[1..(spanned_text.len() - 1).max(1)].into()
+            }
+        } else if let Some(buf) = buf {
+            buf.into()
+        } else {
+            spanned_text.into()
+        };
+
+        if preceding_backslash {
+            self.tree[open].item.body = ItemBody::Text {
+                backslash_escaped: true,
+            };
+            self.tree[open].item.end = self.tree[open].item.start + 1;
+            self.tree[open].next = Some(close);
+            self.tree[close].item.body = ItemBody::Code(self.allocs.allocate_cow(cow));
+            self.tree[close].item.start = self.tree[open].item.start + 1;
+        } else {
+            self.tree[open].item.body = ItemBody::Code(self.allocs.allocate_cow(cow));
+            self.tree[open].item.end = self.tree[close].item.end;
+            self.tree[open].next = self.tree[close].next;
+        }
+    }
+
+    /// On success, returns a buffer containing the inline html and byte offset.
+    /// When no bytes were skipped, the buffer will be empty and the html can be
+    /// represented as a subslice of the input string.
+    fn scan_inline_html(&mut self, bytes: &[u8], ix: usize) -> Option<(Vec<u8>, usize)> {
+        let c = *bytes.get(ix)?;
+192:    broken_link_callback: Option<F>,
+228:                "broken_link_callback",
+229:                &self.broken_link_callback.as_ref().map(|_| ..),
+256:        Self::new_with_broken_link_callback(text, options, None)
+266:    pub fn new_with_broken_link_callback(
+269:        broken_link_callback: Option<F>,
+282:            broken_link_callback,
+297:        &self.allocs.refdefs
+308:    /// the [`broken_link_callback`] will be invoked and given the opportunity
+318:    /// [`broken_link_callback`]: Self::broken_link_callback
+331:            .refdefs
+344:                match self.broken_link_callback.as_mut() {
+347:                        let broken_link = BrokenLink {
+354:                            .handle_broken_link(broken_link)
+1953:    pub refdefs: RefDefs<'a>,
+2009:            refdefs: RefDefs::default(),
+2112:/// See [Parser::new_with_broken_link_callback].
+2115:    fn handle_broken_link(
+2125:    fn handle_broken_link(
+2134:    fn handle_broken_link(
+2138:        (**self).handle_broken_link(link)
+2147:    fn handle_broken_link(
+2682:    fn broken_links_called_only_once() {
+2689:            let callback = &mut |_broken_link: BrokenLink| {
+2694:                Parser::new_with_broken_link_callback(markdown, Options::empty(), Some(callback));
+2701:    fn simple_broken_link_callback() {
+2703:        let mut callback = |broken_link: BrokenLink| {
+2704:            assert_eq!("world", broken_link.reference.as_ref());
+2705:            assert_eq!(&test_str[broken_link.span], "[hello][world]");
+2711:            Parser::new_with_broken_link_callback(test_str, Options::empty(), Some(&mut callback));
+2801:        for _ in Parser::new_with_broken_link_callback(
+2811:        //for _ in Parser::new_with_broken_link_callback(&temporary_str, Options::empty(), Some(&mut callback)) {
+2814:        for _ in Parser::new_with_broken_link_callback(
+2819:        for _ in Parser::new_with_broken_link_callback(
+/// # Examples
+///
+/// ```
+/// use pulldown_cmark::{html, Parser};
+/// use std::io::Cursor;
+///
+/// let markdown_str = r#"
+/// hello
+/// =====
+///
+/// * alpha
+/// * beta
+/// "#;
+/// let mut bytes = Vec::new();
+/// let parser = Parser::new(markdown_str);
+///
+/// html::write_html_io(Cursor::new(&mut bytes), parser);
+///
+/// assert_eq!(&String::from_utf8_lossy(&bytes)[..], r#"<h1>hello</h1>
+/// <ul>
+/// <li>alpha</li>
+/// <li>beta</li>
+/// </ul>
+/// "#);
+/// ```
+pub fn write_html_io<'a, I, W>(writer: W, iter: I) -> std::io::Result<()>
+where
+    I: Iterator<Item = Event<'a>>,
+    W: std::io::Write,
+{
+    HtmlWriter::new(iter, IoWriter(writer)).run()
+}
+
+/// Iterate over an `Iterator` of `Event`s, generate HTML for each `Event`, and
+/// write it into Unicode-accepting buffer or stream.
+///
+/// # Examples
+///
+/// ```
+/// use pulldown_cmark::{html, Parser};
+///
+/// let markdown_str = r#"
+/// hello
+/// =====
+///
+/// * alpha
+/// * beta
+/// "#;
+/// let mut buf = String::new();
+/// let parser = Parser::new(markdown_str);
+///
+/// html::write_html_fmt(&mut buf, parser);
+///
+/// assert_eq!(buf, r#"<h1>hello</h1>
+/// <ul>
+/// <li>alpha</li>
+/// <li>beta</li>
+/// </ul>
+/// "#);
+/// ```
+pub fn write_html_fmt<'a, I, W>(writer: W, iter: I) -> std::fmt::Result
+where
+    I: Iterator<Item = Event<'a>>,
+    W: std::fmt::Write,
+{
+    HtmlWriter::new(iter, FmtWriter(writer)).run()
+}
+use pulldown_cmark::{html, BrokenLink, Options, Parser};
+
+fn main() {
+    let input: &str = "Hello world, check out [my website][].";
+    println!("Parsing the following markdown string:\n{}", input);
+
+    // Setup callback that sets the URL and title when it encounters
+    // a reference to our home page.
+    let callback = |broken_link: BrokenLink| {
+        if broken_link.reference.as_ref() == "my website" {
+            println!(
+                "Replacing the markdown `{}` of type {:?} with a working link",
+                &input[broken_link.span], broken_link.link_type,
+            );
+            Some(("http://example.com".into(), "my example website".into()))
+        } else {
+            None
+        }
+    };
+
+    // Create a parser with our callback function for broken links.
+    let parser = Parser::new_with_broken_link_callback(input, Options::empty(), Some(callback));
+
+    // Write to String buffer.
+    let mut html_output: String = String::with_capacity(input.len() * 3 / 2);
+    html::push_html(&mut html_output, parser);
+
+    // Check that the output is what we expected.
+    let expected_html: &str =
+        "<p>Hello world, check out <a href=\"http://example.com\" title=\"my example website\">my website</a>.</p>\n";
+    assert_eq!(expected_html, &html_output);
+
+    // Write result to stdout.
+    println!("\nHTML output:\n{}", &html_output);
+}
+total 8
+drwxr-xr-x 2 audit audit 4096 Nov  3 07:19 .
+drwxr-xr-x 1 root  root  4096 Nov  3 23:36 ..
+1.2G	/work/.cargo-home

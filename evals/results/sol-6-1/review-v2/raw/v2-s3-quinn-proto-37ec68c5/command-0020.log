@@ -1,0 +1,852 @@
+210-        Ok(())
+211-    }
+212-
+213-    /// Set the priority of the send stream
+214-    ///
+215-    /// Every send stream has an initial priority of 0. Locally buffered data from streams with
+216-    /// higher priority will be transmitted before data from streams with lower priority. Changing
+217-    /// the priority of a stream with pending data may only take effect after that data has been
+218-    /// transmitted. Using many different priority levels per connection may have a negative
+219-    /// impact on performance.
+220:    pub fn set_priority(&self, priority: i32) -> Result<(), ClosedStream> {
+221-        let mut conn = self.conn.state.lock("SendStream::set_priority");
+222-        conn.inner.send_stream(self.stream).set_priority(priority)?;
+223-        Ok(())
+224-    }
+225-
+226-    /// Get the priority of the send stream
+227-    pub fn priority(&self) -> Result<i32, ClosedStream> {
+228-        let mut conn = self.conn.state.lock("SendStream::priority");
+229-        conn.inner.send_stream(self.stream).priority()
+230-    }
+231-
+232-    /// Completes when the peer stops the stream or reads the stream to completion
+233-    ///
+234-    /// Yields `Some` with the stop error code if the peer stops the stream. Yields `None` if the
+235-    /// local side [`finish()`](Self::finish)es the stream and then the peer acknowledges receipt
+236-    /// of all stream data (although not necessarily the processing of it), after which the peer
+237-    /// closing the stream is no longer meaningful.
+238-    ///
+239-    /// For a variety of reasons, the peer may not send acknowledgements immediately upon receiving
+240-    /// data. As such, relying on `stopped` to know when the peer has read a stream to completion
+241-    /// may introduce more latency than using an application-level response of some sort.
+242-    pub fn stopped(
+243-        &self,
+244-    ) -> impl Future<Output = Result<Option<VarInt>, StoppedError>> + Send + Sync + 'static {
+245-        let conn = self.conn.clone();
+246-        let stream = self.stream;
+247-        let is_0rtt = self.is_0rtt;
+248-        async move {
+249-            loop {
+250-                // The `Notify::notified` future needs to be created while the lock is being held,
+251-                // otherwise a wakeup could be missed if triggered inbetween releasing the lock
+252-                // and creating the future.
+253-                // The lock may only be held in a block without `await`s, otherwise the future
+254-                // becomes `!Send`. `Notify::notified` is lifetime-bound to `Notify`, therefore
+255-                // we need to declare `notify` outside of the block, and initialize it inside.
+use std::{collections::VecDeque, ops::Range};
+
+use bytes::{Buf, Bytes};
+
+use crate::{VarInt, range_set::RangeSet};
+
+/// Buffer of outgoing retransmittable stream data
+#[derive(Default, Debug)]
+pub(super) struct SendBuffer {
+    /// Data queued by the application but not yet acknowledged. May or may not have been sent.
+    unacked_segments: VecDeque<Bytes>,
+    /// Total size of `unacked_segments`
+    unacked_len: usize,
+    /// The first offset that hasn't been written by the application, i.e. the offset past the end of `unacked`
+    offset: u64,
+    /// The first offset that hasn't been sent
+    ///
+    /// Always lies in (offset - unacked.len())..offset
+    unsent: u64,
+    /// Acknowledged ranges which couldn't be discarded yet as they don't include the earliest
+    /// offset in `unacked`
+    // TODO: Recover storage from these by compacting (#700)
+    acks: RangeSet,
+    /// Previously transmitted ranges deemed lost
+    retransmits: RangeSet,
+}
+
+impl SendBuffer {
+    /// Construct an empty buffer at the initial offset
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append application data to the end of the stream
+    pub(super) fn write(&mut self, data: Bytes) {
+        self.unacked_len += data.len();
+        self.offset += data.len() as u64;
+        self.unacked_segments.push_back(data);
+    }
+
+    /// Discard a range of acknowledged stream data
+    pub(super) fn ack(&mut self, mut range: Range<u64>) {
+        // Clamp the range to data which is still tracked
+        let base_offset = self.offset - self.unacked_len as u64;
+        range.start = base_offset.max(range.start);
+        range.end = base_offset.max(range.end);
+
+        self.acks.insert(range);
+
+        while self.acks.min() == Some(self.offset - self.unacked_len as u64) {
+            let prefix = self.acks.pop_min().unwrap();
+            let mut to_advance = (prefix.end - prefix.start) as usize;
+
+            self.unacked_len -= to_advance;
+            while to_advance > 0 {
+                let front = self
+                    .unacked_segments
+                    .front_mut()
+                    .expect("Expected buffered data");
+
+                if front.len() <= to_advance {
+                    to_advance -= front.len();
+                    self.unacked_segments.pop_front();
+
+                    if self.unacked_segments.len() * 4 < self.unacked_segments.capacity() {
+                        self.unacked_segments.shrink_to_fit();
+                    }
+                } else {
+                    front.advance(to_advance);
+                    to_advance = 0;
+                }
+            }
+        }
+    }
+
+    /// Compute the next range to transmit on this stream and update state to account for that
+    /// transmission.
+    ///
+    /// `max_len` here includes the space which is available to transmit the
+    /// offset and length of the data to send. The caller has to guarantee that
+    /// there is at least enough space available to write maximum-sized metadata
+    /// (8 byte offset + 8 byte length).
+    ///
+    /// The method returns a tuple:
+    /// - The first return value indicates the range of data to send
+    /// - The second return value indicates whether the length needs to be encoded
+    ///   in the STREAM frames metadata (`true`), or whether it can be omitted
+    ///   since the selected range will fill the whole packet.
+    pub(super) fn poll_transmit(&mut self, mut max_len: usize) -> (Range<u64>, bool) {
+        debug_assert!(max_len >= 8 + 8);
+        let mut encode_length = false;
+
+        if let Some(range) = self.retransmits.pop_min() {
+            // Retransmit sent data
+
+            // When the offset is known, we know how many bytes are required to encode it.
+            // Offset 0 requires no space
+            if range.start != 0 {
+                max_len -= VarInt::size(unsafe { VarInt::from_u64_unchecked(range.start) });
+            }
+            if range.end - range.start < max_len as u64 {
+                encode_length = true;
+                max_len -= 8;
+            }
+
+            let end = range.end.min((max_len as u64).saturating_add(range.start));
+            if end != range.end {
+                self.retransmits.insert(end..range.end);
+            }
+            return (range.start..end, encode_length);
+        }
+
+        // Transmit new data
+
+        // When the offset is known, we know how many bytes are required to encode it.
+        // Offset 0 requires no space
+        if self.unsent != 0 {
+            max_len -= VarInt::size(unsafe { VarInt::from_u64_unchecked(self.unsent) });
+        }
+        if self.offset - self.unsent < max_len as u64 {
+            encode_length = true;
+            max_len -= 8;
+        }
+
+        let end = self
+            .offset
+            .min((max_len as u64).saturating_add(self.unsent));
+        let result = self.unsent..end;
+        self.unsent = end;
+        (result, encode_length)
+    }
+
+    /// Returns data which is associated with a range
+    ///
+    /// This function can return a subset of the range, if the data is stored
+    /// in noncontiguous fashion in the send buffer. In this case callers
+    /// should call the function again with an incremented start offset to
+    /// retrieve more data.
+    pub(super) fn get(&self, offsets: Range<u64>) -> &[u8] {
+        let base_offset = self.offset - self.unacked_len as u64;
+
+        let mut segment_offset = base_offset;
+        for segment in self.unacked_segments.iter() {
+            if offsets.start >= segment_offset
+                && offsets.start < segment_offset + segment.len() as u64
+            {
+                let start = (offsets.start - segment_offset) as usize;
+                let end = (offsets.end - segment_offset) as usize;
+
+                return &segment[start..end.min(segment.len())];
+            }
+            segment_offset += segment.len() as u64;
+        }
+
+        &[]
+    }
+
+    /// Queue a range of sent but unacknowledged data to be retransmitted
+    pub(super) fn retransmit(&mut self, range: Range<u64>) {
+        debug_assert!(range.end <= self.unsent, "unsent data can't be lost");
+        self.retransmits.insert(range);
+    }
+
+    pub(super) fn retransmit_all_for_0rtt(&mut self) {
+        debug_assert_eq!(self.offset, self.unacked_len as u64);
+        self.unsent = 0;
+    }
+
+    /// First stream offset unwritten by the application, i.e. the offset that the next write will
+    /// begin at
+    pub(super) fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Whether all sent data has been acknowledged
+    pub(super) fn is_fully_acked(&self) -> bool {
+        self.unacked_len == 0
+    }
+
+    /// Whether there's data to send
+    ///
+    /// There may be sent unacknowledged data even when this is false.
+    pub(super) fn has_unsent_data(&self) -> bool {
+        self.unsent != self.offset || !self.retransmits.is_empty()
+    }
+
+    /// Compute the amount of data that hasn't been acknowledged
+    pub(super) fn unacked(&self) -> u64 {
+        self.unacked_len as u64 - self.acks.iter().map(|x| x.end - x.start).sum::<u64>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fragment_with_length() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world!";
+        buf.write(MSG.into());
+        // 0 byte offset => 19 bytes left => 13 byte data isn't enough
+        // with 8 bytes reserved for length 11 payload bytes will fit
+        assert_eq!(buf.poll_transmit(19), (0..11, true));
+        assert_eq!(
+            buf.poll_transmit(MSG.len() + 16 - 11),
+            (11..MSG.len() as u64, true)
+        );
+        assert_eq!(
+            buf.poll_transmit(58),
+            (MSG.len() as u64..MSG.len() as u64, true)
+        );
+    }
+
+    #[test]
+    fn fragment_without_length() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world with some extra data!";
+        buf.write(MSG.into());
+        // 0 byte offset => 19 bytes left => can be filled by 34 bytes payload
+        assert_eq!(buf.poll_transmit(19), (0..19, false));
+        assert_eq!(
+            buf.poll_transmit(MSG.len() - 19 + 1),
+            (19..MSG.len() as u64, false)
+        );
+        assert_eq!(
+            buf.poll_transmit(58),
+            (MSG.len() as u64..MSG.len() as u64, true)
+        );
+    }
+
+    #[test]
+    fn reserves_encoded_offset() {
+        let mut buf = SendBuffer::new();
+
+        // Pretend we have more than 1 GB of data in the buffer
+        let chunk: Bytes = Bytes::from_static(&[0; 1024 * 1024]);
+        for _ in 0..1025 {
+            buf.write(chunk.clone());
+        }
+
+        const SIZE1: u64 = 64;
+        const SIZE2: u64 = 16 * 1024;
+        const SIZE3: u64 = 1024 * 1024 * 1024;
+
+        // Offset 0 requires no space
+        assert_eq!(buf.poll_transmit(16), (0..16, false));
+        buf.retransmit(0..16);
+        assert_eq!(buf.poll_transmit(16), (0..16, false));
+        let mut transmitted = 16u64;
+
+        // Offset 16 requires 1 byte
+        assert_eq!(
+            buf.poll_transmit((SIZE1 - transmitted + 1) as usize),
+            (transmitted..SIZE1, false)
+        );
+        buf.retransmit(transmitted..SIZE1);
+        assert_eq!(
+            buf.poll_transmit((SIZE1 - transmitted + 1) as usize),
+            (transmitted..SIZE1, false)
+        );
+        transmitted = SIZE1;
+
+        // Offset 64 requires 2 bytes
+        assert_eq!(
+            buf.poll_transmit((SIZE2 - transmitted + 2) as usize),
+            (transmitted..SIZE2, false)
+        );
+        buf.retransmit(transmitted..SIZE2);
+        assert_eq!(
+            buf.poll_transmit((SIZE2 - transmitted + 2) as usize),
+            (transmitted..SIZE2, false)
+        );
+        transmitted = SIZE2;
+
+        // Offset 16384 requires requires 4 bytes
+        assert_eq!(
+            buf.poll_transmit((SIZE3 - transmitted + 4) as usize),
+            (transmitted..SIZE3, false)
+        );
+        buf.retransmit(transmitted..SIZE3);
+        assert_eq!(
+            buf.poll_transmit((SIZE3 - transmitted + 4) as usize),
+            (transmitted..SIZE3, false)
+        );
+        transmitted = SIZE3;
+
+        // Offset 1GB requires 8 bytes
+        assert_eq!(
+            buf.poll_transmit(chunk.len() + 8),
+            (transmitted..transmitted + chunk.len() as u64, false)
+        );
+        buf.retransmit(transmitted..transmitted + chunk.len() as u64);
+        assert_eq!(
+            buf.poll_transmit(chunk.len() + 8),
+            (transmitted..transmitted + chunk.len() as u64, false)
+        );
+    }
+
+    #[test]
+    fn multiple_segments() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world!";
+        const MSG_LEN: u64 = MSG.len() as u64;
+
+        const SEG1: &[u8] = b"He";
+        buf.write(SEG1.into());
+        const SEG2: &[u8] = b"llo,";
+        buf.write(SEG2.into());
+        const SEG3: &[u8] = b" w";
+        buf.write(SEG3.into());
+        const SEG4: &[u8] = b"o";
+        buf.write(SEG4.into());
+        const SEG5: &[u8] = b"rld!";
+        buf.write(SEG5.into());
+
+        assert_eq!(aggregate_unacked(&buf), MSG);
+
+        assert_eq!(buf.poll_transmit(16), (0..8, true));
+        assert_eq!(buf.get(0..5), SEG1);
+        assert_eq!(buf.get(2..8), SEG2);
+        assert_eq!(buf.get(6..8), SEG3);
+
+        assert_eq!(buf.poll_transmit(16), (8..MSG_LEN, true));
+        assert_eq!(buf.get(8..MSG_LEN), SEG4);
+        assert_eq!(buf.get(9..MSG_LEN), SEG5);
+
+        assert_eq!(buf.poll_transmit(42), (MSG_LEN..MSG_LEN, true));
+
+        // Now drain the segments
+        buf.ack(0..1);
+        assert_eq!(aggregate_unacked(&buf), &MSG[1..]);
+        buf.ack(0..3);
+        assert_eq!(aggregate_unacked(&buf), &MSG[3..]);
+        buf.ack(3..5);
+        assert_eq!(aggregate_unacked(&buf), &MSG[5..]);
+        buf.ack(7..9);
+        assert_eq!(aggregate_unacked(&buf), &MSG[5..]);
+        buf.ack(4..7);
+        assert_eq!(aggregate_unacked(&buf), &MSG[9..]);
+        buf.ack(0..MSG_LEN);
+        assert_eq!(aggregate_unacked(&buf), &[] as &[u8]);
+    }
+
+    #[test]
+    fn retransmit() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world with extra data!";
+        buf.write(MSG.into());
+        // Transmit two frames
+        assert_eq!(buf.poll_transmit(16), (0..16, false));
+        assert_eq!(buf.poll_transmit(16), (16..23, true));
+        // Lose the first, but not the second
+        buf.retransmit(0..16);
+        // Ensure we only retransmit the lost frame, then continue sending fresh data
+        assert_eq!(buf.poll_transmit(16), (0..16, false));
+        assert_eq!(buf.poll_transmit(16), (23..MSG.len() as u64, true));
+        // Lose the second frame
+        buf.retransmit(16..23);
+        assert_eq!(buf.poll_transmit(16), (16..23, true));
+    }
+
+    #[test]
+    fn ack() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world!";
+        buf.write(MSG.into());
+        assert_eq!(buf.poll_transmit(16), (0..8, true));
+        buf.ack(0..8);
+        assert_eq!(aggregate_unacked(&buf), &MSG[8..]);
+    }
+
+    #[test]
+    fn reordered_ack() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world with extra data!";
+        buf.write(MSG.into());
+        assert_eq!(buf.poll_transmit(16), (0..16, false));
+        assert_eq!(buf.poll_transmit(16), (16..23, true));
+        buf.ack(16..23);
+        assert_eq!(aggregate_unacked(&buf), MSG);
+        buf.ack(0..16);
+        assert_eq!(aggregate_unacked(&buf), &MSG[23..]);
+        assert!(buf.acks.is_empty());
+    }
+
+    fn aggregate_unacked(buf: &SendBuffer) -> Vec<u8> {
+        let mut result = Vec::new();
+        for segment in buf.unacked_segments.iter() {
+            result.extend_from_slice(&segment[..]);
+        }
+        result
+    }
+}
+use crate::{Instant, MAX_UDP_PAYLOAD, MtuDiscoveryConfig, packet::SpaceId};
+use std::cmp;
+use tracing::trace;
+
+/// Implements Datagram Packetization Layer Path Maximum Transmission Unit Discovery
+///
+/// See [`MtuDiscoveryConfig`] for details
+#[derive(Clone)]
+pub(crate) struct MtuDiscovery {
+    /// Detected MTU for the path
+    current_mtu: u16,
+    /// The state of the MTU discovery, if enabled
+    state: Option<EnabledMtuDiscovery>,
+    /// The state of the black hole detector
+    black_hole_detector: BlackHoleDetector,
+}
+
+impl MtuDiscovery {
+    pub(crate) fn new(
+        initial_plpmtu: u16,
+        min_mtu: u16,
+        peer_max_udp_payload_size: Option<u16>,
+        config: MtuDiscoveryConfig,
+    ) -> Self {
+        debug_assert!(
+            initial_plpmtu >= min_mtu,
+            "initial_max_udp_payload_size must be at least {min_mtu}"
+        );
+
+        let mut mtud = Self::with_state(
+            initial_plpmtu,
+            min_mtu,
+            Some(EnabledMtuDiscovery::new(config)),
+        );
+
+        // We might be migrating an existing connection to a new path, in which case the transport
+        // parameters have already been transmitted, and we already know the value of
+        // `peer_max_udp_payload_size`
+        if let Some(peer_max_udp_payload_size) = peer_max_udp_payload_size {
+            mtud.on_peer_max_udp_payload_size_received(peer_max_udp_payload_size);
+        }
+
+        mtud
+    }
+
+    /// MTU discovery will be disabled and the current MTU will be fixed to the provided value
+    pub(crate) fn disabled(plpmtu: u16, min_mtu: u16) -> Self {
+        Self::with_state(plpmtu, min_mtu, None)
+    }
+
+    fn with_state(current_mtu: u16, min_mtu: u16, state: Option<EnabledMtuDiscovery>) -> Self {
+        Self {
+            current_mtu,
+            state,
+            black_hole_detector: BlackHoleDetector::new(min_mtu),
+        }
+    }
+
+    pub(super) fn reset(&mut self, current_mtu: u16, min_mtu: u16) {
+        self.current_mtu = current_mtu;
+        if let Some(state) = self.state.take() {
+            self.state = Some(EnabledMtuDiscovery::new(state.config));
+            self.on_peer_max_udp_payload_size_received(state.peer_max_udp_payload_size);
+        }
+        self.black_hole_detector = BlackHoleDetector::new(min_mtu);
+    }
+
+    /// Returns the current MTU
+    pub(crate) fn current_mtu(&self) -> u16 {
+        self.current_mtu
+    }
+
+    /// Returns the amount of bytes that should be sent as an MTU probe, if any
+    pub(crate) fn poll_transmit(&mut self, now: Instant, next_pn: u64) -> Option<u16> {
+        self.state
+            .as_mut()
+            .and_then(|state| state.poll_transmit(now, self.current_mtu, next_pn))
+    }
+
+    /// Notifies the [`MtuDiscovery`] that the peer's `max_udp_payload_size` transport parameter has
+    /// been received
+    pub(crate) fn on_peer_max_udp_payload_size_received(&mut self, peer_max_udp_payload_size: u16) {
+        self.current_mtu = self.current_mtu.min(peer_max_udp_payload_size);
+
+        if let Some(state) = self.state.as_mut() {
+            // MTUD is only active after the connection has been fully established, so it is
+            // guaranteed we will receive the peer's transport parameters before we start probing
+            debug_assert!(matches!(state.phase, Phase::Initial));
+            state.peer_max_udp_payload_size = peer_max_udp_payload_size;
+        }
+    }
+
+    /// Notifies the [`MtuDiscovery`] that a packet has been ACKed
+    ///
+    /// Returns true if the packet was an MTU probe
+    pub(crate) fn on_acked(&mut self, space: SpaceId, pn: u64, len: u16) -> bool {
+        // MTU probes are only sent in application data space
+        if space != SpaceId::Data {
+            return false;
+        }
+
+        // Update the state of the MTU search
+        if let Some(new_mtu) = self
+            .state
+            .as_mut()
+            .and_then(|state| state.on_probe_acked(pn))
+        {
+            self.current_mtu = new_mtu;
+            trace!(current_mtu = self.current_mtu, "new MTU detected");
+
+            self.black_hole_detector.on_probe_acked(pn, len);
+            true
+        } else {
+            self.black_hole_detector.on_non_probe_acked(pn, len);
+            false
+        }
+    }
+
+    /// Returns the packet number of the in-flight MTU probe, if any
+    pub(crate) fn in_flight_mtu_probe(&self) -> Option<u64> {
+        match &self.state {
+            Some(EnabledMtuDiscovery {
+                phase: Phase::Searching(search_state),
+                ..
+            }) => search_state.in_flight_probe,
+            _ => None,
+        }
+    }
+
+    /// Notifies the [`MtuDiscovery`] that the in-flight MTU probe was lost
+    pub(crate) fn on_probe_lost(&mut self) {
+        if let Some(state) = &mut self.state {
+            state.on_probe_lost();
+        }
+    }
+
+    /// Notifies the [`MtuDiscovery`] that a non-probe packet was lost
+    ///
+    /// When done notifying of lost packets, [`MtuDiscovery::black_hole_detected`] must be called, to
+    /// ensure the last loss burst is properly processed and to trigger black hole recovery logic if
+    /// necessary.
+    pub(crate) fn on_non_probe_lost(&mut self, pn: u64, len: u16) {
+        self.black_hole_detector.on_non_probe_lost(pn, len);
+    }
+
+    /// Returns true if a black hole was detected
+    ///
+    /// Calling this function will close the previous loss burst. If a black hole is detected, the
+    /// current MTU will be reset to `min_mtu`.
+    pub(crate) fn black_hole_detected(&mut self, now: Instant) -> bool {
+        if !self.black_hole_detector.black_hole_detected() {
+            return false;
+        }
+
+        self.current_mtu = self.black_hole_detector.min_mtu;
+
+        if let Some(state) = &mut self.state {
+            state.on_black_hole_detected(now);
+        }
+
+        true
+    }
+}
+
+/// Additional state for enabled MTU discovery
+#[derive(Debug, Clone)]
+struct EnabledMtuDiscovery {
+    phase: Phase,
+    peer_max_udp_payload_size: u16,
+    config: MtuDiscoveryConfig,
+}
+
+impl EnabledMtuDiscovery {
+    fn new(config: MtuDiscoveryConfig) -> Self {
+        Self {
+            phase: Phase::Initial,
+            peer_max_udp_payload_size: MAX_UDP_PAYLOAD,
+            config,
+        }
+    }
+
+    /// Returns the amount of bytes that should be sent as an MTU probe, if any
+    fn poll_transmit(&mut self, now: Instant, current_mtu: u16, next_pn: u64) -> Option<u16> {
+        if let Phase::Initial = &self.phase {
+            // Start the first search
+            self.phase = Phase::Searching(SearchState::new(
+                current_mtu,
+                self.peer_max_udp_payload_size,
+                &self.config,
+            ));
+        } else if let Phase::Complete(next_mtud_activation) = &self.phase {
+            if now < *next_mtud_activation {
+                return None;
+            }
+
+            // Start a new search (we have reached the next activation time)
+            self.phase = Phase::Searching(SearchState::new(
+                current_mtu,
+                self.peer_max_udp_payload_size,
+                &self.config,
+            ));
+        }
+
+        if let Phase::Searching(state) = &mut self.phase {
+            // Nothing to do while there is a probe in flight
+            if state.in_flight_probe.is_some() {
+                return None;
+            }
+
+            // Retransmit lost probes, if any
+            if 0 < state.lost_probe_count && state.lost_probe_count < MAX_PROBE_RETRANSMITS {
+                state.in_flight_probe = Some(next_pn);
+                return Some(state.last_probed_mtu);
+            }
+
+            let last_probe_succeeded = state.lost_probe_count == 0;
+
+            // The probe is definitely lost (we reached the MAX_PROBE_RETRANSMITS threshold)
+            if !last_probe_succeeded {
+                state.lost_probe_count = 0;
+                state.in_flight_probe = None;
+            }
+
+            if let Some(probe_udp_payload_size) = state.next_mtu_to_probe(last_probe_succeeded) {
+                state.in_flight_probe = Some(next_pn);
+                state.last_probed_mtu = probe_udp_payload_size;
+                return Some(probe_udp_payload_size);
+            } else {
+                let next_mtud_activation = now + self.config.interval;
+                self.phase = Phase::Complete(next_mtud_activation);
+                return None;
+            }
+        }
+
+        None
+    }
+
+    /// Called when a packet is acknowledged in [`SpaceId::Data`]
+    ///
+    /// Returns the new `current_mtu` if the packet number corresponds to the in-flight MTU probe
+    fn on_probe_acked(&mut self, pn: u64) -> Option<u16> {
+        match &mut self.phase {
+            Phase::Searching(state) if state.in_flight_probe == Some(pn) => {
+                state.in_flight_probe = None;
+                state.lost_probe_count = 0;
+                Some(state.last_probed_mtu)
+            }
+            _ => None,
+        }
+    }
+
+    /// Called when the in-flight MTU probe was lost
+    fn on_probe_lost(&mut self) {
+        // We might no longer be searching, e.g. if a black hole was detected
+        if let Phase::Searching(state) = &mut self.phase {
+            state.in_flight_probe = None;
+            state.lost_probe_count += 1;
+        }
+    }
+
+/*
+ * Based on Google code released under BSD license here:
+ * https://groups.google.com/forum/#!topic/bbr-dev/3RTgkzi5ZD8
+ */
+
+/*
+ * Kathleen Nichols' algorithm for tracking the minimum (or maximum)
+ * value of a data stream over some fixed time interval.  (E.g.,
+ * the minimum RTT over the past five minutes.) It uses constant
+ * space and constant time per update yet almost always delivers
+ * the same minimum as an implementation that has to keep all the
+ * data in the window.
+ *
+ * The algorithm keeps track of the best, 2nd best & 3rd best min
+ * values, maintaining an invariant that the measurement time of
+ * the n'th best >= n-1'th best. It also makes sure that the three
+ * values are widely separated in the time window since that bounds
+ * the worse case error when that data is monotonically increasing
+ * over the window.
+ *
+ * Upon getting a new min, we can forget everything earlier because
+ * it has no value - the new min is <= everything else in the window
+ * by definition and it samples the most recent. So we restart fresh on
+ * every new min and overwrites 2nd & 3rd choices. The same property
+ * holds for 2nd & 3rd best.
+ */
+
+use std::fmt::Debug;
+
+#[derive(Copy, Clone, Debug)]
+pub(super) struct MinMax {
+    /// round count, not a timestamp
+    window: u64,
+    samples: [MinMaxSample; 3],
+}
+
+impl MinMax {
+    pub(super) fn get(&self) -> u64 {
+        self.samples[0].value
+    }
+
+    fn fill(&mut self, sample: MinMaxSample) {
+        self.samples.fill(sample);
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.fill(Default::default())
+    }
+
+    /// update_min is also defined in the original source, but removed here since it is not used.
+    pub(super) fn update_max(&mut self, current_round: u64, measurement: u64) {
+        let sample = MinMaxSample {
+            time: current_round,
+            value: measurement,
+        };
+
+        if self.samples[0].value == 0  /* uninitialised */
+            || /* found new max? */ sample.value >= self.samples[0].value
+            || /* nothing left in window? */ sample.time - self.samples[2].time > self.window
+        {
+            self.fill(sample); /* forget earlier samples */
+            return;
+        }
+
+        if sample.value >= self.samples[1].value {
+            self.samples[2] = sample;
+            self.samples[1] = sample;
+        } else if sample.value >= self.samples[2].value {
+            self.samples[2] = sample;
+        }
+
+        self.subwin_update(sample);
+    }
+
+    /* As time advances, update the 1st, 2nd, and 3rd choices. */
+    fn subwin_update(&mut self, sample: MinMaxSample) {
+        let dt = sample.time - self.samples[0].time;
+        if dt > self.window {
+            /*
+             * Passed entire window without a new sample so make 2nd
+             * choice the new sample & 3rd choice the new 2nd choice.
+             * we may have to iterate this since our 2nd choice
+             * may also be outside the window (we checked on entry
+             * that the third choice was in the window).
+             */
+            self.samples[0] = self.samples[1];
+            self.samples[1] = self.samples[2];
+            self.samples[2] = sample;
+            if sample.time - self.samples[0].time > self.window {
+                self.samples[0] = self.samples[1];
+                self.samples[1] = self.samples[2];
+                self.samples[2] = sample;
+            }
+        } else if self.samples[1].time == self.samples[0].time && dt > self.window / 4 {
+            /*
+             * We've passed a quarter of the window without a new sample
+             * so take a 2nd choice from the 2nd quarter of the window.
+             */
+            self.samples[2] = sample;
+            self.samples[1] = sample;
+        } else if self.samples[2].time == self.samples[1].time && dt > self.window / 2 {
+            /*
+             * We've passed half the window without finding a new sample
+             * so take a 3rd choice from the last half of the window
+             */
+            self.samples[2] = sample;
+        }
+    }
+}
+
+impl Default for MinMax {
+    fn default() -> Self {
+        Self {
+            window: 10,
+            samples: [Default::default(); 3],
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, Default)]
+struct MinMaxSample {
+    /// round number, not a timestamp
+    time: u64,
+    value: u64,
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test() {
+        let round = 25;
+        let mut min_max = MinMax::default();
+        min_max.update_max(round + 1, 100);
+        assert_eq!(100, min_max.get());
+        min_max.update_max(round + 3, 120);
+        assert_eq!(120, min_max.get());
+        min_max.update_max(round + 5, 160);
+        assert_eq!(160, min_max.get());
+        min_max.update_max(round + 7, 100);
+        assert_eq!(160, min_max.get());
+        min_max.update_max(round + 10, 100);
+        assert_eq!(160, min_max.get());
+        min_max.update_max(round + 14, 100);
+        assert_eq!(160, min_max.get());
+        min_max.update_max(round + 16, 100);
+        assert_eq!(100, min_max.get());
+        min_max.update_max(round + 18, 130);
+        assert_eq!(130, min_max.get());
+    }
+}

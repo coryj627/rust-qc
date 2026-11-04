@@ -1,0 +1,565 @@
+        conn.set_initial_window_size(window_size).expect("update");
+
+        // And then ensure we got the data normally "over" the smaller
+        // initial_window_size...
+        let f = async move {
+            let mut body = body;
+            data(&mut body, "data4").await;
+            data(&mut body, "data5").await;
+            assert!(body.data().await.is_none(), "eos");
+        };
+
+        join(async move { conn.await.expect("client") }, f).await;
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn client_decrease_initial_window_size() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200)).await;
+        srv.send_frame(frames::data(1, vec![b'a'; 100])).await;
+
+        srv.recv_frame(
+            frames::headers(3)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(3).response(200)).await;
+        srv.send_frame(frames::data(3, vec![b'a'; 100])).await;
+
+        srv.recv_frame(
+            frames::headers(5)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(5).response(200)).await;
+        srv.send_frame(frames::data(5, vec![b'a'; 100])).await;
+
+        srv.recv_frame(frames::settings().initial_window_size(0))
+            .await;
+        // check settings haven't applied before ACK
+        srv.send_frame(frames::data(1, vec![b'a'; 100]).eos()).await;
+        srv.send_frame(frames::settings_ack()).await;
+
+        // check stream 3 has no window
+        srv.send_frame(frames::data(3, vec![b'a'; 1])).await;
+        srv.recv_frame(frames::reset(3).flow_control()).await;
+
+        // check stream 5 can release capacity
+        srv.recv_frame(frames::window_update(5, 100)).await;
+
+        srv.recv_frame(frames::settings().initial_window_size(16_384))
+            .await;
+        srv.send_frame(frames::settings_ack()).await;
+
+        srv.send_frame(frames::data(5, vec![b'a'; 100])).await;
+        srv.send_frame(frames::data(5, vec![b'a'; 100]).eos()).await;
+    };
+
+    let client = async move {
+        let (mut client, mut conn) = client::handshake(io).await.unwrap();
+
+        async fn req(client: &mut client::SendRequest<Bytes>) -> h2::RecvStream {
+            let res_fut = client.get("https://http2.akamai.com/");
+
+            // Use some of the recv window
+            let resp = res_fut.await.expect("response");
+            let mut body = resp.into_body();
+
+            data(&mut body, "data1").await;
+
+            body
+        }
+
+        async fn data(body: &mut h2::RecvStream, expect: &str) {
+            let buf = body.data().await.expect(expect).expect(expect);
+            assert_eq!(buf.len(), 100, "{}", expect);
+        }
+
+        let mut body1 = conn.drive(req(&mut client)).await;
+        let mut body3 = conn.drive(req(&mut client)).await;
+        let mut body5 = conn.drive(req(&mut client)).await;
+
+        // Remove *all* window size of streams
+        conn.set_initial_window_size(0).expect("update0");
+        conn.drive(yield_once()).await;
+
+        // stream 1 received before settings ACK
+        conn.drive(async {
+            data(&mut body1, "body1 data2").await;
+            assert!(body1.is_end_stream());
+        })
+        .await;
+
+        // stream 3 received after ACK, which is stream error
+        conn.drive(async {
+            body3.data().await.expect("body3").expect_err("data2");
+        })
+        .await;
+
+        // stream 5 went negative, so release back to 0
+        assert_eq!(body5.flow_control().available_capacity(), -100);
+        assert_eq!(body5.flow_control().used_capacity(), 100);
+        body5
+            .flow_control()
+            .release_capacity(100)
+            .expect("release_capacity");
+        conn.drive(yield_once()).await;
+
+        // open up again
+        conn.set_initial_window_size(16_384).expect("update16");
+        conn.drive(yield_once()).await;
+
+        // get stream 5 data after opening up
+        conn.drive(async {
+            data(&mut body5, "body5 data2").await;
+            data(&mut body5, "body5 data3").await;
+            assert!(!body3.is_end_stream());
+        })
+        .await;
+
+        conn.await.expect("client")
+    };
+
+    join(srv, client).await;
+}
+
+#[tokio::test]
+async fn server_target_window_size() {
+    h2_support::trace_init!();
+    let (io, mut client) = mock::new();
+
+    let client = async move {
+        let settings = client.assert_server_handshake().await;
+        assert_default_settings!(settings);
+        client
+}
+
+impl Clone for OpaqueStreamRef {
+    fn clone(&self) -> Self {
+        // Increment the ref count
+        let mut inner = self.inner.lock().unwrap();
+        inner.store.resolve(self.key).ref_inc();
+        inner.refs += 1;
+
+        OpaqueStreamRef {
+            inner: self.inner.clone(),
+            key: self.key,
+        }
+    }
+}
+
+impl Drop for OpaqueStreamRef {
+    fn drop(&mut self) {
+        drop_stream_ref(&self.inner, self.key);
+    }
+}
+
+// TODO: Move back in fn above
+fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
+    let mut me = match inner.lock() {
+        Ok(inner) => inner,
+        Err(_) => {
+            if ::std::thread::panicking() {
+                tracing::trace!("StreamRef::drop; mutex poisoned");
+                return;
+            } else {
+                panic!("StreamRef::drop; mutex poisoned");
+            }
+        }
+    };
+
+    let me = &mut *me;
+    me.refs -= 1;
+    let mut stream = me.store.resolve(key);
+
+    tracing::trace!("drop_stream_ref; stream={:?}", stream);
+
+    // decrement the stream's ref count by 1.
+    stream.ref_dec();
+
+    let actions = &mut me.actions;
+
+    // If the stream is not referenced and it is already
+    // closed (does not have to go through logic below
+    // of canceling the stream), we should notify the task
+    // (connection) so that it can close properly
+    if stream.ref_count == 0 && stream.is_closed() {
+        if let Some(task) = actions.task.take() {
+            task.wake();
+        }
+    }
+
+    me.counts.transition(stream, |counts, stream| {
+        maybe_cancel(stream, actions, counts);
+
+        if stream.ref_count == 0 {
+            // Release any recv window back to connection, no one can access
+            // it anymore.
+            actions
+                .recv
+                .release_closed_capacity(stream, &mut actions.task);
+
+            // We won't be able to reach our push promises anymore
+            let mut ppp = stream.pending_push_promises.take();
+            while let Some(promise) = ppp.pop(stream.store_mut()) {
+                counts.transition(promise, |counts, stream| {
+                    maybe_cancel(stream, actions, counts);
+                });
+            }
+        }
+    });
+}
+
+fn maybe_cancel(stream: &mut store::Ptr, actions: &mut Actions, counts: &mut Counts) {
+    if stream.is_canceled_interest() {
+        // Server is allowed to early respond without fully consuming the client input stream
+        // But per the RFC, must send a RST_STREAM(NO_ERROR) in such cases. https://www.rfc-editor.org/rfc/rfc7540#section-8.1
+        // Some other http2 implementation may interpret other error code as fatal if not respected (i.e: nginx https://trac.nginx.org/nginx/ticket/2376)
+        let reason = if counts.peer().is_server()
+            && stream.state.is_send_closed()
+            && stream.state.is_recv_streaming()
+        {
+            Reason::NO_ERROR
+        } else {
+            Reason::CANCEL
+        };
+
+        actions
+            .send
+            .schedule_implicit_reset(stream, reason, counts, &mut actions.task);
+        actions.recv.enqueue_reset_expiration(stream, counts);
+    }
+}
+
+// ===== impl SendBuffer =====
+
+impl<B> SendBuffer<B> {
+    fn new() -> Self {
+        let inner = Mutex::new(Buffer::new());
+        SendBuffer { inner }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        let buf = self.inner.lock().unwrap();
+        buf.is_empty()
+    }
+}
+
+// ===== impl Actions =====
+
+impl Actions {
+    fn send_reset<B>(
+        &mut self,
+        stream: store::Ptr,
+        reason: Reason,
+        initiator: Initiator,
+        counts: &mut Counts,
+        send_buffer: &mut Buffer<Frame<B>>,
+    ) -> Result<(), crate::proto::error::GoAway> {
+        counts.transition(stream, |counts, stream| {
+            if initiator.is_library() {
+            Some(Event::Headers(Client(response))) => Poll::Ready(Ok(response)),
+            Some(_) => panic!("poll_response called after response returned"),
+            None => {
+                if !stream.state.ensure_recv_open()? {
+                    proto_err!(stream: "poll_response: stream={:?} is not opened;",  stream.id);
+                    return Poll::Ready(Err(Error::library_reset(
+                        stream.id,
+                        Reason::PROTOCOL_ERROR,
+                    )));
+                }
+
+                stream.recv_task = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+
+    /// Transition the stream based on receiving trailers
+    pub fn recv_trailers(
+        &mut self,
+        frame: frame::Headers,
+        stream: &mut store::Ptr,
+    ) -> Result<(), Error> {
+        // Transition the state
+        stream.state.recv_close()?;
+
+        if stream.ensure_content_length_zero().is_err() {
+            proto_err!(stream: "recv_trailers: content-length is not zero; stream={:?};",  stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
+        }
+
+        let trailers = frame.into_fields();
+
+        // Push the frame onto the stream's recv buffer
+        stream
+            .pending_recv
+            .push_back(&mut self.buffer, Event::Trailers(trailers));
+        stream.notify_recv();
+
+        Ok(())
+    }
+
+    /// Releases capacity of the connection
+    pub fn release_connection_capacity(&mut self, capacity: WindowSize, task: &mut Option<Waker>) {
+        tracing::trace!(
+            "release_connection_capacity; size={}, connection in_flight_data={}",
+            capacity,
+            self.in_flight_data,
+        );
+
+        // Decrement in-flight data
+        self.in_flight_data -= capacity;
+
+        // Assign capacity to connection
+        // TODO: proper error handling
+        let _res = self.flow.assign_capacity(capacity);
+        debug_assert!(_res.is_ok());
+
+        if self.flow.unclaimed_capacity().is_some() {
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+        }
+    }
+
+    /// Releases capacity back to the connection & stream
+    pub fn release_capacity(
+        &mut self,
+        capacity: WindowSize,
+        stream: &mut store::Ptr,
+        task: &mut Option<Waker>,
+        }
+    }
+
+    pub fn poll_complete<T, B>(
+        &mut self,
+        cx: &mut Context,
+        store: &mut Store,
+        counts: &mut Counts,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        // Send any pending connection level window updates
+        ready!(self.send_connection_window_update(cx, dst))?;
+
+        // Send any pending stream level window updates
+        ready!(self.send_stream_window_updates(cx, store, counts, dst))?;
+
+        Poll::Ready(Ok(()))
+    }
+
+    /// Send connection level window update
+    fn send_connection_window_update<T, B>(
+        &mut self,
+        cx: &mut Context,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        if let Some(incr) = self.flow.unclaimed_capacity() {
+            let frame = frame::WindowUpdate::new(StreamId::zero(), incr);
+
+            // Ensure the codec has capacity
+            ready!(dst.poll_ready(cx))?;
+
+            // Buffer the WINDOW_UPDATE frame
+            dst.buffer(frame.into())
+                .expect("invalid WINDOW_UPDATE frame");
+
+            // Update flow control
+            self.flow
+                .inc_window(incr)
+                .expect("unexpected flow control state");
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
+    /// Send stream level window update
+    pub fn send_stream_window_updates<T, B>(
+        &mut self,
+        cx: &mut Context,
+        store: &mut Store,
+        counts: &mut Counts,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        loop {
+            // Ensure the codec has capacity
+            ready!(dst.poll_ready(cx))?;
+
+            // Get the next stream
+            let stream = match self.pending_window_updates.pop(store) {
+                Some(stream) => stream,
+                None => return Poll::Ready(Ok(())),
+            };
+
+            counts.transition(stream, |_, stream| {
+                tracing::trace!("pending_window_updates -- pop; stream={:?}", stream.id);
+                debug_assert!(!stream.is_pending_window_update);
+
+                if !stream.state.is_recv_streaming() {
+                    // No need to send window updates on the stream if the stream is
+                    // no longer receiving data.
+                    //
+                    // TODO: is this correct? We could possibly send a window
+                    // update on a ReservedRemote stream if we already know
+                    // we want to stream the data faster...
+                    return;
+                }
+
+                // TODO: de-dup
+                if let Some(incr) = stream.recv_flow.unclaimed_capacity() {
+                    // Create the WINDOW_UPDATE frame
+                    let frame = frame::WindowUpdate::new(stream.id, incr);
+
+                    // Buffer it
+                    dst.buffer(frame.into())
+                        .expect("invalid WINDOW_UPDATE frame");
+
+                    // Update flow control
+                    stream
+                        .recv_flow
+                        .inc_window(incr)
+                        .expect("unexpected flow control state");
+                }
+            })
+        }
+    }
+
+    pub fn next_incoming(&mut self, store: &mut Store) -> Option<store::Key> {
+        self.pending_accept.pop(store).map(|ptr| ptr.key())
+    }
+
+    pub fn poll_data(
+        &mut self,
+        cx: &Context,
+        stream: &mut Stream,
+    ) -> Poll<Option<Result<Bytes, proto::Error>>> {
+        match stream.pending_recv.pop_front(&mut self.buffer) {
+            Some(Event::Data(payload)) => Poll::Ready(Some(Ok(payload))),
+            Some(event) => {
+                // Frame is trailer
+                stream.pending_recv.push_front(&mut self.buffer, event);
+
+                // Notify the recv task. This is done just in case
+                // `poll_trailers` was called.
+                //
+                // It is very likely that `notify_recv` will just be a no-op (as
+                // the task will be None), so this isn't really much of a
+                // performance concern. It also means we don't have to track
+                // state to see if `poll_trailers` was called before `poll_data`
+                // returned `None`.
+                stream.notify_recv();
+
+                // No more data frames
+                Poll::Ready(None)
+            }
+            None => self.schedule_recv(cx, stream),
+        }
+    }
+
+    pub fn poll_trailers(
+        &mut self,
+        cx: &Context,
+        stream: &mut Stream,
+    ) -> Poll<Option<Result<HeaderMap, proto::Error>>> {
+        match stream.pending_recv.pop_front(&mut self.buffer) {
+            Some(Event::Trailers(trailers)) => Poll::Ready(Some(Ok(trailers))),
+            Some(event) => {
+                // Frame is not trailers.. not ready to poll trailers yet.
+                stream.pending_recv.push_front(&mut self.buffer, event);
+
+                Poll::Pending
+            }
+            None => self.schedule_recv(cx, stream),
+        }
+    }
+
+    fn schedule_recv<T>(
+        &mut self,
+        cx: &Context,
+        stream: &mut Stream,
+    ) -> Poll<Option<Result<T, proto::Error>>> {
+        if stream.state.ensure_recv_open()? {
+            // Request to get notified once more frames arrive
+            stream.recv_task = Some(cx.waker().clone());
+            Poll::Pending
+        } else {
+        let _e = span.enter();
+
+        loop {
+            tracing::trace!(connection.state = ?self.inner.state);
+            // TODO: probably clean up this glob of code
+            match self.inner.state {
+                // When open, continue to poll a frame
+                State::Open => {
+                    let result = match self.poll2(cx) {
+                        Poll::Ready(result) => result,
+                        // The connection is not ready to make progress
+                        Poll::Pending => {
+                            // Ensure all window updates have been sent.
+                            //
+                            // This will also handle flushing `self.codec`
+                            ready!(self.inner.streams.poll_complete(cx, &mut self.codec))?;
+
+                            if (self.inner.error.is_some()
+                                || self.inner.go_away.should_close_on_idle())
+                                && !self.inner.streams.has_streams()
+                            {
+                                self.inner.as_dyn().go_away_now(Reason::NO_ERROR);
+                                continue;
+                            }
+
+                            return Poll::Pending;
+                        }
+                    };
+
+                    self.inner.as_dyn().handle_poll2_result(result)?
+                }
+                State::Closing(reason, initiator) => {
+                    tracing::trace!("connection closing after flush");
+                    // Flush/shutdown the codec
+                    ready!(self.codec.shutdown(cx))?;
+
+                    // Transition the state to error
+                    self.inner.state = State::Closed(reason, initiator);
+                }
+                State::Closed(reason, initiator) => {
+                    return Poll::Ready(self.take_error(reason, initiator));
+                }
+            }
+        }
+    }
+
+    fn poll2(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+        // This happens outside of the loop to prevent needing to do a clock
+        // check and then comparison of the queue possibly multiple times a
+        // second (and thus, the clock wouldn't have changed enough to matter).
+        self.clear_expired_reset_streams();

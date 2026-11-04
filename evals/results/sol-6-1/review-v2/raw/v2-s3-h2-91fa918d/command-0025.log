@@ -1,0 +1,784 @@
+        self.prioritize.reclaim_reserved_capacity(stream, counts);
+        self.prioritize.schedule_send(stream, task);
+    }
+
+    pub fn send_data<B>(
+        &mut self,
+        frame: frame::Data<B>,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError>
+    where
+        B: Buf,
+    {
+        self.prioritize
+            .send_data(frame, buffer, stream, counts, task)
+    }
+
+    pub fn send_trailers<B>(
+        &mut self,
+        frame: frame::Headers,
+        buffer: &mut Buffer<Frame<B>>,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+        task: &mut Option<Waker>,
+    ) -> Result<(), UserError> {
+        // TODO: Should this logic be moved into state.rs?
+        if !stream.state.is_send_streaming() {
+            return Err(UserError::UnexpectedFrameType);
+        }
+
+        stream.state.send_close();
+
+        tracing::trace!("send_trailers -- queuing; frame={:?}", frame);
+        self.prioritize
+            .queue_frame(frame.into(), buffer, stream, task);
+
+        // Release any excess capacity
+        self.prioritize.reserve_capacity(0, stream, counts);
+
+        Ok(())
+    }
+
+    pub fn poll_complete<T, B>(
+        &mut self,
+        cx: &mut Context,
+        buffer: &mut Buffer<Frame<B>>,
+        store: &mut Store,
+        counts: &mut Counts,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        self.prioritize
+            .poll_complete(cx, buffer, store, counts, dst)
+    }
+
+    /// Request capacity to send data
+    pub fn reserve_capacity(
+        &mut self,
+        capacity: WindowSize,
+        stream: &mut store::Ptr,
+        counts: &mut Counts,
+    ) {
+        self.prioritize.reserve_capacity(capacity, stream, counts)
+    }
+
+    pub fn poll_capacity(
+        &mut self,
+        cx: &Context,
+        stream: &mut store::Ptr,
+    ) -> Poll<Option<Result<WindowSize, UserError>>> {
+        if !stream.state.is_send_streaming() {
+            return Poll::Ready(None);
+        }
+
+        if !stream.send_capacity_inc {
+            stream.wait_send(cx);
+            return Poll::Pending;
+        }
+
+        stream.send_capacity_inc = false;
+
+        Poll::Ready(Some(Ok(self.capacity(stream))))
+    }
+
+    /// Current available stream send capacity
+    pub fn capacity(&self, stream: &mut store::Ptr) -> WindowSize {
+        stream.capacity(self.prioritize.max_buffer_size())
+    }
+
+    pub fn poll_reset(
+        &self,
+        cx: &Context,
+        stream: &mut Stream,
+        mode: PollReset,
+    ) -> Poll<Result<Reason, crate::Error>> {
+        match stream.state.ensure_reason(mode)? {
+            Some(reason) => Poll::Ready(Ok(reason)),
+            None => {
+                stream.wait_send(cx);
+                Poll::Pending
+            }
+use super::*;
+
+#[derive(Debug)]
+pub(super) struct Counts {
+    /// Acting as a client or server. This allows us to track which values to
+    /// inc / dec.
+    peer: peer::Dyn,
+
+    /// Maximum number of locally initiated streams
+    max_send_streams: usize,
+
+    /// Current number of remote initiated streams
+    num_send_streams: usize,
+
+    /// Maximum number of remote initiated streams
+    max_recv_streams: usize,
+
+    /// Current number of locally initiated streams
+    num_recv_streams: usize,
+
+    /// Maximum number of pending locally reset streams
+    max_local_reset_streams: usize,
+
+    /// Current number of pending locally reset streams
+    num_local_reset_streams: usize,
+
+    /// Max number of "pending accept" streams that were remotely reset
+    max_remote_reset_streams: usize,
+
+    /// Current number of "pending accept" streams that were remotely reset
+    num_remote_reset_streams: usize,
+
+    /// Maximum number of locally reset streams due to protocol error across
+    /// the lifetime of the connection.
+    ///
+    /// When this gets exceeded, we issue GOAWAYs.
+    max_local_error_reset_streams: Option<usize>,
+
+    /// Total number of locally reset streams due to protocol error across the
+    /// lifetime of the connection.
+    num_local_error_reset_streams: usize,
+}
+
+impl Counts {
+    /// Create a new `Counts` using the provided configuration values.
+    pub fn new(peer: peer::Dyn, config: &Config) -> Self {
+        Counts {
+            peer,
+            max_send_streams: config.initial_max_send_streams,
+            num_send_streams: 0,
+            max_recv_streams: config.remote_max_initiated.unwrap_or(usize::MAX),
+            num_recv_streams: 0,
+            max_local_reset_streams: config.local_reset_max,
+            num_local_reset_streams: 0,
+            max_remote_reset_streams: config.remote_reset_max,
+            num_remote_reset_streams: 0,
+            max_local_error_reset_streams: config.local_max_error_reset_streams,
+            num_local_error_reset_streams: 0,
+        }
+    }
+
+    /// Returns true when the next opened stream will reach capacity of outbound streams
+    ///
+    /// The number of client send streams is incremented in prioritize; send_request has to guess if
+    /// it should wait before allowing another request to be sent.
+    pub fn next_send_stream_will_reach_capacity(&self) -> bool {
+        self.max_send_streams <= (self.num_send_streams + 1)
+    }
+
+    /// Returns the current peer
+    pub fn peer(&self) -> peer::Dyn {
+        self.peer
+    }
+
+    pub fn has_streams(&self) -> bool {
+        self.num_send_streams != 0 || self.num_recv_streams != 0
+    }
+
+    /// Returns true if we can issue another local reset due to protocol error.
+    pub fn can_inc_num_local_error_resets(&self) -> bool {
+        if let Some(max) = self.max_local_error_reset_streams {
+            max > self.num_local_error_reset_streams
+        } else {
+            true
+        }
+    }
+
+    pub fn inc_num_local_error_resets(&mut self) {
+        assert!(self.can_inc_num_local_error_resets());
+
+        // Increment the number of remote initiated streams
+        self.num_local_error_reset_streams += 1;
+    }
+
+    pub(crate) fn max_local_error_resets(&self) -> Option<usize> {
+        self.max_local_error_reset_streams
+    }
+
+    /// Returns true if the receive stream concurrency can be incremented
+    pub fn can_inc_num_recv_streams(&self) -> bool {
+        self.max_recv_streams > self.num_recv_streams
+    }
+
+    /// Increments the number of concurrent receive streams.
+    ///
+    /// # Panics
+    ///
+    /// Panics on failure as this should have been validated before hand.
+    pub fn inc_num_recv_streams(&mut self, stream: &mut store::Ptr) {
+        assert!(self.can_inc_num_recv_streams());
+        assert!(!stream.is_counted);
+
+        // Increment the number of remote initiated streams
+        self.num_recv_streams += 1;
+        stream.is_counted = true;
+    }
+
+    /// Returns true if the send stream concurrency can be incremented
+    pub fn can_inc_num_send_streams(&self) -> bool {
+        self.max_send_streams > self.num_send_streams
+    }
+
+    /// Increments the number of concurrent send streams.
+    ///
+    /// # Panics
+    ///
+    /// Panics on failure as this should have been validated before hand.
+    pub fn inc_num_send_streams(&mut self, stream: &mut store::Ptr) {
+        assert!(self.can_inc_num_send_streams());
+        assert!(!stream.is_counted);
+
+        // Increment the number of remote initiated streams
+        self.num_send_streams += 1;
+        stream.is_counted = true;
+    }
+
+    /// Returns true if the number of pending reset streams can be incremented.
+    pub fn can_inc_num_reset_streams(&self) -> bool {
+        self.max_local_reset_streams > self.num_local_reset_streams
+    }
+
+    /// Increments the number of pending reset streams.
+    ///
+    /// # Panics
+    ///
+    /// Panics on failure as this should have been validated before hand.
+    pub fn inc_num_reset_streams(&mut self) {
+        assert!(self.can_inc_num_reset_streams());
+
+        self.num_local_reset_streams += 1;
+    }
+
+    pub(crate) fn max_remote_reset_streams(&self) -> usize {
+        self.max_remote_reset_streams
+    }
+
+    /// Returns true if the number of pending REMOTE reset streams can be
+    /// incremented.
+    pub(crate) fn can_inc_num_remote_reset_streams(&self) -> bool {
+        self.max_remote_reset_streams > self.num_remote_reset_streams
+    }
+
+    /// Increments the number of pending REMOTE reset streams.
+    ///
+    /// # Panics
+    ///
+    /// Panics on failure as this should have been validated before hand.
+    pub(crate) fn inc_num_remote_reset_streams(&mut self) {
+        assert!(self.can_inc_num_remote_reset_streams());
+
+        self.num_remote_reset_streams += 1;
+    }
+
+    pub(crate) fn dec_num_remote_reset_streams(&mut self) {
+        assert!(self.num_remote_reset_streams > 0);
+
+        self.num_remote_reset_streams -= 1;
+    }
+
+    pub fn apply_remote_settings(&mut self, settings: &frame::Settings, is_initial: bool) {
+        match settings.max_concurrent_streams() {
+            Some(val) => self.max_send_streams = val as usize,
+            None if is_initial => self.max_send_streams = usize::MAX,
+            None => {}
+        }
+    }
+
+    /// Run a block of code that could potentially transition a stream's state.
+    ///
+    /// If the stream state transitions to closed, this function will perform
+    /// all necessary cleanup.
+    ///
+    /// TODO: Is this function still needed?
+    pub fn transition<F, U>(&mut self, mut stream: store::Ptr, f: F) -> U
+    where
+        F: FnOnce(&mut Self, &mut store::Ptr) -> U,
+    {
+        // TODO: Does this need to be computed before performing the action?
+        let is_pending_reset = stream.is_pending_reset_expiration();
+
+        // Run the action
+        let ret = f(self, &mut stream);
+
+        self.transition_after(stream, is_pending_reset);
+
+        ret
+    }
+
+    // TODO: move this to macro?
+    pub fn transition_after(&mut self, mut stream: store::Ptr, is_reset_counted: bool) {
+        tracing::trace!(
+            "transition_after; stream={:?}; state={:?}; is_closed={:?}; \
+             pending_send_empty={:?}; buffered_send_data={}; \
+             num_recv={}; num_send={}",
+            stream.id,
+            stream.state,
+            stream.is_closed(),
+            stream.pending_send.is_empty(),
+            stream.buffered_send_data,
+            self.num_recv_streams,
+            self.num_send_streams
+        );
+
+        if stream.is_closed() {
+            if !stream.is_pending_reset_expiration() {
+                stream.unlink();
+                if is_reset_counted {
+                    self.dec_num_reset_streams();
+                }
+            }
+
+            if !stream.state.is_scheduled_reset() && stream.is_counted {
+                tracing::trace!("dec_num_streams; stream={:?}", stream.id);
+                // Decrement the number of active streams.
+                self.dec_num_streams(&mut stream);
+            }
+        }
+
+        // Release the stream if it requires releasing
+        if stream.is_released() {
+            stream.remove();
+        }
+    }
+
+    /// Returns the maximum number of streams that can be initiated by this
+    /// peer.
+    pub(crate) fn max_send_streams(&self) -> usize {
+        self.max_send_streams
+    }
+
+    /// Returns the maximum number of streams that can be initiated by the
+    /// remote peer.
+    pub(crate) fn max_recv_streams(&self) -> usize {
+        self.max_recv_streams
+    }
+
+    fn dec_num_streams(&mut self, stream: &mut store::Ptr) {
+        assert!(stream.is_counted);
+
+        if self.peer.is_local_init(stream.id) {
+
+        let stream = me.store.resolve(self.key);
+
+        me.actions.recv.is_end_stream(&stream)
+    }
+
+    pub fn poll_data(&mut self, cx: &Context) -> Poll<Option<Result<Bytes, proto::Error>>> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.key);
+
+        me.actions.recv.poll_data(cx, &mut stream)
+    }
+
+    pub fn poll_trailers(&mut self, cx: &Context) -> Poll<Option<Result<HeaderMap, proto::Error>>> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.key);
+
+        me.actions.recv.poll_trailers(cx, &mut stream)
+    }
+
+    pub(crate) fn available_recv_capacity(&self) -> isize {
+        let me = self.inner.lock().unwrap();
+        let me = &*me;
+
+        let stream = &me.store[self.key];
+        stream.recv_flow.available().into()
+    }
+
+    pub(crate) fn used_recv_capacity(&self) -> WindowSize {
+        let me = self.inner.lock().unwrap();
+        let me = &*me;
+
+        let stream = &me.store[self.key];
+        stream.in_flight_recv_data
+    }
+
+    /// Releases recv capacity back to the peer. This may result in sending
+    /// WINDOW_UPDATE frames on both the stream and connection.
+    pub fn release_capacity(&mut self, capacity: WindowSize) -> Result<(), UserError> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.key);
+
+        me.actions
+            .recv
+            .release_capacity(capacity, &mut stream, &mut me.actions.task)
+    }
+
+    /// Clear the receive queue and set the status to no longer receive data frames.
+    pub(crate) fn clear_recv_buffer(&mut self) {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+
+        let mut stream = me.store.resolve(self.key);
+        stream.is_recv = false;
+        me.actions.recv.clear_recv_buffer(&mut stream);
+    }
+
+    pub fn stream_id(&self) -> StreamId {
+        self.inner.lock().unwrap().store[self.key].id
+    }
+}
+
+impl fmt::Debug for OpaqueStreamRef {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        use std::sync::TryLockError::*;
+
+        match self.inner.try_lock() {
+            Ok(me) => {
+                let stream = &me.store[self.key];
+                fmt.debug_struct("OpaqueStreamRef")
+                    .field("stream_id", &stream.id)
+                    .field("ref_count", &stream.ref_count)
+                    .finish()
+            }
+            Err(Poisoned(_)) => fmt
+                .debug_struct("OpaqueStreamRef")
+                .field("inner", &"<Poisoned>")
+                .finish(),
+            Err(WouldBlock) => fmt
+                .debug_struct("OpaqueStreamRef")
+                .field("inner", &"<Locked>")
+                .finish(),
+        }
+    }
+}
+
+impl Clone for OpaqueStreamRef {
+    fn clone(&self) -> Self {
+        // Increment the ref count
+        let mut inner = self.inner.lock().unwrap();
+        inner.store.resolve(self.key).ref_inc();
+        inner.refs += 1;
+
+        OpaqueStreamRef {
+            inner: self.inner.clone(),
+            key: self.key,
+        }
+    }
+}
+
+impl Drop for OpaqueStreamRef {
+    fn drop(&mut self) {
+        drop_stream_ref(&self.inner, self.key);
+    }
+}
+
+// TODO: Move back in fn above
+fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
+    let mut me = match inner.lock() {
+        Ok(inner) => inner,
+        Err(_) => {
+            if ::std::thread::panicking() {
+                tracing::trace!("StreamRef::drop; mutex poisoned");
+                return;
+            } else {
+                panic!("StreamRef::drop; mutex poisoned");
+            }
+        }
+    };
+
+    let me = &mut *me;
+    me.refs -= 1;
+    let mut stream = me.store.resolve(key);
+
+    tracing::trace!("drop_stream_ref; stream={:?}", stream);
+            // determined from the first byte.
+            match Representation::load(ty)? {
+                Indexed => {
+                    tracing::trace!(rem = src.remaining(), kind = %"Indexed");
+                    can_resize = false;
+                    let entry = self.decode_indexed(src)?;
+                    consume(src);
+                    f(entry);
+                }
+                LiteralWithIndexing => {
+                    tracing::trace!(rem = src.remaining(), kind = %"LiteralWithIndexing");
+                    can_resize = false;
+                    let entry = self.decode_literal(src, true)?;
+
+                    // Insert the header into the table
+                    self.table.insert(entry.clone());
+                    consume(src);
+
+                    f(entry);
+                }
+                LiteralWithoutIndexing => {
+                    tracing::trace!(rem = src.remaining(), kind = %"LiteralWithoutIndexing");
+                    can_resize = false;
+                    let entry = self.decode_literal(src, false)?;
+                    consume(src);
+                    f(entry);
+                }
+                LiteralNeverIndexed => {
+                    tracing::trace!(rem = src.remaining(), kind = %"LiteralNeverIndexed");
+                    can_resize = false;
+                    let entry = self.decode_literal(src, false)?;
+                    consume(src);
+
+                    // TODO: Track that this should never be indexed
+
+                    f(entry);
+                }
+                SizeUpdate => {
+                    tracing::trace!(rem = src.remaining(), kind = %"SizeUpdate");
+                    if !can_resize {
+                        return Err(DecoderError::InvalidMaxDynamicSize);
+                    }
+
+                    // Handle the dynamic table size update
+                    self.process_size_update(src)?;
+                    consume(src);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn process_size_update(&mut self, buf: &mut Cursor<&mut BytesMut>) -> Result<(), DecoderError> {
+        let new_size = decode_int(buf, 5)?;
+
+        if new_size > self.last_max_update {
+            return Err(DecoderError::InvalidMaxDynamicSize);
+        }
+
+        tracing::debug!(
+            from = self.table.size(),
+            to = new_size,
+            "Decoder changed max table size"
+        );
+
+        self.table.set_max_size(new_size);
+
+        Ok(())
+    }
+
+    fn decode_indexed(&self, buf: &mut Cursor<&mut BytesMut>) -> Result<Header, DecoderError> {
+        let index = decode_int(buf, 7)?;
+        self.table.get(index)
+    }
+
+    fn decode_literal(
+        &mut self,
+        buf: &mut Cursor<&mut BytesMut>,
+        index: bool,
+    ) -> Result<Header, DecoderError> {
+        let prefix = if index { 6 } else { 4 };
+
+        // Extract the table index for the name, or 0 if not indexed
+        let table_idx = decode_int(buf, prefix)?;
+
+        // First, read the header name
+        if table_idx == 0 {
+            let old_pos = buf.position();
+            let name_marker = self.try_decode_string(buf)?;
+            let value_marker = self.try_decode_string(buf)?;
+            buf.set_position(old_pos);
+            // Read the name as a literal
+            let name = name_marker.consume(buf);
+            let value = value_marker.consume(buf);
+            Header::new(name, value)
+        } else {
+            let e = self.table.get(table_idx)?;
+            let value = self.decode_string(buf)?;
+
+            e.name().into_entry(value)
+        }
+    }
+
+    fn try_decode_string(
+        &mut self,
+        buf: &mut Cursor<&mut BytesMut>,
+    ) -> Result<StringMarker, DecoderError> {
+        let old_pos = buf.position();
+        const HUFF_FLAG: u8 = 0b1000_0000;
+
+        // The first bit in the first byte contains the huffman encoded flag.
+        let huff = match peek_u8(buf) {
+            Some(hdr) => (hdr & HUFF_FLAG) == HUFF_FLAG,
+            None => return Err(DecoderError::NeedMore(NeedMore::UnexpectedEndOfStream)),
+        };
+
+        // Decode the string length using 7 bit prefix
+        let len = decode_int(buf, 7)?;
+
+        if len > buf.remaining() {
+            tracing::trace!(len, remaining = buf.remaining(), "decode_string underflow",);
+            return Err(DecoderError::NeedMore(NeedMore::StringUnderflow));
+        }
+
+        let offset = (buf.position() - old_pos) as usize;
+        if huff {
+            let ret = {
+                let raw = &buf.chunk()[..len];
+                huffman::decode(raw, &mut self.buffer).map(|buf| StringMarker {
+                    offset,
+        Table {
+            entries: VecDeque::new(),
+            size: 0,
+            max_size,
+        }
+    }
+
+    fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Returns the entry located at the given index.
+    ///
+    /// The table is 1-indexed and constructed in such a way that the first
+    /// entries belong to the static table, followed by entries in the dynamic
+    /// table. They are merged into a single index address space, though.
+    ///
+    /// This is according to the [HPACK spec, section 2.3.3.]
+    /// (http://http2.github.io/http2-spec/compression.html#index.address.space)
+    pub fn get(&self, index: usize) -> Result<Header, DecoderError> {
+        if index == 0 {
+            return Err(DecoderError::InvalidTableIndex);
+        }
+
+        if index <= 61 {
+            return Ok(get_static(index));
+        }
+
+        // Convert the index for lookup in the entries structure.
+        match self.entries.get(index - 62) {
+            Some(e) => Ok(e.clone()),
+            None => Err(DecoderError::InvalidTableIndex),
+        }
+    }
+
+    fn insert(&mut self, entry: Header) {
+        let len = entry.len();
+
+        self.reserve(len);
+
+        if self.size + len <= self.max_size {
+            self.size += len;
+
+            // Track the entry
+            self.entries.push_front(entry);
+        }
+    }
+
+    fn set_max_size(&mut self, size: usize) {
+        self.max_size = size;
+        // Make the table size fit within the new constraints.
+        self.consolidate();
+    }
+
+    fn reserve(&mut self, size: usize) {
+        while self.size + size > self.max_size {
+            match self.entries.pop_back() {
+                Some(last) => {
+                    self.size -= last.len();
+                }
+                None => return,
+            }
+        }
+    }
+
+    fn consolidate(&mut self) {
+        while self.size > self.max_size {
+            {
+                let last = match self.entries.back() {
+                    Some(x) => x,
+                    None => {
+                        // Can never happen as the size of the table must reach
+                        // 0 by the time we've exhausted all elements.
+                        panic!("Size of table != 0, but no headers left!");
+                    }
+                };
+
+                self.size -= last.len();
+            }
+
+            self.entries.pop_back();
+        }
+    }
+}
+
+// ===== impl DecoderError =====
+
+impl From<Utf8Error> for DecoderError {
+    fn from(_: Utf8Error) -> DecoderError {
+        // TODO: Better error?
+        DecoderError::InvalidUtf8
+    }
+}
+
+impl From<header::InvalidHeaderValue> for DecoderError {
+    fn from(_: header::InvalidHeaderValue) -> DecoderError {
+        // TODO: Better error?
+        DecoderError::InvalidUtf8
+    }
+}
+
+impl From<header::InvalidHeaderName> for DecoderError {
+    fn from(_: header::InvalidHeaderName) -> DecoderError {
+        // TODO: Better error
+        DecoderError::InvalidUtf8
+    }
+}
+
+impl From<method::InvalidMethod> for DecoderError {
+    fn from(_: method::InvalidMethod) -> DecoderError {
+        // TODO: Better error
+        DecoderError::InvalidUtf8
+    }
+}
+
+impl From<status::InvalidStatusCode> for DecoderError {
+    fn from(_: status::InvalidStatusCode) -> DecoderError {
+        // TODO: Better error
+        DecoderError::InvalidUtf8
+    }
+}
+
+impl From<DecoderError> for frame::Error {
+    fn from(src: DecoderError) -> Self {
+        frame::Error::Hpack(src)
+    }
+}
+
+/// Get an entry from the static table
+pub fn get_static(idx: usize) -> Header {
+    use http::header::HeaderValue;
+
+    match idx {
+        1 => Header::Authority(BytesStr::from_static("")),
+        2 => Header::Method(Method::GET),
+        3 => Header::Method(Method::POST),
+        4 => Header::Path(BytesStr::from_static("/")),
+        5 => Header::Path(BytesStr::from_static("/index.html")),
+        6 => Header::Scheme(BytesStr::from_static("http")),
+        7 => Header::Scheme(BytesStr::from_static("https")),
+        8 => Header::Status(StatusCode::OK),
+        9 => Header::Status(StatusCode::NO_CONTENT),
+        10 => Header::Status(StatusCode::PARTIAL_CONTENT),
+        11 => Header::Status(StatusCode::NOT_MODIFIED),
+        12 => Header::Status(StatusCode::BAD_REQUEST),
+        13 => Header::Status(StatusCode::NOT_FOUND),
+        14 => Header::Status(StatusCode::INTERNAL_SERVER_ERROR),
+        15 => Header::Field {
+            name: header::ACCEPT_CHARSET,
+            value: HeaderValue::from_static(""),
+        },
+        16 => Header::Field {
+            name: header::ACCEPT_ENCODING,
+            value: HeaderValue::from_static("gzip, deflate"),
+        },
+        17 => Header::Field {

@@ -1,0 +1,2 @@
+alias hidden := main
+main:

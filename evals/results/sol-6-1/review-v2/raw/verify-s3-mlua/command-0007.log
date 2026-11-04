@@ -1,0 +1,1209 @@
+//! Deserialize Lua values to a Rust data structure.
+
+use std::cell::RefCell;
+use std::os::raw::c_void;
+use std::rc::Rc;
+use std::result::Result as StdResult;
+use std::string::String as StdString;
+
+use rustc_hash::FxHashSet;
+use serde::de::{self, IntoDeserializer};
+
+use crate::error::{Error, Result};
+use crate::table::{Table, TablePairs, TableSequence};
+use crate::userdata::AnyUserData;
+use crate::value::Value;
+
+/// A struct for deserializing Lua values into Rust values.
+#[derive(Debug, Default)]
+pub struct Deserializer {
+    value: Value,
+    options: Options,
+    visited: Rc<RefCell<FxHashSet<*const c_void>>>,
+    len: Option<usize>, // A length hint for sequences
+}
+
+/// A struct with options to change default deserializer behavior.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct Options {
+    /// If true, an attempt to serialize types such as [`Function`], [`Thread`], [`LightUserData`]
+    /// and [`Error`] will cause an error.
+    /// Otherwise these types skipped when iterating or serialized as unit type.
+    ///
+    /// Default: **true**
+    ///
+    /// [`Function`]: crate::Function
+    /// [`Thread`]: crate::Thread
+    /// [`LightUserData`]: crate::LightUserData
+    /// [`Error`]: crate::Error
+    pub deny_unsupported_types: bool,
+
+    /// If true, an attempt to serialize a recursive table (table that refers to itself)
+    /// will cause an error.
+    /// Otherwise subsequent attempts to serialize the same table will be ignored.
+    ///
+    /// Default: **true**
+    pub deny_recursive_tables: bool,
+
+    /// If true, keys in tables will be iterated in sorted order.
+    ///
+    /// Default: **false**
+    pub sort_keys: bool,
+
+    /// If true, empty Lua tables will be encoded as array, instead of map.
+    ///
+    /// Default: **false**
+    pub encode_empty_tables_as_array: bool,
+
+    /// If true, enable detection of mixed tables.
+    ///
+    /// A mixed table is a table that has both array-like and map-like entries or several borders.
+    /// See [`The Length Operator`] documentation for details about borders.
+    ///
+    /// When this option is disabled, a table with a non-zero length (with one or more borders) will
+    /// be always encoded as an array.
+    ///
+    /// Default: **false**
+    ///
+    /// [`The Length Operator`]: https://www.lua.org/manual/5.4/manual.html#3.4.7
+    pub detect_mixed_tables: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        const { Self::new() }
+    }
+}
+
+impl Options {
+    /// Returns a new instance of `Options` with default parameters.
+    pub const fn new() -> Self {
+        Options {
+            deny_unsupported_types: true,
+            deny_recursive_tables: true,
+            sort_keys: false,
+            encode_empty_tables_as_array: false,
+            detect_mixed_tables: false,
+        }
+    }
+
+    /// Sets [`deny_unsupported_types`] option.
+    ///
+    /// [`deny_unsupported_types`]: #structfield.deny_unsupported_types
+    #[must_use]
+    pub const fn deny_unsupported_types(mut self, enabled: bool) -> Self {
+        self.deny_unsupported_types = enabled;
+        self
+    }
+
+    /// Sets [`deny_recursive_tables`] option.
+    ///
+    /// [`deny_recursive_tables`]: #structfield.deny_recursive_tables
+    #[must_use]
+    pub const fn deny_recursive_tables(mut self, enabled: bool) -> Self {
+        self.deny_recursive_tables = enabled;
+        self
+    }
+
+    /// Sets [`sort_keys`] option.
+    ///
+    /// [`sort_keys`]: #structfield.sort_keys
+    #[must_use]
+    pub const fn sort_keys(mut self, enabled: bool) -> Self {
+        self.sort_keys = enabled;
+        self
+    }
+
+    /// Sets [`encode_empty_tables_as_array`] option.
+    ///
+    /// [`encode_empty_tables_as_array`]: #structfield.encode_empty_tables_as_array
+    #[must_use]
+    pub const fn encode_empty_tables_as_array(mut self, enabled: bool) -> Self {
+        self.encode_empty_tables_as_array = enabled;
+        self
+    }
+
+    /// Sets [`detect_mixed_tables`] option.
+    ///
+    /// [`detect_mixed_tables`]: #structfield.detect_mixed_tables
+    #[must_use]
+    pub const fn detect_mixed_tables(mut self, enable: bool) -> Self {
+        self.detect_mixed_tables = enable;
+        self
+    }
+}
+
+impl Deserializer {
+    /// Creates a new Lua Deserializer for the [`Value`].
+    pub fn new(value: Value) -> Self {
+        Self::new_with_options(value, Options::default())
+    }
+
+    /// Creates a new Lua Deserializer for the [`Value`] with custom options.
+    pub fn new_with_options(value: Value, options: Options) -> Self {
+        Deserializer {
+            value,
+            options,
+            ..Default::default()
+        }
+    }
+
+    fn from_parts(value: Value, options: Options, visited: Rc<RefCell<FxHashSet<*const c_void>>>) -> Self {
+        Deserializer {
+            value,
+            options,
+            visited,
+            ..Default::default()
+        }
+    }
+
+    fn with_len(mut self, len: usize) -> Self {
+        self.len = Some(len);
+        self
+    }
+}
+
+impl<'de> serde::Deserializer<'de> for Deserializer {
+    type Error = Error;
+
+    #[inline]
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: de::Visitor<'de>,
+    {
+        match self.value {
+            Value::Nil => visitor.visit_unit(),
+            Value::Boolean(b) => visitor.visit_bool(b),
+            #[allow(clippy::useless_conversion)]
+            Value::Integer(i) => visitor.visit_i64(i.into()),
+            #[allow(clippy::useless_conversion)]
+            Value::Number(n) => visitor.visit_f64(n.into()),
+            #[cfg(feature = "luau")]
+            Value::Vector(_) => self.deserialize_seq(visitor),
+            Value::String(s) => match s.to_str() {
+                Ok(s) => visitor.visit_str(&s),
+                Err(_) => visitor.visit_bytes(&s.as_bytes()),
+            },
+            Value::Table(ref t) => {
+                if let Some(len) = t.encode_as_array(self.options) {
+                    self.with_len(len).deserialize_seq(visitor)
+                } else {
+                    self.deserialize_map(visitor)
+                }
+            }
+            Value::LightUserData(ud) if ud.0.is_null() => visitor.visit_none(),
+            Value::UserData(ud) if ud.is_serializable() => {
+                serde_userdata(ud, |value| value.deserialize_any(visitor))
+            }
+            #[cfg(feature = "luau")]
+            Value::Buffer(buf) => {
+                let lua = buf.0.lua.lock();
+                visitor.visit_bytes(buf.as_slice(&lua))
+            }
+            Value::Function(_)
+            | Value::Thread(_)
+            | Value::UserData(_)
+            | Value::LightUserData(_)
+            | Value::Error(_)
+            | Value::Other(_) => {
+                if self.options.deny_unsupported_types {
+    }
+
+    #[inline]
+    fn deserialize_enum<V>(
+        self,
+        name: &'static str,
+        variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value>
+    where
+        V: de::Visitor<'de>,
+    {
+        let (variant, value, _guard) = match self.value {
+            Value::Table(table) => {
+                let _guard = RecursionGuard::new(&table, &self.visited);
+
+                let mut iter = table.pairs::<StdString, Value>();
+                let (variant, value) = match iter.next() {
+                    Some(v) => v?,
+                    None => {
+                        return Err(de::Error::invalid_value(
+                            de::Unexpected::Map,
+                            &"map with a single key",
+                        ))
+                    }
+                };
+
+                if iter.next().is_some() {
+                    return Err(de::Error::invalid_value(
+                        de::Unexpected::Map,
+                        &"map with a single key",
+                    ));
+                }
+                let skip = check_value_for_skip(&value, self.options, &self.visited)
+                    .map_err(|err| Error::DeserializeError(err.to_string()))?;
+                if skip {
+                    return Err(de::Error::custom("bad enum value"));
+                }
+
+                (variant, Some(value), Some(_guard))
+            }
+            Value::String(variant) => (variant.to_str()?.to_owned(), None, None),
+            Value::UserData(ud) if ud.is_serializable() => {
+                return serde_userdata(ud, |value| value.deserialize_enum(name, variants, visitor));
+            }
+            _ => return Err(de::Error::custom("bad enum value")),
+        };
+
+        visitor.visit_enum(EnumDeserializer {
+            variant,
+            value,
+            options: self.options,
+            visited: self.visited,
+        })
+    }
+
+    #[inline]
+    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: de::Visitor<'de>,
+    {
+        match self.value {
+            #[cfg(feature = "luau")]
+            Value::Vector(vec) => {
+                let mut deserializer = VecDeserializer {
+                    vec,
+                    next: 0,
+                    options: self.options,
+                    visited: self.visited,
+                };
+                visitor.visit_seq(&mut deserializer)
+            }
+            Value::Table(t) => {
+                let _guard = RecursionGuard::new(&t, &self.visited);
+
+                let len = self.len.unwrap_or_else(|| t.raw_len());
+                let mut deserializer = SeqDeserializer {
+                    seq: t.sequence_values().with_len(len),
+                    options: self.options,
+                    visited: self.visited,
+                };
+                let seq = visitor.visit_seq(&mut deserializer)?;
+                if deserializer.seq.next().is_none() {
+                    Ok(seq)
+                } else {
+                    Err(de::Error::invalid_length(len, &"fewer elements in the table"))
+                }
+            }
+            Value::UserData(ud) if ud.is_serializable() => {
+                serde_userdata(ud, |value| value.deserialize_seq(visitor))
+            }
+            value => Err(de::Error::invalid_type(
+                de::Unexpected::Other(value.type_name()),
+                &"table",
+            )),
+        }
+    }
+
+    #[inline]
+    fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value>
+    where
+        V: de::Visitor<'de>,
+    {
+        self.deserialize_seq(visitor)
+    }
+
+    #[inline]
+    fn deserialize_tuple_struct<V>(self, _name: &'static str, _len: usize, visitor: V) -> Result<V::Value>
+    where
+        V: de::Visitor<'de>,
+    {
+        self.deserialize_seq(visitor)
+    }
+
+    #[inline]
+    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: de::Visitor<'de>,
+    {
+        match self.value {
+            Value::Table(t) => {
+                let _guard = RecursionGuard::new(&t, &self.visited);
+
+                let mut deserializer = MapDeserializer {
+                    pairs: MapPairs::new(&t, self.options.sort_keys)?,
+                    value: None,
+                    options: self.options,
+                    visited: self.visited,
+                    processed: 0,
+                };
+                let map = visitor.visit_map(&mut deserializer)?;
+                let count = deserializer.pairs.count();
+                if count == 0 {
+                    Ok(map)
+                } else {
+                    Err(de::Error::invalid_length(
+                        deserializer.processed + count,
+                        &"fewer elements in the table",
+                    ))
+                }
+            }
+            Value::UserData(ud) if ud.is_serializable() => {
+                serde_userdata(ud, |value| value.deserialize_map(visitor))
+            }
+            value => Err(de::Error::invalid_type(
+                de::Unexpected::Other(value.type_name()),
+                &"table",
+            )),
+        }
+    }
+
+    #[inline]
+    fn deserialize_struct<V>(
+        self,
+        _name: &'static str,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value>
+    where
+        V: de::Visitor<'de>,
+    {
+        self.deserialize_map(visitor)
+    }
+
+    #[inline]
+    fn deserialize_newtype_struct<V>(self, name: &'static str, visitor: V) -> Result<V::Value>
+    where
+        V: de::Visitor<'de>,
+    {
+        match self.value {
+            Value::UserData(ud) if ud.is_serializable() => {
+                Some(item) => {
+                    let (key, value) = item?;
+                    let skip_key = check_value_for_skip(&key, self.options, &self.visited)
+                        .map_err(|err| Error::DeserializeError(err.to_string()))?;
+                    let skip_value = check_value_for_skip(&value, self.options, &self.visited)
+                        .map_err(|err| Error::DeserializeError(err.to_string()))?;
+                    if skip_key || skip_value {
+                        continue;
+                    }
+                    self.processed += 1;
+                    self.value = Some(value);
+                    let visited = Rc::clone(&self.visited);
+                    let key_de = Deserializer::from_parts(key, self.options, visited);
+                    return Ok(Some(key_de));
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+
+    fn next_value_deserializer(&mut self) -> Result<Deserializer> {
+        match self.value.take() {
+            Some(value) => {
+                let visited = Rc::clone(&self.visited);
+                Ok(Deserializer::from_parts(value, self.options, visited))
+            }
+            None => Err(de::Error::custom("value is missing")),
+        }
+    }
+}
+
+impl<'de> de::MapAccess<'de> for MapDeserializer<'_> {
+    type Error = Error;
+
+    fn next_key_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>>
+    where
+        T: de::DeserializeSeed<'de>,
+    {
+        match self.next_key_deserializer() {
+            Ok(Some(key_de)) => seed.deserialize(key_de).map(Some),
+            Ok(None) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn next_value_seed<T>(&mut self, seed: T) -> Result<T::Value>
+    where
+        T: de::DeserializeSeed<'de>,
+    {
+        match self.next_value_deserializer() {
+            Ok(value_de) => seed.deserialize(value_de),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        match self.pairs.size_hint() {
+            (lower, Some(upper)) if lower == upper => Some(upper),
+            _ => None,
+        }
+    }
+}
+
+struct EnumDeserializer {
+    variant: StdString,
+    value: Option<Value>,
+    options: Options,
+    visited: Rc<RefCell<FxHashSet<*const c_void>>>,
+}
+
+impl<'de> de::EnumAccess<'de> for EnumDeserializer {
+    type Error = Error;
+    type Variant = VariantDeserializer;
+
+    fn variant_seed<T>(self, seed: T) -> Result<(T::Value, Self::Variant)>
+    where
+        T: de::DeserializeSeed<'de>,
+    {
+        let variant = self.variant.into_deserializer();
+        let variant_access = VariantDeserializer {
+            value: self.value,
+            options: self.options,
+            visited: self.visited,
+        };
+        seed.deserialize(variant).map(|v| (v, variant_access))
+    }
+}
+
+struct VariantDeserializer {
+    value: Option<Value>,
+    options: Options,
+    visited: Rc<RefCell<FxHashSet<*const c_void>>>,
+}
+
+impl<'de> de::VariantAccess<'de> for VariantDeserializer {
+    type Error = Error;
+
+    fn unit_variant(self) -> Result<()> {
+        match self.value {
+            Some(_) => Err(de::Error::invalid_type(
+                de::Unexpected::NewtypeVariant,
+                &"unit variant",
+            )),
+            None => Ok(()),
+        }
+    }
+
+    fn newtype_variant_seed<T>(self, seed: T) -> Result<T::Value>
+    where
+        T: de::DeserializeSeed<'de>,
+    {
+        match self.value {
+            Some(value) => seed.deserialize(Deserializer::from_parts(value, self.options, self.visited)),
+            None => Err(de::Error::invalid_type(
+                de::Unexpected::UnitVariant,
+                &"newtype variant",
+            )),
+        }
+    }
+
+    fn tuple_variant<V>(self, _len: usize, visitor: V) -> Result<V::Value>
+    where
+        V: de::Visitor<'de>,
+    {
+        match self.value {
+            Some(value) => serde::Deserializer::deserialize_seq(
+                Deserializer::from_parts(value, self.options, self.visited),
+                visitor,
+            ),
+            None => Err(de::Error::invalid_type(
+                de::Unexpected::UnitVariant,
+                &"tuple variant",
+            )),
+        }
+    }
+
+    fn struct_variant<V>(self, _fields: &'static [&'static str], visitor: V) -> Result<V::Value>
+    where
+        V: de::Visitor<'de>,
+    {
+        match self.value {
+            Some(value) => serde::Deserializer::deserialize_map(
+                Deserializer::from_parts(value, self.options, self.visited),
+                visitor,
+            ),
+            None => Err(de::Error::invalid_type(
+                de::Unexpected::UnitVariant,
+                &"struct variant",
+            )),
+        }
+    }
+}
+
+// Adds `ptr` to the `visited` map and removes on drop
+// Used to track recursive tables but allow to traverse same tables multiple times
+pub(crate) struct RecursionGuard {
+    ptr: *const c_void,
+    visited: Rc<RefCell<FxHashSet<*const c_void>>>,
+}
+
+impl RecursionGuard {
+    #[inline]
+    pub(crate) fn new(table: &Table, visited: &Rc<RefCell<FxHashSet<*const c_void>>>) -> Self {
+        let visited = Rc::clone(visited);
+        let ptr = table.to_pointer();
+        visited.borrow_mut().insert(ptr);
+        RecursionGuard { ptr, visited }
+    }
+}
+
+impl Drop for RecursionGuard {
+    fn drop(&mut self) {
+        self.visited.borrow_mut().remove(&self.ptr);
+    }
+}
+
+// Checks `options` and decides should we emit an error or skip next element
+pub(crate) fn check_value_for_skip(
+    value: &Value,
+    options: Options,
+    visited: &RefCell<FxHashSet<*const c_void>>,
+) -> StdResult<bool, &'static str> {
+    match value {
+        Value::Table(table) => {
+            let ptr = table.to_pointer();
+            if visited.borrow().contains(&ptr) {
+                if options.deny_recursive_tables {
+                    return Err("recursive table detected");
+                }
+                return Ok(true); // skip
+            }
+        }
+        Value::UserData(ud) if ud.is_serializable() => {}
+        Value::Function(_)
+        | Value::Thread(_)
+        | Value::UserData(_)
+        | Value::LightUserData(_)
+        | Value::Error(_)
+            if !options.deny_unsupported_types =>
+        {
+            return Ok(true); // skip
+        }
+        _ => {}
+    }
+    Ok(false) // do not skip
+}
+
+fn serde_userdata<V>(
+    ud: AnyUserData,
+    f: impl FnOnce(serde_value::Value) -> std::result::Result<V, serde_value::DeserializerError>,
+) -> Result<V> {
+    match serde_value::to_value(ud) {
+        Ok(value) => match f(value) {
+            Ok(r) => Ok(r),
+            Err(error) => Err(Error::DeserializeError(error.to_string())),
+        },
+        Err(error) => Err(Error::SerializeError(error.to_string())),
+    }
+}
+        }
+    }
+
+    #[inline]
+    fn serialize_some<T>(self, value: &T) -> Result<Value>
+    where
+        T: Serialize + ?Sized,
+    {
+        value.serialize(self)
+    }
+
+    #[inline]
+    fn serialize_unit(self) -> Result<Value> {
+        if self.options.serialize_unit_to_null {
+            Ok(self.lua.null())
+        } else {
+            Ok(Value::Nil)
+        }
+    }
+
+    #[inline]
+    fn serialize_unit_struct(self, _name: &'static str) -> Result<Value> {
+        if self.options.serialize_unit_to_null {
+            Ok(self.lua.null())
+        } else {
+            Ok(Value::Nil)
+        }
+    }
+
+    #[inline]
+    fn serialize_unit_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        variant: &'static str,
+    ) -> Result<Value> {
+        self.serialize_str(variant)
+    }
+
+    #[inline]
+    fn serialize_newtype_struct<T>(self, _name: &'static str, value: &T) -> Result<Value>
+    where
+        T: Serialize + ?Sized,
+    {
+        value.serialize(self)
+    }
+
+    #[inline]
+    fn serialize_newtype_variant<T>(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        variant: &'static str,
+        value: &T,
+    ) -> Result<Value>
+    where
+        T: Serialize + ?Sized,
+    {
+        let table = self.lua.create_table()?;
+        let variant = self.lua.create_string(variant)?;
+        let value = self.lua.to_value_with(value, self.options)?;
+        table.raw_set(variant, value)?;
+        Ok(Value::Table(table))
+    }
+
+    #[inline]
+    fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq> {
+        let table = self.lua.create_table_with_capacity(len.unwrap_or(0), 0)?;
+        if self.options.set_array_metatable {
+            table.set_metatable(Some(self.lua.array_metatable()))?;
+        }
+        Ok(SerializeSeq::new(self.lua, table, self.options))
+    }
+
+    #[inline]
+    fn serialize_tuple(self, len: usize) -> Result<Self::SerializeTuple> {
+        self.serialize_seq(Some(len))
+    }
+
+    #[inline]
+    fn serialize_tuple_struct(self, name: &'static str, len: usize) -> Result<Self::SerializeTupleStruct> {
+        #[cfg(feature = "luau")]
+        if name == "Vector" && len == crate::Vector::SIZE {
+            return Ok(SerializeSeq::new_vector(self.lua, self.options));
+        }
+        _ = name;
+        self.serialize_seq(Some(len))
+    }
+
+    #[inline]
+    fn serialize_tuple_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        variant: &'static str,
+        _len: usize,
+    ) -> Result<Self::SerializeTupleVariant> {
+        Ok(SerializeTupleVariant {
+            lua: self.lua,
+            variant,
+            table: self.lua.create_table()?,
+            options: self.options,
+        })
+    }
+
+    #[inline]
+    fn serialize_map(self, len: Option<usize>) -> Result<Self::SerializeMap> {
+        Ok(SerializeMap {
+            lua: self.lua,
+            key: None,
+            table: self.lua.create_table_with_capacity(0, len.unwrap_or(0))?,
+            options: self.options,
+        })
+    }
+
+    #[inline]
+    fn serialize_struct(self, name: &'static str, len: usize) -> Result<Self::SerializeStruct> {
+        if self.options.detect_serde_json_arbitrary_precision
+            && name == "$serde_json::private::Number"
+            && len == 1
+        {
+            return Ok(SerializeStruct {
+                lua: self.lua,
+                inner: None,
+                options: self.options,
+            });
+        }
+
+        Ok(SerializeStruct {
+            lua: self.lua,
+            inner: Some(Value::Table(self.lua.create_table_with_capacity(0, len)?)),
+            options: self.options,
+        })
+    }
+
+    #[inline]
+
+impl ser::SerializeSeq for SerializeSeq<'_> {
+    type Ok = Value;
+    type Error = Error;
+
+    fn serialize_element<T>(&mut self, value: &T) -> Result<()>
+    where
+        T: Serialize + ?Sized,
+    {
+        let value = self.lua.to_value_with(value, self.options)?;
+        let table = self.table.as_ref().unwrap();
+        table.raw_seti(self.next + 1, value)?;
+        self.next += 1;
+        Ok(())
+    }
+
+    fn end(self) -> Result<Value> {
+        Ok(Value::Table(self.table.unwrap()))
+    }
+}
+
+impl ser::SerializeTuple for SerializeSeq<'_> {
+    type Ok = Value;
+    type Error = Error;
+
+    fn serialize_element<T>(&mut self, value: &T) -> Result<()>
+    where
+        T: Serialize + ?Sized,
+    {
+        ser::SerializeSeq::serialize_element(self, value)
+    }
+
+    fn end(self) -> Result<Value> {
+        ser::SerializeSeq::end(self)
+    }
+}
+
+impl ser::SerializeTupleStruct for SerializeSeq<'_> {
+    type Ok = Value;
+    type Error = Error;
+
+    fn serialize_field<T>(&mut self, value: &T) -> Result<()>
+    where
+        T: Serialize + ?Sized,
+    {
+        #[cfg(feature = "luau")]
+        if let Some(vector) = self.vector.as_mut() {
+            let value = self.lua.to_value_with(value, self.options)?;
+            let value = self.lua.unpack(value)?;
+            vector.0[self.next] = value;
+            self.next += 1;
+            return Ok(());
+        }
+        ser::SerializeSeq::serialize_element(self, value)
+    }
+
+    fn end(self) -> Result<Value> {
+        #[cfg(feature = "luau")]
+        if let Some(vector) = self.vector {
+            return Ok(Value::Vector(vector));
+        }
+        ser::SerializeSeq::end(self)
+    }
+}
+
+#[doc(hidden)]
+pub struct SerializeTupleVariant<'a> {
+    lua: &'a Lua,
+    variant: &'static str,
+    table: Table,
+    options: Options,
+}
+
+impl ser::SerializeTupleVariant for SerializeTupleVariant<'_> {
+    type Ok = Value;
+    type Error = Error;
+
+    fn serialize_field<T>(&mut self, value: &T) -> Result<()>
+    where
+        T: Serialize + ?Sized,
+    {
+        self.table.raw_push(self.lua.to_value_with(value, self.options)?)
+    }
+
+    fn end(self) -> Result<Value> {
+        let table = self.lua.create_table()?;
+        table.raw_set(self.variant, self.table)?;
+        Ok(Value::Table(table))
+    }
+}
+
+#[doc(hidden)]
+pub struct SerializeMap<'a> {
+    lua: &'a Lua,
+    table: Table,
+    key: Option<Value>,
+    options: Options,
+}
+
+impl ser::SerializeMap for SerializeMap<'_> {
+    type Ok = Value;
+    type Error = Error;
+
+    fn serialize_key<T>(&mut self, key: &T) -> Result<()>
+    where
+        T: Serialize + ?Sized,
+    {
+        self.key = Some(self.lua.to_value_with(key, self.options)?);
+        Ok(())
+    }
+
+    fn serialize_value<T>(&mut self, value: &T) -> Result<()>
+    where
+        T: Serialize + ?Sized,
+    {
+        let key = mlua_expect!(self.key.take(), "serialize_value called before serialize_key");
+        let value = self.lua.to_value_with(value, self.options)?;
+        self.table.raw_set(key, value)
+    }
+
+    fn end(self) -> Result<Value> {
+                message: Some("expected string or integer".to_string()),
+            }),
+        }
+    }
+}
+
+#[inline]
+unsafe fn push_bytes_into_stack<T>(this: T, lua: &RawLua) -> Result<()>
+where
+    T: IntoLua + AsRef<[u8]>,
+{
+    let bytes = this.as_ref();
+    if lua.unlikely_memory_error() && bytes.len() < (1 << 30) {
+        // Fast path: push directly into the Lua stack.
+        ffi::lua_pushlstring(lua.state(), bytes.as_ptr() as *const _, bytes.len());
+        return Ok(());
+    }
+    // Fallback to default
+    lua.push_value(&T::into_lua(this, lua.lua())?)
+}
+
+macro_rules! lua_convert_int {
+    ($x:ty) => {
+        impl IntoLua for $x {
+            #[inline]
+            fn into_lua(self, _: &Lua) -> Result<Value> {
+                Ok(cast(self)
+                    .map(Value::Integer)
+                    .unwrap_or_else(|| Value::Number(self as ffi::lua_Number)))
+            }
+
+            #[inline]
+            unsafe fn push_into_stack(self, lua: &RawLua) -> Result<()> {
+                match cast(self) {
+                    Some(i) => ffi::lua_pushinteger(lua.state(), i),
+                    None => ffi::lua_pushnumber(lua.state(), self as ffi::lua_Number),
+                }
+                Ok(())
+            }
+        }
+
+        impl FromLua for $x {
+            #[inline]
+            fn from_lua(value: Value, lua: &Lua) -> Result<Self> {
+                let ty = value.type_name();
+                (match value {
+                    Value::Integer(i) => cast(i),
+                    Value::Number(n) => cast(n),
+                    _ => {
+                        if let Some(i) = lua.coerce_integer(value.clone())? {
+                            cast(i)
+                        } else {
+                            cast(
+                                lua.coerce_number(value)?
+                                    .ok_or_else(|| Error::FromLuaConversionError {
+                                        from: ty,
+                                        to: stringify!($x).to_string(),
+                                        message: Some(
+                                            "expected number or string coercible to number".to_string(),
+                                        ),
+                                    })?,
+                            )
+                        }
+                    }
+                })
+                .ok_or_else(|| Error::FromLuaConversionError {
+                    from: ty,
+                    to: stringify!($x).to_string(),
+                    message: Some("out of range".to_owned()),
+                })
+            }
+
+            unsafe fn from_stack(idx: c_int, lua: &RawLua) -> Result<Self> {
+                let state = lua.state();
+                let type_id = ffi::lua_type(state, idx);
+                if type_id == ffi::LUA_TNUMBER {
+                    let mut ok = 0;
+                    let i = ffi::lua_tointegerx(state, idx, &mut ok);
+                    if ok != 0 {
+                        return cast(i).ok_or_else(|| Error::FromLuaConversionError {
+                            from: "integer",
+                            to: stringify!($x).to_string(),
+                            message: Some("out of range".to_owned()),
+                        });
+                    }
+                }
+                // Fallback to default
+                Self::from_lua(lua.stack_value(idx, Some(type_id)), lua.lua())
+            }
+        }
+    };
+}
+
+lua_convert_int!(i8);
+lua_convert_int!(u8);
+lua_convert_int!(i16);
+lua_convert_int!(u16);
+lua_convert_int!(i32);
+lua_convert_int!(u32);
+lua_convert_int!(i64);
+lua_convert_int!(u64);
+lua_convert_int!(i128);
+lua_convert_int!(u128);
+lua_convert_int!(isize);
+lua_convert_int!(usize);
+
+macro_rules! lua_convert_float {
+    ($x:ty) => {
+        impl IntoLua for $x {
+            #[inline]
+            fn into_lua(self, _: &Lua) -> Result<Value> {
+                Ok(Value::Number(self as _))
+            }
+        }
+
+        impl FromLua for $x {
+            #[inline]
+            fn from_lua(value: Value, lua: &Lua) -> Result<Self> {
+                let ty = value.type_name();
+                lua.coerce_number(value)?
+                    .map(|n| n as $x)
+                    .ok_or_else(|| Error::FromLuaConversionError {
+                        from: ty,
+                        to: stringify!($x).to_string(),
+                        message: Some("expected number or string coercible to number".to_string()),
+                    })
+            }
+
+            unsafe fn from_stack(idx: c_int, lua: &RawLua) -> Result<Self> {
+                let state = lua.state();
+                let type_id = ffi::lua_type(state, idx);
+                if type_id == ffi::LUA_TNUMBER {
+                    return Ok(ffi::lua_tonumber(state, idx) as _);
+                }
+                // Fallback to default
+                Self::from_lua(lua.stack_value(idx, Some(type_id)), lua.lua())
+            }
+        }
+    };
+}
+
+lua_convert_float!(f32);
+lua_convert_float!(f64);
+
+impl<T> IntoLua for &[T]
+where
+    T: IntoLua + Clone,
+{
+    #[inline]
+    fn into_lua(self, lua: &Lua) -> Result<Value> {
+        Ok(Value::Table(lua.create_sequence_from(self.iter().cloned())?))
+        Ok(Value::Table(lua.create_sequence_from(self.iter().cloned())?))
+    }
+}
+
+impl<T, const N: usize> IntoLua for [T; N]
+where
+    T: IntoLua,
+{
+    #[inline]
+    fn into_lua(self, lua: &Lua) -> Result<Value> {
+        Ok(Value::Table(lua.create_sequence_from(self)?))
+    }
+}
+
+impl<T, const N: usize> FromLua for [T; N]
+where
+    T: FromLua,
+{
+    #[inline]
+    fn from_lua(value: Value, _lua: &Lua) -> Result<Self> {
+        match value {
+            #[cfg(feature = "luau")]
+            #[rustfmt::skip]
+            Value::Vector(v) if N == crate::Vector::SIZE => unsafe {
+                use std::{mem, ptr};
+                let mut arr: [mem::MaybeUninit<T>; N] = mem::MaybeUninit::uninit().assume_init();
+                ptr::write(arr[0].as_mut_ptr() , T::from_lua(Value::Number(v.x() as _), _lua)?);
+                ptr::write(arr[1].as_mut_ptr(), T::from_lua(Value::Number(v.y() as _), _lua)?);
+                ptr::write(arr[2].as_mut_ptr(), T::from_lua(Value::Number(v.z() as _), _lua)?);
+                #[cfg(feature = "luau-vector4")]
+                ptr::write(arr[3].as_mut_ptr(), T::from_lua(Value::Number(v.w() as _), _lua)?);
+                Ok(mem::transmute_copy(&arr))
+            },
+            Value::Table(table) => {
+                let vec = table.sequence_values().collect::<Result<Vec<_>>>()?;
+                vec.try_into()
+                    .map_err(|vec: Vec<T>| Error::FromLuaConversionError {
+                        from: "table",
+                        to: Self::type_name(),
+                        message: Some(format!("expected table of length {N}, got {}", vec.len())),
+                    })
+            }
+            _ => Err(Error::FromLuaConversionError {
+                from: value.type_name(),
+                to: Self::type_name(),
+                message: Some("expected table".to_string()),
+            }),
+        }
+    }
+}
+
+impl<T: IntoLua> IntoLua for Box<[T]> {
+    #[inline]
+    fn into_lua(self, lua: &Lua) -> Result<Value> {
+        Ok(Value::Table(lua.create_sequence_from(self.into_vec())?))
+    }
+}
+
+impl<T: FromLua> FromLua for Box<[T]> {
+    #[inline]
+    fn from_lua(value: Value, lua: &Lua) -> Result<Self> {
+        Ok(Vec::<T>::from_lua(value, lua)?.into_boxed_slice())
+    }
+}
+
+impl<T: IntoLua> IntoLua for Vec<T> {
+    #[inline]
+    fn into_lua(self, lua: &Lua) -> Result<Value> {
+        Ok(Value::Table(lua.create_sequence_from(self)?))
+    }
+}
+
+impl<T: FromLua> FromLua for Vec<T> {
+    #[inline]
+    fn from_lua(value: Value, _lua: &Lua) -> Result<Self> {
+        match value {
+            Value::Table(table) => table.sequence_values().collect(),
+            _ => Err(Error::FromLuaConversionError {
+                from: value.type_name(),
+                to: Self::type_name(),
+                message: Some("expected table".to_string()),
+            }),
+        }
+    }
+}
+
+impl<K: Eq + Hash + IntoLua, V: IntoLua, S: BuildHasher> IntoLua for HashMap<K, V, S> {
+    #[inline]
+    fn into_lua(self, lua: &Lua) -> Result<Value> {
+        Ok(Value::Table(lua.create_table_from(self)?))
+    }
+}
+
+impl<K: Eq + Hash + FromLua, V: FromLua, S: BuildHasher + Default> FromLua for HashMap<K, V, S> {
+    #[inline]
+    fn from_lua(value: Value, _: &Lua) -> Result<Self> {
+        if let Value::Table(table) = value {
+            table.pairs().collect()
+        } else {
+            Err(Error::FromLuaConversionError {
+                from: value.type_name(),
+                to: Self::type_name(),
+                message: Some("expected table".to_string()),
+            })
+        }
+    }
+}
+
+impl<K: Ord + IntoLua, V: IntoLua> IntoLua for BTreeMap<K, V> {
+    #[inline]
+    fn into_lua(self, lua: &Lua) -> Result<Value> {
+        Ok(Value::Table(lua.create_table_from(self)?))
+    }
+}
+
+impl<K: Ord + FromLua, V: FromLua> FromLua for BTreeMap<K, V> {
+    #[inline]
+    fn from_lua(value: Value, _: &Lua) -> Result<Self> {
+        if let Value::Table(table) = value {
+            table.pairs().collect()
+        } else {
+            Err(Error::FromLuaConversionError {
+                from: value.type_name(),
+                to: Self::type_name(),
+                message: Some("expected table".to_string()),
+            })
+        }
+    }
+}
+
+impl<T: Eq + Hash + IntoLua, S: BuildHasher> IntoLua for HashSet<T, S> {
+    #[inline]
+    fn into_lua(self, lua: &Lua) -> Result<Value> {
+        Ok(Value::Table(
+            lua.create_table_from(self.into_iter().map(|val| (val, true)))?,
+        ))
+    }
+}
+
+impl<T: Eq + Hash + FromLua, S: BuildHasher + Default> FromLua for HashSet<T, S> {
+    #[inline]
+    fn from_lua(value: Value, _: &Lua) -> Result<Self> {
+        match value {
+            Value::Table(table) if table.raw_len() > 0 => table.sequence_values().collect(),
+            Value::Table(table) => table.pairs::<T, Value>().map(|res| res.map(|(k, _)| k)).collect(),
+            _ => Err(Error::FromLuaConversionError {
+                from: value.type_name(),
+                to: Self::type_name(),
+                message: Some("expected table".to_string()),
+            }),
+        }
+    }
+}
+
+impl<T: Ord + IntoLua> IntoLua for BTreeSet<T> {
+    #[inline]
+    fn into_lua(self, lua: &Lua) -> Result<Value> {
+        Ok(Value::Table(
+            lua.create_table_from(self.into_iter().map(|val| (val, true)))?,
+        ))
+    }
+}
+
+impl<T: Ord + FromLua> FromLua for BTreeSet<T> {
+    #[inline]
+    fn from_lua(value: Value, _: &Lua) -> Result<Self> {
+        match value {
+            Value::Table(table) if table.raw_len() > 0 => table.sequence_values().collect(),
+            Value::Table(table) => table.pairs::<T, Value>().map(|res| res.map(|(k, _)| k)).collect(),
+            _ => Err(Error::FromLuaConversionError {
+                from: value.type_name(),
+                to: Self::type_name(),
+                message: Some("expected table".to_string()),
+            }),
+        }
+    }
+}
+
+impl<T: IntoLua> IntoLua for Option<T> {
+    #[inline]
+    fn into_lua(self, lua: &Lua) -> Result<Value> {
+        match self {
+            Some(val) => val.into_lua(lua),
+            None => Ok(Nil),
+        }
+    }
+
+    #[inline]
+    unsafe fn push_into_stack(self, lua: &RawLua) -> Result<()> {
+        match self {
+            Some(val) => val.push_into_stack(lua)?,
+            None => ffi::lua_pushnil(lua.state()),
+        }
+        Ok(())
+    }
+}
+
+impl<T: FromLua> FromLua for Option<T> {
+    #[inline]
+    fn from_lua(value: Value, lua: &Lua) -> Result<Self> {
+        match value {

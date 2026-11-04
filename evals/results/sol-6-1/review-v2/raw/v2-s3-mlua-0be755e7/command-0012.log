@@ -1,0 +1,1040 @@
+use std::cell::{RefCell, UnsafeCell};
+
+#[cfg(feature = "serde")]
+use serde::ser::{Serialize, Serializer};
+
+use crate::error::{Error, Result};
+use crate::types::XRc;
+
+use super::lock::{RawLock, UserDataLock};
+use super::r#ref::{UserDataRef, UserDataRefMut};
+
+#[cfg(all(feature = "serde", not(feature = "send")))]
+type DynSerialize = dyn erased_serde::Serialize;
+
+#[cfg(all(feature = "serde", feature = "send"))]
+type DynSerialize = dyn erased_serde::Serialize + Send;
+
+pub(crate) enum UserDataStorage<T> {
+    Owned(UserDataVariant<T>),
+    Scoped(ScopedUserDataVariant<T>),
+}
+
+// A enum for storing userdata values.
+// It's stored inside a Lua VM and protected by the outer `ReentrantMutex`.
+pub(crate) enum UserDataVariant<T> {
+    Default(XRc<UserDataCell<T>>),
+    #[cfg(feature = "serde")]
+    Serializable(XRc<UserDataCell<Box<DynSerialize>>>, bool), // bool is `is_sync`
+}
+
+impl<T> Clone for UserDataVariant<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        match self {
+            Self::Default(inner) => Self::Default(XRc::clone(inner)),
+            #[cfg(feature = "serde")]
+            Self::Serializable(inner, is_sync) => Self::Serializable(XRc::clone(inner), *is_sync),
+        }
+    }
+}
+
+impl<T> UserDataVariant<T> {
+    #[inline(always)]
+    pub(super) fn try_borrow_scoped<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R> {
+        // We don't need to check for `T: Sync` because when this method is used (internally),
+        // Lua mutex is already locked.
+        // If non-`Sync` userdata is already borrowed by another thread (via `UserDataRef`), it will be
+        // exclusively locked.
+        let _guard = (self.raw_lock().try_lock_shared_guarded()).map_err(|_| Error::UserDataBorrowError)?;
+        Ok(f(unsafe { &*self.as_ptr() }))
+    }
+
+    // Mutably borrows the wrapped value in-place.
+    #[inline(always)]
+    fn try_borrow_scoped_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> Result<R> {
+        let _guard =
+            (self.raw_lock().try_lock_exclusive_guarded()).map_err(|_| Error::UserDataBorrowMutError)?;
+        Ok(f(unsafe { &mut *self.as_ptr() }))
+    }
+
+    // Immutably borrows the wrapped value and returns an owned reference.
+    #[inline(always)]
+    fn try_borrow_owned(&self) -> Result<UserDataRef<T>> {
+        UserDataRef::try_from(self.clone())
+    }
+
+    // Mutably borrows the wrapped value and returns an owned reference.
+    #[inline(always)]
+    fn try_borrow_owned_mut(&self) -> Result<UserDataRefMut<T>> {
+        UserDataRefMut::try_from(self.clone())
+    }
+
+    // Returns the wrapped value.
+    //
+    // This method checks that we have exclusive access to the value.
+    fn into_inner(self) -> Result<T> {
+        if !self.raw_lock().try_lock_exclusive() {
+            return Err(Error::UserDataBorrowMutError);
+        }
+        Ok(match self {
+            Self::Default(inner) => XRc::into_inner(inner).unwrap().value.into_inner(),
+            #[cfg(feature = "serde")]
+            Self::Serializable(inner, _) => unsafe {
+                let raw = Box::into_raw(XRc::into_inner(inner).unwrap().value.into_inner());
+                *Box::from_raw(raw as *mut T)
+            },
+        })
+    }
+
+    #[inline(always)]
+    fn strong_count(&self) -> usize {
+        match self {
+            Self::Default(inner) => XRc::strong_count(inner),
+            #[cfg(feature = "serde")]
+            Self::Serializable(inner, _) => XRc::strong_count(inner),
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn raw_lock(&self) -> &RawLock {
+        match self {
+            Self::Default(inner) => &inner.raw_lock,
+            #[cfg(feature = "serde")]
+            Self::Serializable(inner, _) => &inner.raw_lock,
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn as_ptr(&self) -> *mut T {
+        match self {
+            Self::Default(inner) => inner.value.get(),
+            #[cfg(feature = "serde")]
+            Self::Serializable(inner, _) => unsafe { &mut **(inner.value.get() as *mut Box<T>) },
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for UserDataStorage<()> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Owned(variant @ UserDataVariant::Serializable(inner, is_sync)) => unsafe {
+                #[cfg(feature = "send")]
+                if *is_sync {
+                    let _guard = (variant.raw_lock().try_lock_shared_guarded())
+                        .map_err(|_| serde::ser::Error::custom(Error::UserDataBorrowError))?;
+                    (*inner.value.get()).serialize(serializer)
+                } else {
+                    let _guard = (variant.raw_lock().try_lock_exclusive_guarded())
+                        .map_err(|_| serde::ser::Error::custom(Error::UserDataBorrowError))?;
+                    (*inner.value.get()).serialize(serializer)
+                }
+                #[cfg(not(feature = "send"))]
+                {
+                    let _ = is_sync;
+                    let _guard = (variant.raw_lock().try_lock_shared_guarded())
+                        .map_err(|_| serde::ser::Error::custom(Error::UserDataBorrowError))?;
+                    (*inner.value.get()).serialize(serializer)
+                }
+            },
+            _ => Err(serde::ser::Error::custom("cannot serialize <userdata>")),
+        }
+    }
+}
+
+/// A type that provides interior mutability for a userdata value (thread-safe).
+pub(crate) struct UserDataCell<T> {
+    raw_lock: RawLock,
+    value: UnsafeCell<T>,
+}
+
+#[cfg(feature = "send")]
+unsafe impl<T: Send> Send for UserDataCell<T> {}
+#[cfg(feature = "send")]
+unsafe impl<T: Send> Sync for UserDataCell<T> {}
+
+impl<T> UserDataCell<T> {
+    #[inline(always)]
+    fn new(value: T) -> Self {
+        UserDataCell {
+            raw_lock: RawLock::INIT,
+            value: UnsafeCell::new(value),
+        }
+    }
+}
+
+pub(crate) enum ScopedUserDataVariant<T> {
+    Ref(*const T),
+    RefMut(RefCell<*mut T>),
+    Boxed(RefCell<*mut T>),
+}
+
+impl<T> Drop for ScopedUserDataVariant<T> {
+    #[inline]
+    fn drop(&mut self) {
+        if let Self::Boxed(value) = self {
+            if let Ok(value) = value.try_borrow_mut() {
+                unsafe { drop(Box::from_raw(*value)) };
+            }
+        }
+    }
+}
+
+impl<T: 'static> UserDataStorage<T> {
+    #[inline(always)]
+    pub(crate) fn new(data: T) -> Self {
+        Self::Owned(UserDataVariant::Default(XRc::new(UserDataCell::new(data))))
+    }
+
+    #[inline(always)]
+    pub(crate) fn new_ref(data: &T) -> Self {
+        Self::Scoped(ScopedUserDataVariant::Ref(data))
+    }
+
+    #[inline(always)]
+    pub(crate) fn new_ref_mut(data: &mut T) -> Self {
+        Self::Scoped(ScopedUserDataVariant::RefMut(RefCell::new(data)))
+    }
+
+    #[cfg(feature = "serde")]
+    #[inline(always)]
+    pub(crate) fn new_ser(data: T) -> Self
+    where
+        T: Serialize + crate::types::MaybeSend,
+    {
+        let data = Box::new(data) as Box<DynSerialize>;
+        let is_sync = super::util::is_sync::<T>();
+        let variant = UserDataVariant::Serializable(XRc::new(UserDataCell::new(data)), is_sync);
+        Self::Owned(variant)
+    }
+
+    #[cfg(feature = "serde")]
+    #[inline(always)]
+    pub(crate) fn is_serializable(&self) -> bool {
+        matches!(self, Self::Owned(UserDataVariant::Serializable(..)))
+    }
+
+    // Immutably borrows the wrapped value and returns an owned reference.
+    #[inline(always)]
+    pub(crate) fn try_borrow_owned(&self) -> Result<UserDataRef<T>> {
+        match self {
+            Self::Owned(data) => data.try_borrow_owned(),
+            Self::Scoped(_) => Err(Error::UserDataTypeMismatch),
+        }
+    }
+
+    // Mutably borrows the wrapped value and returns an owned reference.
+    #[inline(always)]
+    pub(crate) fn try_borrow_owned_mut(&self) -> Result<UserDataRefMut<T>> {
+        match self {
+            Self::Owned(data) => data.try_borrow_owned_mut(),
+            Self::Scoped(_) => Err(Error::UserDataTypeMismatch),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn into_inner(self) -> Result<T> {
+        match self {
+            Self::Owned(data) => data.into_inner(),
+            Self::Scoped(_) => Err(Error::UserDataTypeMismatch),
+        }
+    }
+}
+
+impl<T> UserDataStorage<T> {
+    #[inline(always)]
+    pub(crate) fn new_scoped(data: T) -> Self {
+        let data = Box::into_raw(Box::new(data));
+        Self::Scoped(ScopedUserDataVariant::Boxed(RefCell::new(data)))
+    }
+
+    /// Returns `true` if it's safe to destroy the container.
+    ///
+    /// It's safe to destroy the container if the reference count is greater than 1 or the lock is
+    /// not acquired.
+    #[inline(always)]
+    pub(crate) fn is_safe_to_destroy(&self) -> bool {
+        match self {
+            Self::Owned(variant) => variant.strong_count() > 1 || !variant.raw_lock().is_locked(),
+            Self::Scoped(_) => false,
+        }
+    }
+
+    /// Returns `true` if the container has exclusive access to the value.
+    #[inline(always)]
+    pub(crate) fn has_exclusive_access(&self) -> bool {
+        match self {
+            Self::Owned(variant) => !variant.raw_lock().is_locked(),
+            Self::Scoped(_) => false,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn try_borrow_scoped<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R> {
+        match self {
+            Self::Owned(data) => data.try_borrow_scoped(f),
+            Self::Scoped(ScopedUserDataVariant::Ref(value)) => Ok(f(unsafe { &**value })),
+            Self::Scoped(ScopedUserDataVariant::RefMut(value) | ScopedUserDataVariant::Boxed(value)) => {
+                let t = value.try_borrow().map_err(|_| Error::UserDataBorrowError)?;
+                Ok(f(unsafe { &**t }))
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn try_borrow_scoped_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> Result<R> {
+        match self {
+            Self::Owned(data) => data.try_borrow_scoped_mut(f),
+            Self::Scoped(ScopedUserDataVariant::Ref(_)) => Err(Error::UserDataBorrowMutError),
+            Self::Scoped(ScopedUserDataVariant::RefMut(value) | ScopedUserDataVariant::Boxed(value)) => {
+                let mut t = value
+                    .try_borrow_mut()
+                    .map_err(|_| Error::UserDataBorrowMutError)?;
+                Ok(f(unsafe { &mut **t }))
+            }
+        }
+    }
+}
+use std::any::Any;
+use std::os::raw::c_void;
+
+use crate::types::{Callback, CallbackUpvalue};
+
+#[cfg(feature = "async")]
+use crate::types::{AsyncCallback, AsyncCallbackUpvalue, AsyncPollUpvalue};
+
+pub(crate) trait TypeKey: Any {
+    fn type_key() -> *const c_void;
+}
+
+impl TypeKey for String {
+    #[inline(always)]
+    fn type_key() -> *const c_void {
+        static STRING_TYPE_KEY: u8 = 0;
+        &STRING_TYPE_KEY as *const u8 as *const c_void
+    }
+}
+
+impl TypeKey for Callback {
+    #[inline(always)]
+    fn type_key() -> *const c_void {
+        static CALLBACK_TYPE_KEY: u8 = 0;
+        &CALLBACK_TYPE_KEY as *const u8 as *const c_void
+    }
+}
+
+impl TypeKey for CallbackUpvalue {
+    #[inline(always)]
+    fn type_key() -> *const c_void {
+        static CALLBACK_UPVALUE_TYPE_KEY: u8 = 0;
+        &CALLBACK_UPVALUE_TYPE_KEY as *const u8 as *const c_void
+    }
+}
+
+#[cfg(not(feature = "luau"))]
+impl TypeKey for crate::types::HookCallback {
+    #[inline(always)]
+    fn type_key() -> *const c_void {
+        static HOOK_CALLBACK_TYPE_KEY: u8 = 0;
+        &HOOK_CALLBACK_TYPE_KEY as *const u8 as *const c_void
+    }
+}
+
+#[cfg(feature = "async")]
+impl TypeKey for AsyncCallback {
+    #[inline(always)]
+    fn type_key() -> *const c_void {
+        static ASYNC_CALLBACK_TYPE_KEY: u8 = 0;
+        &ASYNC_CALLBACK_TYPE_KEY as *const u8 as *const c_void
+    }
+}
+
+#[cfg(feature = "async")]
+impl TypeKey for AsyncCallbackUpvalue {
+    #[inline(always)]
+    fn type_key() -> *const c_void {
+        static ASYNC_CALLBACK_UPVALUE_TYPE_KEY: u8 = 0;
+        &ASYNC_CALLBACK_UPVALUE_TYPE_KEY as *const u8 as *const c_void
+    }
+}
+
+#[cfg(feature = "async")]
+impl TypeKey for AsyncPollUpvalue {
+    #[inline(always)]
+    fn type_key() -> *const c_void {
+        static ASYNC_POLL_UPVALUE_TYPE_KEY: u8 = 0;
+        &ASYNC_POLL_UPVALUE_TYPE_KEY as *const u8 as *const c_void
+    }
+}
+
+#[cfg(feature = "async")]
+impl TypeKey for Option<std::task::Waker> {
+    #[inline(always)]
+    fn type_key() -> *const c_void {
+        static WAKER_TYPE_KEY: u8 = 0;
+        &WAKER_TYPE_KEY as *const u8 as *const c_void
+    }
+}
+use std::borrow::Cow;
+use std::fmt;
+use std::iter::Peekable;
+use std::str::CharIndices;
+
+use crate::error::{Error, Result};
+use crate::state::Lua;
+use crate::traits::IntoLua;
+use crate::types::Integer;
+use crate::value::Value;
+
+#[derive(Debug)]
+pub(crate) enum PathKey<'a> {
+    Str(Cow<'a, str>),
+    Int(Integer),
+}
+
+impl fmt::Display for PathKey<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            PathKey::Str(s) => write!(f, "{}", s),
+            PathKey::Int(i) => write!(f, "{}", i),
+        }
+    }
+}
+
+impl IntoLua for PathKey<'_> {
+    fn into_lua(self, lua: &Lua) -> Result<Value> {
+        match self {
+            PathKey::Str(s) => Ok(Value::String(lua.create_string(s.as_ref())?)),
+            PathKey::Int(i) => Ok(Value::Integer(i)),
+        }
+    }
+}
+
+// Parses a path like `a.b[3]?.c["d"]` into segments of `(key, safe_nil)`.
+pub(crate) fn parse_path<'a>(path: &'a str) -> Result<Vec<(PathKey<'a>, bool)>> {
+    fn read_ident<'a>(path: &'a str, chars: &mut Peekable<CharIndices<'a>>) -> (Cow<'a, str>, bool) {
+        let mut safe_nil = false;
+        let start = chars.peek().map(|&(i, _)| i).unwrap_or(path.len());
+        let mut end = start;
+        while let Some(&(pos, c)) = chars.peek() {
+            if c == '.' || c == '?' || c.is_ascii_whitespace() || c == '[' {
+                if c == '?' {
+                    safe_nil = true;
+                    chars.next(); // consume '?'
+                }
+                break;
+            }
+            end = pos + c.len_utf8();
+            chars.next();
+        }
+        (Cow::Borrowed(&path[start..end]), safe_nil)
+    }
+
+    let mut segments = Vec::new();
+    let mut chars = path.char_indices().peekable();
+    while let Some(&(pos, next)) = chars.peek() {
+        match next {
+            '.' => {
+                // Dot notation: identifier
+                chars.next();
+                let (key, safe_nil) = read_ident(path, &mut chars);
+                if key.is_empty() {
+                    return Err(Error::runtime(format!("empty key in path at position {pos}")));
+                }
+                segments.push((PathKey::Str(key), safe_nil));
+            }
+            '[' => {
+                // Bracket notation: either integer or quoted string
+                chars.next();
+                let key = match chars.peek() {
+                    Some(&(pos, c @ '0'..='9' | c @ '-')) => {
+                        // Integer key
+                        let negative = c == '-';
+                        if negative {
+                            chars.next(); // consume '-'
+                        }
+                        let mut num: Option<Integer> = None;
+                        while let Some(&(_, c @ '0'..='9')) = chars.peek() {
+                            let new_num = num
+                                .unwrap_or(0)
+                                .checked_mul(10)
+                                .and_then(|n| n.checked_add((c as u8 - b'0') as Integer))
+                                .ok_or_else(|| {
+                                    Error::runtime(format!("integer overflow in path at position {pos}"))
+                                })?;
+                            num = Some(new_num);
+                            chars.next(); // consume digit
+                        }
+                        match num {
+                            Some(n) if negative => PathKey::Int(-n),
+                            Some(n) => PathKey::Int(n),
+                            None => {
+                                let err = format!("invalid integer in path at position {pos}");
+                                return Err(Error::runtime(err));
+                            }
+                        }
+                    }
+                    Some((_, '\'' | '"')) => {
+                        // Quoted string
+                        PathKey::Str(unquote_string(path, &mut chars)?)
+                    }
+                    Some((_, ']')) => {
+                        return Err(Error::runtime(format!("empty key in path at position {pos}")));
+                    }
+                    Some((pos, c)) => {
+                        let err = format!("unexpected character '{c}' in path at position {pos}");
+                        return Err(Error::runtime(err));
+                    }
+                    None => {
+                        return Err(Error::runtime("unexpected end of path"));
+                    }
+                };
+                // Expect closing bracket
+                let mut safe_nil = false;
+                match chars.next() {
+                    Some((_, ']')) => {
+                        // Check for optional safe-nil operator
+                        if let Some(&(_, '?')) = chars.peek() {
+                            safe_nil = true;
+                            chars.next(); // consume '?'
+                        }
+                    }
+                    Some((pos, c)) => {
+                        let err = format!("expected ']' in path at position {pos}, found '{c}'");
+                        return Err(Error::runtime(err));
+                    }
+                    None => {
+                        return Err(Error::runtime("unexpected end of path"));
+                    }
+                }
+                segments.push((key, safe_nil));
+            }
+            c if c.is_ascii_whitespace() => {
+                chars.next(); // Skip whitespace
+            }
+            _ if segments.is_empty() => {
+                // First segment without dot/bracket notation
+                let (key_cow, safe_nil) = read_ident(path, &mut chars);
+                if key_cow.is_empty() {
+                    return Err(Error::runtime(format!("empty key in path at position {pos}")));
+                }
+                segments.push((PathKey::Str(key_cow), safe_nil));
+            }
+            c => {
+                let err = format!("unexpected character '{c}' in path at position {pos}");
+                return Err(Error::runtime(err));
+            }
+        }
+    }
+    Ok(segments)
+}
+
+fn unquote_string<'a>(path: &'a str, chars: &mut Peekable<CharIndices<'a>>) -> Result<Cow<'a, str>> {
+    let (start_pos, first_quote) = chars.next().unwrap();
+    let mut result = String::new();
+    loop {
+        match chars.next() {
+            Some((pos, '\\')) => {
+                if result.is_empty() {
+                    // First escape found, copy everything up to this point
+                    result.push_str(&path[start_pos + 1..pos]);
+                }
+                match chars.next() {
+                    Some((_, '\\')) => result.push('\\'),
+                    Some((_, '"')) => result.push('"'),
+                    Some((_, '\'')) => result.push('\''),
+                    Some((_, other)) => {
+                        result.push('\\');
+                        result.push(other);
+                    }
+                    None => continue, // will be handled by outer loop
+                }
+            }
+            Some((pos, c)) if c == first_quote => {
+                if !result.is_empty() {
+                    return Ok(Cow::Owned(result));
+                }
+                // No escapes, return borrowed slice
+                return Ok(Cow::Borrowed(&path[start_pos + 1..pos]));
+            }
+            Some((_, c)) => {
+                if !result.is_empty() {
+                    result.push(c);
+                }
+                // If no escapes yet, continue tracking for potential borrowed slice
+            }
+            None => {
+                let err = format!("unexpected end of string at position {start_pos}");
+                return Err(Error::runtime(err));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_path, PathKey};
+
+    #[test]
+    fn test_parse_path() {
+        // Test valid paths
+        let path = parse_path("a.b[3]?.c['d']").unwrap();
+        assert_eq!(path.len(), 5);
+        assert!(matches!(path[0], (PathKey::Str(ref s), false) if s == "a"));
+        assert!(matches!(path[1], (PathKey::Str(ref s), false) if s == "b"));
+        assert!(matches!(path[2], (PathKey::Int(3), true)));
+        assert!(matches!(path[3], (PathKey::Str(ref s), false) if s == "c"));
+        assert!(matches!(path[4], (PathKey::Str(ref s), false) if s == "d"));
+
+        // Test empty path
+        let path = parse_path("").unwrap();
+        assert_eq!(path.len(), 0);
+        let path = parse_path("   ").unwrap();
+        assert_eq!(path.len(), 0);
+
+        // Test invalid dot syntax
+        let err = parse_path("a..b").unwrap_err().to_string();
+        assert_eq!(err, "runtime error: empty key in path at position 1");
+        let err = parse_path("a.b.").unwrap_err().to_string();
+        assert_eq!(err, "runtime error: empty key in path at position 3");
+
+        // Test invalid bracket syntax
+        let err = parse_path("a[unclosed").unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "runtime error: unexpected character 'u' in path at position 2"
+        );
+        let err = parse_path("a[]").unwrap_err().to_string();
+        assert_eq!(err, "runtime error: empty key in path at position 1");
+        let err = parse_path(r#"a["unclosed"#).unwrap_err().to_string();
+        assert_eq!(err, "runtime error: unexpected end of string at position 2");
+        let err = parse_path(r#"a["#).unwrap_err().to_string();
+        assert_eq!(err, "runtime error: unexpected end of path");
+        let err = parse_path(r#"a[123"#).unwrap_err().to_string();
+        assert_eq!(err, "runtime error: unexpected end of path");
+        let err = parse_path(r#"a['bla'123"#).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "runtime error: expected ']' in path at position 7, found '1'"
+        );
+        let err = parse_path(r#"a["bla"]x"#).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "runtime error: unexpected character 'x' in path at position 8"
+        );
+
+        // Test bad integers
+        let err = parse_path("a[99999999999999999999]").unwrap_err().to_string();
+        assert_eq!(err, "runtime error: integer overflow in path at position 2");
+        let err = parse_path("a[-]").unwrap_err().to_string();
+        assert_eq!(err, "runtime error: invalid integer in path at position 2");
+    }
+}
+use std::io;
+
+#[cfg(feature = "serde")]
+use serde::ser::{Serialize, Serializer};
+
+use crate::state::RawLua;
+use crate::types::ValueRef;
+
+/// A Luau buffer type.
+///
+/// See the buffer [documentation] for more information.
+///
+/// [documentation]: https://luau.org/library#buffer-library
+#[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Buffer(pub(crate) ValueRef);
+
+#[cfg_attr(not(feature = "luau"), allow(unused))]
+impl Buffer {
+    /// Copies the buffer data into a new `Vec<u8>`.
+    pub fn to_vec(&self) -> Vec<u8> {
+        let lua = self.0.lua.lock();
+        self.as_slice(&lua).to_vec()
+    }
+
+    /// Returns the length of the buffer.
+    pub fn len(&self) -> usize {
+        let lua = self.0.lua.lock();
+        self.as_slice(&lua).len()
+    }
+
+    /// Returns `true` if the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Reads given number of bytes from the buffer at the given offset.
+    ///
+    /// Offset is 0-based.
+    #[track_caller]
+    pub fn read_bytes<const N: usize>(&self, offset: usize) -> [u8; N] {
+        let lua = self.0.lua.lock();
+        let data = self.as_slice(&lua);
+        let mut bytes = [0u8; N];
+        bytes.copy_from_slice(&data[offset..offset + N]);
+        bytes
+    }
+
+    /// Writes given bytes to the buffer at the given offset.
+    ///
+    /// Offset is 0-based.
+    #[track_caller]
+    pub fn write_bytes(&self, offset: usize, bytes: &[u8]) {
+        let lua = self.0.lua.lock();
+        let data = self.as_slice_mut(&lua);
+        data[offset..offset + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// Returns an adaptor implementing [`io::Read`], [`io::Write`] and [`io::Seek`] over the
+    /// buffer.
+    ///
+    /// Buffer operations are infallible, none of the read/write functions will return a Err.
+    pub fn cursor(self) -> impl io::Read + io::Write + io::Seek {
+        BufferCursor(self, 0)
+    }
+
+    pub(crate) fn as_slice(&self, lua: &RawLua) -> &[u8] {
+        unsafe {
+            let (buf, size) = self.as_raw_parts(lua);
+            std::slice::from_raw_parts(buf, size)
+        }
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    fn as_slice_mut(&self, lua: &RawLua) -> &mut [u8] {
+        unsafe {
+            let (buf, size) = self.as_raw_parts(lua);
+            std::slice::from_raw_parts_mut(buf, size)
+        }
+    }
+
+    #[cfg(feature = "luau")]
+    unsafe fn as_raw_parts(&self, lua: &RawLua) -> (*mut u8, usize) {
+        let mut size = 0usize;
+        let buf = ffi::lua_tobuffer(lua.ref_thread(), self.0.index, &mut size);
+        mlua_assert!(!buf.is_null(), "invalid Luau buffer");
+        (buf as *mut u8, size)
+    }
+
+    #[cfg(not(feature = "luau"))]
+    unsafe fn as_raw_parts(&self, lua: &RawLua) -> (*mut u8, usize) {
+        unreachable!()
+    }
+}
+
+struct BufferCursor(Buffer, usize);
+
+impl io::Read for BufferCursor {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let lua = self.0 .0.lua.lock();
+        let data = self.0.as_slice(&lua);
+        if self.1 == data.len() {
+            return Ok(0);
+        }
+        let len = buf.len().min(data.len() - self.1);
+        buf[..len].copy_from_slice(&data[self.1..self.1 + len]);
+        self.1 += len;
+        Ok(len)
+    }
+}
+
+impl io::Write for BufferCursor {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let lua = self.0 .0.lua.lock();
+        let data = self.0.as_slice_mut(&lua);
+        if self.1 == data.len() {
+            return Ok(0);
+        }
+        let len = buf.len().min(data.len() - self.1);
+        data[self.1..self.1 + len].copy_from_slice(&buf[..len]);
+        self.1 += len;
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl io::Seek for BufferCursor {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        let lua = self.0 .0.lua.lock();
+        let data = self.0.as_slice(&lua);
+        let new_offset = match pos {
+            io::SeekFrom::Start(offset) => offset as i64,
+            io::SeekFrom::End(offset) => data.len() as i64 + offset,
+            io::SeekFrom::Current(offset) => self.1 as i64 + offset,
+        };
+        if new_offset < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid seek to a negative position",
+            ));
+        }
+        if new_offset as usize > data.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid seek to a position beyond the end of the buffer",
+            ));
+        }
+        self.1 = new_offset as usize;
+        Ok(self.1 as u64)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for Buffer {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        let lua = self.0.lua.lock();
+        serializer.serialize_bytes(self.as_slice(&lua))
+    }
+}
+
+#[cfg(feature = "luau")]
+impl crate::types::LuaType for Buffer {
+    const TYPE_ID: std::os::raw::c_int = ffi::LUA_TBUFFER;
+}
+use std::fmt;
+use std::os::raw::{c_int, c_void};
+
+use crate::error::{Error, Result};
+use crate::function::Function;
+use crate::state::RawLua;
+use crate::traits::{FromLuaMulti, IntoLuaMulti};
+use crate::types::{LuaType, ValueRef};
+use crate::util::{check_stack, error_traceback_thread, pop_error, StackGuard};
+
+#[cfg(not(feature = "luau"))]
+use crate::{
+    debug::{Debug, HookTriggers},
+    types::HookKind,
+};
+
+#[cfg(feature = "async")]
+use {
+    futures_util::stream::Stream,
+    std::{
+        future::Future,
+        marker::PhantomData,
+        pin::Pin,
+        ptr::NonNull,
+        task::{Context, Poll, Waker},
+    },
+};
+
+/// Status of a Lua thread (coroutine).
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ThreadStatus {
+    /// The thread was just created or is suspended (yielded).
+    ///
+    /// If a thread is in this state, it can be resumed by calling [`Thread::resume`].
+    Resumable,
+    /// The thread is currently running.
+    Running,
+    /// The thread has finished executing.
+    Finished,
+    /// The thread has raised a Lua error during execution.
+    Error,
+}
+
+/// Internal representation of a Lua thread status.
+///
+/// The number in `New` and `Yielded` variants is the number of arguments pushed
+/// to the thread stack.
+#[derive(Clone, Copy)]
+enum ThreadStatusInner {
+    New(c_int),
+    Running,
+    Yielded(c_int),
+    Finished,
+    Error,
+}
+
+impl ThreadStatusInner {
+    #[cfg(feature = "async")]
+    #[inline(always)]
+    fn is_resumable(self) -> bool {
+        matches!(self, ThreadStatusInner::New(_) | ThreadStatusInner::Yielded(_))
+    }
+
+    #[cfg(feature = "async")]
+    #[inline(always)]
+    fn is_yielded(self) -> bool {
+        matches!(self, ThreadStatusInner::Yielded(_))
+    }
+}
+
+/// Handle to an internal Lua thread (coroutine).
+#[derive(Clone)]
+pub struct Thread(pub(crate) ValueRef, pub(crate) *mut ffi::lua_State);
+
+#[cfg(feature = "send")]
+unsafe impl Send for Thread {}
+#[cfg(feature = "send")]
+unsafe impl Sync for Thread {}
+
+/// Thread (coroutine) representation as an async [`Future`] or [`Stream`].
+///
+/// [`Future`]: std::future::Future
+/// [`Stream`]: futures_util::stream::Stream
+#[cfg(feature = "async")]
+#[cfg_attr(docsrs, doc(cfg(feature = "async")))]
+#[must_use = "futures do nothing unless you `.await` or poll them"]
+pub struct AsyncThread<R> {
+    thread: Thread,
+    ret: PhantomData<fn() -> R>,
+    recycle: bool,
+}
+
+impl Thread {
+    /// Returns reference to the Lua state that this thread is associated with.
+    #[doc(hidden)]
+    #[inline(always)]
+    pub fn state(&self) -> *mut ffi::lua_State {
+        self.1
+    }
+
+    /// Resumes execution of this thread.
+    ///
+    /// Equivalent to [`coroutine.resume`].
+    ///
+    /// Passes `args` as arguments to the thread. If the coroutine has called [`coroutine.yield`],
+    /// it will return these arguments. Otherwise, the coroutine wasn't yet started, so the
+    /// arguments are passed to its main function.
+    ///
+    /// If the thread is no longer resumable (meaning it has finished execution or encountered an
+    /// error), this will return [`Error::CoroutineUnresumable`], otherwise will return `Ok` as
+    /// follows:
+    ///
+    /// If the thread calls [`coroutine.yield`], returns the values passed to `yield`. If the thread
+    /// `return`s values from its main function, returns those.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use mlua::{Error, Lua, Result, Thread};
+    /// # fn main() -> Result<()> {
+    /// # let lua = Lua::new();
+    /// let thread: Thread = lua.load(r#"
+    ///     coroutine.create(function(arg)
+    ///         assert(arg == 42)
+    ///         local yieldarg = coroutine.yield(123)
+    ///         assert(yieldarg == 43)
+    ///         return 987
+    ///     end)
+    /// "#).eval()?;
+    ///
+    /// assert_eq!(thread.resume::<u32>(42)?, 123);
+    /// assert_eq!(thread.resume::<u32>(43)?, 987);
+    ///
+    /// // The coroutine has now returned, so `resume` will fail
+    /// match thread.resume::<u32>(()) {
+    ///     Err(Error::CoroutineUnresumable) => {},
+    ///     unexpected => panic!("unexpected result {:?}", unexpected),
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`coroutine.resume`]: https://www.lua.org/manual/5.4/manual.html#pdf-coroutine.resume
+    /// [`coroutine.yield`]: https://www.lua.org/manual/5.4/manual.html#pdf-coroutine.yield
+    pub fn resume<R>(&self, args: impl IntoLuaMulti) -> Result<R>
+    where
+        R: FromLuaMulti,
+    {
+        let lua = self.0.lua.lock();
+        let mut pushed_nargs = match self.status_inner(&lua) {
+            ThreadStatusInner::New(nargs) | ThreadStatusInner::Yielded(nargs) => nargs,
+            _ => return Err(Error::CoroutineUnresumable),
+        };
+
+        let state = lua.state();
+        let thread_state = self.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+
+            let nargs = args.push_into_stack_multi(&lua)?;
+            if nargs > 0 {
+                check_stack(thread_state, nargs)?;
+                ffi::lua_xmove(state, thread_state, nargs);
+                pushed_nargs += nargs;
+            }
+
+            let _thread_sg = StackGuard::with_top(thread_state, 0);
+            let (_, nresults) = self.resume_inner(&lua, pushed_nargs)?;
+            check_stack(state, nresults + 1)?;
+            ffi::lua_xmove(thread_state, state, nresults);
+
+            R::from_stack_multi(nresults, &lua)
+        }
+    }
+
+    /// Resumes execution of this thread, immediately raising an error.
+    ///
+    /// This is a Luau specific extension.
+    #[cfg(feature = "luau")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "luau")))]
+    pub fn resume_error<R>(&self, error: impl crate::IntoLua) -> Result<R>
+    where
+        R: FromLuaMulti,
+    {
+        let lua = self.0.lua.lock();
+        match self.status_inner(&lua) {
+            ThreadStatusInner::New(_) | ThreadStatusInner::Yielded(_) => {}
+            _ => return Err(Error::CoroutineUnresumable),
+        };
+
+        let state = lua.state();
+        let thread_state = self.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+
+            check_stack(state, 1)?;
+            error.push_into_stack(&lua)?;
+            ffi::lua_xmove(state, thread_state, 1);
+
+            let _thread_sg = StackGuard::with_top(thread_state, 0);
+            let (_, nresults) = self.resume_inner(&lua, ffi::LUA_RESUMEERROR)?;
+            check_stack(state, nresults + 1)?;
+            ffi::lua_xmove(thread_state, state, nresults);
+
+            R::from_stack_multi(nresults, &lua)
+        }
+    }
+
+    /// Resumes execution of this thread.
+    ///
+    /// It's similar to `resume()` but leaves `nresults` values on the thread stack.
+    unsafe fn resume_inner(&self, lua: &RawLua, nargs: c_int) -> Result<(ThreadStatusInner, c_int)> {
+        let state = lua.state();
+        let thread_state = self.state();
+        let mut nresults = 0;
+        #[cfg(not(feature = "luau"))]
+        let ret = ffi::lua_resume(thread_state, state, nargs, &mut nresults as *mut c_int);
+        #[cfg(feature = "luau")]
+        let ret = ffi::lua_resumex(thread_state, state, nargs, &mut nresults as *mut c_int);
+        match ret {
+            ffi::LUA_OK => Ok((ThreadStatusInner::Finished, nresults)),
+            ffi::LUA_YIELD => Ok((ThreadStatusInner::Yielded(0), nresults)),
+            ffi::LUA_ERRMEM => {
+                // Don't call error handler for memory errors
+                Err(pop_error(thread_state, ret))
+            }
+            _ => {
+                check_stack(state, 3)?;
+                protect_lua!(state, 0, 1, |state| error_traceback_thread(state, thread_state))?;
+                Err(pop_error(state, ret))
+            }
+        }
+    }
+
+    /// Gets the status of the thread.
+    pub fn status(&self) -> ThreadStatus {
+        match self.status_inner(&self.0.lua.lock()) {
+            ThreadStatusInner::New(_) | ThreadStatusInner::Yielded(_) => ThreadStatus::Resumable,
+            ThreadStatusInner::Running => ThreadStatus::Running,
+            ThreadStatusInner::Finished => ThreadStatus::Finished,

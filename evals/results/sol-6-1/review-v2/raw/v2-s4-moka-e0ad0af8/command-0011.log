@@ -1,0 +1,812 @@
+#[cfg(test)]
+mod tests {
+    use super::Cache;
+    use crate::{
+        common::{time::Clock, HousekeeperConfig},
+        notification::RemovalCause,
+        policy::{test_utils::ExpiryCallCounters, EvictionPolicy},
+        Expiry,
+    };
+
+    use parking_lot::Mutex;
+    use std::{
+        convert::Infallible,
+        sync::{
+            atomic::{AtomicU8, Ordering},
+            Arc,
+        },
+        time::{Duration, Instant as StdInstant},
+    };
+
+    #[test]
+    fn max_capacity_zero() {
+        let mut cache = Cache::new(0);
+        cache.reconfigure_for_testing();
+
+        // Make the cache exterior immutable.
+        let cache = cache;
+
+        cache.insert(0, ());
+
+        assert!(!cache.contains_key(&0));
+        assert!(cache.get(&0).is_none());
+        cache.run_pending_tasks();
+        assert!(!cache.contains_key(&0));
+        assert!(cache.get(&0).is_none());
+        assert_eq!(cache.entry_count(), 0)
+    }
+
+    #[test]
+    fn basic_single_thread() {
+        // The following `Vec`s will hold actual and expected notifications.
+        let actual = Arc::new(Mutex::new(Vec::new()));
+        let mut expected = Vec::new();
+
+        // Create an eviction listener.
+        let a1 = Arc::clone(&actual);
+        let listener = move |k, v, cause| a1.lock().push((k, v, cause));
+
+        // Create a cache with the eviction listener.
+        let mut cache = Cache::builder()
+            .max_capacity(3)
+            .eviction_listener(listener)
+            .build();
+        cache.reconfigure_for_testing();
+
+        // Make the cache exterior immutable.
+        let cache = cache;
+
+        cache.insert("a", "alice");
+        cache.insert("b", "bob");
+        assert_eq!(cache.get(&"a"), Some("alice"));
+        assert!(cache.contains_key(&"a"));
+        assert!(cache.contains_key(&"b"));
+        assert_eq!(cache.get(&"b"), Some("bob"));
+        cache.run_pending_tasks();
+        // counts: a -> 1, b -> 1
+
+        cache.insert("c", "cindy");
+        assert_eq!(cache.get(&"c"), Some("cindy"));
+        assert!(cache.contains_key(&"c"));
+        // counts: a -> 1, b -> 1, c -> 1
+        cache.run_pending_tasks();
+
+        assert!(cache.contains_key(&"a"));
+        assert_eq!(cache.get(&"a"), Some("alice"));
+        assert_eq!(cache.get(&"b"), Some("bob"));
+        assert!(cache.contains_key(&"b"));
+        cache.run_pending_tasks();
+        // counts: a -> 2, b -> 2, c -> 1
+
+        // "d" should not be admitted because its frequency is too low.
+        cache.insert("d", "david"); //   count: d -> 0
+        expected.push((Arc::new("d"), "david", RemovalCause::Size));
+        cache.run_pending_tasks();
+        assert_eq!(cache.get(&"d"), None); //   d -> 1
+        assert!(!cache.contains_key(&"d"));
+
+        cache.insert("d", "david");
+        expected.push((Arc::new("d"), "david", RemovalCause::Size));
+        cache.run_pending_tasks();
+        assert!(!cache.contains_key(&"d"));
+        assert_eq!(cache.get(&"d"), None); //   d -> 2
+
+        // "d" should be admitted and "c" should be evicted
+        // because d's frequency is higher than c's.
+        cache.insert("d", "dennis");
+        expected.push((Arc::new("c"), "cindy", RemovalCause::Size));
+        cache.run_pending_tasks();
+        assert_eq!(cache.get(&"a"), Some("alice"));
+        assert_eq!(cache.get(&"b"), Some("bob"));
+        assert_eq!(cache.get(&"c"), None);
+        assert_eq!(cache.get(&"d"), Some("dennis"));
+        assert!(cache.contains_key(&"a"));
+        assert!(cache.contains_key(&"b"));
+        assert!(!cache.contains_key(&"c"));
+        assert!(cache.contains_key(&"d"));
+
+        cache.invalidate(&"b");
+        expected.push((Arc::new("b"), "bob", RemovalCause::Explicit));
+        cache.run_pending_tasks();
+        assert_eq!(cache.get(&"b"), None);
+        assert!(!cache.contains_key(&"b"));
+
+        assert!(cache.remove(&"b").is_none());
+        assert_eq!(cache.remove(&"d"), Some("dennis"));
+        expected.push((Arc::new("d"), "dennis", RemovalCause::Explicit));
+        cache.run_pending_tasks();
+        assert_eq!(cache.get(&"d"), None);
+        assert!(!cache.contains_key(&"d"));
+
+        verify_notification_vec(&cache, actual, &expected);
+        assert!(cache.key_locks_map_is_empty());
+    }
+
+    #[test]
+    fn basic_lru_single_thread() {
+        // The following `Vec`s will hold actual and expected notifications.
+        let actual = Arc::new(Mutex::new(Vec::new()));
+        let mut expected = Vec::new();
+
+        // Create an eviction listener.
+        let a1 = Arc::clone(&actual);
+        let listener = move |k, v, cause| a1.lock().push((k, v, cause));
+
+        // Create a cache with the eviction listener.
+        let mut cache = Cache::builder()
+            .max_capacity(3)
+            .eviction_policy(EvictionPolicy::lru())
+            .eviction_listener(listener)
+            .build();
+        cache.reconfigure_for_testing();
+
+        // Make the cache exterior immutable.
+        let cache = cache;
+
+        cache.insert("a", "alice");
+        cache.insert("b", "bob");
+        assert_eq!(cache.get(&"a"), Some("alice"));
+        assert!(cache.contains_key(&"a"));
+        assert!(cache.contains_key(&"b"));
+        assert_eq!(cache.get(&"b"), Some("bob"));
+        cache.run_pending_tasks();
+        // a -> b
+
+        cache.insert("c", "cindy");
+        assert_eq!(cache.get(&"c"), Some("cindy"));
+        assert!(cache.contains_key(&"c"));
+        cache.run_pending_tasks();
+        // a -> b -> c
+
+        assert!(cache.contains_key(&"a"));
+        assert_eq!(cache.get(&"a"), Some("alice"));
+        assert_eq!(cache.get(&"b"), Some("bob"));
+        assert!(cache.contains_key(&"b"));
+        cache.run_pending_tasks();
+        // c -> a -> b
+
+        // "d" should be admitted because the cache uses the LRU strategy.
+        cache.insert("d", "david");
+        // "c" is the LRU and should have be evicted.
+        expected.push((Arc::new("c"), "cindy", RemovalCause::Size));
+        cache.run_pending_tasks();
+
+        assert_eq!(cache.get(&"a"), Some("alice"));
+        assert_eq!(cache.get(&"b"), Some("bob"));
+        assert_eq!(cache.get(&"c"), None);
+        assert_eq!(cache.get(&"d"), Some("david"));
+        assert!(cache.contains_key(&"a"));
+        assert!(cache.contains_key(&"b"));
+        assert!(!cache.contains_key(&"c"));
+        assert!(cache.contains_key(&"d"));
+        cache.run_pending_tasks();
+        // a -> b -> d
+
+        cache.invalidate(&"b");
+        expected.push((Arc::new("b"), "bob", RemovalCause::Explicit));
+        cache.run_pending_tasks();
+        // a -> d
+        assert_eq!(cache.get(&"b"), None);
+        assert!(!cache.contains_key(&"b"));
+
+        assert!(cache.remove(&"b").is_none());
+        assert_eq!(cache.remove(&"d"), Some("david"));
+        expected.push((Arc::new("d"), "david", RemovalCause::Explicit));
+        cache.run_pending_tasks();
+        // a
+        assert_eq!(cache.get(&"d"), None);
+        assert!(!cache.contains_key(&"d"));
+
+        cache.insert("e", "emily");
+        cache.insert("f", "frank");
+        // "a" should be evicted because it is the LRU.
+        cache.insert("g", "gina");
+        expected.push((Arc::new("a"), "alice", RemovalCause::Size));
+        cache.run_pending_tasks();
+        // e -> f -> g
+        assert_eq!(cache.get(&"a"), None);
+        assert_eq!(cache.get(&"e"), Some("emily"));
+        assert_eq!(cache.get(&"f"), Some("frank"));
+        assert_eq!(cache.get(&"g"), Some("gina"));
+        assert!(!cache.contains_key(&"a"));
+        assert!(cache.contains_key(&"e"));
+        assert!(cache.contains_key(&"f"));
+        assert!(cache.contains_key(&"g"));
+
+        verify_notification_vec(&cache, actual, &expected);
+        assert!(cache.key_locks_map_is_empty());
+    }
+
+    #[test]
+    fn size_aware_eviction() {
+        let weigher = |_k: &&str, v: &(&str, u32)| v.1;
+
+        let alice = ("alice", 10);
+        let bob = ("bob", 15);
+        let bill = ("bill", 20);
+        let cindy = ("cindy", 5);
+        let david = ("david", 15);
+        let dennis = ("dennis", 15);
+
+        // The following `Vec`s will hold actual and expected notifications.
+        let actual = Arc::new(Mutex::new(Vec::new()));
+        let mut expected = Vec::new();
+
+        // Create an eviction listener.
+        let a1 = Arc::clone(&actual);
+        let listener = move |k, v, cause| a1.lock().push((k, v, cause));
+
+        // Create a cache with the eviction listener.
+        let mut cache = Cache::builder()
+            .max_capacity(31)
+            .weigher(weigher)
+            .eviction_listener(listener)
+            .build();
+        cache.reconfigure_for_testing();
+
+        // Make the cache exterior immutable.
+        let cache = cache;
+
+        cache.insert("a", alice);
+        cache.insert("b", bob);
+        assert_eq!(cache.get(&"a"), Some(alice));
+        assert!(cache.contains_key(&"a"));
+        assert!(cache.contains_key(&"b"));
+        assert_eq!(cache.get(&"b"), Some(bob));
+        cache.run_pending_tasks();
+        // order (LRU -> MRU) and counts: a -> 1, b -> 1
+
+        cache.insert("c", cindy);
+        assert_eq!(cache.get(&"c"), Some(cindy));
+        assert!(cache.contains_key(&"c"));
+        // order and counts: a -> 1, b -> 1, c -> 1
+        cache.run_pending_tasks();
+
+        assert!(cache.contains_key(&"a"));
+        assert_eq!(cache.get(&"a"), Some(alice));
+        assert_eq!(cache.get(&"b"), Some(bob));
+        assert!(cache.contains_key(&"b"));
+        cache.run_pending_tasks();
+        // order and counts: c -> 1, a -> 2, b -> 2
+
+        // To enter "d" (weight: 15), it needs to evict "c" (w: 5) and "a" (w: 10).
+        // "d" must have higher count than 3, which is the aggregated count
+        // of "a" and "c".
+        cache.insert("d", david); //   count: d -> 0
+        expected.push((Arc::new("d"), david, RemovalCause::Size));
+        cache.run_pending_tasks();
+        assert_eq!(cache.get(&"d"), None); //   d -> 1
+        assert!(!cache.contains_key(&"d"));
+
+        cache.insert("d", david);
+        expected.push((Arc::new("d"), david, RemovalCause::Size));
+        cache.run_pending_tasks();
+        assert!(!cache.contains_key(&"d"));
+        assert_eq!(cache.get(&"d"), None); //   d -> 2
+
+        cache.insert("d", david);
+        expected.push((Arc::new("d"), david, RemovalCause::Size));
+        cache.run_pending_tasks();
+        assert_eq!(cache.get(&"d"), None); //   d -> 3
+        assert!(!cache.contains_key(&"d"));
+
+        cache.insert("d", david);
+        expected.push((Arc::new("d"), david, RemovalCause::Size));
+        cache.run_pending_tasks();
+        assert!(!cache.contains_key(&"d"));
+        assert_eq!(cache.get(&"d"), None); //   d -> 4
+
+        // Finally "d" should be admitted by evicting "c" and "a".
+        cache.insert("d", dennis);
+        expected.push((Arc::new("c"), cindy, RemovalCause::Size));
+        expected.push((Arc::new("a"), alice, RemovalCause::Size));
+        cache.run_pending_tasks();
+        assert_eq!(cache.get(&"a"), None);
+        assert_eq!(cache.get(&"b"), Some(bob));
+        assert_eq!(cache.get(&"c"), None);
+        assert_eq!(cache.get(&"d"), Some(dennis));
+        assert!(!cache.contains_key(&"a"));
+        assert!(cache.contains_key(&"b"));
+        assert!(!cache.contains_key(&"c"));
+        assert!(cache.contains_key(&"d"));
+
+        // Update "b" with "bill" (w: 15 -> 20). This should evict "d" (w: 15).
+        cache.insert("b", bill);
+        expected.push((Arc::new("b"), bob, RemovalCause::Replaced));
+        expected.push((Arc::new("d"), dennis, RemovalCause::Size));
+        cache.run_pending_tasks();
+        assert_eq!(cache.get(&"b"), Some(bill));
+        assert_eq!(cache.get(&"d"), None);
+        assert!(cache.contains_key(&"b"));
+        assert!(!cache.contains_key(&"d"));
+
+        // Re-add "a" (w: 10) and update "b" with "bob" (w: 20 -> 15).
+        cache.insert("a", alice);
+        cache.insert("b", bob);
+        expected.push((Arc::new("b"), bill, RemovalCause::Replaced));
+        cache.run_pending_tasks();
+        assert_eq!(cache.get(&"a"), Some(alice));
+        assert_eq!(cache.get(&"b"), Some(bob));
+        assert_eq!(cache.get(&"d"), None);
+        assert!(cache.contains_key(&"a"));
+        assert!(cache.contains_key(&"b"));
+        assert!(!cache.contains_key(&"d"));
+
+        // Verify the sizes.
+        assert_eq!(cache.entry_count(), 2);
+        assert_eq!(cache.weighted_size(), 25);
+
+        verify_notification_vec(&cache, actual, &expected);
+        assert!(cache.key_locks_map_is_empty());
+    }
+
+    #[test]
+    fn basic_multi_threads() {
+        let num_threads = 4;
+        let cache = Cache::new(100);
+
+        // https://rust-lang.github.io/rust-clippy/master/index.html#needless_collect
+        #[allow(clippy::needless_collect)]
+        let handles = (0..num_threads)
+            .map(|id| {
+                let cache = cache.clone();
+                std::thread::spawn(move || {
+                    cache.insert(10, format!("{id}-100"));
+                    cache.get(&10);
+                    cache.insert(20, format!("{id}-200"));
+                    cache.invalidate(&10);
+                })
+            })
+            .collect::<Vec<_>>();
+
+                    key,
+                    value,
+                    current_time,
+                    current_duration_secs,
+                    new_duration_secs,
+                }
+            }
+        }
+
+        let expectation = Arc::new(Mutex::new(ExpiryExpectation::NoCall));
+
+        struct MyExpiry {
+            expectation: Arc<Mutex<ExpiryExpectation>>,
+        }
+
+        impl Expiry<u32, char> for MyExpiry {
+            fn expire_after_create(
+                &self,
+                actual_key: &u32,
+                actual_value: &char,
+                actual_current_time: StdInstant,
+            ) -> Option<Duration> {
+                use ExpiryExpectation::*;
+
+                let lock = &mut *self.expectation.lock().unwrap();
+                let expected = std::mem::replace(lock, NoCall);
+                match expected {
+                    AfterCreate {
+                        caller_line,
+                        key,
+                        value,
+                        current_time,
+                        new_duration_secs: new_duration,
+                    } => {
+                        assert_params_eq!(*actual_key, key, "key", caller_line);
+                        assert_params_eq!(*actual_value, value, "value", caller_line);
+                        assert_params_eq!(
+                            actual_current_time,
+                            current_time,
+                            "current_time",
+                            caller_line
+                        );
+                        new_duration.map(Duration::from_secs)
+                    }
+                    expected => {
+                        panic!(
+                            "Unexpected call to expire_after_create: caller_line {}, expected: {expected:?}",
+                            line!()
+                        );
+                    }
+                }
+            }
+
+            fn expire_after_read(
+                &self,
+                actual_key: &u32,
+                actual_value: &char,
+                actual_current_time: StdInstant,
+                actual_current_duration: Option<Duration>,
+                actual_last_modified_at: StdInstant,
+            ) -> Option<Duration> {
+                use ExpiryExpectation::*;
+
+                let lock = &mut *self.expectation.lock().unwrap();
+                let expected = std::mem::replace(lock, NoCall);
+                match expected {
+                    AfterRead {
+                        caller_line,
+                        key,
+                        value,
+                        current_time,
+                        current_duration_secs,
+                        last_modified_at,
+                        new_duration_secs,
+                    } => {
+                        assert_params_eq!(*actual_key, key, "key", caller_line);
+                        assert_params_eq!(*actual_value, value, "value", caller_line);
+                        assert_params_eq!(
+                            actual_current_time,
+                            current_time,
+                            "current_time",
+                            caller_line
+                        );
+                        assert_params_eq!(
+                            actual_current_duration,
+                            current_duration_secs.map(Duration::from_secs),
+                            "current_duration",
+                            caller_line
+                        );
+                        assert_params_eq!(
+                            actual_last_modified_at,
+                            last_modified_at,
+                            "last_modified_at",
+                            caller_line
+                        );
+                        new_duration_secs.map(Duration::from_secs)
+                    }
+                    expected => {
+                        panic!(
+                            "Unexpected call to expire_after_read: caller_line {}, expected: {expected:?}",
+                            line!()
+                        );
+                    }
+                }
+            }
+
+            fn expire_after_update(
+                &self,
+                actual_key: &u32,
+                actual_value: &char,
+                actual_current_time: StdInstant,
+                actual_current_duration: Option<Duration>,
+            ) -> Option<Duration> {
+                use ExpiryExpectation::*;
+
+                let lock = &mut *self.expectation.lock().unwrap();
+                let expected = std::mem::replace(lock, NoCall);
+                match expected {
+                    AfterUpdate {
+                        caller_line,
+                        key,
+                        value,
+                        current_time,
+                        current_duration_secs,
+                        new_duration_secs,
+                    } => {
+                        assert_params_eq!(*actual_key, key, "key", caller_line);
+                        assert_params_eq!(*actual_value, value, "value", caller_line);
+                        assert_params_eq!(
+                            actual_current_time,
+                            current_time,
+                            "current_time",
+                            caller_line
+                        );
+                        assert_params_eq!(
+                            actual_current_duration,
+                            current_duration_secs.map(Duration::from_secs),
+                            "current_duration",
+                            caller_line
+                        );
+                        new_duration_secs.map(Duration::from_secs)
+                    }
+                    expected => {
+                        panic!(
+                            "Unexpected call to expire_after_update: caller_line {}, expected: {expected:?}",
+                            line!()
+                        );
+                    }
+                }
+            }
+        }
+
+        const TTL: u64 = 16;
+        const TTI: u64 = 7;
+        let expiry: Option<Arc<dyn Expiry<_, _> + Send + Sync + 'static>> =
+            Some(Arc::new(MyExpiry {
+                expectation: Arc::clone(&expectation),
+            }));
+
+        let (clock, mock) = Clock::mock();
+
+        let mut cache = BaseCache::<Key, Value>::new(
+            None,
+            None,
+            None,
+            RandomState::default(),
+            None,
+            EvictionPolicy::default(),
+            None,
+            ExpirationPolicy::new(
+                Some(Duration::from_secs(TTL)),
+                Some(Duration::from_secs(TTI)),
+                expiry,
+            ),
+            HousekeeperConfig::default(),
+            false,
+            clock,
+        );
+        cache.reconfigure_for_testing();
+
+        // Make the cache exterior immutable.
+        let cache = cache;
+
+        mock.increment(Duration::from_millis(10));
+
+        // ----------------------------------------------------
+        // Case 1
+        //
+        // 1.  0s: Insert with per-entry TTL 1s.
+        // 2. +1s: Expires.
+        // ----------------------------------------------------
+
+        // Insert an entry (1). It will have a per-entry TTL of 1 second.
+        let key = 1;
+        let hash = cache.hash(&key);
+        let value = 'a';
+
+        *expectation.lock().unwrap() =
+            ExpiryExpectation::after_create(line!(), key, value, current_time(&cache), Some(1));
+
+        insert(&cache, key, hash, value);
+        // Run a sync to register the entry to the internal data structures including
+        // the timer wheel.
+        cache.inner.run_pending_tasks(None, 1, 10);
+        assert_eq!(cache.entry_count(), 1);
+
+        assert_expiry!(cache, key, hash, mock, 1);
+
+        // ----------------------------------------------------
+        // Case 2
+        //
+        // 1.  0s: Insert with no per-entry TTL.
+        // 2. +1s: Get with per-entry TTL 3s.
+        // 3. +3s: Expires.
+        // ----------------------------------------------------
+
+        // Insert an entry (1).
+        let key = 2;
+        let hash = cache.hash(&key);
+        let value = 'b';
+
+        *expectation.lock().unwrap() =
+            ExpiryExpectation::after_create(line!(), key, value, current_time(&cache), None);
+        let inserted_at = current_time(&cache);
+        insert(&cache, key, hash, value);
+        cache.inner.run_pending_tasks(None, 1, 10);
+        assert_eq!(cache.entry_count(), 1);
+
+        // Increment the time.
+        mock.increment(Duration::from_secs(1));
+        cache.inner.run_pending_tasks(None, 1, 10);
+        assert!(cache.contains_key_with_hash(&key, hash));
+
+        // Read the entry (2).
+        *expectation.lock().unwrap() = ExpiryExpectation::after_read(
+            line!(),
+            key,
+            value,
+            current_time(&cache),
+            Some(TTI - 1),
+            inserted_at,
+            Some(3),
+        );
+        assert_eq!(
+            cache
+                .get_with_hash(&key, hash, false)
+                .map(Entry::into_value),
+            Some(value)
+        );
+        cache.inner.run_pending_tasks(None, 1, 10);
+
+        assert_expiry!(cache, key, hash, mock, 3);
+
+        // ----------------------------------------------------
+        // Case 3
+        //
+        // 1.  0s: Insert with no per-entry TTL.
+        // 2. +1s: Get with no per-entry TTL.
+        // 3. +2s: Update with per-entry TTL 3s.
+        // 4. +3s: Expires.
+        // ----------------------------------------------------
+
+        // Insert an entry (1).
+        let key = 3;
+        let hash = cache.hash(&key);
+        let value = 'c';
+
+        *expectation.lock().unwrap() =
+            ExpiryExpectation::after_create(line!(), key, value, current_time(&cache), None);
+        let inserted_at = current_time(&cache);
+        insert(&cache, key, hash, value);
+        cache.inner.run_pending_tasks(None, 1, 10);
+        assert_eq!(cache.entry_count(), 1);
+
+        // Increment the time.
+        mock.increment(Duration::from_secs(1));
+        cache.inner.run_pending_tasks(None, 1, 10);
+        assert!(cache.contains_key_with_hash(&key, hash));
+
+        // Read the entry (2).
+        *expectation.lock().unwrap() = ExpiryExpectation::after_read(
+            line!(),
+            key,
+            value,
+            current_time(&cache),
+            Some(TTI - 1),
+            inserted_at,
+            None,
+        );
+        assert_eq!(
+            cache
+                .get_with_hash(&key, hash, false)
+                .map(Entry::into_value),
+            Some(value)
+        );
+        cache.inner.run_pending_tasks(None, 1, 10);
+
+        // Increment the time.
+        mock.increment(Duration::from_secs(2));
+        cache.inner.run_pending_tasks(None, 1, 10);
+        assert!(cache.contains_key_with_hash(&key, hash));
+        assert_eq!(cache.entry_count(), 1);
+
+        // Update the entry (3).
+        *expectation.lock().unwrap() = ExpiryExpectation::after_update(
+            line!(),
+            key,
+            value,
+            current_time(&cache),
+            // TTI should be reset by this update.
+            Some(TTI),
+            Some(3),
+        );
+        insert(&cache, key, hash, value);
+        cache.inner.run_pending_tasks(None, 1, 10);
+        assert_eq!(cache.entry_count(), 1);
+
+        assert_expiry!(cache, key, hash, mock, 3);
+
+        // ----------------------------------------------------
+        // Case 4
+        //
+        // 1.  0s: Insert with no per-entry TTL.
+        // 2. +1s: Get with no per-entry TTL.
+        // 3. +2s: Update with no per-entry TTL.
+        // 4. +7s: Expires by TTI (7s from step 3).
+        // ----------------------------------------------------
+
+        // Insert an entry (1).
+        let key = 4;
+        let hash = cache.hash(&key);
+        let value = 'd';
+
+        *expectation.lock().unwrap() =
+            ExpiryExpectation::after_create(line!(), key, value, current_time(&cache), None);
+        let inserted_at = current_time(&cache);
+        insert(&cache, key, hash, value);
+        cache.inner.run_pending_tasks(None, 1, 10);
+        assert_eq!(cache.entry_count(), 1);
+
+        // Increment the time.
+        mock.increment(Duration::from_secs(1));
+        cache.inner.run_pending_tasks(None, 1, 10);
+        assert!(cache.contains_key_with_hash(&key, hash));
+        assert_eq!(cache.entry_count(), 1);
+
+        // Read the entry (2).
+        *expectation.lock().unwrap() = ExpiryExpectation::after_read(
+            line!(),
+            key,
+            value,
+            current_time(&cache),
+            Some(TTI - 1),
+            inserted_at,
+            None,
+        );
+        assert_eq!(
+            cache
+                .get_with_hash(&key, hash, false)
+                .map(Entry::into_value),
+            Some(value)
+        );
+        cache.inner.run_pending_tasks(None, 1, 10);
+
+        // Increment the time.
+        mock.increment(Duration::from_secs(2));
+        cache.inner.run_pending_tasks(None, 1, 10);
+        assert!(cache.contains_key_with_hash(&key, hash));
+        assert_eq!(cache.entry_count(), 1);
+
+        // Update the entry (3).
+//! Cache operations.
+
+/// Operations used by the `and_compute_with` and similar methods.
+pub mod compute {
+    use std::sync::Arc;
+
+    use crate::Entry;
+
+    /// Instructs the `and_compute_with` and similar methods how to modify the cached
+    /// entry.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Op<V> {
+        /// No-operation. Do not modify the cached entry.
+        Nop,
+        /// Insert or update the value of the cached entry.
+        Put(V),
+        /// Remove the cached entry.
+        Remove,
+    }
+
+    /// The result of the `and_compute_with` and similar methods.
+    #[derive(Debug)]
+    pub enum CompResult<K, V> {
+        /// The entry did not exist and still does not exist.
+        StillNone(Arc<K>),
+        /// The entry already existed and was not modified. The returned entry
+        /// contains the existing value.
+        Unchanged(Entry<K, V>),
+        /// The entry did not exist and was inserted. The returned entry contains
+        /// the inserted value.
+        Inserted(Entry<K, V>),
+        /// The entry already existed and its value was replaced with a new one. The
+        /// returned entry contains the new value (not the replaced value).
+        ReplacedWith(Entry<K, V>),
+        /// The entry already existed and was removed. The returned entry contains
+        /// the removed value.
+        ///
+        /// Note: `StillNone` is returned instead of `Removed` if `Op::Remove` was
+        /// requested but the entry did not exist.
+        Removed(Entry<K, V>),
+    }
+
+    impl<K, V> CompResult<K, V> {
+        /// Returns the contained `Some(Entry)` if any. Otherwise returns `None`.
+        /// Consumes the `self` value.
+        pub fn into_entry(self) -> Option<Entry<K, V>> {
+            match self {
+                CompResult::StillNone(_) => None,
+                CompResult::Unchanged(entry) => Some(entry),
+                CompResult::Inserted(entry) => Some(entry),
+                CompResult::ReplacedWith(entry) => Some(entry),
+                CompResult::Removed(entry) => Some(entry),
+            }
+        }
+
+        /// Unwraps the contained `Entry`, consuming the `self` value.
+        ///
+        /// # Panics
+        ///
+        /// Panics if the `self` value is `StillNone`.
+        pub fn unwrap(self) -> Entry<K, V> {
+            match self {
+                CompResult::StillNone(_) => panic!("`CompResult::unwrap` called on `StillNone`"),
+                CompResult::Unchanged(entry) => entry,
+                CompResult::Inserted(entry) => entry,
+                CompResult::ReplacedWith(entry) => entry,
+                CompResult::Removed(entry) => entry,
+            }
+        }
+    }
+}
+[target.armv5te-unknown-linux-musleabi]
+rustflags = ["--cfg", "armv5te", "--cfg", "rustver"]
+
+[target.mips-unknown-linux-musl]
+rustflags = ["--cfg", "mips", "--cfg", "rustver"]
+
+[target.mipsel-unknown-linux-musl]
+rustflags = ["--cfg", "mips", "--cfg", "rustver"]
+2.202933333333333 minutes used of 15.0

@@ -1,0 +1,1099 @@
+}
+
+impl Peer {
+    pub fn convert_send_message(
+        id: StreamId,
+        response: Response<()>,
+        end_of_stream: bool,
+    ) -> frame::Headers {
+        use http::response::Parts;
+
+        // Extract the components of the HTTP request
+        let (
+            Parts {
+                status, headers, ..
+            },
+            _,
+        ) = response.into_parts();
+
+        // Build the set pseudo header set. All requests will include `method`
+        // and `path`.
+        let pseudo = Pseudo::response(status);
+
+        // Create the HEADERS frame
+        let mut frame = frame::Headers::new(id, pseudo, headers);
+
+        if end_of_stream {
+            frame.set_end_stream()
+        }
+
+        frame
+    }
+
+    pub fn convert_push_message(
+        stream_id: StreamId,
+        promised_id: StreamId,
+        request: Request<()>,
+    ) -> Result<frame::PushPromise, UserError> {
+        use http::request::Parts;
+
+        if let Err(e) = frame::PushPromise::validate_request(&request) {
+            use PushPromiseHeaderError::*;
+            match e {
+                NotSafeAndCacheable => tracing::debug!(
+                    ?promised_id,
+                    "convert_push_message: method {} is not safe and cacheable",
+                    request.method(),
+                ),
+                InvalidContentLength(e) => tracing::debug!(
+                    ?promised_id,
+                    "convert_push_message; promised request has invalid content-length {:?}",
+                    e,
+                ),
+            }
+            return Err(UserError::MalformedHeaders);
+        }
+
+        // Extract the components of the HTTP request
+        let (
+            Parts {
+                method,
+                uri,
+                headers,
+                ..
+            },
+            _,
+        ) = request.into_parts();
+
+        let pseudo = Pseudo::request(method, uri, None);
+
+        Ok(frame::PushPromise::new(
+            stream_id,
+            promised_id,
+            pseudo,
+            headers,
+        ))
+    }
+}
+
+impl proto::Peer for Peer {
+    type Poll = Request<()>;
+
+    const NAME: &'static str = "Server";
+
+    /*
+    fn is_server() -> bool {
+        true
+    }
+    */
+
+    fn r#dyn() -> proto::DynPeer {
+        proto::DynPeer::Server
+    }
+
+    fn convert_poll_message(
+        pseudo: Pseudo,
+        fields: HeaderMap,
+        stream_id: StreamId,
+    ) -> Result<Self::Poll, Error> {
+        use http::{uri, Version};
+
+        let mut b = Request::builder();
+
+        macro_rules! malformed {
+            ($($arg:tt)*) => {{
+                tracing::debug!($($arg)*);
+                return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
+            }}
+        }
+
+        b = b.version(Version::HTTP_2);
+
+        let is_connect;
+        if let Some(method) = pseudo.method {
+            is_connect = method == Method::CONNECT;
+            b = b.method(method);
+        } else {
+            malformed!("malformed headers: missing method");
+        }
+
+        let has_protocol = pseudo.protocol.is_some();
+        if has_protocol {
+            if is_connect {
+                // Assert that we have the right type.
+                b = b.extension::<crate::ext::Protocol>(pseudo.protocol.unwrap());
+            } else {
+                malformed!("malformed headers: :protocol on non-CONNECT request");
+            }
+        }
+
+        if pseudo.status.is_some() {
+            malformed!("malformed headers: :status field on request");
+        }
+
+        // Convert the URI
+        let mut parts = uri::Parts::default();
+
+        // A request translated from HTTP/1 must not include the :authority
+        // header
+        if let Some(authority) = pseudo.authority {
+            let maybe_authority = uri::Authority::from_maybe_shared(authority.clone().into_inner());
+            parts.authority = Some(maybe_authority.or_else(|why| {
+                malformed!(
+                    "malformed headers: malformed authority ({:?}): {}",
+                    authority,
+                    why,
+                )
+            })?);
+        }
+
+        // A :scheme is required, except CONNECT.
+        if let Some(scheme) = pseudo.scheme {
+            if is_connect && !has_protocol {
+                malformed!("malformed headers: :scheme in CONNECT");
+            }
+            let maybe_scheme = scheme.parse();
+            let scheme = maybe_scheme.or_else(|why| {
+                malformed!(
+                    "malformed headers: malformed scheme ({:?}): {}",
+                    scheme,
+                    why,
+                )
+            })?;
+
+            // It's not possible to build an `Uri` from a scheme and path. So,
+            // after validating is was a valid scheme, we just have to drop it
+            // if there isn't an :authority.
+            if parts.authority.is_some() {
+                parts.scheme = Some(scheme);
+            }
+        } else if !is_connect || has_protocol {
+            malformed!("malformed headers: missing scheme");
+        }
+
+        if let Some(path) = pseudo.path {
+            if is_connect && !has_protocol {
+                malformed!("malformed headers: :path in CONNECT");
+            }
+
+            // This cannot be empty
+            if path.is_empty() {
+                malformed!("malformed headers: missing path");
+            }
+
+            let maybe_path = uri::PathAndQuery::from_maybe_shared(path.clone().into_inner());
+            parts.path_and_query = Some(maybe_path.or_else(|why| {
+                malformed!("malformed headers: malformed path ({:?}): {}", path, why,)
+            })?);
+        } else if is_connect && has_protocol {
+            malformed!("malformed headers: missing path in extended CONNECT");
+        }
+
+        b = b.uri(parts);
+
+        let mut request = match b.body(()) {
+            Ok(request) => request,
+            Err(e) => {
+                // TODO: Should there be more specialized handling for different
+                // kinds of errors
+                proto_err!(stream: "error building request: {}; stream={:?}", e, stream_id);
+                return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
+            }
+        };
+
+        *request.headers_mut() = fields;
+
+        Ok(request)
+    }
+}
+
+// ===== impl Handshaking =====
+
+impl<T, B> fmt::Debug for Handshaking<T, B>
+where
+    B: Buf,
+{
+    #[inline]
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        match *self {
+            Handshaking::Flushing(_) => f.write_str("Flushing(_)"),
+            Handshaking::ReadingPreface(_) => f.write_str("ReadingPreface(_)"),
+            Handshaking::Done => f.write_str("Done"),
+        }
+    }
+}
+    pub fn stream_id(&self) -> crate::StreamId {
+        self.inner.stream_id()
+    }
+}
+
+// ===== impl Peer =====
+
+impl Peer {
+    pub fn convert_send_message(
+        id: StreamId,
+        request: Request<()>,
+        protocol: Option<Protocol>,
+        end_of_stream: bool,
+    ) -> Result<Headers, SendError> {
+        use http::request::Parts;
+
+        let (
+            Parts {
+                method,
+                uri,
+                headers,
+                version,
+                ..
+            },
+            _,
+        ) = request.into_parts();
+
+        let is_connect = method == Method::CONNECT;
+
+        // Build the set pseudo header set. All requests will include `method`
+        // and `path`.
+        let mut pseudo = Pseudo::request(method, uri, protocol);
+
+        if pseudo.scheme.is_none() {
+            // If the scheme is not set, then there are a two options.
+            //
+            // 1) Authority is not set. In this case, a request was issued with
+            //    a relative URI. This is permitted **only** when forwarding
+            //    HTTP 1.x requests. If the HTTP version is set to 2.0, then
+            //    this is an error.
+            //
+            // 2) Authority is set, then the HTTP method *must* be CONNECT.
+            //
+            // It is not possible to have a scheme but not an authority set (the
+            // `http` crate does not allow it).
+            //
+            if pseudo.authority.is_none() {
+                if version == Version::HTTP_2 {
+                    return Err(UserError::MissingUriSchemeAndAuthority.into());
+                } else {
+                    // This is acceptable as per the above comment. However,
+                    // HTTP/2 requires that a scheme is set. Since we are
+                    // forwarding an HTTP 1.1 request, the scheme is set to
+                    // "http".
+                    pseudo.set_scheme(uri::Scheme::HTTP);
+                }
+            } else if !is_connect {
+                // TODO: Error
+            }
+        }
+
+        // Create the HEADERS frame
+        let mut frame = Headers::new(id, pseudo, headers);
+
+        if end_of_stream {
+            frame.set_end_stream()
+        }
+
+        Ok(frame)
+    }
+}
+
+impl proto::Peer for Peer {
+    type Poll = Response<()>;
+
+    const NAME: &'static str = "Client";
+
+    fn r#dyn() -> proto::DynPeer {
+        proto::DynPeer::Client
+    }
+
+    /*
+    fn is_server() -> bool {
+        false
+    }
+    */
+
+    fn convert_poll_message(
+        pseudo: Pseudo,
+        fields: HeaderMap,
+        stream_id: StreamId,
+    ) -> Result<Self::Poll, Error> {
+        let mut b = Response::builder();
+
+        b = b.version(Version::HTTP_2);
+
+        if let Some(status) = pseudo.status {
+            b = b.status(status);
+        }
+
+        let mut response = match b.body(()) {
+            Ok(response) => response,
+            Err(_) => {
+                // TODO: Should there be more specialized handling for different
+                // kinds of errors
+                return Err(Error::library_reset(stream_id, Reason::PROTOCOL_ERROR));
+            }
+        };
+
+        *response.headers_mut() = fields;
+
+        Ok(response)
+    }
+}
+    /// [`SendStream::send_trailers`] will result in an error.
+    ///
+    /// If no request body or trailers are to be sent, set `end_of_stream` to
+    /// `true` and drop the returned [`SendStream`] instance.
+    ///
+    /// # A note on HTTP versions
+    ///
+    /// The provided `Request` will be encoded differently depending on the
+    /// value of its version field. If the version is set to 2.0, then the
+    /// request is encoded as per the specification recommends.
+    ///
+    /// If the version is set to a lower value, then the request is encoded to
+    /// preserve the characteristics of HTTP 1.1 and lower. Specifically, host
+    /// headers are permitted and the `:authority` pseudo header is not
+    /// included.
+    ///
+    /// The caller should always set the request's version field to 2.0 unless
+    /// specifically transmitting an HTTP 1.1 request over 2.0.
+    ///
+    /// # Examples
+    ///
+    /// Sending a request with no body
+    ///
+    /// ```rust
+    /// # use h2::client::*;
+    /// # use http::*;
+    /// # async fn doc(send_request: SendRequest<&'static [u8]>)
+    /// # {
+    /// // First, wait until the `send_request` handle is ready to send a new
+    /// // request
+    /// let mut send_request = send_request.ready().await.unwrap();
+    /// // Prepare the HTTP request to send to the server.
+    /// let request = Request::get("https://www.example.com/")
+    ///     .body(())
+    ///     .unwrap();
+    ///
+    /// // Send the request to the server. Since we are not sending a
+    /// // body or trailers, we can drop the `SendStream` instance.
+    /// let (response, _) = send_request.send_request(request, true).unwrap();
+    /// let response = response.await.unwrap();
+    /// // Process the response
+    /// # }
+    /// # pub fn main() {}
+    /// ```
+    ///
+    /// Sending a request with a body and trailers
+    ///
+    /// ```rust
+    /// # use h2::client::*;
+    /// # use http::*;
+    /// # async fn doc(send_request: SendRequest<&'static [u8]>)
+    /// # {
+    /// // First, wait until the `send_request` handle is ready to send a new
+    /// // request
+    /// let mut send_request = send_request.ready().await.unwrap();
+    ///
+    /// // Prepare the HTTP request to send to the server.
+    /// let request = Request::get("https://www.example.com/")
+    ///     .body(())
+    ///     .unwrap();
+    ///
+    /// // Send the request to the server. If we are not sending a
+    /// // body or trailers, we can drop the `SendStream` instance.
+    /// let (response, mut send_stream) = send_request
+    ///     .send_request(request, false).unwrap();
+    ///
+    /// // At this point, one option would be to wait for send capacity.
+    /// // Doing so would allow us to not hold data in memory that
+    /// // cannot be sent. However, this is not a requirement, so this
+    /// // example will skip that step. See `SendStream` documentation
+    /// // for more details.
+    /// send_stream.send_data(b"hello", false).unwrap();
+    /// send_stream.send_data(b"world", false).unwrap();
+    ///
+    /// // Send the trailers.
+    /// let mut trailers = HeaderMap::new();
+    /// trailers.insert(
+    ///     header::HeaderName::from_bytes(b"my-trailer").unwrap(),
+    ///     header::HeaderValue::from_bytes(b"hello").unwrap());
+    ///
+    /// send_stream.send_trailers(trailers).unwrap();
+    ///
+    /// let response = response.await.unwrap();
+    /// // Process the response
+    /// # }
+    /// # pub fn main() {}
+    /// ```
+    ///
+    /// [`ResponseFuture`]: struct.ResponseFuture.html
+    /// [`SendStream`]: ../struct.SendStream.html
+    /// [`SendStream::send_data`]: ../struct.SendStream.html#method.send_data
+    /// [`SendStream::send_trailers`]: ../struct.SendStream.html#method.send_trailers
+    pub fn send_request(
+        &mut self,
+        request: Request<()>,
+        end_of_stream: bool,
+    ) -> Result<(ResponseFuture, SendStream<B>), crate::Error> {
+        self.inner
+            .send_request(request, end_of_stream, self.pending.as_ref())
+            .map_err(Into::into)
+            .map(|(stream, is_full)| {
+                if stream.is_pending_open() && is_full {
+                    // Only prevent sending another request when the request queue
+                    // is not full.
+                    self.pending = Some(stream.clone_to_opaque());
+                }
+
+                let response = ResponseFuture {
+                    inner: stream.clone_to_opaque(),
+                    push_promise_consumed: false,
+                };
+
+                let stream = SendStream::new(stream);
+
+                (response, stream)
+            })
+    }
+
+    /// Returns whether the [extended CONNECT protocol][1] is enabled or not.
+    ///
+    /// This setting is configured by the server peer by sending the
+    /// [`SETTINGS_ENABLE_CONNECT_PROTOCOL` parameter][2] in a `SETTINGS` frame.
+    /// This method returns the currently acknowledged value received from the
+    /// remote.
+    ///
+    /// [1]: https://datatracker.ietf.org/doc/html/rfc8441#section-4
+    /// [2]: https://datatracker.ietf.org/doc/html/rfc8441#section-3
+    pub fn is_extended_connect_protocol_enabled(&self) -> bool {
+        self.inner.is_extended_connect_protocol_enabled()
+    }
+
+    /// Returns the current max send streams
+    pub fn current_max_send_streams(&self) -> usize {
+        self.inner.current_max_send_streams()
+    }
+
+    /// Returns the current max recv streams
+    pub fn current_max_recv_streams(&self) -> usize {
+        self.inner.current_max_recv_streams()
+    }
+}
+
+impl<B> fmt::Debug for SendRequest<B>
+where
+    B: Buf,
+{
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        fmt.debug_struct("SendRequest").finish()
+    }
+}
+
+impl<B> Clone for SendRequest<B>
+where
+    B: Buf,
+{
+    fn clone(&self) -> Self {
+        SendRequest {
+            inner: self.inner.clone(),
+            pending: None,
+        }
+    }
+}
+
+#[cfg(feature = "unstable")]
+impl<B> SendRequest<B>
+where
+    B: Buf,
+{
+    /// Returns the number of active streams.
+    ///
+    /// An active stream is a stream that has not yet transitioned to a closed
+    /// state.
+    pub fn num_active_streams(&self) -> usize {
+        self.inner.num_active_streams()
+    }
+
+    /// Returns the number of streams that are held in memory.
+    ///
+    /// A wired stream is a stream that is either active or is closed but must
+    /// stay in memory for some reason. For example, there are still outstanding
+    /// userspace handles pointing to the slot.
+    pub fn num_wired_streams(&self) -> usize {
+        self.inner.num_wired_streams()
+    }
+}
+
+// ===== impl ReadySendRequest =====
+
+impl<B> Future for ReadySendRequest<B>
+where
+    B: Buf,
+{
+    type Output = Result<SendRequest<B>, crate::Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match &mut self.inner {
+            Some(send_request) => {
+                ready!(send_request.poll_ready(cx))?;
+            }
+            None => panic!("called `poll` after future completed"),
+        }
+use futures::future::{ready, Either};
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
+use h2_support::prelude::*;
+use std::pin::Pin;
+use std::task::Context;
+use std::{io, panic};
+
+#[tokio::test]
+async fn handshake() {
+    h2_support::trace_init!();
+
+    let mock = mock_io::Builder::new()
+        .handshake()
+        .write(SETTINGS_ACK)
+        .build();
+
+    let (_client, h2) = client::handshake(mock).await.unwrap();
+
+    tracing::trace!("hands have been shook");
+
+    // At this point, the connection should be closed
+    h2.await.unwrap();
+}
+
+#[tokio::test]
+async fn client_other_thread() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://http2.akamai.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, h2) = client::handshake(io).await.unwrap();
+        tokio::spawn(async move {
+            let request = Request::builder()
+                .uri("https://http2.akamai.com/")
+                .body(())
+                .unwrap();
+            let _res = client
+                .send_request(request, true)
+                .unwrap()
+                .0
+                .await
+                .expect("request");
+        });
+        h2.await.expect("h2");
+    };
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn recv_invalid_server_stream_id() {
+    h2_support::trace_init!();
+
+    let mock = mock_io::Builder::new()
+        .handshake()
+        // Write GET /
+        .write(&[
+            0, 0, 0x10, 1, 5, 0, 0, 0, 1, 0x82, 0x87, 0x41, 0x8B, 0x9D, 0x29, 0xAC, 0x4B, 0x8F,
+            0xA8, 0xE9, 0x19, 0x97, 0x21, 0xE9, 0x84,
+        ])
+        .write(SETTINGS_ACK)
+        // Read response
+        .read(&[0, 0, 1, 1, 5, 0, 0, 0, 2, 137])
+        // Write GO_AWAY
+        .write(&[0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+        .build();
+
+    let (mut client, h2) = client::handshake(mock).await.unwrap();
+
+    // Send the request
+    let request = Request::builder()
+        .uri("https://http2.akamai.com/")
+        .body(())
+        .unwrap();
+
+    tracing::info!("sending request");
+    let (response, _) = client.send_request(request, true).unwrap();
+
+    // The connection errors
+    assert!(h2.await.is_err());
+
+    // The stream errors
+    assert!(response.await.is_err());
+}
+
+#[tokio::test]
+async fn request_stream_id_overflows() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::Builder::new()
+            .initial_stream_id(::std::u32::MAX >> 1)
+            .handshake::<_, Bytes>(io)
+            .await
+            .unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+
+        // first request is allowed
+        let (response, _) = client.send_request(request, true).unwrap();
+        let _x = h2.drive(response).await.unwrap();
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+        // second cannot use the next stream id, it's over
+        let poll_err = poll_fn(|cx| client.poll_ready(cx)).await.unwrap_err();
+        assert_eq!(poll_err.to_string(), "user error: stream ID overflowed");
+
+        let err = client.send_request(request, true).unwrap_err();
+        assert_eq!(err.to_string(), "user error: stream ID overflowed");
+
+        h2.await.unwrap();
+    };
+
+    let srv = async move {
+        let settings = srv.assert_client_handshake().await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(::std::u32::MAX >> 1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(::std::u32::MAX >> 1).response(200).eos())
+            .await;
+        idle_ms(10).await;
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn client_builder_max_concurrent_streams() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let mut settings = frame::Settings::default();
+    settings.set_max_concurrent_streams(Some(1));
+
+    let srv = async move {
+        let rcvd_settings = srv.assert_client_handshake().await;
+        assert_frame_eq(settings, rcvd_settings);
+
+        srv.recv_frame(
+            frames::headers(1)
+                .request("GET", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+    };
+
+    let mut builder = client::Builder::new();
+    builder.max_concurrent_streams(1);
+
+    let h2 = async move {
+        let (mut client, mut h2) = builder.handshake::<_, Bytes>(io).await.unwrap();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+        let (response, _) = client.send_request(request, true).unwrap();
+        h2.drive(response).await.unwrap();
+    };
+
+    join(srv, h2).await;
+}
+
+#[tokio::test]
+async fn request_over_max_concurrent_streams_errors() {
+    h2_support::trace_init!();
+    let (io, mut srv) = mock::new();
+
+    let srv = async move {
+        let settings = srv
+            .assert_client_handshake_with_settings(
+                frames::settings()
+                    // super tiny server
+                    .max_concurrent_streams(1),
+            )
+            .await;
+        assert_default_settings!(settings);
+        srv.recv_frame(
+            frames::headers(1)
+                .request("POST", "https://example.com/")
+                .eos(),
+        )
+        .await;
+        srv.send_frame(frames::headers(1).response(200).eos()).await;
+        srv.recv_frame(frames::headers(3).request("POST", "https://example.com/"))
+            .await;
+        srv.send_frame(frames::headers(3).response(200)).await;
+        srv.recv_frame(frames::data(3, "hello").eos()).await;
+        srv.send_frame(frames::data(3, "").eos()).await;
+        srv.recv_frame(frames::headers(5).request("POST", "https://example.com/"))
+            .await;
+        srv.send_frame(frames::headers(5).response(200)).await;
+        srv.recv_frame(frames::data(5, "hello").eos()).await;
+        srv.send_frame(frames::data(5, "").eos()).await;
+    };
+
+    let h2 = async move {
+        let (mut client, mut h2) = client::handshake(io).await.expect("handshake");
+        // we send a simple req here just to drive the connection so we can
+        // receive the server settings.
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://example.com/")
+            .body(())
+            .unwrap();
+use futures::StreamExt;
+use h2_support::prelude::*;
+
+#[tokio::test]
+async fn recv_trailers_only() {
+    h2_support::trace_init!();
+
+    let mock = mock_io::Builder::new()
+        .handshake()
+        // Write GET /
+        .write(&[
+            0, 0, 0x10, 1, 5, 0, 0, 0, 1, 0x82, 0x87, 0x41, 0x8B, 0x9D, 0x29, 0xAC, 0x4B, 0x8F,
+            0xA8, 0xE9, 0x19, 0x97, 0x21, 0xE9, 0x84,
+        ])
+        .write(frames::SETTINGS_ACK)
+        // Read response
+        .read(&[
+            0, 0, 1, 1, 4, 0, 0, 0, 1, 0x88, 0, 0, 9, 1, 5, 0, 0, 0, 1, 0x40, 0x84, 0x42, 0x46,
+            0x9B, 0x51, 0x82, 0x3F, 0x5F,
+        ])
+        .build();
+
+    let (mut client, mut h2) = client::handshake(mock).await.unwrap();
+
+    // Send the request
+    let request = Request::builder()
+        .uri("https://http2.akamai.com/")
+        .body(())
+        .unwrap();
+
+    tracing::info!("sending request");
+    let (response, _) = client.send_request(request, true).unwrap();
+
+    let response = h2.run(response).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (_, mut body) = response.into_parts();
+
+    // Make sure there is no body
+    let chunk = h2.run(Box::pin(body.next())).await;
+    assert!(chunk.is_none());
+
+    let trailers = h2
+        .run(poll_fn(|cx| body.poll_trailers(cx)))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(1, trailers.len());
+    assert_eq!(trailers["status"], "ok");
+
+    h2.await.unwrap();
+}
+
+#[tokio::test]
+async fn send_trailers_immediately() {
+    h2_support::trace_init!();
+
+    let mock = mock_io::Builder::new()
+        .handshake()
+        // Write GET /
+        .write(&[
+            0, 0, 0x10, 1, 4, 0, 0, 0, 1, 0x82, 0x87, 0x41, 0x8B, 0x9D, 0x29, 0xAC, 0x4B, 0x8F,
+            0xA8, 0xE9, 0x19, 0x97, 0x21, 0xE9, 0x84, 0, 0, 0x0A, 1, 5, 0, 0, 0, 1, 0x40, 0x83,
+            0xF6, 0x7A, 0x66, 0x84, 0x9C, 0xB4, 0x50, 0x7F,
+        ])
+        .write(frames::SETTINGS_ACK)
+        // Read response
+        .read(&[
+            0, 0, 1, 1, 4, 0, 0, 0, 1, 0x88, 0, 0, 0x0B, 0, 1, 0, 0, 0, 1, 0x68, 0x65, 0x6C, 0x6C,
+            0x6F, 0x20, 0x77, 0x6F, 0x72, 0x6C, 0x64,
+        ])
+        .build();
+
+    let (mut client, mut h2) = client::handshake(mock).await.unwrap();
+
+    // Send the request
+    let request = Request::builder()
+        .uri("https://http2.akamai.com/")
+        .body(())
+        .unwrap();
+
+    tracing::info!("sending request");
+    let (response, mut stream) = client.send_request(request, false).unwrap();
+
+    let mut trailers = HeaderMap::new();
+    trailers.insert("zomg", "hello".parse().unwrap());
+
+    stream.send_trailers(trailers).unwrap();
+
+    let response = h2.run(response).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (_, mut body) = response.into_parts();
+
+    // There is a data chunk
+    let _ = h2.run(body.next()).await.unwrap().unwrap();
+
+    let chunk = h2.run(body.next()).await;
+    assert!(chunk.is_none());
+
+    let trailers = h2.run(poll_fn(|cx| body.poll_trailers(cx))).await.unwrap();
+    assert!(trailers.is_none());
+
+    h2.await.unwrap();
+}
+
+#[test]
+#[ignore]
+fn recv_trailers_without_eos() {
+    // This should be a protocol error?
+}
+39-    Checking h2 v0.4.12 (/work/crate)
+40-   Compiling jobserver v0.1.35
+41-    Checking lazy_static v1.5.1
+42:error: large array defined as const
+43-    --> src/hpack/huffman/table.rs:265:1
+44-     |
+45- 265 |   pub const DECODE_TABLE: [[(usize, u8, u8); 16]; 256] = [
+46-     |   ^   ----- help: make this a static item: `static`
+47-     |  _|
+48-     | |
+49- 266 | |     // 0
+50- 267 | |     [
+51- 268 | |         (4, 0, 0x00),
+52-...    |
+53-5129 | |     ],
+54-5130 | | ];
+55-     | |__^
+56-     |
+57-     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#large_const_arrays
+58-     = note: `-D clippy::large-const-arrays` implied by `-D warnings`
+59-     = help: to override `-D warnings` add `#[allow(clippy::large_const_arrays)]`
+60-
+61:error: replacing an `Option` with `Some(..)`
+62-   --> src/hpack/table.rs:309:20
+63-    |
+64-309 |           let prev = mem::replace(
+65-    |  ____________________^
+66-310 | |             &mut self.indices[probe],
+67-311 | |             Some(Pos {
+68-312 | |                 index: pos_idx,
+69-313 | |                 hash,
+70-314 | |             }),
+71-315 | |         );
+72-    | |_________^
+73-    |
+74-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#mem_replace_option_with_some
+75-    = note: `-D clippy::mem-replace-option-with-some` implied by `-D warnings`
+76-    = help: to override `-D warnings` add `#[allow(clippy::mem_replace_option_with_some)]`
+77-help: consider using `Option::replace()` instead
+78-    |
+79-309 ~         let prev = self.indices[probe].replace(Pos {
+--
+82-312 ~             });
+83-    |
+84-
+85:error: replacing an `Option` with `Some(..)`
+86-   --> src/hpack/table.rs:324:30
+87-    |
+88-324 |                 prev = match mem::replace(pos, Some(prev)) {
+89-    |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `Option::replace()` instead: `pos.replace(prev)`
+90-    |
+91-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#mem_replace_option_with_some
+92-
+93:error: manually filling a slice
+94-   --> src/hpack/table.rs:356:13
+95-    |
+96-356 | /             for i in &mut self.indices {
+97-357 | |                 *i = None;
+98-358 | |             }
+99-    | |_____________^ help: try: `&mut self.indices.fill(None);`
+100-    |
+101-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#manual_slice_fill
+102-    = note: `-D clippy::manual-slice-fill` implied by `-D warnings`
+103-    = help: to override `-D warnings` add `#[allow(clippy::manual_slice_fill)]`
+104-
+105-    Checking sharded-slab v0.1.7
+106:error: this `match` expression can be replaced with `?`
+107-   --> src/proto/streams/prioritize.rs:718:13
+108-    |
+109-718 | /             match self.pending_send.pop(store) {
+110-719 | |                 Some(mut stream) => {
+111-720 | |                     let span = tracing::trace_span!("popped", ?stream.id, ?stream.state);
+112-721 | |                     let _e = span.enter();
+113-...   |
+114-888 | |                 None => return None,
+115-889 | |             }
+116-    | |_____________^
+117-    |
+118-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#question_mark
+119-    = note: `-D clippy::question-mark` implied by `-D warnings`
+120-    = help: to override `-D warnings` add `#[allow(clippy::question_mark)]`
+121-help: try instead
+122-    |
+123-718 ~             {
+124-719 +                 let mut stream = self.pending_send.pop(store)?;
+--
+292-887 +             }
+293-    |
+294-
+295:error: the `Err`-variant returned from this function is very large
+296-   --> src/proto/streams/recv.rs:160:10
+297-    |
+298- 73 |     Oversize(T),
+299-    |     ----------- the largest variant contains at least 288 bytes
+300-...
+301-160 |     ) -> Result<(), RecvHeaderBlockError<Option<frame::Headers>>> {
+302-    |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+303-    |
+304-    = help: try reducing the size of `proto::streams::recv::RecvHeaderBlockError<std::option::Option<frame::headers::Headers>>`, for example by boxing large elements or replacing it with `Box<proto::streams::recv::RecvHeaderBlockError<std::option::Option<frame::headers::Headers>>>`
+305-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#result_large_err
+306-    = note: `-D clippy::result-large-err` implied by `-D warnings`
+307-    = help: to override `-D warnings` add `#[allow(clippy::result_large_err)]`
+308-
+309:error: this `match` expression can be replaced with `?`
+310-  --> src/proto/streams/store.rs:90:21
+311-   |
+312-90 |           let index = match self.ids.get(id) {
+313-   |  _____________________^
+314-91 | |             Some(key) => *key,
+315-92 | |             None => return None,
+316-93 | |         };
+317-   | |_________^
+318-   |
+319-   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#question_mark
+320-help: try instead
+321-   |
+322-90 ~         let index = {
+323-91 +             let key = self.ids.get(id)?;
+324-92 +             *key
+325-93 ~         };
+326-   |
+327-
+328:error: this `if` can be collapsed into the outer `match`
+329-   --> src/proto/streams/stream.rs:345:17
+330-    |
+331-345 | /                 if len != 0 {
+332-346 | |                     return Err(());
+333-347 | |                 }
+334-    | |_________________^
+335-    |
+336-    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#collapsible_match
+337-    = note: `-D clippy::collapsible-match` implied by `-D warnings`
+338-    = help: to override `-D warnings` add `#[allow(clippy::collapsible_match)]`
+339-help: collapse nested if block
+340-    |
+341-344 ~             ContentLength::Head
+342-345 ~                 if len != 0 => {
+343-346 |                     return Err(());
+344-347 ~                 }
+345-    |
+346-
+347:error: could not compile `h2` (lib) due to 8 previous errors
+348-warning: build failed, waiting for other jobs to finish...
+349-
+350-== rustdoc
+351-    Checking thread_local v1.1.10
+352-    Checking semver v1.0.28
+353-   Compiling honggfuzz v0.5.62
+354-    Checking overload v0.1.1
+355-    Checking nu-ansi-term v0.46.0
+356-    Checking rustc_version v0.4.1
+357-    Checking tracing-subscriber v0.3.23
+358-    Checking futures v0.3.34
+359-    Checking h2 v0.4.12 (/work/crate)
+360-    Checking tracing-log v0.1.4
+361-    Checking tokio-stream v0.1.19
+362-    Checking same-file v1.0.6
+363-    Checking arbitrary v1.5.0
+364-    Checking walkdir v2.5.0
+365-    Checking tokio-test v0.4.6
+84:    pub fn new(peer: peer::Dyn, config: &Config) -> Self {
+93:        flow.assign_capacity(DEFAULT_INITIAL_WINDOW_SIZE).unwrap();
+114:    pub fn init_window_sz(&self) -> WindowSize {
+119:    pub fn last_processed_id(&self) -> StreamId {
+126:    pub fn open(
+132:        assert!(self.refused.is_none());
+155:    pub fn recv_headers(
+165:            // TODO: be smarter about this logic
+278:    pub fn take_request(&mut self, stream: &mut store::Ptr) -> Request<()> {
+288:    pub fn poll_pushed(
+320:    pub fn poll_response(
+348:    pub fn recv_trailers(
+373:    pub fn release_connection_capacity(&mut self, capacity: WindowSize, task: &mut Option<Waker>) {
+384:        // TODO: proper error handling
+386:        debug_assert!(_res.is_ok());
+396:    pub fn release_capacity(
+414:        // TODO: proper error handling
+416:        debug_assert!(_res.is_ok());
+431:    pub fn release_closed_capacity(&mut self, stream: &mut store::Ptr, task: &mut Option<Waker>) {
+462:    pub fn set_target_connection_window(
+501:    pub(crate) fn apply_local_settings(
+571:    pub fn is_end_stream(&self, stream: &store::Ptr) -> bool {
+579:    pub fn recv_data(&mut self, frame: frame::Data, stream: &mut store::Ptr) -> Result<(), Error> {
+584:        assert!(sz <= MAX_WINDOW_SIZE as usize);
+591:            // TODO: There are cases where this can be a stream error of
+684:    pub fn ignore_data(&mut self, sz: WindowSize) -> Result<(), Error> {
+700:    pub fn consume_connection_window(&mut self, sz: WindowSize) -> Result<(), Error> {
+718:    pub fn recv_push_promise(
+780:    pub fn ensure_not_idle(&self, id: StreamId) -> Result<(), Reason> {
+796:    pub fn recv_reset(
+836:    pub fn handle_error(&mut self, err: &proto::Error, stream: &mut Stream) {
+846:    pub fn go_away(&mut self, last_processed_id: StreamId) {
+847:        assert!(self.max_stream_id >= last_processed_id);
+851:    pub fn recv_eof(&mut self, stream: &mut Stream) {
+858:    pub(super) fn clear_recv_buffer(&mut self, stream: &mut Stream) {
+867:    pub fn max_stream_id(&self) -> StreamId {
+871:    pub fn next_stream_id(&self) -> Result<StreamId, Error> {
+879:    pub fn may_have_created_stream(&self, id: StreamId) -> bool {
+889:    pub(super) fn maybe_reset_next_stream_id(&mut self, id: StreamId) {
+900:    pub fn ensure_can_reserve(&self) -> Result<(), Error> {
+910:    pub fn enqueue_reset_expiration(&mut self, stream: &mut store::Ptr, counts: &mut Counts) {
+928:    pub fn send_pending_refusal<T, B>(
+952:    pub fn clear_expired_reset_streams(&mut self, store: &mut Store, counts: &mut Counts) {
+968:    pub fn clear_queues(
+982:    fn clear_stream_window_update_queue(&mut self, store: &mut Store, counts: &mut Counts) {
+991:    fn clear_all_reset_streams(&mut self, store: &mut Store, counts: &mut Counts) {
+997:    fn clear_all_pending_accept(&mut self, store: &mut Store, counts: &mut Counts) {
+1003:    pub fn poll_complete<T, B>(
+1024:    fn send_connection_window_update<T, B>(
+1053:    pub fn send_stream_window_updates<T, B>(
+1076:                debug_assert!(!stream.is_pending_window_update);
+1082:                    // TODO: is this correct? We could possibly send a window
+1088:                // TODO: de-dup
+1107:    pub fn next_incoming(&mut self, store: &mut Store) -> Option<store::Key> {
+1111:    pub fn poll_data(
+1139:    pub fn poll_trailers(
+1156:    fn schedule_recv<T>(
+1175:    pub fn is_push_promise(&self) -> bool {
+1183:    fn from(err: Error) -> Self {

@@ -1,0 +1,1059 @@
+//! Lock-free hash tables.
+//!
+//! The hash tables in this crate are, at their core, open addressing hash
+//! tables implemented using open addressing and boxed buckets. The core of
+//! these hash tables are bucket arrays, which consist of a vector of atomic
+//! pointers to buckets, an atomic pointer to the next bucket array, and an
+//! epoch number. In the context of this crate, an atomic pointer is a nullable
+//! pointer that is accessed and manipulated using atomic memory operations.
+//! Each bucket consists of a key and a possibly-uninitialized value.
+//!
+//! The key insight into making the hash table resizable is to incrementally
+//! copy buckets from the old bucket array to the new bucket array. As buckets
+//! are copied between bucket arrays, their pointers in the old bucket array are
+//! CAS'd with a null pointer that has a sentinel bit set. If the CAS fails,
+//! that thread must read the bucket pointer again and retry copying it into the
+//! new bucket array. If at any time a thread reads a bucket pointer with the
+//! sentinel bit set, that thread knows that a new (larger) bucket array has
+//! been allocated. That thread will then immediately attempt to copy all
+//! buckets to the new bucket array. It is possible to implement an algorithm in
+//! which a subset of buckets are relocated per-thread; such an algorithm has
+//! not been implemented for the sake of simplicity.
+//!
+//! Bucket pointers that have been copied from an old bucket array into a new
+//! bucket array are marked with a borrowed bit. If a thread copies a bucket
+//! from an old bucket array into a new bucket array, fails to CAS the bucket
+//! pointer in the old bucket array, it attempts to CAS the bucket pointer in
+//! the new bucket array that it previously inserted to. If the bucket pointer
+//! in the new bucket array does *not* have the borrowed tag bit set, that
+//! thread knows that the value in the new bucket array was modified more
+//! recently than the value in the old bucket array. To avoid discarding updates
+//! to the new bucket array, a thread will never replace a bucket pointer that
+//! has the borrowed tag bit set with one that does not. To see why this is
+//! necessary, consider the case where a bucket pointer is copied into the new
+//! array, removed from the new array by a second thread, then copied into the
+//! new array again by a third thread.
+//!
+//! Mutating operations are, at their core, an atomic compare-and-swap (CAS) on
+//! a bucket pointer. Insertions CAS null pointers and bucket pointers with
+//! matching keys, modifications CAS bucket pointers with matching keys, and
+//! removals CAS non-tombstone bucket pointers. Tombstone bucket pointers are
+//! bucket pointers with a tombstone bit set as part of a removal; this
+//! indicates that the bucket's value has been moved from and will be destroyed
+//! if it has not been already.
+//!
+//! As previously mentioned, removing an entry from the hash table results in
+//! that bucket pointer having a tombstone bit set. Insertions cannot
+//! displace a tombstone bucket unless their key compares equal, so once an
+//! entry is inserted into the hash table, the specific index it is assigned to
+//! will only ever hold entries whose keys compare equal. Without this
+//! restriction, resizing operations could result in the old and new bucket
+//! arrays being temporarily inconsistent. Consider the case where one thread,
+//! as part of a resizing operation, copies a bucket into a new bucket array
+//! while another thread removes and replaces that bucket from the old bucket
+//! array. If the new bucket has a non-matching key, what happens to the bucket
+//! that was just copied into the new bucket array?
+//!
+//! Tombstone bucket pointers are typically not copied into new bucket arrays.
+//! The exception is the case where a bucket pointer was copied to the new
+//! bucket array, then CAS on the old bucket array fails because that bucket has
+//! been replaced with a tombstone. In this case, the tombstone bucket pointer
+//! will be copied over to reflect the update without displacing a key from its
+//! bucket.
+//!
+//! This hash table algorithm was inspired by [a blog post by Jeff Phreshing]
+//! that describes the implementation of the Linear hash table in [Junction], a
+//! C++ library of concurrent data structures. Additional inspiration was drawn
+//! from the lock-free hash table described by Cliff Click in [a tech talk] given
+//! at Google in 2007.
+//!
+//! [a blog post by Jeff Phreshing]: https://preshing.com/20160222/a-resizable-concurrent-map/
+//! [Junction]: https://github.com/preshing/junction
+//! [a tech talk]: https://youtu.be/HJ-719EGIts
+
+pub(crate) mod iter;
+pub(crate) mod map;
+pub(crate) mod segment;
+
+#[cfg(test)]
+#[macro_use]
+pub(crate) mod test_util;
+
+pub(crate) use segment::HashMap as SegmentedHashMap;
+//! Segmented lock-free hash tables.
+//!
+//! Segmented hash tables divide their entries between a number of smaller
+//! logical hash tables, or segments. Each segment is entirely independent from
+//! the others, and entries are never relocated across segment boundaries.
+//!
+//! In the context of this crate, a segment refers specifically to an array of
+//! bucket pointers. The number of segments in a hash table is rounded up to the
+//! nearest power of two; this is so that selecting the segment for a key is no
+//! more than a right shift to select the most significant bits of a hashed key.
+//!
+//! Each segment is entirely independent from the others, all operations can be
+//! performed concurrently by multiple threads. Should a set of threads be
+//! operating on disjoint sets of segments, the only synchronization between
+//! them will be destructive interference as they access and update the bucket
+//! array pointer and length for each segment.
+//!
+//! Compared to the unsegmented hash tables in this crate, the segmented hash
+//! tables have higher concurrent write throughput for disjoint sets of keys.
+//! However, the segmented hash tables have slightly lower read and
+//! single-threaded write throughput. This is because the segmenting structure
+//! adds another layer of indirection between the hash table and its buckets.
+//!
+//! The idea for segmenting hash tables was inspired by the
+//! [`ConcurrentHashMap`] from OpenJDK 7, which consists of a number of
+//! separately-locked segments. OpenJDK 8 introduced a striped concurrent hash
+//! map that stripes a set of bucket locks across the set of buckets using the
+//! least significant bits of hashed keys.
+//!
+//! [`ConcurrentHashMap`]: https://github.com/openjdk-mirror/jdk7u-jdk/blob/master/src/share/classes/java/util/concurrent/ConcurrentHashMap.java
+
+use crate::cht::map::{
+    bucket::{self, BucketArray},
+    bucket_array_ref::BucketArrayRef,
+    DefaultHashBuilder,
+};
+
+use super::iter::{Iter, ScanningGet};
+
+use std::{
+    hash::{BuildHasher, Hash},
+    ptr,
+    sync::atomic::{self, AtomicUsize, Ordering},
+};
+
+use crossbeam_epoch::Atomic;
+use equivalent::Equivalent;
+
+/// A lock-free hash map implemented with segmented bucket pointer arrays, open
+/// addressing, and linear probing.
+///
+/// By default, `Cache` uses a hashing algorithm selected to provide resistance
+/// against HashDoS attacks.
+///
+/// The default hashing algorithm is the one used by `std::collections::HashMap`,
+/// which is currently SipHash 1-3.
+///
+/// While its performance is very competitive for medium sized keys, other hashing
+/// algorithms will outperform it for small keys such as integers as well as large
+/// keys such as long strings. However those algorithms will typically not protect
+/// against attacks such as HashDoS.
+///
+/// The hashing algorithm can be replaced on a per-`HashMap` basis using the
+/// [`default`], [`with_hasher`], [`with_capacity_and_hasher`],
+/// [`with_num_segments_and_hasher`], and
+/// [`with_num_segments_capacity_and_hasher`] methods. Many alternative
+/// algorithms are available on crates.io, such as the [`AHash`] crate.
+///
+/// The number of segments can be specified on a per-`HashMap` basis using the
+/// [`with_num_segments`], [`with_num_segments_and_capacity`],
+/// [`with_num_segments_and_hasher`], and
+/// [`with_num_segments_capacity_and_hasher`] methods. By default, the
+/// `num-cpus` feature is enabled and [`new`], [`with_capacity`],
+/// [`with_hasher`], and [`with_capacity_and_hasher`] will create maps with
+/// twice as many segments as the system has CPUs.
+///
+/// It is required that the keys implement the [`Eq`] and [`Hash`] traits,
+/// although this can frequently be achieved by using
+/// `#[derive(PartialEq, Eq, Hash)]`. If you implement these yourself, it is
+/// important that the following property holds:
+///
+/// ```text
+/// k1 == k2 -> hash(k1) == hash(k2)
+/// ```
+///
+/// In other words, if two keys are equal, their hashes must be equal.
+///
+/// It is a logic error for a key to be modified in such a way that the key's
+/// hash, as determined by the [`Hash`] trait, or its equality, as determined by
+/// the [`Eq`] trait, changes while it is in the map. This is normally only
+/// possible through [`Cell`], [`RefCell`], global state, I/O, or unsafe code.
+///
+/// [`AHash`]: https://crates.io/crates/ahash
+/// [`default`]: #method.default
+/// [`with_hasher`]: #method.with_hasher
+/// [`with_capacity`]: #method.with_capacity
+/// [`with_capacity_and_hasher`]: #method.with_capacity_and_hasher
+/// [`with_num_segments_and_hasher`]: #method.with_num_segments_and_hasher
+/// [`with_num_segments_capacity_and_hasher`]: #method.with_num_segments_capacity_and_hasher
+/// [`with_num_segments`]: #method.with_num_segments
+/// [`with_num_segments_and_capacity`]: #method.with_num_segments_and_capacity
+/// [`new`]: #method.new
+/// [`Eq`]: https://doc.rust-lang.org/std/cmp/trait.Eq.html
+/// [`Hash`]: https://doc.rust-lang.org/std/hash/trait.Hash.html
+/// [`Cell`]: https://doc.rust-lang.org/std/cell/struct.Ref.html
+/// [`RefCell`]: https://doc.rust-lang.org/std/cell/struct.RefCell.html
+pub(crate) struct HashMap<K, V, S = DefaultHashBuilder> {
+    segments: Box<[Segment<K, V>]>,
+    build_hasher: S,
+    len: AtomicUsize,
+    segment_shift: u32,
+}
+
+#[cfg(test)]
+impl<K, V> HashMap<K, V, DefaultHashBuilder> {
+    /// Creates an empty `HashMap` with the specified capacity.
+    ///
+    /// The hash map will be able to hold at least `capacity` elements without
+    /// reallocating any bucket pointer arrays. If `capacity` is 0, the hash map
+    /// will not allocate any bucket pointer arrays. However, it will always
+    /// allocate memory for segment pointers and lengths.
+    ///
+    /// The `HashMap` will be created with at least twice as many segments as
+    /// the system has CPUs.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_num_segments_capacity_and_hasher(
+            default_num_segments(),
+            capacity,
+            DefaultHashBuilder::default(),
+        )
+    }
+}
+
+impl<K, V, S> HashMap<K, V, S> {
+    /// Creates an empty `HashMap` with the specified number of segments, using
+    /// `build_hasher` to hash the keys.
+    ///
+    /// The hash map is initially created with a capacity of 0, so it will not
+    /// allocate bucket pointer arrays until it is first inserted into. However,
+    /// it will always allocate memory for segment pointers and lengths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is 0.
+    pub(crate) fn with_num_segments_and_hasher(num_segments: usize, build_hasher: S) -> Self {
+        Self::with_num_segments_capacity_and_hasher(num_segments, 0, build_hasher)
+    }
+
+    /// Creates an empty `HashMap` with the specified number of segments and
+    /// capacity, using `build_hasher` to hash the keys.
+    ///
+    /// The hash map will be able to hold at least `capacity` elements without
+    /// reallocating any bucket pointer arrays. If `capacity` is 0, the hash map
+    /// will not allocate any bucket pointer arrays. However, it will always
+    /// allocate memory for segment pointers and lengths.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `num_segments` is 0.
+    pub(crate) fn with_num_segments_capacity_and_hasher(
+        num_segments: usize,
+        capacity: usize,
+        build_hasher: S,
+    ) -> Self {
+        assert!(num_segments > 0);
+
+        let actual_num_segments = num_segments.next_power_of_two();
+        let segment_shift = 64 - actual_num_segments.trailing_zeros();
+
+        let mut segments = Vec::with_capacity(actual_num_segments);
+
+        if capacity == 0 {
+            unsafe {
+                ptr::write_bytes(segments.as_mut_ptr(), 0, actual_num_segments);
+                segments.set_len(actual_num_segments);
+            }
+        } else {
+            let actual_capacity = (capacity * 2 / actual_num_segments).next_power_of_two();
+
+            for _ in 0..actual_num_segments {
+                segments.push(Segment {
+                    bucket_array: Atomic::new(BucketArray::with_length(0, actual_capacity)),
+                    len: AtomicUsize::new(0),
+                });
+            }
+        }
+
+        let segments = segments.into_boxed_slice();
+
+        Self {
+            segments,
+            build_hasher,
+            len: AtomicUsize::new(0),
+            segment_shift,
+        }
+    }
+
+    pub(crate) fn actual_num_segments(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Returns the number of elements in the map.
+    ///
+    /// # Safety
+    ///
+    /// This method on its own is safe, but other threads can add or remove
+    /// elements at any time.
+    pub(crate) fn len(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
+    }
+
+    /// Returns `true` if the map contains no elements.
+    ///
+    /// # Safety
+    ///
+    /// This method on its own is safe, but other threads can add or remove
+    /// elements at any time.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the number of elements the map can hold without reallocating any
+    /// bucket pointer arrays.
+    ///
+    /// Note that all mutating operations except removal will result in a bucket
+    /// being allocated or reallocated.
+    ///
+    /// # Safety
+    ///
+    /// This method on its own is safe, but other threads can increase the
+    /// capacity of each segment at any time by adding elements.
+    #[cfg(any(test, feature = "unstable-debug-counters"))]
+    pub(crate) fn capacity(&self) -> usize {
+        let guard = &crossbeam_epoch::pin();
+
+        self.segments
+            .iter()
+            .map(|s| s.bucket_array.load_consume(guard))
+            .map(|p| unsafe { p.as_ref() })
+            .map(|a| a.map_or(0, BucketArray::capacity))
+            .sum::<usize>()
+    }
+
+    #[cfg(test)]
+    /// Returns the number of segments in the map.
+    pub(crate) fn num_segments(&self) -> usize {
+        self.segments.len()
+    }
+}
+
+impl<K: Hash + Eq, V, S: BuildHasher> HashMap<K, V, S> {
+    #[inline]
+    pub(crate) fn contains_key(&self, hash: u64, eq: impl FnMut(&K) -> bool) -> bool {
+        self.get_key_value_and_then(hash, eq, |_, _| Some(()))
+            .is_some()
+    }
+
+    /// Returns a clone of the value corresponding to the key.
+    #[inline]
+    pub(crate) fn get(&self, hash: u64, eq: impl FnMut(&K) -> bool) -> Option<V>
+// This module's source code was written by us, the `moka` developers, referring to
+// the following book and code:
+//
+// - Chapter 6. Building Our Own "Arc" of the Rust Atomics and Locks book.
+//     - Rust Atomics and Locks by Mara Bos (O’Reilly). Copyright 2023 Mara Bos,
+//       ISBN: 978-1-098-11944-7
+//     - https://marabos.nl/atomics/
+// - The `triomphe` crate v0.1.13 and v0.1.11 by Manish Goregaokar (Manishearth)
+//     - MIT or Apache-2.0 License
+//     - https://github.com/Manishearth/triomphe
+// - `std::sync::Arc` in the Rust Standard Library (1.81.0).
+//     -  MIT or Apache-2.0 License
+
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+    ops::Deref,
+    ptr::NonNull,
+};
+
+#[cfg(not(moka_loom))]
+use std::sync::atomic::{self, AtomicU32};
+
+#[cfg(moka_loom)]
+use loom::sync::atomic::{self, AtomicU32};
+
+/// A thread-safe reference-counting pointer. `MiniArc` is similar to
+/// `std::sync::Arc`, Atomically Reference Counted shared pointer, but with a few
+/// differences:
+///
+/// - Smaller memory overhead:
+///     - `MiniArc` does not support weak references, so it does not need to store a
+///       weak reference count.
+///     - `MiniArc` uses `AtomicU32` for the reference count, while `std::sync::Arc`
+///       uses `AtomicUsize`. On a 64-bit system, `AtomicU32` is half the size of
+///       `AtomicUsize`.
+///         - Note: Depending on the value type `T`, the Rust compiler may add
+///           padding to the internal struct of `MiniArc<T>`, so the actual memory
+///           overhead may vary.
+/// - Smaller code size:
+///     - Only about 100 lines of code.
+///         - This is because `MiniArc` provides only the methods needed for the
+///           `moka` and `mini-moka` crates.
+///     - Smaller code size means less chance of bugs.
+pub(crate) struct MiniArc<T: ?Sized> {
+    ptr: NonNull<ArcData<T>>,
+}
+
+struct ArcData<T: ?Sized> {
+    ref_count: AtomicU32,
+    data: T,
+}
+
+/// A soft limit on the amount of references that may be made to an `MiniArc`.
+///
+/// Going above this limit will abort your program (although not necessarily)
+/// at _exactly_ `MAX_REFCOUNT + 1` references.
+const MAX_REFCOUNT: u32 = (i32::MAX) as u32;
+
+unsafe impl<T: ?Sized + Send + Sync> Send for MiniArc<T> {}
+unsafe impl<T: ?Sized + Send + Sync> Sync for MiniArc<T> {}
+
+impl<T> MiniArc<T> {
+    pub(crate) fn new(data: T) -> MiniArc<T> {
+        MiniArc {
+            ptr: NonNull::from(Box::leak(Box::new(ArcData {
+                ref_count: AtomicU32::new(1),
+                data,
+            }))),
+        }
+    }
+}
+
+impl<T: ?Sized> MiniArc<T> {
+    /// Gets the number of [`MiniArc`] pointers to this allocation
+    pub(crate) fn count(this: &Self) -> u32 {
+        use atomic::Ordering::Acquire;
+
+        this.data().ref_count.load(Acquire)
+    }
+
+    /// Returns `true` if the two `MiniArc`s point to the same allocation in a
+    /// vein similar to [`ptr::eq`].
+    ///
+    /// # Safety
+    ///
+    /// This function is unreliable when `T` is a `dyn Trait`. Currently
+    /// coercing `MiniArc<SomeTime>` to `MiniArc<dyn Trait>` is not possible, so
+    /// this is not a problem in practice. However, if this coercion becomes
+    /// possible in the future, this function may return incorrect results when
+    /// comparing `MiniArc<dyn Trait>` instances.
+    ///
+    /// To fix this, we must rise the minimum supported Rust version (MSRV) to
+    /// 1.76 and use `std::ptr::addr_eq` internally instead of `eq` (`==`).
+    /// `addr_eq` compares the _addresses_ of the pointers for equality,
+    /// ignoring any metadata in fat pointers.
+    ///
+    /// See the following `triomphe` issue for more information:
+    /// https://github.com/Manishearth/triomphe/pull/84
+    ///
+    /// Note that `triomphe` has a feature called `unsize`, which enables the
+    /// coercion by using the `unsize` crate. `MiniArc` does not have such a
+    /// feature, so we are safe for now.
+    #[inline]
+    #[allow(ambiguous_wide_pointer_comparisons)] // Remove this when MSRV is 1.76 or newer.
+    #[allow(clippy::ptr_eq)] // Remove this when MSRV is 1.76 or newer.
+    pub(crate) fn ptr_eq(this: &Self, other: &Self) -> bool {
+        // `addr_eq` requires Rust 1.76 or newer.
+        // ptr::addr_eq(this.ptr.as_ptr(), other.ptr.as_ptr())
+        this.ptr.as_ptr() == other.ptr.as_ptr()
+    }
+
+    #[inline]
+    fn data(&self) -> &ArcData<T> {
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
+impl<T: ?Sized> Deref for MiniArc<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.data().data
+    }
+}
+
+impl<T: ?Sized> Clone for MiniArc<T> {
+    fn clone(&self) -> Self {
+        use atomic::Ordering::Relaxed;
+
+        if self.data().ref_count.fetch_add(1, Relaxed) > MAX_REFCOUNT {
+            std::process::abort();
+        }
+
+        MiniArc { ptr: self.ptr }
+    }
+}
+
+impl<T: ?Sized> Drop for MiniArc<T> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+
+        if self.data().ref_count.fetch_sub(1, Release) == 1 {
+            atomic::fence(Acquire);
+            unsafe {
+                drop(Box::from_raw(self.ptr.as_ptr()));
+            }
+        }
+    }
+}
+
+impl<T: Default> Default for MiniArc<T> {
+    /// Creates a new `MiniArc<T>`, with the `Default` value for `T`.
+    fn default() -> MiniArc<T> {
+        MiniArc::new(Default::default())
+    }
+}
+
+impl<T: ?Sized + PartialEq> PartialEq for MiniArc<T> {
+    fn eq(&self, other: &MiniArc<T>) -> bool {
+        // TODO: pointer equality is incorrect if `T` is not `Eq`.
+        // See: https://github.com/Manishearth/triomphe/pull/88
+        Self::ptr_eq(self, other) || *(*self) == *(*other)
+    }
+
+    #[allow(clippy::partialeq_ne_impl)]
+    fn ne(&self, other: &MiniArc<T>) -> bool {
+        !Self::ptr_eq(self, other) && *(*self) != *(*other)
+    }
+}
+
+impl<T: ?Sized + Eq> Eq for MiniArc<T> {}
+
+impl<T: ?Sized + fmt::Display> fmt::Display for MiniArc<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&**self, f)
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for MiniArc<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<T: ?Sized> fmt::Pointer for MiniArc<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Pointer::fmt(&self.ptr.as_ptr(), f)
+    }
+}
+
+impl<T: ?Sized + Hash> Hash for MiniArc<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (**self).hash(state)
+    }
+}
+
+#[cfg(all(test, not(moka_loom)))]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    use super::*;
+
+    #[test]
+    fn test_drop() {
+        static NUM_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+        struct DetectDrop;
+
+        impl Drop for DetectDrop {
+            fn drop(&mut self) {
+                NUM_DROPS.fetch_add(1, Relaxed);
+            }
+        }
+
+        // Create two MiniArcs sharing an object containing a string
+        // and a DetectDrop, to detect when it is dropped.
+        let x = MiniArc::new(("hello", DetectDrop));
+        let y = x.clone();
+
+use super::{base_cache::Inner, PredicateId, PredicateIdStr};
+use crate::{
+    common::{
+        concurrent::{arc::MiniArc, AccessTime, KvEntry, ValueEntry},
+        time::Instant,
+    },
+    notification::RemovalCause,
+    PredicateError,
+};
+
+use parking_lot::{Mutex, MutexGuard};
+use std::{
+    hash::{BuildHasher, Hash},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
+use uuid::Uuid;
+
+pub(crate) type PredicateFun<K, V> = Arc<dyn Fn(&K, &V) -> bool + Send + Sync + 'static>;
+
+const PREDICATE_MAP_NUM_SEGMENTS: usize = 16;
+
+pub(crate) struct KeyDateLite<K> {
+    key: Arc<K>,
+    hash: u64,
+    timestamp: Instant,
+}
+
+impl<K> Clone for KeyDateLite<K> {
+    fn clone(&self) -> Self {
+        Self {
+            key: Arc::clone(&self.key),
+            hash: self.hash,
+            timestamp: self.timestamp,
+        }
+    }
+}
+
+impl<K> KeyDateLite<K> {
+    pub(crate) fn new(key: &Arc<K>, hash: u64, timestamp: Instant) -> Self {
+        Self {
+            key: Arc::clone(key),
+            hash,
+            timestamp,
+        }
+    }
+}
+
+pub(crate) struct Invalidator<K, V, S> {
+    predicates: crate::cht::SegmentedHashMap<PredicateId, Predicate<K, V>, S>,
+    is_empty: AtomicBool,
+    scan_context: Arc<ScanContext<K, V>>,
+}
+
+//
+// Crate public methods.
+//
+impl<K, V, S> Invalidator<K, V, S> {
+    pub(crate) fn new(hasher: S) -> Self
+    where
+        S: BuildHasher,
+    {
+        const CAPACITY: usize = 0;
+        let predicates = crate::cht::SegmentedHashMap::with_num_segments_capacity_and_hasher(
+            PREDICATE_MAP_NUM_SEGMENTS,
+            CAPACITY,
+            hasher,
+        );
+        Self {
+            predicates,
+            is_empty: AtomicBool::new(true),
+            scan_context: Arc::new(ScanContext::default()),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.is_empty.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn remove_predicates_registered_before(&self, ts: Instant)
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher,
+    {
+        let pred_map = &self.predicates;
+
+        let removing_ids = pred_map
+            .iter()
+            .filter(|(_, pred)| pred.registered_at <= ts)
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+
+        for id in removing_ids {
+            let hash = pred_map.hash(&id);
+            pred_map.remove(hash, |k| k == &id);
+        }
+
+        if pred_map.is_empty() {
+            self.is_empty.store(true, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn register_predicate(
+        &self,
+        predicate: PredicateFun<K, V>,
+        registered_at: Instant,
+    ) -> Result<PredicateId, PredicateError>
+    where
+        K: Hash + Eq,
+        S: BuildHasher,
+    {
+        const MAX_RETRY: usize = 1_000;
+        let mut tries = 0;
+        let preds = &self.predicates;
+
+        while tries < MAX_RETRY {
+            let id = Uuid::new_v4().as_hyphenated().to_string();
+
+            let hash = preds.hash(&id);
+            if preds.contains_key(hash, |k| k == &id) {
+                tries += 1;
+
+                continue; // Retry
+            }
+            let pred = Predicate::new(&id, predicate, registered_at);
+            preds.insert_entry_and(id.clone(), hash, pred, |_, _| ());
+            self.is_empty.store(false, Ordering::Release);
+
+            return Ok(id);
+        }
+
+        // Since we are using 128-bit UUID for the ID and we do retries for MAX_RETRY
+        // times, this panic should extremely unlikely occur (unless there is a bug in
+        // UUID generation).
+        panic!("Cannot assign a new PredicateId to a predicate");
+    }
+
+    // This method will be called by the get method of Cache.
+    #[inline]
+    pub(crate) fn apply_predicates(&self, key: &Arc<K>, entry: &MiniArc<ValueEntry<K, V>>) -> bool
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher,
+    {
+        if self.is_empty() {
+            false
+        } else if let Some(ts) = entry.last_modified() {
+            Self::do_apply_predicates(
+                self.predicates.iter().map(|(_, v)| v),
+                key,
+                &entry.value,
+                ts,
+            )
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn scan_and_invalidate(
+        &self,
+        cache: &Inner<K, V, S>,
+        candidates: Vec<KeyDateLite<K>>,
+        is_truncated: bool,
+    ) -> (Vec<KvEntry<K, V>>, bool)
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher,
+    {
+        let mut predicates = self.scan_context.predicates.lock();
+        if predicates.is_empty() {
+            *predicates = self.predicates.iter().map(|(_k, v)| v).collect();
+        }
+
+        let mut invalidated = Vec::default();
+        let mut newest_timestamp = None;
+
+        for candidate in &candidates {
+            let key = &candidate.key;
+            let hash = candidate.hash;
+            let ts = candidate.timestamp;
+            if self.apply(&predicates, cache, key, hash, ts) {
+                if let Some(entry) = Self::invalidate(cache, key, hash, ts) {
+                    invalidated.push(KvEntry {
+                        key: Arc::clone(key),
+                        entry,
+                    });
+                }
+            }
+            newest_timestamp = Some(ts);
+        }
+
+        self.remove_finished_predicates(predicates, is_truncated, newest_timestamp);
+
+        (invalidated, self.predicates.is_empty())
+    }
+}
+
+//
+// Private methods.
+//
+impl<K, V, S> Invalidator<K, V, S>
+where
+    K: Hash + Eq,
+    S: BuildHasher,
+{
+    #[inline]
+    fn do_apply_predicates<I>(predicates: I, key: &K, value: &V, ts: Instant) -> bool
+    where
+        I: Iterator<Item = Predicate<K, V>>,
+    {
+        for predicate in predicates {
+            if predicate.is_applicable(ts) && predicate.apply(key, value) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn remove_finished_predicates(
+        &self,
+        mut predicates: MutexGuard<'_, Vec<Predicate<K, V>>>,
+        is_truncated: bool,
+        newest_timestamp: Option<Instant>,
+    ) where
+        K: Hash + Eq,
+        S: BuildHasher,
+    {
+        let predicates = &mut *predicates;
+        if is_truncated {
+            if let Some(ts) = newest_timestamp {
+                let (active, finished): (Vec<_>, Vec<_>) =
+                    predicates.drain(..).partition(|p| p.is_applicable(ts));
+
+                // Remove finished predicates from the predicate registry.
+                self.remove_predicates(&finished);
+                self.remove_predicates(&finished);
+                // Set the active predicates to the scan context.
+                *predicates = active;
+            } else {
+                unreachable!();
+            }
+        } else {
+            // Remove all the predicates from the predicate registry and scan context.
+            self.remove_predicates(predicates);
+            predicates.clear();
+        }
+    }
+
+    fn remove_predicates(&self, predicates: &[Predicate<K, V>])
+    where
+        K: Hash + Eq,
+        S: BuildHasher,
+    {
+        let pred_map = &self.predicates;
+        for p in predicates.iter() {
+            let hash = pred_map.hash(p.id());
+            pred_map.remove(hash, |k| k == p.id());
+        }
+
+        if pred_map.is_empty() {
+            self.is_empty.store(true, Ordering::Release);
+        }
+    }
+
+    fn apply(
+        &self,
+        predicates: &[Predicate<K, V>],
+        cache: &Inner<K, V, S>,
+        key: &Arc<K>,
+        hash: u64,
+        ts: Instant,
+    ) -> bool {
+        if let Some(entry) = cache.cache.get(hash, |k| k == key) {
+            if let Some(lm) = entry.last_modified() {
+                if lm == ts {
+                    return Invalidator::<_, _, S>::do_apply_predicates(
+                        predicates.iter().cloned(),
+                        key,
+                        &entry.value,
+                        lm,
+                    );
+                }
+            }
+        }
+
+        false
+    }
+
+    fn invalidate(
+        cache: &Inner<K, V, S>,
+        key: &Arc<K>,
+        hash: u64,
+        ts: Instant,
+    ) -> Option<MiniArc<ValueEntry<K, V>>>
+    where
+        K: Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+    {
+        // Lock the key for removal if blocking removal notification is enabled.
+        let kl = cache.maybe_key_lock(key);
+        let _klg = &kl.as_ref().map(|kl| kl.lock());
+
+        let maybe_entry = cache.cache.remove_if(
+            hash,
+            |k| k == key,
+            |_, v| {
+                if let Some(lm) = v.last_modified() {
+                    lm == ts
+                } else {
+                    false
+                }
+            },
+        );
+        if let Some(entry) = &maybe_entry {
+            if cache.is_removal_notifier_enabled() {
+                cache.notify_single_removal(Arc::clone(key), entry, RemovalCause::Explicit);
+            }
+        }
+        maybe_entry
+    }
+}
+
+//
+// for testing
+//
+#[cfg(test)]
+impl<K, V, S> Invalidator<K, V, S> {
+    pub(crate) fn predicate_count(&self) -> usize {
+        self.predicates.len()
+    }
+}
+
+struct ScanContext<K, V> {
+    predicates: Mutex<Vec<Predicate<K, V>>>,
+}
+
+impl<K, V> Default for ScanContext<K, V> {
+    fn default() -> Self {
+        Self {
+            predicates: Mutex::new(Vec::default()),
+        }
+    }
+}
+
+struct Predicate<K, V> {
+    id: PredicateId,
+    f: PredicateFun<K, V>,
+    registered_at: Instant,
+}
+
+impl<K, V> Clone for Predicate<K, V> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            f: Arc::clone(&self.f),
+            registered_at: self.registered_at,
+        }
+    }
+}
+
+impl<K, V> Predicate<K, V> {
+    fn new(id: PredicateIdStr<'_>, f: PredicateFun<K, V>, registered_at: Instant) -> Self {
+        Self {
+            id: id.to_string(),
+            f,
+            registered_at,
+        }
+    }
+
+    fn id(&self) -> PredicateIdStr<'_> {
+        &self.id
+    }
+
+    fn is_applicable(&self, last_modified: Instant) -> bool {
+        last_modified <= self.registered_at
+    }
+
+    fn apply(&self, key: &K, value: &V) -> bool {
+        (self.f)(key, value)
+    }
+}
+            .base
+            .get_with_hash_and_ignore_if(&*c_key, c_hash, ignore_if, true);
+        let maybe_value = if allow_nop {
+            maybe_entry.as_ref().map(|ent| ent.value().clone())
+        } else {
+            None
+        };
+        let entry_existed = maybe_entry.is_some();
+
+        // Evaluate the `f` closure. Catching panic is safe here as we will not
+        // evaluate the closure again.
+        let output = match catch_unwind(AssertUnwindSafe(|| f(maybe_entry))) {
+            // Evaluated.
+            Ok(output) => {
+                *lock = WaiterValue::ReadyNone;
+                output
+            }
+            // Panicked.
+            Err(payload) => {
+                *lock = WaiterValue::InitClosurePanicked;
+                // Remove the waiter so that others can retry.
+                self.remove_waiter(w_key, w_hash);
+                resume_unwind(payload);
+            }
+        };
+
+        let op = match post_init(output) {
+            Ok(op) => op,
+            Err(e) => {
+                self.remove_waiter(w_key, w_hash);
+                return Err(e);
+            }
+        };
+
+        let result = match op {
+            Op::Nop => {
+                if let Some(value) = maybe_value {
+                    Ok(CompResult::Unchanged(Entry::new(
+                        Some(c_key),
+                        value,
+                        false,
+                        false,
+                    )))
+                } else {
+                    Ok(CompResult::StillNone(c_key))
+                }
+            }
+            Op::Put(value) => {
+                cache.insert_with_hash(Arc::clone(&c_key), c_hash, value.clone());
+                if entry_existed {
+                    crossbeam_epoch::pin().flush();
+                    let entry = Entry::new(Some(c_key), value, true, true);
+                    Ok(CompResult::ReplacedWith(entry))
+                } else {
+                    let entry = Entry::new(Some(c_key), value, true, false);
+                    Ok(CompResult::Inserted(entry))
+                }
+            }
+            Op::Remove => {
+                let maybe_prev_v = cache.invalidate_with_hash(&*c_key, c_hash, true);
+                if let Some(prev_v) = maybe_prev_v {
+                    crossbeam_epoch::pin().flush();
+                    let entry = Entry::new(Some(c_key), prev_v, false, false);
+                    Ok(CompResult::Removed(entry))
+                } else {
+                    Ok(CompResult::StillNone(c_key))
+                }
+            }
+        };
+        self.remove_waiter(w_key, w_hash);
+        result
+
+        // The lock will be unlocked here.
+    }
+
+    /// The `post_init` function for the `get_with` method of cache.
+    pub(crate) fn post_init_for_get_with(value: V) -> Result<V, ()> {
+        Ok(value)
+    }
+
+    /// The `post_init` function for the `optionally_get_with` method of cache.
+    pub(crate) fn post_init_for_optionally_get_with(
+        value: Option<V>,
+    ) -> Result<V, Arc<OptionallyNone>> {
+        // `value` can be either `Some` or `None`. For `None` case, without change
+        // the existing API too much, we will need to convert `None` to Arc<E> here.
+        // `Infallible` could not be instantiated. So it might be good to use an
+        // empty struct to indicate the error type.
+        value.ok_or(Arc::new(OptionallyNone))
+    }
+
+    /// The `post_init` function for `try_get_with` method of cache.
+    pub(crate) fn post_init_for_try_get_with<E>(result: Result<V, E>) -> Result<V, E> {
+        result
+    }
+
+    /// The `post_init` function for the `and_upsert_with` method of cache.
+    pub(crate) fn post_init_for_upsert_with(value: V) -> Result<Op<V>, ()> {
+        Ok(Op::Put(value))
+    }
+
+    /// The `post_init` function for the `and_compute_with` method of cache.
+    pub(crate) fn post_init_for_compute_with(op: Op<V>) -> Result<Op<V>, ()> {
+        Ok(op)
+    }
+
+    /// The `post_init` function for the `and_try_compute_with` method of cache.
+    pub(crate) fn post_init_for_try_compute_with<E>(op: Result<Op<V>, E>) -> Result<Op<V>, E>
+    where
+        E: Send + Sync + 'static,
+    {

@@ -1,0 +1,736 @@
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+use futures_util::FutureExt;
+
+use crate::notification::{AsyncEvictionListener, RemovalCause};
+
+pub(crate) struct RemovalNotifier<K, V> {
+    listener: AsyncEvictionListener<K, V>,
+    is_enabled: AtomicBool,
+    #[cfg(feature = "logging")]
+    cache_name: Option<String>,
+}
+
+impl<K, V> RemovalNotifier<K, V> {
+    pub(crate) fn new(listener: AsyncEvictionListener<K, V>, _cache_name: Option<String>) -> Self {
+        Self {
+            listener,
+            is_enabled: AtomicBool::new(true),
+            #[cfg(feature = "logging")]
+            cache_name: _cache_name,
+        }
+    }
+
+    pub(crate) async fn notify(&self, key: Arc<K>, value: V, cause: RemovalCause) {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        if !self.is_enabled.load(Ordering::Acquire) {
+            return;
+        }
+
+        // This macro unwraps the result of the catch_unwind call if it is Ok. And
+        // disable the notifier and do early return if the listener panicked.
+        macro_rules! try_or_disable {
+            ($match_expr:expr) => {
+                match $match_expr {
+                    Ok(v) => v,
+                    Err(_payload) => {
+                        self.is_enabled.store(false, Ordering::Release);
+                        #[cfg(feature = "logging")]
+                        log_panic(&*_payload, self.cache_name.as_deref());
+                        return;
+                    }
+                }
+            };
+        }
+
+        let listener_clo = || (self.listener)(key, value, cause);
+
+        // Safety: It is safe to assert unwind safety here because we will not
+        // call the listener again if it has been panicked.
+        let fut = try_or_disable!(catch_unwind(AssertUnwindSafe(listener_clo)));
+        try_or_disable!(AssertUnwindSafe(fut).catch_unwind().await);
+    }
+}
+
+#[cfg(feature = "logging")]
+fn log_panic(payload: &(dyn std::any::Any + Send + 'static), cache_name: Option<&str>) {
+    // Try to downcast the payload into &str or String.
+    //
+    // NOTE: Clippy will complain if we use `if let Some(_)` here.
+    // https://rust-lang.github.io/rust-clippy/master/index.html#manual_map
+    let message: Option<std::borrow::Cow<'_, str>> =
+        (payload.downcast_ref::<&str>().map(|s| (*s).into()))
+            .or_else(|| payload.downcast_ref::<String>().map(Into::into));
+
+    let cn = cache_name
+        .map(|name| format!("[{name}] "))
+        .unwrap_or_default();
+
+    if let Some(m) = message {
+        log::error!("{cn}Disabled the eviction listener because it panicked at '{m}'");
+    } else {
+        log::error!("{cn}Disabled the eviction listener because it panicked");
+    }
+}
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+use crate::notification::{EvictionListener, RemovalCause};
+
+pub(crate) struct RemovalNotifier<K, V> {
+    listener: EvictionListener<K, V>,
+    is_enabled: AtomicBool,
+    #[cfg(feature = "logging")]
+    cache_name: Option<String>,
+}
+
+impl<K, V> RemovalNotifier<K, V> {
+    pub(crate) fn new(listener: EvictionListener<K, V>, _cache_name: Option<String>) -> Self {
+        Self {
+            listener,
+            is_enabled: AtomicBool::new(true),
+            #[cfg(feature = "logging")]
+            cache_name: _cache_name,
+        }
+    }
+
+    pub(crate) fn notify(&self, key: Arc<K>, value: V, cause: RemovalCause) {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        if !self.is_enabled.load(Ordering::Acquire) {
+            return;
+        }
+
+        let listener_clo = || (self.listener)(key, value, cause);
+
+        // Safety: It is safe to assert unwind safety here because we will not
+        // call the listener again if it has been panicked.
+        let result = catch_unwind(AssertUnwindSafe(listener_clo));
+        if let Err(_payload) = result {
+            self.is_enabled.store(false, Ordering::Release);
+            #[cfg(feature = "logging")]
+            log_panic(&*_payload, self.cache_name.as_deref());
+        }
+    }
+}
+
+#[cfg(feature = "logging")]
+fn log_panic(payload: &(dyn std::any::Any + Send + 'static), cache_name: Option<&str>) {
+    // Try to downcast the payload into &str or String.
+    //
+    // NOTE: Clippy will complain if we use `if let Some(_)` here.
+    // https://rust-lang.github.io/rust-clippy/master/index.html#manual_map
+    let message: Option<std::borrow::Cow<'_, str>> =
+        (payload.downcast_ref::<&str>().map(|s| (*s).into()))
+            .or_else(|| payload.downcast_ref::<String>().map(Into::into));
+
+    let cn = cache_name
+        .map(|name| format!("[{name}] "))
+        .unwrap_or_default();
+
+    if let Some(m) = message {
+        log::error!("{cn}Disabled the eviction listener because it panicked at '{m}'");
+    } else {
+        log::error!("{cn}Disabled the eviction listener because it panicked");
+    }
+}
+use std::{
+    hash::{BuildHasher, Hash},
+    sync::Arc,
+};
+
+use crate::{cht::SegmentedHashMap, common::concurrent::arc::MiniArc};
+
+use parking_lot::{Mutex, MutexGuard};
+
+const LOCK_MAP_NUM_SEGMENTS: usize = 64;
+
+type LockMap<K, S> = SegmentedHashMap<Arc<K>, MiniArc<Mutex<()>>, S>;
+
+// We need the `where` clause here because of the Drop impl.
+pub(crate) struct KeyLock<'a, K, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
+    map: &'a LockMap<K, S>,
+    key: Arc<K>,
+    hash: u64,
+    lock: MiniArc<Mutex<()>>,
+}
+
+impl<K, S> Drop for KeyLock<'_, K, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
+    fn drop(&mut self) {
+        if MiniArc::count(&self.lock) <= 2 {
+            self.map.remove_if(
+                self.hash,
+                |k| k == &self.key,
+                |_k, v| MiniArc::count(v) <= 2,
+            );
+        }
+    }
+}
+
+impl<'a, K, S> KeyLock<'a, K, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
+    fn new(map: &'a LockMap<K, S>, key: &Arc<K>, hash: u64, lock: MiniArc<Mutex<()>>) -> Self {
+        Self {
+            map,
+            key: Arc::clone(key),
+            hash,
+            lock,
+        }
+    }
+
+    pub(crate) fn lock(&self) -> MutexGuard<'_, ()> {
+        self.lock.lock()
+    }
+}
+
+pub(crate) struct KeyLockMap<K, S> {
+    locks: LockMap<K, S>,
+}
+
+impl<K, S> KeyLockMap<K, S>
+where
+    K: Eq + Hash,
+    S: BuildHasher,
+{
+    pub(crate) fn with_hasher(hasher: S) -> Self {
+        Self {
+            locks: SegmentedHashMap::with_num_segments_and_hasher(LOCK_MAP_NUM_SEGMENTS, hasher),
+        }
+    }
+
+    pub(crate) fn key_lock(&self, key: &Arc<K>) -> KeyLock<'_, K, S> {
+        let hash = self.locks.hash(key);
+        let kl = MiniArc::new(Mutex::new(()));
+        match self
+            .locks
+            .insert_if_not_present(Arc::clone(key), hash, kl.clone())
+        {
+            None => KeyLock::new(&self.locks, key, hash, kl),
+            Some(existing_kl) => KeyLock::new(&self.locks, key, hash, existing_kl),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<K, S> KeyLockMap<K, S> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.locks.len() == 0
+    }
+}
+                    let err: ErrorObject = Arc::new(e);
+                    waiter_guard.set_waiter_value(WaiterValue::Ready(Err(Arc::clone(&err))));
+                    InitErr(err.downcast().unwrap())
+                }
+            },
+            // Panicked.
+            Err(payload) => {
+                waiter_guard.set_waiter_value(WaiterValue::InitFuturePanicked);
+                resume_unwind(payload);
+            }
+        }
+        // The lock will be unlocked here.
+    }
+
+    /// # Panics
+    /// Panics if the `init` future has been panicked.
+    pub(crate) async fn try_compute<'a, F, Fut, O, E>(
+        &'a self,
+        c_key: Arc<K>,
+        c_hash: u64,
+        cache: &Cache<K, V, S>,
+        f: F,
+        post_init: fn(O) -> Result<Op<V>, E>,
+        allow_nop: bool,
+    ) -> Result<CompResult<K, V>, E>
+    where
+        F: FnOnce(Option<Entry<K, V>>) -> Fut,
+        Fut: Future<Output = O> + 'a,
+        E: Send + Sync + 'static,
+    {
+        use std::panic::{resume_unwind, AssertUnwindSafe};
+
+        let type_id = TypeId::of::<ComputeNone>();
+        let (w_key, w_hash) = waiter_key_hash(&self.waiters, &c_key, type_id);
+        let waiter = MiniArc::new(RwLock::new(WaiterValue::Computing));
+        // NOTE: We have to acquire a write lock before `try_insert_waiter`,
+        // so that any concurrent attempt will get our lock and wait on it.
+        let lock = waiter.write().await;
+
+        loop {
+            let Some(existing_waiter) =
+                try_insert_waiter(&self.waiters, w_key.clone(), w_hash, &waiter)
+            else {
+                // Inserted.
+                break;
+            };
+
+            // Somebody else's waiter already exists, so wait for it to finish
+            // (wait for it to release the write lock).
+            let waiter_result = existing_waiter.read().await;
+            match &*waiter_result {
+                // Unexpected state.
+                WaiterValue::Computing => panic!(
+                    "Got unexpected state `Computing` after resolving `init` future. \
+                    This might be a bug in Moka"
+                ),
+                _ => {
+                    // Try to insert our waiter again.
+                    continue;
+                }
+            }
+        }
+
+        // Our waiter was inserted.
+
+        // Create a guard. This will ensure to remove our waiter when the
+        // enclosing future has been aborted:
+        // https://github.com/moka-rs/moka/issues/59
+        let waiter_guard = WaiterGuard::new(w_key, w_hash, &self.waiters, lock);
+
+        // Get the current value.
+        let ignore_if = None as Option<&mut fn(&V) -> bool>;
+        let maybe_entry = cache
+            .base
+            .get_with_hash(&*c_key, c_hash, ignore_if, true, true)
+            .await;
+        let maybe_value = if allow_nop {
+            maybe_entry.as_ref().map(|ent| ent.value().clone())
+        } else {
+            None
+        };
+        let entry_existed = maybe_entry.is_some();
+
+        // Evaluate the `f` closure and get a future. Catching panic is safe here as
+        // we will not evaluate the closure again.
+        let fut = match std::panic::catch_unwind(AssertUnwindSafe(|| f(maybe_entry))) {
+            // Evaluated.
+            Ok(fut) => fut,
+            // Panicked.
+            Err(payload) => {
+                waiter_guard.set_waiter_value(WaiterValue::InitFuturePanicked);
+                resume_unwind(payload);
+            }
+        };
+
+        // Resolve the `fut` future. Catching panic is safe here as we will not
+        // resolve the future again.
+        let output = match AssertUnwindSafe(fut).catch_unwind().await {
+            // Resolved.
+            Ok(output) => {
+                waiter_guard.set_waiter_value(WaiterValue::ReadyNone);
+                output
+            }
+            // Panicked.
+            Err(payload) => {
+                waiter_guard.set_waiter_value(WaiterValue::InitFuturePanicked);
+                resume_unwind(payload);
+            }
+        };
+
+        match post_init(output)? {
+            Op::Nop => {
+                if let Some(value) = maybe_value {
+                    Ok(CompResult::Unchanged(Entry::new(
+                        Some(c_key),
+                        value,
+                        false,
+                        false,
+                    )))
+                } else {
+                    Ok(CompResult::StillNone(c_key))
+                }
+            }
+            Op::Put(value) => {
+                cache
+                    .insert_with_hash(Arc::clone(&c_key), c_hash, value.clone())
+                    .await;
+                if entry_existed {
+                    crossbeam_epoch::pin().flush();
+                    let entry = Entry::new(Some(c_key), value, true, true);
+                    Ok(CompResult::ReplacedWith(entry))
+                } else {
+                    let entry = Entry::new(Some(c_key), value, true, false);
+                    Ok(CompResult::Inserted(entry))
+                }
+            }
+            Op::Remove => {
+                let maybe_prev_v = cache.invalidate_with_hash(&*c_key, c_hash, true).await;
+                if let Some(prev_v) = maybe_prev_v {
+                    crossbeam_epoch::pin().flush();
+                    let entry = Entry::new(Some(c_key), prev_v, false, false);
+                    Ok(CompResult::Removed(entry))
+                } else {
+                    Ok(CompResult::StillNone(c_key))
+                }
+            }
+        }
+
+        // The lock will be unlocked here.
+    }
+
+    pub(crate) async fn try_compute_if_nobody_else<'a, F, Fut, O, E>(
+        &'a self,
+        c_key: Arc<K>,
+        c_hash: u64,
+        cache: &Cache<K, V, S>,
+        f: F,
+        post_init: fn(O) -> Result<Op<V>, E>,
+        allow_nop: bool,
+    ) -> Result<CompResult<K, V>, E>
+    where
+        F: FnOnce(Option<Entry<K, V>>) -> Fut,
+        Fut: Future<Output = O> + 'a,
+        E: Send + Sync + 'static,
+    {
+        use std::panic::{resume_unwind, AssertUnwindSafe};
+
+        let type_id = TypeId::of::<ComputeNone>();
+        let (w_key, w_hash) = waiter_key_hash(&self.waiters, &c_key, type_id);
+        let waiter = MiniArc::new(RwLock::new(WaiterValue::Computing));
+        // NOTE: We have to acquire a write lock before `try_insert_waiter`,
+        // so that any concurrent attempt will get our lock and wait on it.
+        let lock = waiter.write().await;
+
+        if let Some(_existing_waiter) =
+            try_insert_waiter(&self.waiters, w_key.clone(), w_hash, &waiter)
+        {
+            // There's already a waiter computing for this entry, cancel this computation.
+
+            // Get the current value.
+            let ignore_if = None as Option<&mut fn(&V) -> bool>;
+            let maybe_entry = cache
+                .base
+                .get_with_hash(&*c_key, c_hash, ignore_if, true, true)
+                .await;
+            let maybe_value = maybe_entry.as_ref().map(|ent| ent.value().clone());
+
+            return if let Some(value) = maybe_value {
+                Ok(CompResult::Unchanged(Entry::new(
+                    Some(c_key),
+                    value,
+                    false,
+                    false,
+                )))
+            } else {
+                Ok(CompResult::StillNone(c_key))
+            };
+            // The lock will be unlocked here.
+        } else {
+            // Inserted.
+        }
+
+        // Our waiter was inserted.
+
+        // Create a guard. This will ensure to remove our waiter when the
+        // enclosing future has been aborted:
+        // https://github.com/moka-rs/moka/issues/59
+        let waiter_guard = WaiterGuard::new(w_key, w_hash, &self.waiters, lock);
+
+        // Get the current value.
+        let ignore_if = None as Option<&mut fn(&V) -> bool>;
+//
+#[cfg(test)]
+impl<K, V, S> Inner<K, V, S>
+where
+    K: Hash + Eq,
+    S: BuildHasher + Clone,
+{
+    fn invalidation_predicate_count(&self) -> usize {
+        if let Some(inv) = &self.invalidator {
+            inv.predicate_count()
+        } else {
+            0
+        }
+    }
+
+    fn key_locks_map_is_empty(&self) -> bool {
+        self.key_locks
+            .as_ref()
+            .map(|m| m.is_empty())
+            // If key_locks is None, consider it is empty.
+            .unwrap_or(true)
+    }
+}
+
+//
+// private free-standing functions
+//
+
+/// Returns `true` if this entry is expired by its per-entry TTL.
+#[inline]
+fn is_expired_by_per_entry_ttl<K>(entry_info: &MiniArc<EntryInfo<K>>, now: Instant) -> bool {
+    if let Some(ts) = entry_info.expiration_time() {
+        ts <= now
+    } else {
+        false
+    }
+}
+
+/// Returns `true` when one of the followings conditions is met:
+///
+/// - This entry is expired by the time-to-idle config of this cache instance.
+/// - Or, it is invalidated by the `invalidate_all` method.
+#[inline]
+fn is_expired_entry_ao(
+    time_to_idle: &Option<Duration>,
+    valid_after: &Option<Instant>,
+    entry: &impl AccessTime,
+    now: Instant,
+) -> bool {
+    if let Some(ts) = entry.last_accessed() {
+        is_invalid_entry(valid_after, ts) || is_expired_by_tti(time_to_idle, ts, now)
+    } else {
+        false
+    }
+}
+
+/// Returns `true` when one of the following conditions is met:
+///
+/// - This entry is expired by the time-to-live (TTL) config of this cache instance.
+/// - Or, it is invalidated by the `invalidate_all` method.
+#[inline]
+fn is_expired_entry_wo(
+    time_to_live: &Option<Duration>,
+    valid_after: &Option<Instant>,
+    entry: &impl AccessTime,
+    now: Instant,
+) -> bool {
+    if let Some(ts) = entry.last_modified() {
+        is_invalid_entry(valid_after, ts) || is_expired_by_ttl(time_to_live, ts, now)
+    } else {
+        false
+    }
+}
+
+#[inline]
+fn is_entry_expired_ao_or_invalid(
+    time_to_idle: &Option<Duration>,
+    valid_after: &Option<Instant>,
+    entry_last_accessed: Instant,
+    now: Instant,
+) -> (bool, bool) {
+    let ts = entry_last_accessed;
+    let expired = is_expired_by_tti(time_to_idle, ts, now);
+    let invalid = is_invalid_entry(valid_after, ts);
+    (expired, invalid)
+}
+
+#[inline]
+fn is_entry_expired_wo_or_invalid(
+    time_to_live: &Option<Duration>,
+    valid_after: &Option<Instant>,
+    entry_last_modified: Instant,
+    now: Instant,
+) -> (bool, bool) {
+    let ts = entry_last_modified;
+    let expired = is_expired_by_ttl(time_to_live, ts, now);
+    let invalid = is_invalid_entry(valid_after, ts);
+    (expired, invalid)
+}
+
+#[inline]
+fn is_invalid_entry(valid_after: &Option<Instant>, entry_ts: Instant) -> bool {
+    if let Some(va) = valid_after {
+        entry_ts < *va
+    } else {
+        false
+    }
+}
+
+#[inline]
+fn is_expired_by_tti(
+    time_to_idle: &Option<Duration>,
+    entry_last_accessed: Instant,
+    now: Instant,
+) -> bool {
+    if let Some(tti) = time_to_idle {
+        let expiration = entry_last_accessed.saturating_add(*tti);
+        expiration <= now
+    } else {
+        false
+    }
+}
+
+#[inline]
+fn is_expired_by_ttl(
+    time_to_live: &Option<Duration>,
+    entry_last_modified: Instant,
+    now: Instant,
+) -> bool {
+    if let Some(ttl) = time_to_live {
+        let expiration = entry_last_modified.saturating_add(*ttl);
+        expiration <= now
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        common::{time::Clock, HousekeeperConfig},
+        policy::{EvictionPolicy, ExpirationPolicy},
+    };
+
+    use super::BaseCache;
+
+    #[cfg_attr(target_pointer_width = "16", ignore)]
+    #[test]
+    fn test_skt_capacity_will_not_overflow() {
+        use std::collections::hash_map::RandomState;
+
+    ) {
+        let duration =
+            expiry.expire_after_create(key, &value_entry.value, clock.to_std_instant(ts));
+        let expiration_time = duration.map(|duration| ts.saturating_add(duration));
+        value_entry
+            .entry_info()
+            .set_expiration_time(expiration_time);
+    }
+
+    fn expire_after_read_or_update(
+        expiry: impl FnOnce(&K, &V, StdInstant, Option<Duration>) -> Option<Duration>,
+        key: &K,
+        value_entry: &ValueEntry<K, V>,
+        ttl: Option<Duration>,
+        tti: Option<Duration>,
+        ts: Instant,
+        clock: &Clock,
+    ) -> bool {
+        let current_time = clock.to_std_instant(ts);
+        let ei = &value_entry.entry_info();
+
+        let exp_time = IntoIterator::into_iter([
+            ei.expiration_time(),
+            ttl.and_then(|dur| ei.last_modified().map(|ts| ts.saturating_add(dur))),
+            tti.and_then(|dur| ei.last_accessed().map(|ts| ts.saturating_add(dur))),
+        ])
+        .flatten()
+        .min();
+
+        let current_duration = exp_time.and_then(|time| {
+            let std_time = clock.to_std_instant(time);
+            std_time.checked_duration_since(current_time)
+        });
+
+        let duration = expiry(key, &value_entry.value, current_time, current_duration);
+
+        if duration != current_duration {
+            let expiration_time = duration.map(|duration| ts.saturating_add(duration));
+            value_entry
+                .entry_info()
+                .set_expiration_time(expiration_time);
+            // The `expiration_time` has changed from `None` to `Some` or vice versa.
+            true
+        } else {
+            false
+        }
+    }
+}
+
+//
+// for testing
+//
+#[cfg(test)]
+impl<K, V, S> BaseCache<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+                }
+                Err(_) => break,
+            };
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_upsert(
+        &self,
+        kh: KeyHash<K>,
+        entry: MiniArc<ValueEntry<K, V>>,
+        gen: u16,
+        old_weight: u32,
+        new_weight: u32,
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        freq: &FrequencySketch,
+        eviction_state: &mut EvictionState<'_, K, V>,
+    ) where
+        V: Clone,
+    {
+        {
+            let counters = &mut eviction_state.counters;
+
+            if entry.is_admitted() {
+                // The entry has been already admitted, so treat this as an update.
+                counters.saturating_sub(0, old_weight);
+                counters.saturating_add(0, new_weight);
+                self.update_timer_wheel(&entry, timer_wheel);
+                deqs.move_to_back_ao(&entry);
+                deqs.move_to_back_wo(&entry);
+                entry.entry_info().set_policy_gen(gen);
+                return;
+            }
+
+            if self.has_enough_capacity(new_weight, counters) {
+                // There are enough room in the cache (or the cache is unbounded).
+                // Add the candidate to the deques.
+                self.handle_admit(&entry, new_weight, deqs, timer_wheel, counters);
+                entry.entry_info().set_policy_gen(gen);
+                return;
+            }
+        }
+
+src/sync/entry_selector.rs:153:    pub fn and_compute_with<F>(self, f: F) -> compute::CompResult<K, V>
+src/sync/entry_selector.rs:212:    pub fn and_try_compute_with<F, E>(self, f: F) -> Result<compute::CompResult<K, V>, E>
+src/sync/entry_selector.rs:289:    pub fn and_upsert_with<F>(self, f: F) -> Entry<K, V>
+src/sync/entry_selector.rs:321:    pub fn or_default(self) -> Entry<K, V>
+src/sync/entry_selector.rs:354:    pub fn or_insert(self, default: V) -> Entry<K, V> {
+src/sync/entry_selector.rs:401:    pub fn or_insert_with(self, init: impl FnOnce() -> V) -> Entry<K, V> {
+src/sync/entry_selector.rs:416:    pub fn or_insert_with_if(
+src/sync/entry_selector.rs:477:    pub fn or_optionally_insert_with(
+src/sync/entry_selector.rs:539:    pub fn or_try_insert_with<F, E>(self, init: F) -> Result<Entry<K, V>, Arc<E>>
+src/sync/entry_selector.rs:695:    pub fn and_compute_with<F>(self, f: F) -> compute::CompResult<K, V>
+src/sync/entry_selector.rs:754:    pub fn and_try_compute_with<F, E>(self, f: F) -> Result<compute::CompResult<K, V>, E>
+src/sync/entry_selector.rs:831:    pub fn and_upsert_with<F>(self, f: F) -> Entry<K, V>
+src/sync/entry_selector.rs:864:    pub fn or_default(self) -> Entry<K, V>
+src/sync/entry_selector.rs:896:    pub fn or_insert(self, default: V) -> Entry<K, V> {
+src/sync/entry_selector.rs:943:    pub fn or_insert_with(self, init: impl FnOnce() -> V) -> Entry<K, V> {
+src/sync/entry_selector.rs:962:    pub fn or_insert_with_if(
+src/sync/entry_selector.rs:1027:    pub fn or_optionally_insert_with(
+src/sync/entry_selector.rs:1089:    pub fn or_try_insert_with<F, E>(self, init: F) -> Result<Entry<K, V>, Arc<E>>
+src/future/entry_selector.rs:167:    pub async fn and_compute_with<F, Fut>(self, f: F) -> compute::CompResult<K, V>
+src/future/entry_selector.rs:230:    pub async fn and_try_compute_with<F, Fut, E>(self, f: F) -> Result<compute::CompResult<K, V>, E>
+src/future/entry_selector.rs:242:    pub async fn and_try_compute_if_nobody_else<F, Fut, E>(
+src/future/entry_selector.rs:339:    pub async fn and_upsert_with<F, Fut>(self, f: F) -> Entry<K, V>
+src/future/entry_selector.rs:381:    pub async fn or_default(self) -> Entry<K, V>
+src/future/entry_selector.rs:424:    pub async fn or_insert(self, default: V) -> Entry<K, V> {
+src/future/entry_selector.rs:484:    pub async fn or_insert_with(self, init: impl Future<Output = V>) -> Entry<K, V> {
+src/future/entry_selector.rs:501:    pub async fn or_insert_with_if(
+src/future/entry_selector.rs:576:    pub async fn or_optionally_insert_with(
+src/future/entry_selector.rs:651:    pub async fn or_try_insert_with<F, E>(self, init: F) -> Result<Entry<K, V>, Arc<E>>
+src/future/entry_selector.rs:822:    pub async fn and_compute_with<F, Fut>(self, f: F) -> compute::CompResult<K, V>
+src/future/entry_selector.rs:885:    pub async fn and_try_compute_with<F, Fut, E>(self, f: F) -> Result<compute::CompResult<K, V>, E>
+src/future/entry_selector.rs:897:    pub async fn and_try_compute_if_nobody_else<F, Fut, E>(
+src/future/entry_selector.rs:994:    pub async fn and_upsert_with<F, Fut>(self, f: F) -> Entry<K, V>
+src/future/entry_selector.rs:1037:    pub async fn or_default(self) -> Entry<K, V>
+src/future/entry_selector.rs:1079:    pub async fn or_insert(self, default: V) -> Entry<K, V> {
+src/future/entry_selector.rs:1138:    pub async fn or_insert_with(self, init: impl Future<Output = V>) -> Entry<K, V> {
+src/future/entry_selector.rs:1154:    pub async fn or_insert_with_if(
+src/future/entry_selector.rs:1233:    pub async fn or_optionally_insert_with(
+src/future/entry_selector.rs:1308:    pub async fn or_try_insert_with<F, E>(self, init: F) -> Result<Entry<K, V>, Arc<E>>

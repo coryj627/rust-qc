@@ -1,0 +1,561 @@
+13:pub struct Protocol {
+19:    pub const fn from_static(value: &'static str) -> Self {
+26:    pub fn as_str(&self) -> &str {
+use crate::codec::Codec;
+use crate::frame::{self, Reason, StreamId};
+
+use bytes::Buf;
+use std::io;
+use std::task::{Context, Poll};
+use tokio::io::AsyncWrite;
+
+/// Manages our sending of GOAWAY frames.
+#[derive(Debug)]
+pub(super) struct GoAway {
+    /// Whether the connection should close now, or wait until idle.
+    close_now: bool,
+    /// Records if we've sent any GOAWAY before.
+    going_away: Option<GoingAway>,
+    /// Whether the user started the GOAWAY by calling `abrupt_shutdown`.
+    is_user_initiated: bool,
+    /// A GOAWAY frame that must be buffered in the Codec immediately.
+    pending: Option<frame::GoAway>,
+}
+
+/// Keeps a memory of any GOAWAY frames we've sent before.
+///
+/// This looks very similar to a `frame::GoAway`, but is a separate type. Why?
+/// Mostly for documentation purposes. This type is to record status. If it
+/// were a `frame::GoAway`, it might appear like we eventually wanted to
+/// serialize it. We **only** want to be able to look up these fields at a
+/// later time.
+#[derive(Debug)]
+pub(crate) struct GoingAway {
+    /// Stores the highest stream ID of a GOAWAY that has been sent.
+    ///
+    /// It's illegal to send a subsequent GOAWAY with a higher ID.
+    last_processed_id: StreamId,
+
+    /// Records the error code of any GOAWAY frame sent.
+    reason: Reason,
+}
+
+impl GoAway {
+    pub fn new() -> Self {
+        GoAway {
+            close_now: false,
+            going_away: None,
+            is_user_initiated: false,
+            pending: None,
+        }
+    }
+
+    /// Enqueue a GOAWAY frame to be written.
+    ///
+    /// The connection is expected to continue to run until idle.
+    pub fn go_away(&mut self, f: frame::GoAway) {
+        if let Some(ref going_away) = self.going_away {
+            assert!(
+                f.last_stream_id() <= going_away.last_processed_id,
+                "GOAWAY stream IDs shouldn't be higher; \
+                 last_processed_id = {:?}, f.last_stream_id() = {:?}",
+                going_away.last_processed_id,
+                f.last_stream_id(),
+            );
+        }
+
+        self.going_away = Some(GoingAway {
+            last_processed_id: f.last_stream_id(),
+            reason: f.reason(),
+        });
+        self.pending = Some(f);
+    }
+
+    pub fn go_away_now(&mut self, f: frame::GoAway) {
+        self.close_now = true;
+        if let Some(ref going_away) = self.going_away {
+            // Prevent sending the same GOAWAY twice.
+            if going_away.last_processed_id == f.last_stream_id() && going_away.reason == f.reason()
+            {
+                return;
+            }
+        }
+        self.go_away(f);
+    }
+
+    pub fn go_away_from_user(&mut self, f: frame::GoAway) {
+        self.is_user_initiated = true;
+        self.go_away_now(f);
+    }
+
+    /// Return if a GOAWAY has ever been scheduled.
+    pub fn is_going_away(&self) -> bool {
+        self.going_away.is_some()
+    }
+
+    pub fn is_user_initiated(&self) -> bool {
+        self.is_user_initiated
+    }
+
+    /// Returns the going away info, if any.
+    pub fn going_away(&self) -> Option<&GoingAway> {
+        self.going_away.as_ref()
+    }
+
+    /// Returns if the connection should close now, or wait until idle.
+    pub fn should_close_now(&self) -> bool {
+        self.pending.is_none() && self.close_now
+    }
+
+    /// Returns if the connection should be closed when idle.
+    pub fn should_close_on_idle(&self) -> bool {
+        !self.close_now
+            && self
+                .going_away
+                .as_ref()
+                .map(|g| g.last_processed_id != StreamId::MAX)
+                .unwrap_or(false)
+    }
+
+    /// Try to write a pending GOAWAY frame to the buffer.
+    ///
+    /// If a frame is written, the `Reason` of the GOAWAY is returned.
+    pub fn send_pending_go_away<T, B>(
+        &mut self,
+        cx: &mut Context,
+        dst: &mut Codec<T, B>,
+    ) -> Poll<Option<io::Result<Reason>>>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        if let Some(frame) = self.pending.take() {
+            if !dst.poll_ready(cx)?.is_ready() {
+                self.pending = Some(frame);
+                return Poll::Pending;
+            }
+
+            let reason = frame.reason();
+            dst.buffer(frame.into()).expect("invalid GOAWAY frame");
+
+            return Poll::Ready(Some(Ok(reason)));
+        } else if self.should_close_now() {
+            return match self.going_away().map(|going_away| going_away.reason) {
+                Some(reason) => Poll::Ready(Some(Ok(reason))),
+                None => Poll::Ready(None),
+            };
+        }
+
+        Poll::Ready(None)
+    }
+}
+
+impl GoingAway {
+    pub(crate) fn reason(&self) -> Reason {
+        self.reason
+    }
+}
+use crate::frame::{self, Frame, Kind, Reason};
+use crate::frame::{
+    DEFAULT_MAX_FRAME_SIZE, DEFAULT_SETTINGS_HEADER_TABLE_SIZE, MAX_MAX_FRAME_SIZE,
+};
+use crate::proto::Error;
+
+use crate::hpack;
+
+use futures_core::Stream;
+
+use bytes::{Buf, BytesMut};
+
+use std::io;
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::AsyncRead;
+use tokio_util::codec::FramedRead as InnerFramedRead;
+use tokio_util::codec::{LengthDelimitedCodec, LengthDelimitedCodecError};
+
+// 16 MB "sane default" taken from golang http2
+const DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE: usize = 16 << 20;
+
+#[derive(Debug)]
+pub struct FramedRead<T> {
+    inner: InnerFramedRead<T, LengthDelimitedCodec>,
+
+    // hpack decoder state
+    hpack: hpack::Decoder,
+
+    max_header_list_size: usize,
+
+    max_continuation_frames: usize,
+
+    partial: Option<Partial>,
+}
+
+/// Partially loaded headers frame
+#[derive(Debug)]
+struct Partial {
+    /// Empty frame
+    frame: Continuable,
+
+    /// Partial header payload
+    buf: BytesMut,
+
+    continuation_frames_count: usize,
+}
+
+#[derive(Debug)]
+enum Continuable {
+    Headers(frame::Headers),
+    PushPromise(frame::PushPromise),
+}
+
+impl<T> FramedRead<T> {
+    pub fn new(inner: InnerFramedRead<T, LengthDelimitedCodec>) -> FramedRead<T> {
+        let max_header_list_size = DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE;
+        let max_continuation_frames =
+            calc_max_continuation_frames(max_header_list_size, inner.decoder().max_frame_length());
+        FramedRead {
+            inner,
+            hpack: hpack::Decoder::new(DEFAULT_SETTINGS_HEADER_TABLE_SIZE),
+            max_header_list_size,
+            max_continuation_frames,
+            partial: None,
+        }
+    }
+
+    pub fn get_ref(&self) -> &T {
+        self.inner.get_ref()
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        self.inner.get_mut()
+    }
+
+    /// Returns the current max frame size setting
+    #[inline]
+    pub fn max_frame_size(&self) -> usize {
+        self.inner.decoder().max_frame_length()
+    }
+
+    /// Updates the max frame size setting.
+    ///
+    /// Must be within 16,384 and 16,777,215.
+    #[inline]
+    pub fn set_max_frame_size(&mut self, val: usize) {
+        assert!(DEFAULT_MAX_FRAME_SIZE as usize <= val && val <= MAX_MAX_FRAME_SIZE as usize);
+        self.inner.decoder_mut().set_max_frame_length(val);
+        // Update max CONTINUATION frames too, since its based on this
+        self.max_continuation_frames = calc_max_continuation_frames(self.max_header_list_size, val);
+    }
+
+    /// Update the max header list size setting.
+    #[inline]
+    pub fn set_max_header_list_size(&mut self, val: usize) {
+        self.max_header_list_size = val;
+        // Update max CONTINUATION frames too, since its based on this
+        self.max_continuation_frames = calc_max_continuation_frames(val, self.max_frame_size());
+    }
+
+    /// Update the header table size setting.
+    #[inline]
+    pub fn set_header_table_size(&mut self, val: usize) {
+        self.hpack.queue_size_update(val);
+    }
+}
+
+fn calc_max_continuation_frames(header_max: usize, frame_max: usize) -> usize {
+    // At least this many frames needed to use max header list size
+    let min_frames_for_list = (header_max / frame_max).max(1);
+    // Some padding for imperfectly packed frames
+    // 25% without floats
+    let padding = min_frames_for_list >> 2;
+    min_frames_for_list.saturating_add(padding).max(5)
+}
+
+/// Decodes a frame.
+///
+/// This method is intentionally de-generified and outlined because it is very large.
+fn decode_frame(
+    hpack: &mut hpack::Decoder,
+    max_header_list_size: usize,
+    max_continuation_frames: usize,
+    partial_inout: &mut Option<Partial>,
+    mut bytes: BytesMut,
+) -> Result<Option<Frame>, Error> {
+    let span = tracing::trace_span!("FramedRead::decode_frame", offset = bytes.len());
+    let _e = span.enter();
+
+    tracing::trace!("decoding frame from {}B", bytes.len());
+
+    // Parse the head
+    let head = frame::Head::parse(&bytes);
+
+    if partial_inout.is_some() && head.kind() != Kind::Continuation {
+        proto_err!(conn: "expected CONTINUATION, got {:?}", head.kind());
+        return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+    }
+
+    let kind = head.kind();
+
+    tracing::trace!(frame.kind = ?kind);
+
+    macro_rules! header_block {
+        ($frame:ident, $head:ident, $bytes:ident) => ({
+            // Drop the frame header
+            $bytes.advance(frame::HEADER_LEN);
+
+            // Parse the header frame w/o parsing the payload
+            let (mut frame, mut payload) = match frame::$frame::load($head, $bytes) {
+                Ok(res) => res,
+                Err(frame::Error::InvalidDependencyId) => {
+                    proto_err!(stream: "invalid HEADERS dependency ID");
+                    // A stream cannot depend on itself. An endpoint MUST
+                    // treat this as a stream error (Section 5.4.2) of type
+                    // `PROTOCOL_ERROR`.
+                    return Err(Error::library_reset($head.stream_id(), Reason::PROTOCOL_ERROR));
+                },
+                Err(e) => {
+                    proto_err!(conn: "failed to load frame; err={:?}", e);
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+                }
+            };
+
+            let is_end_headers = frame.is_end_headers();
+
+            // Load the HPACK encoded headers
+            match frame.load_hpack(&mut payload, max_header_list_size, hpack) {
+                Ok(_) => {},
+                Err(frame::Error::Hpack(hpack::DecoderError::NeedMore(_))) if !is_end_headers => {},
+                Err(frame::Error::MalformedMessage) => {
+                    let id = $head.stream_id();
+                    proto_err!(stream: "malformed header block; stream={:?}", id);
+                    return Err(Error::library_reset(id, Reason::PROTOCOL_ERROR));
+                },
+                Err(e) => {
+                    proto_err!(conn: "failed HPACK decoding; err={:?}", e);
+                    return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
+                }
+            }
+
+            if is_end_headers {
+                frame.into()
+            } else {
+                tracing::trace!("loaded partial header block");
+                // Defer returning the frame
+                *partial_inout = Some(Partial {
+                    frame: Continuable::$frame(frame),
+                    buf: payload,
+                    continuation_frames_count: 0,
+                });
+
+                return Ok(None);
+            }
+        });
+    }
+
+    let frame = match kind {
+        Kind::Settings => {
+            let res = frame::Settings::load(head, &bytes[frame::HEADER_LEN..]);
+
+            res.map_err(|e| {
+                proto_err!(conn: "failed to load SETTINGS frame; err={:?}", e);
+                Error::library_go_away(Reason::PROTOCOL_ERROR)
+            })?
+            .into()
+        }
+        Kind::Ping => {
+            let res = frame::Ping::load(head, &bytes[frame::HEADER_LEN..]);
+
+            res.map_err(|e| {
+                proto_err!(conn: "failed to load PING frame; err={:?}", e);
+                Error::library_go_away(Reason::PROTOCOL_ERROR)
+            })?
+            .into()
+        }
+        Kind::WindowUpdate => {
+            let res = frame::WindowUpdate::load(head, &bytes[frame::HEADER_LEN..]);
+
+            res.map_err(|e| {
+                proto_err!(conn: "failed to load WINDOW_UPDATE frame; err={:?}", e);
+                Error::library_go_away(Reason::PROTOCOL_ERROR)
+            })?
+            .into()
+        }
+        Kind::Data => {
+            bytes.advance(frame::HEADER_LEN);
+            let res = frame::Data::load(head, bytes.freeze());
+    ///
+    /// ```
+    /// # use tokio::io::{AsyncRead, AsyncWrite};
+    /// # use h2::client::*;
+    /// # use bytes::Bytes;
+    /// #
+    /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
+    /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), h2::Error>
+    /// # {
+    /// // `client_fut` is a future representing the completion of the HTTP/2
+    /// // handshake.
+    /// let client_fut = Builder::new()
+    ///     .initial_window_size(1_000_000)
+    ///     .handshake(my_io);
+    /// # client_fut.await
+    /// # }
+    /// #
+    /// # pub fn main() {}
+    /// ```
+    pub fn initial_window_size(&mut self, size: u32) -> &mut Self {
+        self.settings.set_initial_window_size(Some(size));
+        self
+    }
+
+    /// Indicates the initial window size (in octets) for connection-level flow control
+    /// for received data.
+    ///
+    /// The initial window of a connection is used as part of flow control. For more details,
+    /// see [`FlowControl`].
+    ///
+    /// The default value is 65,535.
+    ///
+    /// [`FlowControl`]: ../struct.FlowControl.html
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use tokio::io::{AsyncRead, AsyncWrite};
+    /// # use h2::client::*;
+    /// # use bytes::Bytes;
+    /// #
+    /// # async fn doc<T: AsyncRead + AsyncWrite + Unpin>(my_io: T)
+    /// # -> Result<((SendRequest<Bytes>, Connection<T, Bytes>)), h2::Error>
+    /// # {
+    /// // `client_fut` is a future representing the completion of the HTTP/2
+    /// // handshake.
+    /// let client_fut = Builder::new()
+    ///     .initial_connection_window_size(1_000_000)
+    ///     .handshake(my_io);
+    /// # client_fut.await
+    /// # }
+    /// #
+    /// # pub fn main() {}
+    /// ```
+    pub fn initial_connection_window_size(&mut self, size: u32) -> &mut Self {
+        self.initial_target_connection_window_size = Some(size);
+        self
+    }
+
+    /// Indicates the size (in octets) of the largest HTTP/2 frame payload that the
+    /// configured client is able to accept.
+    ///
+    /// The sender may send data frames that are **smaller** than this value,
+    /// but any data larger than `max` will be broken up into multiple `DATA`
+    /// frames.
+    ///
+    /// The value **must** be between 16,384 and 16,777,215. The default value is 16,384.
+    ///
+    /// # Examples
+    ///
+    /// ```
+grep: Unmatched [, [^, [:, [., or [=
+        Ok((send_request, connection))
+    }
+
+    /// Sets the target window size for the whole connection.
+    ///
+    /// If `size` is greater than the current value, then a `WINDOW_UPDATE`
+    /// frame will be immediately sent to the remote, increasing the connection
+    /// level window by `size - current_value`.
+    ///
+    /// If `size` is less than the current value, nothing will happen
+    /// immediately. However, as window capacity is released by
+    /// [`FlowControl`] instances, no `WINDOW_UPDATE` frames will be sent
+    /// out until the number of "in flight" bytes drops below `size`.
+    ///
+    /// The default value is 65,535.
+    ///
+    /// See [`FlowControl`] documentation for more details.
+    ///
+    /// [`FlowControl`]: ../struct.FlowControl.html
+    /// [library level]: ../index.html#flow-control
+    pub fn set_target_window_size(&mut self, size: u32) {
+        assert!(size <= proto::MAX_WINDOW_SIZE);
+        self.inner.set_target_window_size(size);
+    }
+
+    /// Set a new `INITIAL_WINDOW_SIZE` setting (in octets) for stream-level
+    /// flow control for received data.
+    ///
+    /// The `SETTINGS` will be sent to the remote, and only applied once the
+    /// remote acknowledges the change.
+    ///
+    /// This can be used to increase or decrease the window size for existing
+    /// streams.
+    ///
+    /// # Errors
+    ///
+                counts.transition(promise, |counts, stream| {
+                    maybe_cancel(stream, actions, counts);
+                });
+            }
+        }
+    });
+}
+
+fn maybe_cancel(stream: &mut store::Ptr, actions: &mut Actions, counts: &mut Counts) {
+    if stream.is_canceled_interest() {
+        // Server is allowed to early respond without fully consuming the client input stream
+        // But per the RFC, must send a RST_STREAM(NO_ERROR) in such cases. https://www.rfc-editor.org/rfc/rfc7540#section-8.1
+        // Some other http2 implementation may interpret other error code as fatal if not respected (i.e: nginx https://trac.nginx.org/nginx/ticket/2376)
+        let reason = if counts.peer().is_server()
+            && stream.state.is_send_closed()
+            && stream.state.is_recv_streaming()
+        {
+            Reason::NO_ERROR
+        } else {
+            Reason::CANCEL
+        };
+
+        actions
+            .send
+            .schedule_implicit_reset(stream, reason, counts, &mut actions.task);
+        actions.recv.enqueue_reset_expiration(stream, counts);
+    }
+}
+
+// ===== impl SendBuffer =====
+
+impl<B> SendBuffer<B> {
+    fn new() -> Self {
+        let inner = Mutex::new(Buffer::new());
+        SendBuffer { inner }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        let buf = self.inner.lock().unwrap();
+        buf.is_empty()
+    }
+}
+
+// ===== impl Actions =====
+
+impl Actions {
+    fn send_reset<B>(
+        &mut self,
+        stream: store::Ptr,
+        reason: Reason,
+        initiator: Initiator,
+        counts: &mut Counts,
+        send_buffer: &mut Buffer<Frame<B>>,
+    ) -> Result<(), crate::proto::error::GoAway> {
+        counts.transition(stream, |counts, stream| {
+            if initiator.is_library() {
+                if counts.can_inc_num_local_error_resets() {
+                    counts.inc_num_local_error_resets();
+                } else {
+                    tracing::warn!(
+                        "locally-reset streams reached limit ({:?})",
+                        counts.max_local_error_resets().unwrap(),
+                    );
+                    return Err(crate::proto::error::GoAway {
+                        reason: Reason::ENHANCE_YOUR_CALM,
+                        debug_data: "too_many_internal_resets".into(),

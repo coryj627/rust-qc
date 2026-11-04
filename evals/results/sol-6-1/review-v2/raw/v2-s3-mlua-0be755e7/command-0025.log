@@ -1,0 +1,774 @@
+use std::any::TypeId;
+use std::cell::{Cell, UnsafeCell};
+use std::ffi::CStr;
+use std::mem;
+use std::os::raw::{c_char, c_int, c_void};
+use std::panic::resume_unwind;
+use std::ptr::{self, NonNull};
+use std::sync::Arc;
+
+use crate::chunk::ChunkMode;
+use crate::error::{Error, Result};
+use crate::function::Function;
+use crate::memory::{MemoryState, ALLOCATOR};
+use crate::state::util::callback_error_ext;
+use crate::stdlib::StdLib;
+use crate::string::String;
+use crate::table::Table;
+use crate::thread::Thread;
+use crate::traits::IntoLua;
+use crate::types::{
+    AppDataRef, AppDataRefMut, Callback, CallbackUpvalue, DestructedUserdata, Integer, LightUserData,
+    MaybeSend, ReentrantMutex, RegistryKey, ValueRef, XRc,
+};
+use crate::userdata::{
+    init_userdata_metatable, AnyUserData, MetaMethod, RawUserDataRegistry, UserData, UserDataRegistry,
+    UserDataStorage,
+};
+use crate::util::{
+    assert_stack, check_stack, get_destructed_userdata_metatable, get_internal_userdata, get_main_state,
+    get_metatable_ptr, get_userdata, init_error_registry, init_internal_metatable, pop_error,
+    push_internal_userdata, push_string, push_table, push_userdata, rawset_field, safe_pcall, safe_xpcall,
+    short_type_name, StackGuard, WrappedFailure,
+};
+use crate::value::{Nil, Value};
+
+use super::extra::ExtraData;
+use super::{Lua, LuaOptions, WeakLua};
+
+#[cfg(not(feature = "luau"))]
+use crate::{
+    debug::Debug,
+    types::{HookCallback, HookKind, VmState},
+};
+
+#[cfg(feature = "async")]
+use {
+    crate::multi::MultiValue,
+    crate::traits::FromLuaMulti,
+    crate::types::{AsyncCallback, AsyncCallbackUpvalue, AsyncPollUpvalue},
+    std::task::{Context, Poll, Waker},
+};
+
+/// An inner Lua struct which holds a raw Lua state.
+#[doc(hidden)]
+pub struct RawLua {
+    // The state is dynamic and depends on context
+    pub(super) state: Cell<*mut ffi::lua_State>,
+    pub(super) main_state: Option<NonNull<ffi::lua_State>>,
+    pub(super) extra: XRc<UnsafeCell<ExtraData>>,
+    owned: bool,
+}
+
+impl Drop for RawLua {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.owned {
+                return;
+            }
+
+            let mem_state = MemoryState::get(self.main_state());
+
+            #[cfg(feature = "luau")]
+            {
+                // Reset any callbacks
+                (*ffi::lua_callbacks(self.main_state())).interrupt = None;
+                (*ffi::lua_callbacks(self.main_state())).userthread = None;
+            }
+
+            ffi::lua_close(self.main_state());
+
+            // Deallocate `MemoryState`
+            if !mem_state.is_null() {
+                drop(Box::from_raw(mem_state));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "send")]
+unsafe impl Send for RawLua {}
+
+impl RawLua {
+    #[inline(always)]
+    pub(crate) fn lua(&self) -> &Lua {
+        unsafe { (*self.extra.get()).lua() }
+    }
+
+    #[inline(always)]
+    pub(crate) fn weak(&self) -> &WeakLua {
+        unsafe { (*self.extra.get()).weak() }
+    }
+
+    /// Returns a pointer to the current Lua state.
+    ///
+    /// The pointer refers to the active Lua coroutine and depends on the context.
+    #[inline(always)]
+    pub fn state(&self) -> *mut ffi::lua_State {
+        self.state.get()
+    }
+
+    #[inline(always)]
+    pub(crate) fn main_state(&self) -> *mut ffi::lua_State {
+        self.main_state
+            .map(|state| state.as_ptr())
+            .unwrap_or_else(|| self.state())
+    }
+
+    #[inline(always)]
+    pub(crate) fn ref_thread(&self) -> *mut ffi::lua_State {
+        unsafe { (*self.extra.get()).ref_thread }
+    }
+
+    pub(super) unsafe fn new(libs: StdLib, options: &LuaOptions) -> XRc<ReentrantMutex<Self>> {
+        let mem_state: *mut MemoryState = Box::into_raw(Box::default());
+        let mut state = ffi::lua_newstate(ALLOCATOR, mem_state as *mut c_void);
+        // If state is null then switch to Lua internal allocator
+        if state.is_null() {
+            drop(Box::from_raw(mem_state));
+            state = ffi::luaL_newstate();
+        }
+        assert!(!state.is_null(), "Failed to create a Lua VM");
+
+        ffi::luaL_requiref(state, cstr!("_G"), ffi::luaopen_base, 1);
+        ffi::lua_pop(state, 1);
+
+        // Init Luau code generator (jit)
+        #[cfg(feature = "luau-jit")]
+        if ffi::luau_codegen_supported() != 0 {
+            ffi::luau_codegen_create(state);
+        }
+
+        let rawlua = Self::init_from_ptr(state, true);
+        let extra = rawlua.lock().extra.get();
+
+        mlua_expect!(
+            load_std_libs(state, libs),
+            "Error during loading standard libraries"
+        );
+        (*extra).libs |= libs;
+
+        if !options.catch_rust_panics {
+            mlua_expect!(
+                (|| -> Result<()> {
+                    let _sg = StackGuard::new(state);
+
+                    #[cfg(any(feature = "lua54", feature = "lua53", feature = "lua52"))]
+                    ffi::lua_rawgeti(state, ffi::LUA_REGISTRYINDEX, ffi::LUA_RIDX_GLOBALS);
+                    #[cfg(any(feature = "lua51", feature = "luajit", feature = "luau"))]
+                    ffi::lua_pushvalue(state, ffi::LUA_GLOBALSINDEX);
+
+                    ffi::lua_pushcfunction(state, safe_pcall);
+                    rawset_field(state, -2, "pcall")?;
+
+                    ffi::lua_pushcfunction(state, safe_xpcall);
+                    rawset_field(state, -2, "xpcall")?;
+
+                    Ok(())
+                })(),
+                "Error during applying option `catch_rust_panics`"
+            )
+        }
+
+        #[cfg(feature = "async")]
+        if options.thread_pool_size > 0 {
+            (*extra).thread_pool.reserve_exact(options.thread_pool_size);
+        }
+
+        rawlua
+    }
+
+    pub(super) unsafe fn init_from_ptr(state: *mut ffi::lua_State, owned: bool) -> XRc<ReentrantMutex<Self>> {
+        assert!(!state.is_null(), "Lua state is NULL");
+        if let Some(lua) = Self::try_from_ptr(state) {
+            return lua;
+        }
+
+        let main_state = get_main_state(state).unwrap_or(state);
+        let main_state_top = ffi::lua_gettop(main_state);
+
+        mlua_expect!(
+            (|state| {
+                init_error_registry(state)?;
+
+                // Create the internal metatables and store them in the registry
+                // to prevent from being garbage collected.
+
+                init_internal_metatable::<XRc<UnsafeCell<ExtraData>>>(state, None)?;
+                init_internal_metatable::<Callback>(state, None)?;
+                init_internal_metatable::<CallbackUpvalue>(state, None)?;
+                #[cfg(not(feature = "luau"))]
+                init_internal_metatable::<HookCallback>(state, None)?;
+                #[cfg(feature = "async")]
+                {
+                    init_internal_metatable::<AsyncCallback>(state, None)?;
+                    init_internal_metatable::<AsyncCallbackUpvalue>(state, None)?;
+                    init_internal_metatable::<AsyncPollUpvalue>(state, None)?;
+                    init_internal_metatable::<Option<Waker>>(state, None)?;
+                }
+
+                // Init serde metatables
+                #[cfg(feature = "serde")]
+                crate::serde::init_metatables(state)?;
+
+                Ok::<_, Error>(())
+            })(main_state),
+            "Error during Lua initialization",
+        );
+
+        // Init ExtraData
+        let extra = ExtraData::init(main_state, owned);
+
+        // Register `DestructedUserdata` type
+        get_destructed_userdata_metatable(main_state);
+        let destructed_mt_ptr = ffi::lua_topointer(main_state, -1);
+        let destructed_ud_typeid = TypeId::of::<DestructedUserdata>();
+        (*extra.get())
+            .registered_userdata_mt
+            .insert(destructed_mt_ptr, Some(destructed_ud_typeid));
+        ffi::lua_pop(main_state, 1);
+
+        mlua_debug_assert!(
+            ffi::lua_gettop(main_state) == main_state_top,
+            "stack leak during creation"
+        );
+        assert_stack(main_state, ffi::LUA_MINSTACK);
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let rawlua = XRc::new(ReentrantMutex::new(RawLua {
+            state: Cell::new(state),
+            // Make sure that we don't store current state as main state (if it's not available)
+            main_state: get_main_state(state).and_then(NonNull::new),
+            extra: XRc::clone(&extra),
+            owned,
+        }));
+        (*extra.get()).set_lua(&rawlua);
+        if owned {
+            // If Lua state is managed by us, then make internal `RawLua` reference "weak"
+            XRc::decrement_strong_count(XRc::as_ptr(&rawlua));
+        } else {
+            // If Lua state is not managed by us, then keep internal `RawLua` reference "strong"
+94:    pub(crate) fn lua(&self) -> &Lua {
+99:    pub(crate) fn weak(&self) -> &WeakLua {
+112:    pub(crate) fn main_state(&self) -> *mut ffi::lua_State {
+119:    pub(crate) fn ref_thread(&self) -> *mut ffi::lua_State {
+311:    pub(crate) fn set_priv_app_data<T: MaybeSend + 'static>(&self, data: T) -> Option<T> {
+319:    pub(crate) fn priv_app_data_ref<T: 'static>(&self) -> Option<AppDataRef<'_, T>> {
+327:    pub(crate) fn priv_app_data_mut<T: 'static>(&self) -> Option<AppDataRefMut<'_, T>> {
+334:    pub(crate) fn owns_registry_value(&self, key: &RegistryKey) -> bool {
+339:    pub(crate) fn load_chunk(
+372:    pub(crate) unsafe fn load_chunk_inner(
+405:    pub(crate) unsafe fn set_thread_hook(
+513:    pub(crate) unsafe fn create_string(&self, s: impl AsRef<[u8]>) -> Result<String> {
+527:    pub(crate) unsafe fn create_buffer_with_capacity(&self, size: usize) -> Result<(*mut u8, crate::Buffer)> {
+541:    pub(crate) unsafe fn create_table_with_capacity(&self, narr: usize, nrec: usize) -> Result<Table> {
+555:    pub(crate) unsafe fn create_table_from<I, K, V>(&self, iter: I) -> Result<Table>
+583:    pub(crate) unsafe fn create_sequence_from<T, I>(&self, iter: I) -> Result<Table>
+613:    pub(crate) unsafe fn create_thread(&self, func: &Function) -> Result<Thread> {
+639:    pub(crate) unsafe fn create_recycled_thread(&self, func: &Function) -> Result<Thread> {
+659:    pub(crate) unsafe fn recycle_thread(&self, thread: &mut Thread) {
+672:    pub(crate) unsafe fn push(&self, value: impl IntoLua) -> Result<()> {
+679:    pub(crate) unsafe fn push_value(&self, value: &Value) -> Result<()> {
+713:    pub(crate) unsafe fn pop_value(&self) -> Value {
+722:    pub(crate) unsafe fn stack_value(&self, idx: c_int, type_hint: Option<c_int>) -> Value {
+816:    pub(crate) fn push_ref(&self, vref: &ValueRef) {
+832:    pub(crate) unsafe fn pop_ref(&self) -> ValueRef {
+840:    pub(crate) unsafe fn pop_ref_thread(&self) -> ValueRef {
+845:    pub(crate) unsafe fn drop_ref(&self, vref: &ValueRef) {
+857:    pub(crate) unsafe fn push_error_traceback(&self) {
+867:    pub(crate) unsafe fn unlikely_memory_error(&self) -> bool {
+880:    pub(crate) unsafe fn make_userdata<T>(&self, data: UserDataStorage<T>) -> Result<AnyUserData>
+899:    pub(crate) unsafe fn make_any_userdata<T>(&self, data: UserDataStorage<T>) -> Result<AnyUserData>
+950:    pub(crate) unsafe fn create_userdata_metatable(&self, registry: RawUserDataRegistry) -> Result<Integer> {
+969:    pub(crate) unsafe fn push_userdata_metatable(&self, mut registry: RawUserDataRegistry) -> Result<()> {
+1128:    pub(crate) unsafe fn register_userdata_metatable(&self, mt_ptr: *const c_void, type_id: Option<TypeId>) {
+1133:    pub(crate) unsafe fn deregister_userdata_metatable(&self, mt_ptr: *const c_void) {
+1144:    pub(crate) fn get_userdata_ref_type_id(&self, vref: &ValueRef) -> Result<Option<TypeId>> {
+1149:    pub(crate) unsafe fn get_userdata_type_id<T>(
+1197:    pub(crate) unsafe fn push_userdata_ref(&self, vref: &ValueRef) -> Result<Option<TypeId>> {
+1204:    pub(crate) fn create_callback(&self, func: Callback) -> Result<Function> {
+1240:    pub(crate) fn create_async_callback(&self, func: AsyncCallback) -> Result<Function> {
+1412:    pub(crate) fn waker(&self) -> &Waker {
+1418:    pub(crate) fn set_waker(&self, waker: NonNull<Waker>) -> NonNull<Waker> {
+}
+
+impl<V> TableSequence<'_, V> {
+    /// Sets the length (hint) of the sequence.
+    #[cfg(feature = "serde")]
+    pub(crate) fn with_len(mut self, len: usize) -> Self {
+        self.len = Some(len);
+        self
+    }
+}
+
+#[cfg(feature = "serde")]
+impl Serialize for SerializableTable<'_> {
+    fn serialize<S>(&self, serializer: S) -> StdResult<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use crate::serde::de::{check_value_for_skip, MapPairs, RecursionGuard};
+        use crate::value::SerializableValue;
+
+        let convert_result = |res: Result<()>, serialize_err: Option<S::Error>| match res {
+            Ok(v) => Ok(v),
+            Err(Error::SerializeError(_)) if serialize_err.is_some() => Err(serialize_err.unwrap()),
+            Err(Error::SerializeError(msg)) => Err(serde::ser::Error::custom(msg)),
+            Err(err) => Err(serde::ser::Error::custom(err.to_string())),
+        };
+
+        let options = self.options;
+        let visited = &self.visited;
+        let _guard = RecursionGuard::new(self.table, visited);
+
+        // Array
+        if let Some(len) = self.table.encode_as_array(self.options) {
+            let mut seq = serializer.serialize_seq(Some(len))?;
+            let mut serialize_err = None;
+            let res = self.table.for_each_value_by_len::<Value>(len, |value| {
+                let skip = check_value_for_skip(&value, self.options, visited)
+                    .map_err(|err| Error::SerializeError(err.to_string()))?;
+                if skip {
+                    // continue iteration
+                    return Ok(());
+                }
+                seq.serialize_element(&SerializableValue::new(&value, options, Some(visited)))
+                    .map_err(|err| {
+                        serialize_err = Some(err);
+                        Error::SerializeError(StdString::new())
+                    })
+            });
+            convert_result(res, serialize_err)?;
+            return seq.end();
+        }
+
+        // HashMap
+        let mut map = serializer.serialize_map(None)?;
+        let mut serialize_err = None;
+        let mut process_pair = |key, value| {
+            let skip_key = check_value_for_skip(&key, self.options, visited)
+                .map_err(|err| Error::SerializeError(err.to_string()))?;
+            let skip_value = check_value_for_skip(&value, self.options, visited)
+                .map_err(|err| Error::SerializeError(err.to_string()))?;
+            if skip_key || skip_value {
+                // continue iteration
+                return Ok(());
+            }
+            map.serialize_entry(
+                &SerializableValue::new(&key, options, Some(visited)),
+                &SerializableValue::new(&value, options, Some(visited)),
+            )
+            .map_err(|err| {
+                serialize_err = Some(err);
+                Error::SerializeError(StdString::new())
+            })
+        };
+
+        let res = if !self.options.sort_keys {
+            // Fast track
+            self.table.for_each(process_pair)
+        } else {
+            MapPairs::new(self.table, self.options.sort_keys)
+                .map_err(serde::ser::Error::custom)?
+                .try_for_each(|kv| {
+                    let (key, value) = kv?;
+                    process_pair(key, value)
+                })
+        };
+        convert_result(res, serialize_err)?;
+        map.end()
+    }
+}
+
+/// An iterator over the pairs of a Lua table.
+///
+/// This struct is created by the [`Table::pairs`] method.
+///
+/// [`Table::pairs`]: crate::Table::pairs
+pub struct TablePairs<'a, K, V> {
+    guard: LuaGuard,
+    table: &'a Table,
+    key: Option<Value>,
+    _phantom: PhantomData<(K, V)>,
+}
+
+impl<K, V> Iterator for TablePairs<'_, K, V>
+where
+    K: FromLua,
+    V: FromLua,
+{
+    type Item = Result<(K, V)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(prev_key) = self.key.take() {
+            let lua: &RawLua = &self.guard;
+            let state = lua.state();
+
+            let res = (|| unsafe {
+                let _sg = StackGuard::new(state);
+                check_stack(state, 5)?;
+
+                lua.push_ref(&self.table.0);
+                lua.push_value(&prev_key)?;
+
+                // It must be safe to call `lua_next` unprotected as deleting a key from a table is
+                // a permitted operation.
+                // It fails only if the key is not found (never existed) which seems impossible scenario.
+                if ffi::lua_next(state, -2) != 0 {
+                    let key = lua.stack_value(-2, None);
+                    Ok(Some((
+                        key.clone(),
+                        K::from_lua(key, lua.lua())?,
+                        V::from_stack(-1, lua)?,
+                    )))
+                } else {
+                    Ok(None)
+                }
+            })();
+
+            match res {
+                Ok(Some((key, ret_key, value))) => {
+                    self.key = Some(key);
+                    Some(Ok((ret_key, value)))
+                }
+                Ok(None) => None,
+                Err(e) => Some(Err(e)),
+            }
+        } else {
+            None
+        }
+    }
+}
+
+/// An iterator over the sequence part of a Lua table.
+///
+/// This struct is created by the [`Table::sequence_values`] method.
+///
+/// [`Table::sequence_values`]: crate::Table::sequence_values
+pub struct TableSequence<'a, V> {
+    guard: LuaGuard,
+    table: &'a Table,
+    index: Integer,
+    len: Option<usize>,
+    _phantom: PhantomData<V>,
+}
+
+impl<V: FromLua> Iterator for TableSequence<'_, V> {
+    type Item = Result<V>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let lua: &RawLua = &self.guard;
+        let state = lua.state();
+        unsafe {
+            let _sg = StackGuard::new(state);
+            if let Err(err) = check_stack(state, 1) {
+                return Some(Err(err));
+            }
+
+            lua.push_ref(&self.table.0);
+            match ffi::lua_rawgeti(state, -1, self.index) {
+                ffi::LUA_TNIL if self.index as usize > self.len.unwrap_or(0) => None,
+                _ => {
+                    self.index += 1;
+                    Some(V::from_stack(-1, lua))
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod assertions {
+    use super::*;
+
+    #[cfg(not(feature = "send"))]
+    static_assertions::assert_not_impl_any!(Table: Send);
+    #[cfg(feature = "send")]
+    static_assertions::assert_impl_all!(Table: Send, Sync);
+}
+    fn from_lua(value: Value, _: &Lua) -> Result<Self> {
+        if let Value::Table(table) = value {
+            table.pairs().collect()
+        } else {
+            Err(Error::FromLuaConversionError {
+                from: value.type_name(),
+                to: Self::type_name(),
+                message: Some("expected table".to_string()),
+            })
+        }
+    }
+}
+
+impl<K: Ord + IntoLua, V: IntoLua> IntoLua for BTreeMap<K, V> {
+    #[inline]
+    fn into_lua(self, lua: &Lua) -> Result<Value> {
+        Ok(Value::Table(lua.create_table_from(self)?))
+    }
+}
+
+impl<K: Ord + FromLua, V: FromLua> FromLua for BTreeMap<K, V> {
+    #[inline]
+    fn from_lua(value: Value, _: &Lua) -> Result<Self> {
+        if let Value::Table(table) = value {
+            table.pairs().collect()
+        } else {
+            Err(Error::FromLuaConversionError {
+                from: value.type_name(),
+                to: Self::type_name(),
+                message: Some("expected table".to_string()),
+            })
+        }
+    }
+}
+
+impl<T: Eq + Hash + IntoLua, S: BuildHasher> IntoLua for HashSet<T, S> {
+    #[inline]
+    fn into_lua(self, lua: &Lua) -> Result<Value> {
+        Ok(Value::Table(
+            lua.create_table_from(self.into_iter().map(|val| (val, true)))?,
+        ))
+    }
+}
+
+impl<T: Eq + Hash + FromLua, S: BuildHasher + Default> FromLua for HashSet<T, S> {
+    #[inline]
+    fn from_lua(value: Value, _: &Lua) -> Result<Self> {
+        match value {
+            Value::Table(table) if table.raw_len() > 0 => table.sequence_values().collect(),
+            Value::Table(table) => table.pairs::<T, Value>().map(|res| res.map(|(k, _)| k)).collect(),
+            _ => Err(Error::FromLuaConversionError {
+                from: value.type_name(),
+                to: Self::type_name(),
+                message: Some("expected table".to_string()),
+            }),
+        }
+    }
+}
+
+impl<T: Ord + IntoLua> IntoLua for BTreeSet<T> {
+    #[inline]
+    fn into_lua(self, lua: &Lua) -> Result<Value> {
+        Ok(Value::Table(
+            lua.create_table_from(self.into_iter().map(|val| (val, true)))?,
+        ))
+    }
+}
+
+impl<T: Ord + FromLua> FromLua for BTreeSet<T> {
+    #[inline]
+    fn from_lua(value: Value, _: &Lua) -> Result<Self> {
+        match value {
+            Value::Table(table) if table.raw_len() > 0 => table.sequence_values().collect(),
+            Value::Table(table) => table.pairs::<T, Value>().map(|res| res.map(|(k, _)| k)).collect(),
+            _ => Err(Error::FromLuaConversionError {
+                from: value.type_name(),
+                to: Self::type_name(),
+                message: Some("expected table".to_string()),
+            }),
+        }
+    }
+}
+
+impl<T: IntoLua> IntoLua for Option<T> {
+    #[inline]
+    fn into_lua(self, lua: &Lua) -> Result<Value> {
+        match self {
+            Some(val) => val.into_lua(lua),
+            None => Ok(Nil),
+        }
+    }
+
+    #[inline]
+    unsafe fn push_into_stack(self, lua: &RawLua) -> Result<()> {
+        match self {
+            Some(val) => val.push_into_stack(lua)?,
+            None => ffi::lua_pushnil(lua.state()),
+        }
+        Ok(())
+    }
+}
+
+impl<T: FromLua> FromLua for Option<T> {
+    #[inline]
+    fn from_lua(value: Value, lua: &Lua) -> Result<Self> {
+        match value {
+            Nil => Ok(None),
+            value => Ok(Some(T::from_lua(value, lua)?)),
+        }
+    }
+
+    #[inline]
+    unsafe fn from_stack(idx: c_int, lua: &RawLua) -> Result<Self> {
+        match ffi::lua_type(lua.state(), idx) {
+            ffi::LUA_TNIL => Ok(None),
+            _ => Ok(Some(T::from_stack(idx, lua)?)),
+        }
+    }
+}
+
+impl<L: IntoLua, R: IntoLua> IntoLua for Either<L, R> {
+    #[inline]
+    fn into_lua(self, lua: &Lua) -> Result<Value> {
+        match self {
+            Either::Left(l) => l.into_lua(lua),
+            Either::Right(r) => r.into_lua(lua),
+        }
+    }
+
+    #[inline]
+    unsafe fn push_into_stack(self, lua: &RawLua) -> Result<()> {
+        match self {
+            Either::Left(l) => l.push_into_stack(lua),
+            Either::Right(r) => r.push_into_stack(lua),
+        }
+    }
+}
+
+impl<L: FromLua, R: FromLua> FromLua for Either<L, R> {
+    #[inline]
+    fn from_lua(value: Value, lua: &Lua) -> Result<Self> {
+        let value_type_name = value.type_name();
+        // Try the left type first
+        match L::from_lua(value.clone(), lua) {
+            Ok(l) => Ok(Either::Left(l)),
+            // Try the right type
+            Err(_) => match R::from_lua(value, lua).map(Either::Right) {
+                Ok(r) => Ok(r),
+                Err(_) => Err(Error::FromLuaConversionError {
+                    from: value_type_name,
+                    to: Self::type_name(),
+                    message: None,
+                }),
+            },
+        }
+    }
+
+    #[inline]
+    unsafe fn from_stack(idx: c_int, lua: &RawLua) -> Result<Self> {
+        match L::from_stack(idx, lua) {
+            Ok(l) => Ok(Either::Left(l)),
+            Err(_) => match R::from_stack(idx, lua).map(Either::Right) {
+                Ok(r) => Ok(r),
+                Err(_) => {
+                    let value_type_name = CStr::from_ptr(ffi::luaL_typename(lua.state(), idx));
+                    Err(Error::FromLuaConversionError {
+                        from: value_type_name.to_str().unwrap(),
+                        to: Self::type_name(),
+                        message: None,
+                    })
+                }
+            },
+        }
+    }
+}
+    pub fn is_buffer(&self) -> bool {
+        self.as_buffer().is_some()
+    }
+
+    /// Returns `true` if the value is an [`Error`].
+    #[inline]
+    pub fn is_error(&self) -> bool {
+        self.as_error().is_some()
+    }
+
+    /// Cast the value to [`Error`].
+    ///
+    /// If the value is an [`Error`], returns it or `None` otherwise.
+    pub fn as_error(&self) -> Option<&Error> {
+        match self {
+            Value::Error(e) => Some(e),
+            _ => None,
+        }
+    }
+
+    /// Wrap reference to this Value into [`SerializableValue`].
+    ///
+    /// This allows customizing serialization behavior using serde.
+    #[cfg(feature = "serde")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+    pub fn to_serializable(&self) -> SerializableValue<'_> {
+        SerializableValue::new(self, Default::default(), None)
+    }
+
+    // Compares two values.
+    // Used to sort values for Debug printing.
+    pub(crate) fn sort_cmp(&self, other: &Self) -> Ordering {
+        fn cmp_num(a: Number, b: Number) -> Ordering {
+            match (a, b) {
+                _ if a < b => Ordering::Less,
+                _ if a > b => Ordering::Greater,
+                _ => Ordering::Equal,
+            }
+        }
+
+        match (self, other) {
+            // Nil
+            (Value::Nil, Value::Nil) => Ordering::Equal,
+            (Value::Nil, _) => Ordering::Less,
+            (_, Value::Nil) => Ordering::Greater,
+            // Null (a special case)
+            (Value::LightUserData(ud1), Value::LightUserData(ud2)) if ud1 == ud2 => Ordering::Equal,
+            (Value::LightUserData(ud1), _) if ud1.0.is_null() => Ordering::Less,
+            (_, Value::LightUserData(ud2)) if ud2.0.is_null() => Ordering::Greater,
+            // Boolean
+            (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
+            (Value::Boolean(_), _) => Ordering::Less,
+            (_, Value::Boolean(_)) => Ordering::Greater,
+            // Integer && Number
+            (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
+            (Value::Integer(a), Value::Number(b)) => cmp_num(*a as Number, *b),
+            (Value::Number(a), Value::Integer(b)) => cmp_num(*a, *b as Number),
+            (Value::Number(a), Value::Number(b)) => cmp_num(*a, *b),
+            (Value::Integer(_) | Value::Number(_), _) => Ordering::Less,
+            (_, Value::Integer(_) | Value::Number(_)) => Ordering::Greater,
+            // Vector (Luau)
+            #[cfg(feature = "luau")]
+            (Value::Vector(a), Value::Vector(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+            // String
+            (Value::String(a), Value::String(b)) => a.as_bytes().cmp(&b.as_bytes()),
+            (Value::String(_), _) => Ordering::Less,
+            (_, Value::String(_)) => Ordering::Greater,
+            // Other variants can be ordered by their pointer
+            (a, b) => a.to_pointer().cmp(&b.to_pointer()),
+        }
+    }
+
+    pub(crate) fn fmt_pretty(
+        &self,
+        fmt: &mut fmt::Formatter,
+        recursive: bool,
+        ident: usize,
+        visited: &mut HashSet<*const c_void>,
+    ) -> fmt::Result {
+        match self {
+            Value::Nil => write!(fmt, "nil"),
+            Value::Boolean(b) => write!(fmt, "{b}"),
+            Value::LightUserData(ud) if ud.0.is_null() => write!(fmt, "null"),
+            Value::LightUserData(ud) => write!(fmt, "lightuserdata: {:?}", ud.0),
+            Value::Integer(i) => write!(fmt, "{i}"),
+            Value::Number(n) => write!(fmt, "{n}"),
+            #[cfg(feature = "luau")]
+            Value::Vector(v) => write!(fmt, "{v}"),
+            Value::String(s) => write!(fmt, "{s:?}"),
+            Value::Table(t) if recursive && !visited.contains(&t.to_pointer()) => {
+                t.fmt_pretty(fmt, ident, visited)
+            }
+            t @ Value::Table(_) => write!(fmt, "table: {:?}", t.to_pointer()),
+            f @ Value::Function(_) => write!(fmt, "function: {:?}", f.to_pointer()),
+            t @ Value::Thread(_) => write!(fmt, "thread: {:?}", t.to_pointer()),
+            u @ Value::UserData(ud) => {
+                // Try `__name/__type` first then `__tostring`
+                let name = ud.type_name().ok().flatten();
+                let s = name
+                    .map(|name| format!("{name}: {:?}", u.to_pointer()))
+                    .or_else(|| u.to_string().ok())
+                    .unwrap_or_else(|| format!("userdata: {:?}", u.to_pointer()));
+                write!(fmt, "{s}")
+            }
+            #[cfg(feature = "luau")]
+            buf @ Value::Buffer(_) => write!(fmt, "buffer: {:?}", buf.to_pointer()),
+            Value::Error(e) if recursive => write!(fmt, "{e:?}"),
+            Value::Error(_) => write!(fmt, "error"),
+            Value::Other(v) => write!(fmt, "other: {:?}", v.to_pointer()),
+        }
+    }

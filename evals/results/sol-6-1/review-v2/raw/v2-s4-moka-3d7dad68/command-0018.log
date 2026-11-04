@@ -1,0 +1,708 @@
+use crate::common::{
+    concurrent::constants::{
+        LOG_SYNC_INTERVAL_MILLIS, READ_LOG_FLUSH_POINT, WRITE_LOG_FLUSH_POINT,
+    },
+    time::{AtomicInstant, Instant},
+    HousekeeperConfig,
+};
+
+use std::{
+    hash::{BuildHasher, Hash},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+
+use async_lock::Mutex;
+use futures_util::future::{BoxFuture, Shared};
+
+use super::base_cache::Inner;
+
+pub(crate) struct Housekeeper {
+    /// A shared `Future` of the maintenance task that is currently being resolved.
+    current_task: Mutex<Option<Shared<BoxFuture<'static, bool>>>>,
+    run_after: AtomicInstant,
+    /// A flag to indicate if the last call on `run_pending_tasks` method left some
+    /// entries to evict.
+    ///
+    /// Used only when the eviction listener closure is set for this cache instance
+    /// because, if not, `run_pending_tasks` will never leave entries to evict.
+    more_entries_to_evict: Option<AtomicBool>,
+    /// The timeout duration for the `run_pending_tasks` method. This is a safe-guard
+    /// to prevent cache read/write operations (that may call `run_pending_tasks`
+    /// internally) from being blocked for a long time when the user wrote a slow
+    /// eviction listener closure.
+    ///
+    /// Used only when the eviction listener closure is set for this cache instance.
+    maintenance_task_timeout: Option<Duration>,
+    /// The maximum repeat count for receiving operation logs from the read and write
+    /// log channels. Default: `MAX_LOG_SYNC_REPEATS`.
+    max_log_sync_repeats: u32,
+    /// The batch size of entries to be processed by each internal eviction method.
+    /// Default: `EVICTION_BATCH_SIZE`.
+    eviction_batch_size: u32,
+    auto_run_enabled: AtomicBool,
+    #[cfg(test)]
+    pub(crate) start_count: AtomicUsize,
+    #[cfg(test)]
+    pub(crate) complete_count: AtomicUsize,
+}
+
+impl Housekeeper {
+    pub(crate) fn new(
+        is_eviction_listener_enabled: bool,
+        config: HousekeeperConfig,
+        now: Instant,
+    ) -> Self {
+        let (more_entries_to_evict, maintenance_task_timeout) = if is_eviction_listener_enabled {
+            (
+                Some(AtomicBool::new(false)),
+                Some(config.maintenance_task_timeout),
+            )
+        } else {
+            (None, None)
+        };
+
+        Self {
+            current_task: Mutex::default(),
+            run_after: AtomicInstant::new(Self::sync_after(now)),
+            more_entries_to_evict,
+            maintenance_task_timeout,
+            max_log_sync_repeats: config.max_log_sync_repeats,
+            eviction_batch_size: config.eviction_batch_size,
+            auto_run_enabled: AtomicBool::new(true),
+            #[cfg(test)]
+            start_count: Default::default(),
+            #[cfg(test)]
+            complete_count: Default::default(),
+        }
+    }
+
+    pub(crate) fn should_apply_reads(&self, ch_len: usize, now: Instant) -> bool {
+        self.more_entries_to_evict() || self.should_apply(ch_len, READ_LOG_FLUSH_POINT, now)
+    }
+
+    pub(crate) fn should_apply_writes(&self, ch_len: usize, now: Instant) -> bool {
+        self.more_entries_to_evict() || self.should_apply(ch_len, WRITE_LOG_FLUSH_POINT, now)
+    }
+
+    #[inline]
+    fn more_entries_to_evict(&self) -> bool {
+        self.more_entries_to_evict
+            .as_ref()
+            .map(|v| v.load(Ordering::Acquire))
+            .unwrap_or(false)
+    }
+
+    fn set_more_entries_to_evict(&self, v: bool) {
+        if let Some(flag) = &self.more_entries_to_evict {
+            flag.store(v, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    fn should_apply(&self, ch_len: usize, ch_flush_point: usize, now: Instant) -> bool {
+        self.auto_run_enabled.load(Ordering::Relaxed)
+            && (ch_len >= ch_flush_point || now >= self.run_after.instant().unwrap())
+    }
+
+    pub(crate) async fn run_pending_tasks<K, V, S>(&self, cache: Arc<Inner<K, V, S>>)
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher + Clone + Send + Sync + 'static,
+    {
+        let mut current_task = self.current_task.lock().await;
+        self.do_run_pending_tasks(Arc::clone(&cache), &mut current_task)
+            .await;
+
+        drop(current_task);
+
+        // If there are any async tasks waiting in `BaseCache::schedule_write_op`
+        // method for the write op channel, notify them.
+        cache.write_op_ch_ready_event.notify(usize::MAX);
+    }
+
+    /// Tries to run the pending tasks if the lock is free. Returns `true` if there
+    /// are more entries to evict in next run.
+    pub(crate) async fn try_run_pending_tasks<K, V, S>(&self, cache: &Arc<Inner<K, V, S>>) -> bool
+    where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher + Clone + Send + Sync + 'static,
+    {
+        if let Some(mut current_task) = self.current_task.try_lock() {
+            self.do_run_pending_tasks(Arc::clone(cache), &mut current_task)
+                .await;
+        } else {
+            return false;
+        }
+
+        // The `current_task` lock should be free now.
+
+        // If there are any async tasks waiting in `BaseCache::schedule_write_op`
+        // method for the write op channel, notify them.
+        cache.write_op_ch_ready_event.notify(usize::MAX);
+        true
+    }
+
+    async fn do_run_pending_tasks<K, V, S>(
+        &self,
+        cache: Arc<Inner<K, V, S>>,
+        current_task: &mut Option<Shared<BoxFuture<'static, bool>>>,
+    ) where
+        K: Hash + Eq + Send + Sync + 'static,
+        V: Clone + Send + Sync + 'static,
+        S: BuildHasher + Clone + Send + Sync + 'static,
+    {
+        use futures_util::FutureExt;
+
+        let now = cache.current_time();
+        let more_to_evict;
+        // Async Cancellation Safety: Our maintenance task is cancellable as we save
+        // it in the lock. If it is canceled, we will resume it in the next run.
+
+        if let Some(task) = &*current_task {
+            // This task was cancelled in the previous run due to the enclosing
+            // Future was dropped. Resume the task now by awaiting.
+            more_to_evict = task.clone().await;
+        } else {
+            let timeout = self.maintenance_task_timeout;
+            let repeats = self.max_log_sync_repeats;
+            let batch_size = self.eviction_batch_size;
+            // Create a new maintenance task and await it.
+            let task = async move {
+                cache
+                    .do_run_pending_tasks(timeout, repeats, batch_size)
+                    .await
+            }
+            .boxed()
+            .shared();
+            *current_task = Some(task.clone());
+
+            #[cfg(test)]
+            self.start_count.fetch_add(1, Ordering::AcqRel);
+
+            more_to_evict = task.await;
+        }
+
+        // If we are here, it means that the maintenance task has been completed.
+        // We can remove it from the lock.
+        *current_task = None;
+        self.run_after.set_instant(Self::sync_after(now));
+        self.set_more_entries_to_evict(more_to_evict);
+
+        #[cfg(test)]
+        self.complete_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn sync_after(now: Instant) -> Instant {
+        let dur = Duration::from_millis(LOG_SYNC_INTERVAL_MILLIS);
+        now.saturating_add(dur)
+    }
+}
+
+#[cfg(test)]
+impl Housekeeper {
+    pub(crate) fn disable_auto_run(&self) {
+        self.auto_run_enabled.store(false, Ordering::Relaxed);
+    }
+}
+            read_op_ch,
+            write_op_ch,
+            write_op_ch_ready_event: event_listener::Event::default(),
+            eviction_policy: eviction_policy.config,
+            expiration_policy,
+            valid_after: AtomicInstant::default(),
+            weigher,
+            removal_notifier,
+            key_locks,
+            invalidator,
+            clock,
+        }
+    }
+
+    #[inline]
+    fn hash<Q>(&self, key: &Q) -> u64
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        let mut hasher = self.build_hasher.build_hasher();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[inline]
+    fn get_key_value_and<Q, F, T>(&self, key: &Q, hash: u64, with_entry: F) -> Option<T>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+        F: FnOnce(&Arc<K>, &MiniArc<ValueEntry<K, V>>) -> T,
+    {
+        self.cache
+            .get_key_value_and(hash, |k| key.equivalent(k as &K), with_entry)
+    }
+
+    #[inline]
+    fn get_key_value_and_then<Q, F, T>(&self, key: &Q, hash: u64, with_entry: F) -> Option<T>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+        F: FnOnce(&Arc<K>, &MiniArc<ValueEntry<K, V>>) -> Option<T>,
+    {
+        self.cache
+            .get_key_value_and_then(hash, |k| key.equivalent(k as &K), with_entry)
+    }
+
+    #[inline]
+    fn remove_entry<Q>(&self, key: &Q, hash: u64) -> Option<KvEntry<K, V>>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+    {
+        self.cache
+            .remove_entry(hash, |k| key.equivalent(k as &K))
+            .map(|(key, entry)| KvEntry::new(key, entry))
+    }
+
+    fn keys(&self, cht_segment: usize) -> Option<Vec<Arc<K>>> {
+        // Do `Arc::clone` instead of `Arc::downgrade`. Updating existing entry
+        // in the cht with a new value replaces the key in the cht even though the
+        // old and new keys are equal. If we return `Weak<K>`, it will not be
+        // upgraded later to `Arc<K> as the key may have been replaced with a new
+        // key that equals to the old key.
+        self.cache.keys(cht_segment, Arc::clone)
+    }
+
+    #[inline]
+    fn register_invalidation_predicate(
+        &self,
+        predicate: PredicateFun<K, V>,
+        registered_at: Instant,
+    ) -> Result<PredicateId, PredicateError> {
+        if let Some(inv) = &self.invalidator {
+            inv.register_predicate(predicate, registered_at)
+        } else {
+            Err(PredicateError::InvalidationClosuresDisabled)
+        }
+    }
+
+    /// Returns `true` if the entry is invalidated by `invalidate_entries_if` method.
+    #[inline]
+    fn is_invalidated_entry(&self, key: &Arc<K>, entry: &MiniArc<ValueEntry<K, V>>) -> bool
+    where
+        V: Clone,
+    {
+        if let Some(inv) = &self.invalidator {
+            return inv.apply_predicates(key, entry);
+        }
+        false
+    }
+
+    #[inline]
+    fn weigh(&self, key: &K, value: &V) -> u32 {
+        self.weigher.as_ref().map_or(1, |w| w(key, value))
+    }
+}
+
+impl<K, V, S> Inner<K, V, S>
+where
+    K: Hash + Eq + Send + Sync + 'static,
+    V: Clone + Send + Sync + 'static,
+    S: BuildHasher + Clone + Send + Sync + 'static,
+{
+    /// Runs the pending tasks. Returns `true` if there are more entries to evict.
+    pub(crate) async fn do_run_pending_tasks(
+        &self,
+        timeout: Option<Duration>,
+        max_log_sync_repeats: u32,
+        eviction_batch_size: u32,
+    ) -> bool {
+        if self.max_capacity == Some(0) {
+            return false;
+        }
+
+        // Acquire some locks.
+        let mut deqs = self.deques.lock().await;
+        let mut timer_wheel = self.timer_wheel.lock().await;
+
+        let started_at = if timeout.is_some() {
+            Some(self.current_time())
+        } else {
+            None
+        };
+        let mut should_process_logs = true;
+        let mut calls = 0u32;
+        let current_ec = self.entry_count.load();
+        let current_ws = self.weighted_size.load();
+        let mut eviction_state =
+            EvictionState::new(current_ec, current_ws, self.removal_notifier.as_ref());
+
+        loop {
+            if should_process_logs {
+                let r_len = self.read_op_ch.len();
+                if r_len > 0 {
+                    self.apply_reads(&mut deqs, &mut timer_wheel, r_len).await;
+                }
+
+                let w_len = self.write_op_ch.len();
+                if w_len > 0 {
+                    self.apply_writes(&mut deqs, &mut timer_wheel, w_len, &mut eviction_state)
+                        .await;
+                }
+
+                if self.eviction_policy == EvictionPolicyConfig::TinyLfu
+                    && self.should_enable_frequency_sketch(&eviction_state.counters)
+                {
+                    self.enable_frequency_sketch(&eviction_state.counters).await;
+                }
+
+                // If there are any async tasks waiting in `BaseCache::schedule_write_op`
+                // method for the write op channel to have enough room, notify them.
+                let listeners = self.write_op_ch_ready_event.total_listeners();
+                if listeners > 0 {
+                    let n = listeners.min(WRITE_LOG_CH_SIZE - self.write_op_ch.len());
+                    // Notify the `n` listeners. The `notify` method accepts 0, so no
+                    // need to check if `n` is greater than 0.
+                    self.write_op_ch_ready_event.notify(n);
+                }
+
+                calls += 1;
+            }
+
+            // Set this flag to `false`. The `evict_*` and `invalidate_*` methods
+            // below may set it to `true` if there are more entries to evict in next
+            // loop.
+            eviction_state.more_entries_to_evict = false;
+            let last_eviction_count = eviction_state.counters.eviction_count;
+
+            // Evict entries if there are any expired entries in the hierarchical
+            // timer wheels.
+            if timer_wheel.is_enabled() {
+                self.evict_expired_entries_using_timers(
+                    &mut timer_wheel,
+                    &mut deqs,
+    #[allow(clippy::too_many_arguments)]
+    fn handle_upsert(
+        &self,
+        kh: KeyHash<K>,
+        entry: MiniArc<ValueEntry<K, V>>,
+        gen: u16,
+        old_weight: u32,
+        new_weight: u32,
+        deqs: &mut Deques<K>,
+        timer_wheel: &mut TimerWheel<K>,
+        freq: &FrequencySketch,
+        eviction_state: &mut EvictionState<'_, K, V>,
+    ) where
+        V: Clone,
+    {
+        {
+            let counters = &mut eviction_state.counters;
+
+            if entry.is_admitted() {
+                // The entry has been already admitted, so treat this as an update.
+                counters.saturating_sub(0, old_weight);
+                counters.saturating_add(0, new_weight);
+                self.update_timer_wheel(&entry, timer_wheel);
+                deqs.move_to_back_ao(&entry);
+                deqs.move_to_back_wo(&entry);
+                entry.entry_info().set_policy_gen(gen);
+                return;
+            }
+
+            if self.has_enough_capacity(new_weight, counters) {
+                // There are enough room in the cache (or the cache is unbounded).
+                // Add the candidate to the deques.
+                self.handle_admit(&entry, new_weight, deqs, timer_wheel, counters);
+                entry.entry_info().set_policy_gen(gen);
+                return;
+            }
+        }
+
+        if let Some(max) = self.max_capacity {
+            if new_weight as u64 > max {
+                // The candidate is too big to fit in the cache. Reject it.
+
+                // Lock the key for removal if blocking removal notification is enabled.
+                let kl = self.maybe_key_lock(&kh.key);
+                let _klg = &kl.as_ref().map(|kl| kl.lock());
+
+                let removed = self.cache.remove_if(
+                    kh.hash,
+                    |k| k == &kh.key,
+                    |_, current_entry| {
+                        MiniArc::ptr_eq(entry.entry_info(), current_entry.entry_info())
+                            && current_entry.entry_info().entry_gen() == gen
+                    },
+                );
+                if let Some(entry) = removed {
+                    if eviction_state.is_notifier_enabled() {
+                        let key = Arc::clone(&kh.key);
+                        eviction_state.notify_entry_removal(key, &entry, RemovalCause::Size);
+                    }
+                    eviction_state.counters.incr_eviction_count();
+                }
+                entry.entry_info().set_policy_gen(gen);
+                return;
+            }
+        }
+
+        // TODO: Refactoring the policy implementations.
+        // https://github.com/moka-rs/moka/issues/389
+
+        // Try to admit the candidate.
+        let admission_result = match &self.eviction_policy {
+            EvictionPolicyConfig::TinyLfu => {
+                let mut candidate = EntrySizeAndFrequency::new(new_weight);
+                candidate.add_frequency(freq, kh.hash);
+                Self::admit(&candidate, &self.cache, deqs, freq)
+            }
+            EvictionPolicyConfig::Lru => AdmissionResult::Admitted {
+                victim_keys: SmallVec::default(),
+            },
+        };
+
+        match admission_result {
+            AdmissionResult::Admitted { victim_keys } => {
+                // Try to remove the victims from the hash map.
+                for (vic_kh, vic_la) in victim_keys {
+                    let vic_key = vic_kh.key;
+                    let vic_hash = vic_kh.hash;
+
+                    // Lock the key for removal if blocking removal notification is enabled.
+                    let kl = self.maybe_key_lock(&vic_key);
+                    let _klg = &kl.as_ref().map(|kl| kl.lock());
+
+                    if let Some((vic_key, vic_entry)) = self.cache.remove_entry_if_and(
+                        vic_hash,
+                        |k| k == &vic_key,
+                        |_, entry| entry.entry_info().last_accessed() == vic_la,
+                        |k, v| (k.clone(), v.clone()),
+                    ) {
+                        if eviction_state.is_notifier_enabled() {
+                            eviction_state.notify_entry_removal(
+                                vic_key,
+                                &vic_entry,
+                                RemovalCause::Size,
+                            );
+                        }
+                        eviction_state.counters.incr_eviction_count();
+                        // And then remove the victim from the deques.
+                        Self::handle_remove(
+                            deqs,
+                            timer_wheel,
+                            vic_entry,
+                            None,
+                            &mut eviction_state.counters,
+                        );
+                    } else {
+                        // Could not remove the victim from the cache. Skip it as its
+                        // ValueEntry might have been invalidated.
+                        if let Some(node) = deqs.probation.peek_front() {
+                            if node.element.key() == &vic_key && node.element.hash() == vic_hash {
+                                deqs.probation.move_front_to_back();
+                            }
+                        }
+                    }
+                }
+
+                // Add the candidate to the deques.
+                self.handle_admit(
+                    &entry,
+                    new_weight,
+                    deqs,
+                    timer_wheel,
+                    &mut eviction_state.counters,
+                );
+                entry.entry_info().set_policy_gen(gen);
+            }
+            AdmissionResult::Rejected => {
+                // Lock the key for removal if blocking removal notification is enabled.
+                let kl = self.maybe_key_lock(&kh.key);
+                let _klg = &kl.as_ref().map(|kl| kl.lock());
+
+                // Remove the candidate from the cache (hash map) if the entry
+                // generation matches.
+                let key = Arc::clone(&kh.key);
+                let removed = self.cache.remove_if(
+                    kh.hash,
+                    |k| k == &key,
+                    |_, current_entry| {
+                        MiniArc::ptr_eq(entry.entry_info(), current_entry.entry_info())
+                            && current_entry.entry_info().entry_gen() == gen
+                    },
+                );
+
+                if let Some(entry) = removed {
+                    entry.entry_info().set_policy_gen(gen);
+                    if eviction_state.is_notifier_enabled() {
+                        eviction_state.notify_entry_removal(key, &entry, RemovalCause::Size);
+                    }
+                    eviction_state.counters.incr_eviction_count();
+                }
+            }
+        };
+    }
+
+    /// Performs size-aware admission explained in the paper:
+    /// [Lightweight Robust Size Aware Cache Management][size-aware-cache-paper]
+    /// by Gil Einziger, Ohad Eytan, Roy Friedman, Ben Manes.
+    ///
+    /// [size-aware-cache-paper]: https://arxiv.org/abs/2105.08770
+    ///
+    /// There are some modifications in this implementation:
+    /// - To admit to the main space, candidate's frequency must be higher than
+    ///   the aggregated frequencies of the potential victims. (In the paper,
+    ///   `>=` operator is used rather than `>`)  The `>` operator will do a better
+    ///   job to prevent the main space from polluting.
+    /// - When a candidate is rejected, the potential victims will stay at the LRU
+    ///   position of the probation access-order queue. (In the paper, they will be
+    ///   promoted (to the MRU position?) to force the eviction policy to select a
+    ///   different set of victims for the next candidate). We may implement the
+    ///   paper's behavior later?
+    ///
+    #[inline]
+                ReschedulingResult::Rescheduled
+            } else {
+                entry.unset_position();
+                entry.unset_timer_node_in_deq_nodes();
+                ReschedulingResult::Removed(unsafe { Box::from_raw(node.as_ptr()) })
+            }
+        } else {
+            unreachable!()
+        }
+    }
+
+    /// Reschedules an active timer event for the node.
+    pub(crate) fn reschedule(
+        &mut self,
+        node: NonNull<DeqNode<TimerNode<K>>>,
+    ) -> ReschedulingResult<K> {
+        debug_assert!(self.is_enabled());
+        unsafe { self.unlink_timer(node) };
+        self.schedule_existing_node(node)
+    }
+
+    /// Removes a timer event for this node if present.
+    pub(crate) fn deschedule(&mut self, node: NonNull<DeqNode<TimerNode<K>>>) {
+        debug_assert!(self.is_enabled());
+        unsafe {
+            self.unlink_timer(node);
+            Self::drop_node(node);
+        }
+    }
+
+    /// Removes a timer event for this node if present.
+    ///
+    /// IMPORTANT: This method does not drop the node.
+    unsafe fn unlink_timer(&mut self, mut node: NonNull<DeqNode<TimerNode<K>>>) {
+        // SAFETY: The self (`TimerWheel`) is the only owner of the node, and we have
+        // `&mut self` here. We are the only one who can mutate the node.
+        let p = node.as_mut();
+        if let entry @ TimerNode::Entry { .. } = &mut p.element {
+            if let Some((level, index)) = entry.position() {
+                self.wheels[level][index].unlink(node);
+                entry.unset_position();
+            }
+        } else {
+            unreachable!();
+        }
+    }
+
+    unsafe fn drop_node(node: NonNull<DeqNode<TimerNode<K>>>) {
+        std::mem::drop(Box::from_raw(node.as_ptr()));
+    }
+
+    /// Advances the timer wheel to the current time, and returns an iterator over
+    /// timer events.
+    pub(crate) fn advance(
+        &mut self,
+        current_time: Instant,
+    ) -> impl Iterator<Item = TimerEvent<K>> + '_ {
+        debug_assert!(self.is_enabled());
+
+        let previous_time = self.current;
+        self.current = current_time;
+        TimerEventsIter::new(self, previous_time, current_time)
+    }
+
+    /// Returns a pointer to the timer event (cache entry) at the front of the queue.
+    /// Returns `None` if the front node is a sentinel.
+    fn pop_timer_node(&mut self, level: usize, index: usize) -> Option<Box<DeqNode<TimerNode<K>>>> {
+        let deque = &mut self.wheels[level][index];
+        if let Some(node) = deque.peek_front() {
+            if node.element.is_sentinel() {
+                return None;
+            }
+        }
+
+        deque.pop_front()
+    }
+
+    /// Reset the positions of the nodes in the queue at the given level and index.
+    /// When done, the sentinel is at the back of the queue.
+    fn reset_timer_node_positions(&mut self, level: usize, index: usize) {
+        let deque = &mut self.wheels[level][index];
+        debug_assert!(
+            deque.len() > 0,
+            "BUG: The queue is empty. level: {level}, index: {index}"
+        );
+
+        // Rotate the nodes in the queue until we see the sentinel at the back of the
+        // queue.
+        while !deque.peek_back().unwrap().element.is_sentinel() {
+            deque.move_front_to_back();
+        }
+    }
+
+    /// Returns the bucket indices to locate the bucket that the timer event
+    /// should be added to.
+    fn bucket_indices(&self, time: Instant) -> (usize, usize) {
+        let duration_nanos = self.duration_nanos_since_last_advanced(time);
+        let time_nanos = self.time_nanos(time);
+        for level in 0..=NUM_LEVELS {
+            if duration_nanos < SPANS[level + 1] {
+                let ticks = time_nanos >> SHIFT[level];
+                let index = ticks & (BUCKET_COUNTS[level] - 1);
+                return (level, index as usize);
+            }
+        }
+        (OVERFLOW_QUEUE_INDEX, 0)
+    }
+
+    // Returns nano-seconds between the given `time` and the time when this timer
+    // wheel was advanced. If the `time` is earlier than other, returns zero.
+    fn duration_nanos_since_last_advanced(&self, time: Instant) -> u64 {
+        // If `time` is earlier than `self.current`, use zero. This could happen
+        // when a user provided `Expiry` method returned zero or a very short
+        // duration.
+        time.saturating_duration_since(self.current).as_nanos() as u64
+    }
+
+    // Returns nano-seconds between the given `time` and `self.origin`, the time when
+    // this timer wheel was created.
+    //
+    // - If the `time` is earlier than other, returns zero.
+    // - If the `time` is later than `self.origin + u64::MAX`, returns `u64::MAX`,
+    //   which is ~584 years in nanoseconds.
+    //
+    fn time_nanos(&self, time: Instant) -> u64 {
+        let nanos_u128 = time
+            // If `time` is earlier than `self.origin`, use zero. This would never
+            // happen in practice as there should be some delay between the timer
+            // wheel was created and the first timer event is scheduled. But we will
+            // do this just in case.
+            .saturating_duration_since(self.origin)
+            .as_nanos();
+
+        // Convert an `u128` into an `u64`. If the value is too large, use `u64::MAX`
+        // (~584 years)
+        nanos_u128.try_into().unwrap_or(u64::MAX)
+    }
+}
+
+/// A timer event, which is either an expired/rescheduled cache entry, or a
+/// descheduled timer. `TimerWheel::advance` method returns an iterator over timer

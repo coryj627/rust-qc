@@ -1,0 +1,904 @@
+[package]
+name = "quinn-proto"
+version = "0.11.13"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "State machine for the QUIC transport protocol"
+keywords.workspace = true
+categories.workspace = true
+workspace = ".."
+
+[features]
+# NOTE: Please keep this in sync with the feature list in `.github/workflows/codecov.yml`, see
+# comment in that file for more information.
+default = ["rustls-ring", "log", "bloom"]
+aws-lc-rs = ["dep:aws-lc-rs", "aws-lc-rs?/aws-lc-sys", "aws-lc-rs?/prebuilt-nasm"]
+aws-lc-rs-fips = ["aws-lc-rs", "aws-lc-rs?/fips"]
+# Enables BloomTokenLog, and uses it by default
+bloom = ["dep:fastbloom"]
+# For backwards compatibility, `rustls` forwards to `rustls-ring`
+rustls = ["rustls-ring"]
+# Enable rustls with the `aws-lc-rs` crypto provider
+rustls-aws-lc-rs = ["dep:rustls", "rustls?/aws-lc-rs", "aws-lc-rs"]
+rustls-aws-lc-rs-fips = ["rustls-aws-lc-rs", "aws-lc-rs-fips"]
+# Enable rustls with the `ring` crypto provider
+rustls-ring = ["dep:rustls", "rustls?/ring", "ring"]
+ring = ["dep:ring"]
+# Enable rustls ring provider and direct ring usage
+# Provides `ClientConfig::with_platform_verifier()` convenience method
+platform-verifier = ["dep:rustls-platform-verifier"]
+# Configure `tracing` to log events via `log` if no `tracing` subscriber exists.
+log = ["tracing/log"]
+# Enable rustls logging
+rustls-log = ["rustls?/logging"]
+# Enable qlog support
+qlog = ["dep:qlog"]
+
+[dependencies]
+arbitrary = { workspace = true, optional = true }
+aws-lc-rs = { workspace = true, optional = true }
+bytes = { workspace = true }
+fastbloom = { workspace = true, optional = true }
+lru-slab = { workspace = true }
+qlog = { workspace = true, optional = true }
+rustc-hash = { workspace = true }
+rand = { workspace = true }
+ring = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-platform-verifier = { workspace = true, optional = true }
+slab = { workspace = true }
+thiserror = { workspace = true }
+tinyvec = { workspace = true, features = ["alloc"] }
+tracing = { workspace = true }
+
+# Feature flags & dependencies for wasm
+# wasm-bindgen is assumed for a wasm*-*-unknown target
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+ring = { workspace = true, features = ["wasm32_unknown_unknown_js"] }
+getrandom = { workspace = true, features = ["wasm_js"] }
+rustls-pki-types = { workspace = true, features = ["web"] } # only added as dependency to enforce the `web` feature for this target
+web-time = { workspace = true }
+
+[dev-dependencies]
+assert_matches = { workspace = true }
+hex-literal = { workspace = true  }
+rand_pcg = "0.9"
+rcgen = { workspace = true }
+tracing-subscriber = { workspace = true }
+lazy_static = "1"
+wasm-bindgen-test = { workspace = true }
+
+[lints.rust]
+# https://rust-fuzz.github.io/book/cargo-fuzz/guide.html#cfgfuzzing
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+[package.metadata.docs.rs]
+# all non-default features except fips (cannot build on docs.rs environment)
+features = ["rustls-aws-lc-rs", "rustls-ring", "platform-verifier", "log", "rustls-log"]
+use std::{
+    collections::{HashMap, hash_map},
+    convert::TryFrom,
+    fmt, mem,
+    net::{IpAddr, SocketAddr},
+    ops::{Index, IndexMut},
+    sync::Arc,
+};
+
+use bytes::{BufMut, Bytes, BytesMut};
+use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
+use rustc_hash::FxHashMap;
+use slab::Slab;
+use thiserror::Error;
+use tracing::{debug, error, trace, warn};
+
+use crate::{
+    Duration, INITIAL_MTU, Instant, MAX_CID_SIZE, MIN_INITIAL_SIZE, RESET_TOKEN_SIZE, ResetToken,
+    Side, Transmit, TransportConfig, TransportError,
+    cid_generator::ConnectionIdGenerator,
+    coding::BufMutExt,
+    config::{ClientConfig, EndpointConfig, ServerConfig},
+    connection::{Connection, ConnectionError, SideArgs},
+    crypto::{self, Keys, UnsupportedVersion},
+    frame,
+    packet::{
+        FixedLengthConnectionIdParser, Header, InitialHeader, InitialPacket, PacketDecodeError,
+        PacketNumber, PartialDecode, ProtectedInitialHeader,
+    },
+    shared::{
+        ConnectionEvent, ConnectionEventInner, ConnectionId, DatagramConnectionEvent, EcnCodepoint,
+        EndpointEvent, EndpointEventInner, IssuedCid,
+    },
+    token::{IncomingToken, InvalidRetryTokenError, Token, TokenPayload},
+    transport_parameters::{PreferredAddress, TransportParameters},
+};
+
+/// The main entry point to the library
+///
+/// This object performs no I/O whatsoever. Instead, it consumes incoming packets and
+/// connection-generated events via `handle` and `handle_event`.
+pub struct Endpoint {
+    rng: StdRng,
+    index: ConnectionIndex,
+    connections: Slab<ConnectionMeta>,
+    local_cid_generator: Box<dyn ConnectionIdGenerator>,
+    config: Arc<EndpointConfig>,
+    server_config: Option<Arc<ServerConfig>>,
+    /// Whether the underlying UDP socket promises not to fragment packets
+    allow_mtud: bool,
+    /// Time at which a stateless reset was most recently sent
+    last_stateless_reset: Option<Instant>,
+    /// Buffered Initial and 0-RTT messages for pending incoming connections
+    incoming_buffers: Slab<IncomingBuffer>,
+    all_incoming_buffers_total_bytes: u64,
+}
+
+impl Endpoint {
+    /// Create a new endpoint
+    ///
+    /// `allow_mtud` enables path MTU detection when requested by `Connection` configuration for
+    /// better performance. This requires that outgoing packets are never fragmented, which can be
+    /// achieved via e.g. the `IPV6_DONTFRAG` socket option.
+    ///
+    /// If `rng_seed` is provided, it will be used to initialize the endpoint's rng (having priority
+    /// over the rng seed configured in [`EndpointConfig`]). Note that the `rng_seed` parameter will
+    /// be removed in a future release, so prefer setting it to `None` and configuring rng seeds
+    /// using [`EndpointConfig::rng_seed`].
+    pub fn new(
+        config: Arc<EndpointConfig>,
+        server_config: Option<Arc<ServerConfig>>,
+        allow_mtud: bool,
+        rng_seed: Option<[u8; 32]>,
+    ) -> Self {
+        let rng_seed = rng_seed.or(config.rng_seed);
+        Self {
+            rng: rng_seed.map_or(StdRng::from_os_rng(), StdRng::from_seed),
+            index: ConnectionIndex::default(),
+            connections: Slab::new(),
+            local_cid_generator: (config.connection_id_generator_factory.as_ref())(),
+            config,
+            server_config,
+            allow_mtud,
+            last_stateless_reset: None,
+            incoming_buffers: Slab::new(),
+            all_incoming_buffers_total_bytes: 0,
+        }
+    }
+
+    /// Replace the server configuration, affecting new incoming connections only
+    pub fn set_server_config(&mut self, server_config: Option<Arc<ServerConfig>>) {
+        self.server_config = server_config;
+    }
+
+    /// Process `EndpointEvent`s emitted from related `Connection`s
+    ///
+    /// In turn, processing this event may return a `ConnectionEvent` for the same `Connection`.
+    pub fn handle_event(
+        &mut self,
+        ch: ConnectionHandle,
+        event: EndpointEvent,
+    ) -> Option<ConnectionEvent> {
+        use EndpointEventInner::*;
+        match event.0 {
+            NeedIdentifiers(now, n) => {
+                return Some(self.send_new_identifiers(now, ch, n));
+            }
+            ResetToken(remote, token) => {
+                if let Some(old) = self.connections[ch].reset_token.replace((remote, token)) {
+                    self.index.connection_reset_tokens.remove(old.0, old.1);
+                }
+                if self.index.connection_reset_tokens.insert(remote, token, ch) {
+                    warn!("duplicate reset token");
+                }
+            }
+            RetireConnectionId(now, seq, allow_more_cids) => {
+                if let Some(cid) = self.connections[ch].loc_cids.remove(&seq) {
+                    trace!("peer retired CID {}: {}", seq, cid);
+                    self.index.retire(cid);
+                    if allow_more_cids {
+                        return Some(self.send_new_identifiers(now, ch, 1));
+                    }
+                }
+            }
+            Drained => {
+                if let Some(conn) = self.connections.try_remove(ch.0) {
+                    self.index.remove(&conn);
+                } else {
+                    // This indicates a bug in downstream code, which could cause spurious
+                    // connection loss instead of this error if the CID was (re)allocated prior to
+                    // the illegal call.
+                    error!(id = ch.0, "unknown connection drained");
+                }
+            }
+        }
+        None
+    }
+
+    /// Process an incoming UDP datagram
+    pub fn handle(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+        ecn: Option<EcnCodepoint>,
+        data: BytesMut,
+        buf: &mut Vec<u8>,
+    ) -> Option<DatagramEvent> {
+        // Partially decode packet or short-circuit if unable
+        let datagram_len = data.len();
+        let event = match PartialDecode::new(
+            data,
+            &FixedLengthConnectionIdParser::new(self.local_cid_generator.cid_len()),
+            &self.config.supported_versions,
+            self.config.grease_quic_bit,
+        ) {
+            Ok((first_decode, remaining)) => DatagramConnectionEvent {
+                now,
+                remote,
+                ecn,
+                first_decode,
+                remaining,
+            },
+            Err(PacketDecodeError::UnsupportedVersion {
+                src_cid,
+                dst_cid,
+                version,
+            }) => {
+                if self.server_config.is_none() {
+                    debug!("dropping packet with unsupported version");
+                    return None;
+                }
+                trace!("sending version negotiation");
+                // Negotiate versions
+                Header::VersionNegotiate {
+                    random: self.rng.random::<u8>() | 0x40,
+                    src_cid: dst_cid,
+                    dst_cid: src_cid,
+                }
+                .encode(buf);
+                // Grease with a reserved version
+                buf.write::<u32>(match version {
+                    0x0a1a_2a3a => 0x0a1a_2a4a,
+                    _ => 0x0a1a_2a3a,
+                });
+                for &version in &self.config.supported_versions {
+                    buf.write(version);
+                }
+                return Some(DatagramEvent::Response(Transmit {
+                    destination: remote,
+                    ecn: None,
+                    size: buf.len(),
+                    segment_size: None,
+                    src_ip: local_ip,
+                }));
+            }
+            Err(e) => {
+                trace!("malformed header: {}", e);
+                return None;
+            }
+        };
+
+        let addresses = FourTuple { remote, local_ip };
+        let dst_cid = event.first_decode.dst_cid();
+
+        if let Some(route_to) = self.index.get(&addresses, &event.first_decode) {
+            // Handle packet on existing connection
+            match route_to {
+                RouteDatagramTo::Incoming(incoming_idx) => {
+                    let incoming_buffer = &mut self.incoming_buffers[incoming_idx];
+                    let config = &self.server_config.as_ref().unwrap();
+
+                    if incoming_buffer
+                        .total_bytes
+                        .checked_add(datagram_len as u64)
+                        .is_some_and(|n| n <= config.incoming_buffer_size)
+                        && self
+                            .all_incoming_buffers_total_bytes
+                            .checked_add(datagram_len as u64)
+                            .is_some_and(|n| n <= config.incoming_buffer_size_total)
+                    {
+                        incoming_buffer.datagrams.push(event);
+                        incoming_buffer.total_bytes += datagram_len as u64;
+                        self.all_incoming_buffers_total_bytes += datagram_len as u64;
+                    }
+
+                    None
+                }
+                RouteDatagramTo::Connection(ch) => Some(DatagramEvent::ConnectionEvent(
+                    ch,
+                    ConnectionEvent(ConnectionEventInner::Datagram(event)),
+                )),
+            }
+        } else if event.first_decode.initial_header().is_some() {
+            // Potentially create a new connection
+
+            self.handle_first_packet(datagram_len, event, addresses, buf)
+        } else if event.first_decode.has_long_header() {
+            debug!(
+                "ignoring non-initial packet for unknown connection {}",
+                dst_cid
+            );
+            None
+        } else if !event.first_decode.is_initial()
+            && self.local_cid_generator.validate(dst_cid).is_err()
+        {
+            debug!("dropping packet with invalid CID");
+            None
+        } else if dst_cid.is_empty() {
+            trace!("dropping unrecognized short packet without ID");
+            None
+        } else {
+            // If we got this far, we're receiving a seemingly valid packet for an unknown
+            // connection. Send a stateless reset if possible.
+            self.stateless_reset(now, datagram_len, addresses, *dst_cid, buf)
+                .map(DatagramEvent::Response)
+        }
+    }
+
+    fn stateless_reset(
+        &mut self,
+        now: Instant,
+        inciting_dgram_len: usize,
+        addresses: FourTuple,
+        dst_cid: ConnectionId,
+        buf: &mut Vec<u8>,
+    ) -> Option<Transmit> {
+        if self
+            .last_stateless_reset
+            .is_some_and(|last| last + self.config.min_reset_interval > now)
+        {
+            debug!("ignoring unexpected packet within minimum stateless reset interval");
+            return None;
+        }
+
+        /// Minimum amount of padding for the stateless reset to look like a short-header packet
+        const MIN_PADDING_LEN: usize = 5;
+
+        // Prevent amplification attacks and reset loops by ensuring we pad to at most 1 byte
+        // smaller than the inciting packet.
+        let max_padding_len = match inciting_dgram_len.checked_sub(RESET_TOKEN_SIZE) {
+            Some(headroom) if headroom > MIN_PADDING_LEN => headroom - 1,
+            _ => {
+                debug!(
+                    "ignoring unexpected {} byte packet: not larger than minimum stateless reset size",
+                    inciting_dgram_len
+                );
+                return None;
+            }
+        };
+
+        debug!(
+            "sending stateless reset for {} to {}",
+            dst_cid, addresses.remote
+        );
+        self.last_stateless_reset = Some(now);
+        // Resets with at least this much padding can't possibly be distinguished from real packets
+        const IDEAL_MIN_PADDING_LEN: usize = MIN_PADDING_LEN + MAX_CID_SIZE;
+        let padding_len = if max_padding_len <= IDEAL_MIN_PADDING_LEN {
+            max_padding_len
+        } else {
+            self.rng
+                .random_range(IDEAL_MIN_PADDING_LEN..max_padding_len)
+        };
+        buf.reserve(padding_len + RESET_TOKEN_SIZE);
+        buf.resize(padding_len, 0);
+        self.rng.fill_bytes(&mut buf[0..padding_len]);
+        buf[0] = 0b0100_0000 | (buf[0] >> 2);
+        buf.extend_from_slice(&ResetToken::new(&*self.config.reset_key, dst_cid));
+
+        debug_assert!(buf.len() < inciting_dgram_len);
+
+        Some(Transmit {
+            destination: addresses.remote,
+            ecn: None,
+            size: buf.len(),
+            segment_size: None,
+            src_ip: addresses.local_ip,
+        })
+    }
+
+    /// Initiate a connection
+    pub fn connect(
+        &mut self,
+        now: Instant,
+        config: ClientConfig,
+        remote: SocketAddr,
+        server_name: &str,
+    ) -> Result<(ConnectionHandle, Connection), ConnectError> {
+        if self.cids_exhausted() {
+            return Err(ConnectError::CidsExhausted);
+        }
+        if remote.port() == 0 || remote.ip().is_unspecified() {
+            return Err(ConnectError::InvalidRemoteAddress(remote));
+        }
+        if !self.config.supported_versions.contains(&config.version) {
+            return Err(ConnectError::UnsupportedVersion);
+        }
+
+        let remote_id = (config.initial_dst_cid_provider)();
+        trace!(initial_dcid = %remote_id);
+
+        let ch = ConnectionHandle(self.connections.vacant_key());
+        let loc_cid = self.new_cid(ch);
+        let params = TransportParameters::new(
+            &config.transport,
+            &self.config,
+            self.local_cid_generator.as_ref(),
+            loc_cid,
+            None,
+            &mut self.rng,
+        );
+        let tls = config
+            .crypto
+            .start_session(config.version, server_name, &params)?;
+
+        let conn = self.add_connection(
+            ch,
+            config.version,
+            remote_id,
+            loc_cid,
+            remote_id,
+            FourTuple {
+                remote,
+                local_ip: None,
+            },
+            now,
+            tls,
+            config.transport,
+            SideArgs::Client {
+                token_store: config.token_store,
+                server_name: server_name.into(),
+            },
+        );
+        Ok((ch, conn))
+    }
+
+    fn send_new_identifiers(
+        &mut self,
+        now: Instant,
+        ch: ConnectionHandle,
+        num: u64,
+    ) -> ConnectionEvent {
+        let mut ids = vec![];
+        for _ in 0..num {
+            let id = self.new_cid(ch);
+            let meta = &mut self.connections[ch];
+            let sequence = meta.cids_issued;
+            meta.cids_issued += 1;
+            meta.loc_cids.insert(sequence, id);
+                    TransportError::INVALID_TOKEN(""),
+                    buf,
+                )));
+            }
+        };
+
+        let incoming_idx = self.incoming_buffers.insert(IncomingBuffer::default());
+        self.index
+            .insert_initial_incoming(header.dst_cid, incoming_idx);
+
+        Some(DatagramEvent::NewConnection(Incoming {
+            received_at: event.now,
+            addresses,
+            ecn: event.ecn,
+            packet: InitialPacket {
+                header,
+                header_data: packet.header_data,
+                payload: packet.payload,
+            },
+            rest: event.remaining,
+            crypto,
+            token,
+            incoming_idx,
+            improper_drop_warner: IncomingImproperDropWarner,
+        }))
+    }
+
+    /// Attempt to accept this incoming connection (an error may still occur)
+    // AcceptError cannot be made smaller without semver breakage
+    #[allow(clippy::result_large_err)]
+    pub fn accept(
+        &mut self,
+        mut incoming: Incoming,
+        now: Instant,
+        buf: &mut Vec<u8>,
+        server_config: Option<Arc<ServerConfig>>,
+    ) -> Result<(ConnectionHandle, Connection), AcceptError> {
+        let remote_address_validated = incoming.remote_address_validated();
+        incoming.improper_drop_warner.dismiss();
+        let incoming_buffer = self.incoming_buffers.remove(incoming.incoming_idx);
+        self.all_incoming_buffers_total_bytes -= incoming_buffer.total_bytes;
+
+        let packet_number = incoming.packet.header.number.expand(0);
+        let InitialHeader {
+            src_cid,
+            dst_cid,
+            version,
+            ..
+        } = incoming.packet.header;
+        let server_config =
+            server_config.unwrap_or_else(|| self.server_config.as_ref().unwrap().clone());
+
+        if server_config
+            .transport
+            .max_idle_timeout
+            .is_some_and(|timeout| {
+                incoming.received_at + Duration::from_millis(timeout.into()) <= now
+            })
+        {
+            debug!("abandoning accept of stale initial");
+            self.index.remove_initial(dst_cid);
+            return Err(AcceptError {
+                cause: ConnectionError::TimedOut,
+                response: None,
+            });
+        }
+
+        if self.cids_exhausted() {
+            debug!("refusing connection");
+            self.index.remove_initial(dst_cid);
+            return Err(AcceptError {
+                cause: ConnectionError::CidsExhausted,
+                response: Some(self.initial_close(
+                    version,
+                    incoming.addresses,
+                    &incoming.crypto,
+                    &src_cid,
+                    TransportError::CONNECTION_REFUSED(""),
+                    buf,
+                )),
+            });
+        }
+
+        if incoming
+            .crypto
+            .packet
+            .remote
+            .decrypt(
+                packet_number,
+                &incoming.packet.header_data,
+                &mut incoming.packet.payload,
+            )
+            .is_err()
+        {
+            debug!(packet_number, "failed to authenticate initial packet");
+            self.index.remove_initial(dst_cid);
+            return Err(AcceptError {
+                cause: TransportError::PROTOCOL_VIOLATION("authentication failed").into(),
+                response: None,
+            });
+        };
+
+        let ch = ConnectionHandle(self.connections.vacant_key());
+        let loc_cid = self.new_cid(ch);
+        let mut params = TransportParameters::new(
+            &server_config.transport,
+            &self.config,
+            self.local_cid_generator.as_ref(),
+            loc_cid,
+            Some(&server_config),
+            &mut self.rng,
+        );
+        params.stateless_reset_token = Some(ResetToken::new(&*self.config.reset_key, loc_cid));
+        params.original_dst_cid = Some(incoming.token.orig_dst_cid);
+        params.retry_src_cid = incoming.token.retry_src_cid;
+        let mut pref_addr_cid = None;
+        if server_config.has_preferred_address() {
+            let cid = self.new_cid(ch);
+            pref_addr_cid = Some(cid);
+            params.preferred_address = Some(PreferredAddress {
+                address_v4: server_config.preferred_address_v4,
+                address_v6: server_config.preferred_address_v6,
+                connection_id: cid,
+                stateless_reset_token: ResetToken::new(&*self.config.reset_key, cid),
+            });
+        }
+
+        let tls = server_config.crypto.clone().start_session(version, &params);
+        let transport_config = server_config.transport.clone();
+        let mut conn = self.add_connection(
+            ch,
+            version,
+            dst_cid,
+            loc_cid,
+            src_cid,
+            incoming.addresses,
+            incoming.received_at,
+            tls,
+            transport_config,
+            SideArgs::Server {
+                server_config,
+                pref_addr_cid,
+                path_validated: remote_address_validated,
+            },
+        );
+        self.index.insert_initial(dst_cid, ch);
+
+        match conn.handle_first_packet(
+            incoming.received_at,
+            incoming.addresses.remote,
+            incoming.ecn,
+use std::{convert::TryInto, fmt};
+
+use bytes::{Buf, BufMut};
+use thiserror::Error;
+
+use crate::coding::{self, Codec, UnexpectedEnd};
+
+#[cfg(feature = "arbitrary")]
+use arbitrary::Arbitrary;
+
+/// An integer less than 2^62
+///
+/// Values of this type are suitable for encoding as QUIC variable-length integer.
+// It would be neat if we could express to Rust that the top two bits are available for use as enum
+// discriminants
+#[derive(Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct VarInt(pub(crate) u64);
+
+impl VarInt {
+    /// The largest representable value
+    pub const MAX: Self = Self((1 << 62) - 1);
+    /// The largest encoded value length
+    pub const MAX_SIZE: usize = 8;
+
+    /// Construct a `VarInt` infallibly
+    pub const fn from_u32(x: u32) -> Self {
+        Self(x as u64)
+    }
+
+    /// Succeeds iff `x` < 2^62
+    pub fn from_u64(x: u64) -> Result<Self, VarIntBoundsExceeded> {
+        if x < 2u64.pow(62) {
+            Ok(Self(x))
+        } else {
+            Err(VarIntBoundsExceeded)
+        }
+    }
+
+    /// Create a VarInt without ensuring it's in range
+    ///
+    /// # Safety
+    ///
+    /// `x` must be less than 2^62.
+    pub const unsafe fn from_u64_unchecked(x: u64) -> Self {
+        Self(x)
+    }
+
+    /// Extract the integer value
+    pub const fn into_inner(self) -> u64 {
+        self.0
+    }
+
+    /// Compute the number of bytes needed to encode this value
+    pub(crate) const fn size(self) -> usize {
+        let x = self.0;
+        if x < 2u64.pow(6) {
+            1
+        } else if x < 2u64.pow(14) {
+            2
+        } else if x < 2u64.pow(30) {
+            4
+        } else if x < 2u64.pow(62) {
+            8
+        } else {
+            panic!("malformed VarInt");
+        }
+    }
+}
+
+impl From<VarInt> for u64 {
+    fn from(x: VarInt) -> Self {
+        x.0
+    }
+}
+
+impl From<u8> for VarInt {
+    fn from(x: u8) -> Self {
+        Self(x.into())
+    }
+}
+
+impl From<u16> for VarInt {
+    fn from(x: u16) -> Self {
+        Self(x.into())
+    }
+}
+
+impl From<u32> for VarInt {
+    fn from(x: u32) -> Self {
+        Self(x.into())
+    }
+}
+
+impl std::convert::TryFrom<u64> for VarInt {
+    type Error = VarIntBoundsExceeded;
+    /// Succeeds iff `x` < 2^62
+    fn try_from(x: u64) -> Result<Self, VarIntBoundsExceeded> {
+        Self::from_u64(x)
+    }
+}
+
+impl std::convert::TryFrom<u128> for VarInt {
+    type Error = VarIntBoundsExceeded;
+    /// Succeeds iff `x` < 2^62
+    fn try_from(x: u128) -> Result<Self, VarIntBoundsExceeded> {
+        Self::from_u64(x.try_into().map_err(|_| VarIntBoundsExceeded)?)
+    }
+}
+
+impl std::convert::TryFrom<usize> for VarInt {
+    type Error = VarIntBoundsExceeded;
+    /// Succeeds iff `x` < 2^62
+    fn try_from(x: usize) -> Result<Self, VarIntBoundsExceeded> {
+        Self::try_from(x as u64)
+    }
+}
+
+impl fmt::Debug for VarInt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Display for VarInt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+impl<'arbitrary> Arbitrary<'arbitrary> for VarInt {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'arbitrary>) -> arbitrary::Result<Self> {
+        Ok(Self(u.int_in_range(0..=Self::MAX.0)?))
+    }
+}
+
+/// Error returned when constructing a `VarInt` from a value >= 2^62
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Error)]
+#[error("value too large for varint encoding")]
+pub struct VarIntBoundsExceeded;
+
+impl Codec for VarInt {
+    fn decode<B: Buf>(r: &mut B) -> coding::Result<Self> {
+        if !r.has_remaining() {
+            return Err(UnexpectedEnd);
+        }
+        let mut buf = [0; 8];
+        buf[0] = r.get_u8();
+        let tag = buf[0] >> 6;
+        buf[0] &= 0b0011_1111;
+        let x = match tag {
+            0b00 => u64::from(buf[0]),
+            0b01 => {
+                if r.remaining() < 1 {
+                    return Err(UnexpectedEnd);
+                }
+                r.copy_to_slice(&mut buf[1..2]);
+                u64::from(u16::from_be_bytes(buf[..2].try_into().unwrap()))
+            }
+            0b10 => {
+                if r.remaining() < 3 {
+                    return Err(UnexpectedEnd);
+                }
+                r.copy_to_slice(&mut buf[1..4]);
+                u64::from(u32::from_be_bytes(buf[..4].try_into().unwrap()))
+            }
+            0b11 => {
+                if r.remaining() < 7 {
+                    return Err(UnexpectedEnd);
+                }
+                r.copy_to_slice(&mut buf[1..8]);
+                u64::from_be_bytes(buf)
+            }
+            _ => unreachable!(),
+        };
+        Ok(Self(x))
+    }
+
+    fn encode<B: BufMut>(&self, w: &mut B) {
+        let x = self.0;
+        if x < 2u64.pow(6) {
+            w.put_u8(x as u8);
+        } else if x < 2u64.pow(14) {
+            w.put_u16((0b01 << 14) | x as u16);
+        } else if x < 2u64.pow(30) {
+            w.put_u32((0b10 << 30) | x as u32);
+        } else if x < 2u64.pow(62) {
+            w.put_u64((0b11 << 62) | x);
+        } else {
+            unreachable!("malformed VarInt")
+        }
+    }
+}
+            Uni => "unidirectional",
+        })
+    }
+}
+
+/// Identifier for a stream within a particular connection
+#[cfg_attr(feature = "arbitrary", derive(Arbitrary))]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct StreamId(u64);
+
+impl fmt::Display for StreamId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let initiator = match self.initiator() {
+            Side::Client => "client",
+            Side::Server => "server",
+        };
+        let dir = match self.dir() {
+            Dir::Uni => "uni",
+            Dir::Bi => "bi",
+        };
+        write!(
+            f,
+            "{} {}directional stream {}",
+            initiator,
+            dir,
+            self.index()
+        )
+    }
+}
+
+impl StreamId {
+    /// Create a new StreamId
+    pub fn new(initiator: Side, dir: Dir, index: u64) -> Self {
+        Self((index << 2) | ((dir as u64) << 1) | initiator as u64)
+    }
+    /// Which side of a connection initiated the stream
+    pub fn initiator(self) -> Side {
+        if self.0 & 0x1 == 0 {
+            Side::Client
+        } else {
+            Side::Server
+        }
+    }
+    /// Which directions data flows in
+    pub fn dir(self) -> Dir {
+        if self.0 & 0x2 == 0 { Dir::Bi } else { Dir::Uni }
+    }
+    /// Distinguishes streams of the same initiator and directionality
+    pub fn index(self) -> u64 {
+        self.0 >> 2
+    }
+}
+
+impl From<StreamId> for VarInt {
+    fn from(x: StreamId) -> Self {
+        unsafe { Self::from_u64_unchecked(x.0) }
+    }
+}
+
+impl From<VarInt> for StreamId {
+    fn from(v: VarInt) -> Self {
+        Self(v.0)
+    }
+}
+
+impl From<StreamId> for u64 {
+    fn from(x: StreamId) -> Self {
+        x.0
+    }
+}
+
+impl coding::Codec for StreamId {
+    fn decode<B: bytes::Buf>(buf: &mut B) -> coding::Result<Self> {
+        VarInt::decode(buf).map(|x| Self(x.into_inner()))
+    }
+    fn encode<B: bytes::BufMut>(&self, buf: &mut B) {
+        VarInt::from_u64(self.0).unwrap().encode(buf);
+    }
+}
+
+/// An outgoing packet
+#[derive(Debug)]
+#[must_use]
+pub struct Transmit {
+    /// The socket this datagram should be sent to
+    pub destination: SocketAddr,
+    /// Explicit congestion notification bits to set on the packet
+    pub ecn: Option<EcnCodepoint>,
+    /// Amount of data written to the caller-supplied buffer
+    pub size: usize,
+    /// The segment size if this transmission contains multiple datagrams.

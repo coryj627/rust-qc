@@ -1,0 +1,462 @@
+4.387316666666666 minutes used of 45.0
+//! An asynchronous, HTTP/2 server and client implementation.
+//!
+//! This library implements the [HTTP/2] specification. The implementation is
+//! asynchronous, using [futures] as the basis for the API. The implementation
+//! is also decoupled from TCP or TLS details. The user must handle ALPN and
+//! HTTP/1.1 upgrades themselves.
+//!
+//! # Getting started
+//!
+//! Add the following to your `Cargo.toml` file:
+//!
+//! ```toml
+//! [dependencies]
+//! h2 = "0.4"
+//! ```
+//!
+//! # Layout
+//!
+//! The crate is split into [`client`] and [`server`] modules. Types that are
+//! common to both clients and servers are located at the root of the crate.
+//!
+//! See module level documentation for more details on how to use `h2`.
+//!
+//! # Handshake
+//!
+//! Both the client and the server require a connection to already be in a state
+//! ready to start the HTTP/2 handshake. This library does not provide
+//! facilities to do this.
+//!
+//! There are three ways to reach an appropriate state to start the HTTP/2
+//! handshake.
+//!
+//! * Opening an HTTP/1.1 connection and performing an [upgrade].
+//! * Opening a connection with TLS and use ALPN to negotiate the protocol.
+//! * Open a connection with prior knowledge, i.e. both the client and the
+//!   server assume that the connection is immediately ready to start the
+//!   HTTP/2 handshake once opened.
+//!
+//! Once the connection is ready to start the HTTP/2 handshake, it can be
+//! passed to [`server::handshake`] or [`client::handshake`]. At this point, the
+//! library will start the handshake process, which consists of:
+//!
+//! * The client sends the connection preface (a predefined sequence of 24
+//!   octets).
+//! * Both the client and the server sending a SETTINGS frame.
+//!
+//! See the [Starting HTTP/2] in the specification for more details.
+//!
+//! # Flow control
+//!
+//! [Flow control] is a fundamental feature of HTTP/2. The `h2` library
+//! exposes flow control to the user.
+//!
+//! An HTTP/2 client or server may not send unlimited data to the peer. When a
+//! stream is initiated, both the client and the server are provided with an
+//! initial window size for that stream.  A window size is the number of bytes
+//! the endpoint can send to the peer. At any point in time, the peer may
+//! increase this window size by sending a `WINDOW_UPDATE` frame. Once a client
+//! or server has sent data filling the window for a stream, no further data may
+//! be sent on that stream until the peer increases the window.
+//!
+//! There is also a **connection level** window governing data sent across all
+//! streams.
+//!
+//! Managing flow control for inbound data is done through [`FlowControl`].
+//! Managing flow control for outbound data is done through [`SendStream`]. See
+//! the struct level documentation for those two types for more details.
+//!
+//! [HTTP/2]: https://http2.github.io/
+//! [futures]: https://docs.rs/futures/
+//! [`client`]: client/index.html
+//! [`server`]: server/index.html
+//! [Flow control]: http://httpwg.org/specs/rfc7540.html#FlowControl
+//! [`FlowControl`]: struct.FlowControl.html
+//! [`SendStream`]: struct.SendStream.html
+//! [Starting HTTP/2]: http://httpwg.org/specs/rfc7540.html#starting
+//! [upgrade]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Protocol_upgrade_mechanism
+//! [`server::handshake`]: server/fn.handshake.html
+//! [`client::handshake`]: client/fn.handshake.html
+
+#![deny(
+    missing_debug_implementations,
+    missing_docs,
+    clippy::missing_safety_doc,
+    clippy::undocumented_unsafe_blocks
+)]
+#![allow(clippy::type_complexity, clippy::manual_range_contains)]
+#![cfg_attr(test, deny(warnings))]
+
+macro_rules! proto_err {
+    (conn: $($msg:tt)+) => {
+        tracing::debug!("connection error PROTOCOL_ERROR -- {};", format_args!($($msg)+))
+    };
+    (stream: $($msg:tt)+) => {
+        tracing::debug!("stream error PROTOCOL_ERROR -- {};", format_args!($($msg)+))
+    };
+}
+
+macro_rules! ready {
+    ($e:expr) => {
+        match $e {
+            ::std::task::Poll::Ready(r) => r,
+            ::std::task::Poll::Pending => return ::std::task::Poll::Pending,
+        }
+    };
+}
+
+#[cfg_attr(feature = "unstable", allow(missing_docs))]
+mod codec;
+mod error;
+mod hpack;
+
+#[cfg(not(feature = "unstable"))]
+mod proto;
+
+#[cfg(feature = "unstable")]
+#[allow(missing_docs)]
+pub mod proto;
+
+#[cfg(not(feature = "unstable"))]
+mod frame;
+
+#[cfg(feature = "unstable")]
+#[allow(missing_docs)]
+pub mod frame;
+
+pub mod client;
+pub mod ext;
+pub mod server;
+mod share;
+
+#[cfg(fuzzing)]
+#[cfg_attr(feature = "unstable", allow(missing_docs))]
+pub mod fuzz_bridge;
+
+pub use crate::error::{Error, Reason};
+pub use crate::share::{FlowControl, Ping, PingPong, Pong, RecvStream, SendStream, StreamId};
+
+#[cfg(feature = "unstable")]
+pub use codec::{Codec, SendError, UserError};
+
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+/// Creates a future from a function that returns `Poll`.
+fn poll_fn<T, F: FnMut(&mut Context<'_>) -> T>(f: F) -> PollFn<F> {
+    PollFn(f)
+}
+
+/// The future created by `poll_fn`.
+struct PollFn<F>(F);
+
+impl<F> Unpin for PollFn<F> {}
+
+impl<T, F: FnMut(&mut Context<'_>) -> Poll<T>> Future for PollFn<F> {
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        (self.0)(cx)
+    }
+}
+use crate::codec::UserError;
+use crate::frame::Reason;
+use crate::proto::{self, WindowSize};
+
+use bytes::{Buf, Bytes};
+use http::HeaderMap;
+
+use std::fmt;
+#[cfg(feature = "stream")]
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+/// Sends the body stream and trailers to the remote peer.
+///
+/// # Overview
+///
+/// A `SendStream` is provided by [`SendRequest`] and [`SendResponse`] once the
+/// HTTP/2 message header has been sent sent. It is used to stream the message
+/// body and send the message trailers. See method level documentation for more
+/// details.
+///
+/// The `SendStream` instance is also used to manage outbound flow control.
+///
+/// If a `SendStream` is dropped without explicitly closing the send stream, a
+/// `RST_STREAM` frame will be sent. This essentially cancels the request /
+/// response exchange.
+///
+/// The ways to explicitly close the send stream are:
+///
+/// * Set `end_of_stream` to true when calling [`send_request`],
+///   [`send_response`], or [`send_data`].
+/// * Send trailers with [`send_trailers`].
+/// * Explicitly reset the stream with [`send_reset`].
+///
+/// # Flow control
+///
+/// In HTTP/2, data cannot be sent to the remote peer unless there is
+/// available window capacity on both the stream and the connection. When a data
+/// frame is sent, both the stream window and the connection window are
+/// decremented. When the stream level window reaches zero, no further data can
+/// be sent on that stream. When the connection level window reaches zero, no
+/// further data can be sent on any stream for that connection.
+///
+/// When the remote peer is ready to receive more data, it sends `WINDOW_UPDATE`
+/// frames. These frames increment the windows. See the [specification] for more
+/// details on the principles of HTTP/2 flow control.
+///
+/// The implications for sending data are that the caller **should** ensure that
+/// both the stream and the connection has available window capacity before
+/// loading the data to send into memory. The `SendStream` instance provides the
+/// necessary APIs to perform this logic. This, however, is not an obligation.
+/// If the caller attempts to send data on a stream when there is no available
+/// window capacity, the library will buffer the data until capacity becomes
+/// available, at which point the buffer will be flushed to the connection.
+///
+/// **NOTE**: There is no bound on the amount of data that the library will
+/// buffer. If you are sending large amounts of data, you really should hook
+/// into the flow control lifecycle. Otherwise, you risk using up significant
+/// amounts of memory.
+///
+/// To hook into the flow control lifecycle, the caller signals to the library
+/// that it intends to send data by calling [`reserve_capacity`], specifying the
+/// amount of data, in octets, that the caller intends to send. After this,
+/// `poll_capacity` is used to be notified when the requested capacity is
+/// assigned to the stream. Once [`poll_capacity`] returns `Ready` with the number
+/// of octets available to the stream, the caller is able to actually send the
+/// data using [`send_data`].
+///
+/// Because there is also a connection level window that applies to **all**
+/// streams on a connection, when capacity is assigned to a stream (indicated by
+/// `poll_capacity` returning `Ready`), this capacity is reserved on the
+/// connection and will **not** be assigned to any other stream. If data is
+/// never written to the stream, that capacity is effectively lost to other
+/// streams and this introduces the risk of deadlocking a connection.
+///
+/// To avoid throttling data on a connection, the caller should not reserve
+/// capacity until ready to send data and once any capacity is assigned to the
+/// stream, the caller should immediately send data consuming this capacity.
+/// There is no guarantee as to when the full capacity requested will become
+/// available. For example, if the caller requests 64 KB of data and 512 bytes
+/// become available, the caller should immediately send 512 bytes of data.
+///
+/// See [`reserve_capacity`] documentation for more details.
+///
+/// [`SendRequest`]: client/struct.SendRequest.html
+/// [`SendResponse`]: server/struct.SendResponse.html
+/// [specification]: http://httpwg.org/specs/rfc7540.html#FlowControl
+/// [`reserve_capacity`]: #method.reserve_capacity
+/// [`poll_capacity`]: #method.poll_capacity
+/// [`send_data`]: #method.send_data
+/// [`send_request`]: client/struct.SendRequest.html#method.send_request
+/// [`send_response`]: server/struct.SendResponse.html#method.send_response
+/// [`send_data`]: #method.send_data
+/// [`send_trailers`]: #method.send_trailers
+/// [`send_reset`]: #method.send_reset
+#[derive(Debug)]
+pub struct SendStream<B> {
+    inner: proto::StreamRef<B>,
+}
+
+/// A stream identifier, as described in [Section 5.1.1] of RFC 7540.
+///
+/// Streams are identified with an unsigned 31-bit integer. Streams
+/// initiated by a client MUST use odd-numbered stream identifiers; those
+/// initiated by the server MUST use even-numbered stream identifiers.  A
+/// stream identifier of zero (0x0) is used for connection control
+/// messages; the stream identifier of zero cannot be used to establish a
+/// new stream.
+///
+/// [Section 5.1.1]: https://tools.ietf.org/html/rfc7540#section-5.1.1
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct StreamId(u32);
+
+impl From<StreamId> for u32 {
+    fn from(src: StreamId) -> Self {
+        src.0
+    }
+}
+
+/// Receives the body stream and trailers from the remote peer.
+///
+/// A `RecvStream` is provided by [`client::ResponseFuture`] and
+/// [`server::Connection`] with the received HTTP/2 message head (the response
+/// and request head respectively).
+///
+/// A `RecvStream` instance is used to receive the streaming message body and
+/// any trailers from the remote peer. It is also used to manage inbound flow
+/// control.
+///
+/// See method level documentation for more details on receiving data. See
+/// [`FlowControl`] for more details on inbound flow control.
+///
+/// [`client::ResponseFuture`]: client/struct.ResponseFuture.html
+/// [`server::Connection`]: server/struct.Connection.html
+/// [`FlowControl`]: struct.FlowControl.html
+/// [`Stream`]: https://docs.rs/futures/0.1/futures/stream/trait.Stream.html
+#[must_use = "streams do nothing unless polled"]
+pub struct RecvStream {
+    inner: FlowControl,
+}
+
+/// A handle to release window capacity to a remote stream.
+///
+/// This type allows the caller to manage inbound data [flow control]. The
+/// caller is expected to call [`release_capacity`] after dropping data frames.
+///
+/// # Overview
+///
+/// Each stream has a window size. This window size is the maximum amount of
+/// inbound data that can be in-flight. In-flight data is defined as data that
+/// has been received, but not yet released.
+///
+/// When a stream is created, the window size is set to the connection's initial
+/// window size value. When a data frame is received, the window size is then
+/// decremented by size of the data frame before the data is provided to the
+/// caller. As the caller finishes using the data, [`release_capacity`] must be
+/// called. This will then increment the window size again, allowing the peer to
+/// send more data.
+///
+/// There is also a connection level window as well as the stream level window.
+/// Received data counts against the connection level window as well and calls
+/// to [`release_capacity`] will also increment the connection level window.
+///
+/// # Sending `WINDOW_UPDATE` frames
+///
+/// `WINDOW_UPDATE` frames will not be sent out for **every** call to
+/// `release_capacity`, as this would end up slowing down the protocol. Instead,
+/// `h2` waits until the window size is increased to a certain threshold and
+/// then sends out a single `WINDOW_UPDATE` frame representing all the calls to
+/// `release_capacity` since the last `WINDOW_UPDATE` frame.
+///
+/// This essentially batches window updating.
+///
+/// # Scenarios
+///
+/// Following is a basic scenario with an HTTP/2 connection containing a
+/// single active stream.
+///
+/// * A new stream is activated. The receive window is initialized to 1024 (the
+///   value of the initial window size for this connection).
+/// * A `DATA` frame is received containing a payload of 600 bytes.
+/// * The receive window size is reduced to 424 bytes.
+/// * [`release_capacity`] is called with 200.
+/// * The receive window size is now 624 bytes. The peer may send no more than
+///   this.
+/// * A `DATA` frame is received with a payload of 624 bytes.
+/// * The window size is now 0 bytes. The peer may not send any more data.
+/// * [`release_capacity`] is called with 1024.
+/// * The receive window size is now 1024 bytes. The peer may now send more
+///   data.
+///
+/// [flow control]: ../index.html#flow-control
+/// [`release_capacity`]: struct.FlowControl.html#method.release_capacity
+#[derive(Clone, Debug)]
+pub struct FlowControl {
+    inner: proto::OpaqueStreamRef,
+}
+
+/// A handle to send and receive PING frames with the peer.
+// NOT Clone on purpose
+pub struct PingPong {
+    inner: proto::UserPings,
+}
+
+/// Sent via [`PingPong`][] to send a PING frame to a peer.
+///
+/// [`PingPong`]: struct.PingPong.html
+pub struct Ping {
+    _p: (),
+}
+
+/// Received via [`PingPong`][] when a peer acknowledges a [`Ping`][].
+///
+/// [`PingPong`]: struct.PingPong.html
+/// [`Ping`]: struct.Ping.html
+pub struct Pong {
+    _p: (),
+}
+
+// ===== impl SendStream =====
+
+impl<B: Buf> SendStream<B> {
+    pub(crate) fn new(inner: proto::StreamRef<B>) -> Self {
+        SendStream { inner }
+    }
+
+    /// Requests capacity to send data.
+    ///
+    /// This function is used to express intent to send data. This requests
+    /// connection level capacity. Once the capacity is available, it is
+    /// assigned to the stream and not reused by other streams.
+    ///
+    /// This function may be called repeatedly. The `capacity` argument is the
+    /// **total** amount of requested capacity. Sequential calls to
+    /// `reserve_capacity` are *not* additive. Given the following:
+    ///
+    /// ```rust
+    /// # use h2::*;
+    /// # fn doc(mut send_stream: SendStream<&'static [u8]>) {
+    /// send_stream.reserve_capacity(100);
+    /// send_stream.reserve_capacity(200);
+    /// # }
+    /// ```
+    ///
+    /// After the second call to `reserve_capacity`, the *total* requested
+    /// capacity will be 200.
+    ///
+    /// `reserve_capacity` is also used to cancel previous capacity requests.
+    /// Given the following:
+    ///
+    /// ```rust
+    /// # use h2::*;
+    /// # fn doc(mut send_stream: SendStream<&'static [u8]>) {
+    /// send_stream.reserve_capacity(100);
+    /// send_stream.reserve_capacity(0);
+    /// # }
+    /// ```
+    ///
+    /// After the second call to `reserve_capacity`, the *total* requested
+    /// capacity will be 0, i.e. there is no requested capacity for the stream.
+    ///
+    /// If `reserve_capacity` is called with a lower value than the amount of
+    /// capacity **currently** assigned to the stream, this capacity will be
+    /// returned to the connection to be re-assigned to other streams.
+    ///
+    /// Also, the amount of capacity that is reserved gets decremented as data
+    /// is sent. For example:
+    ///
+    /// ```rust
+    /// # use h2::*;
+    /// # async fn doc(mut send_stream: SendStream<&'static [u8]>) {
+    /// send_stream.reserve_capacity(100);
+    ///
+    /// send_stream.send_data(b"hello", false).unwrap();
+    /// // At this point, the total amount of requested capacity is 95 bytes.
+    ///
+    /// // Calling `reserve_capacity` with `100` again essentially requests an
+    /// // additional 5 bytes.
+    /// send_stream.reserve_capacity(100);
+    /// # }
+  1693 src/client.rs
+   211 src/error.rs
+    55 src/ext.rs
+    28 src/fuzz_bridge.rs
+   162 src/lib.rs
+  1643 src/server.rs
+   606 src/share.rs
+    99 src/proto/streams/buffer.rs
+   285 src/proto/streams/counts.rs
+   269 src/proto/streams/flow_control.rs
+   128 src/proto/streams/mod.rs
+   945 src/proto/streams/prioritize.rs
+  1186 src/proto/streams/recv.rs
+   595 src/proto/streams/send.rs
+   475 src/proto/streams/state.rs
+   474 src/proto/streams/store.rs
+   599 src/proto/streams/stream.rs
+  1681 src/proto/streams/streams.rs
+ 11134 total

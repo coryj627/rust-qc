@@ -1,0 +1,949 @@
+use super::*;
+
+pub(crate) type UnresolvedRecipe<'src> = Recipe<'src, UnresolvedDependency<'src>>;
+
+impl<'src> UnresolvedRecipe<'src> {
+  pub(crate) fn resolve(
+    self,
+    assignments: &Table<'src, Assignment<'src>>,
+    functions: &Table<'src, FunctionDefinition<'src>>,
+    modulepath: &Modulepath,
+    resolved: Vec<Arc<Recipe<'src>>>,
+    settings: &Settings,
+  ) -> CompileResult<'src, Recipe<'src>> {
+    assert_eq!(
+      self.dependencies.len(),
+      resolved.len(),
+      "UnresolvedRecipe::resolve: dependency count not equal to resolved count: {} != {}",
+      self.dependencies.len(),
+      resolved.len()
+    );
+
+    let mut variable_references = HashSet::new();
+
+    for (i, parameter) in self.parameters.iter().enumerate() {
+      if let Some(expression) = &parameter.default {
+        Self::resolve_expression(
+          assignments,
+          expression,
+          functions,
+          &self.parameters[..i],
+          &mut variable_references,
+        )?;
+      }
+    }
+
+    for dependency in &self.dependencies {
+      for argument in &dependency.arguments {
+        Self::resolve_expression(
+          assignments,
+          argument,
+          functions,
+          &self.parameters,
+          &mut variable_references,
+        )?;
+      }
+    }
+
+    for attribute in &self.attributes {
+      if let Attribute::Confirm(Some(expression)) = attribute {
+        Self::resolve_expression(
+          assignments,
+          expression,
+          functions,
+          &self.parameters,
+          &mut variable_references,
+        )?;
+      }
+    }
+
+    for line in &self.body {
+      if line.is_comment() && settings.ignore_comments {
+        continue;
+      }
+
+      for fragment in &line.fragments {
+        if let Fragment::Interpolation { expression, .. } = fragment {
+          Self::resolve_expression(
+            assignments,
+            expression,
+            functions,
+            &self.parameters,
+            &mut variable_references,
+          )?;
+        }
+      }
+    }
+
+    for (unresolved, resolved) in self.dependencies.iter().zip(&resolved) {
+      assert_eq!(unresolved.recipe.last().lexeme(), resolved.name.lexeme());
+      if !resolved
+        .argument_range()
+        .contains(&unresolved.arguments.len())
+      {
+        return Err(unresolved.recipe.last().error(
+          CompileErrorKind::DependencyArgumentCountMismatch {
+            dependency: unresolved.recipe.clone(),
+            found: unresolved.arguments.len(),
+            min: resolved.min_arguments(),
+            max: resolved.max_arguments(),
+          },
+        ));
+      }
+    }
+
+    let dependencies = self
+      .dependencies
+      .into_iter()
+      .zip(resolved)
+      .map(|(unresolved, resolved)| Dependency {
+        arguments: resolved.group_arguments(&unresolved.arguments),
+        recipe: resolved,
+      })
+      .collect();
+
+    let mut recipe_path = modulepath.clone();
+
+    recipe_path.components.push(self.name.lexeme().into());
+
+    Ok(Recipe {
+      attributes: self.attributes,
+      body: self.body,
+      dependencies,
+      doc: self.doc,
+      file_depth: self.file_depth,
+      import_offsets: self.import_offsets,
+      module_path: Some(modulepath.clone()),
+      name: self.name,
+      parameters: self.parameters,
+      priors: self.priors,
+      private: self.private,
+      quiet: self.quiet,
+      recipe_path: Some(recipe_path),
+      shebang: self.shebang,
+      variable_references,
+    })
+  }
+
+  fn resolve_expression(
+    assignments: &Table<'src, Assignment<'src>>,
+    expression: &Expression<'src>,
+    functions: &Table<'src, FunctionDefinition<'src>>,
+    parameters: &[Parameter],
+    variable_references: &mut HashSet<Number>,
+  ) -> CompileResult<'src> {
+    for reference in expression.references() {
+      match reference {
+        Reference::Variable(variable) => {
+          Self::resolve_variable(assignments, parameters, variable, variable_references)?;
+        }
+        Reference::Call { name, arguments } => {
+          Analyzer::resolve_call(functions, name, arguments)?;
+        }
+      }
+    }
+    Ok(())
+  }
+
+  fn resolve_variable(
+    assignments: &Table<'src, Assignment<'src>>,
+    parameters: &[Parameter],
+    variable: Name<'src>,
+    variable_references: &mut HashSet<Number>,
+  ) -> CompileResult<'src> {
+    let name = variable.lexeme();
+
+    if parameters.iter().any(|p| p.name.lexeme() == name) {
+      Ok(())
+    } else if let Some(assignment) = assignments.get(name) {
+      variable_references.insert(assignment.number);
+      Ok(())
+    } else if constants().contains_key(name) {
+      Ok(())
+    } else {
+      Err(variable.error(CompileErrorKind::UndefinedVariable { variable: name }))
+    }
+  }
+}
+use super::*;
+
+pub(crate) struct Compiler;
+
+impl Compiler {
+  pub(crate) fn compile<'src>(
+    config: &Config,
+    loader: &'src Loader,
+    root: &Path,
+  ) -> RunResult<'src, Compilation<'src>> {
+    let mut asts = HashMap::<PathBuf, Ast>::new();
+    let mut loaded = Vec::new();
+    let mut numerator = Numerator::new();
+    let mut paths = HashMap::<PathBuf, PathBuf>::new();
+    let mut stack = Vec::new();
+    stack.push(Source::root(root));
+
+    while let Some(current) = stack.pop() {
+      if paths.contains_key(&current.path) {
+        continue;
+      }
+
+      let (relative, src) = loader.load(config, root, &current.path)?;
+      loaded.push(relative.into());
+      let mut ast = Parser::parse_source(&mut numerator, relative, &current, src)?;
+
+      paths.insert(current.path.clone(), relative.into());
+
+      for item in &mut ast.items {
+        match item {
+          Item::Module {
+            absolute,
+            name,
+            optional,
+            relative,
+            ..
+          } => {
+            let parent = current.path.parent().unwrap();
+
+            let relative = relative
+              .as_ref()
+              .map(|relative| Self::expand_tilde(&relative.cooked))
+              .transpose()?;
+
+            let import = Self::find_module_file(parent, *name, relative.as_deref())?;
+
+            if let Some(import) = import {
+              if current.file_path.contains(&import) {
+                return Err(Error::CircularImport {
+                  current: current.path,
+                  import,
+                });
+              }
+              *absolute = Some(import.clone());
+              stack.push(current.module(*name, import));
+            } else if !*optional {
+              return Err(Error::MissingModuleFile { module: *name });
+            }
+          }
+          Item::Import {
+            relative,
+            absolute,
+            optional,
+          } => {
+            let import = current
+              .path
+              .parent()
+              .unwrap()
+              .join(Self::expand_tilde(&relative.cooked)?)
+              .lexiclean();
+
+            if filesystem::is_file(&import)? {
+              if current.file_path.contains(&import) {
+                return Err(Error::CircularImport {
+                  current: current.path,
+                  import,
+                });
+              }
+              *absolute = Some(import.clone());
+              stack.push(current.import(import, relative.token.offset));
+            } else if !*optional {
+              return Err(Error::MissingImportFile {
+                path: relative.token,
+              });
+            }
+          }
+          _ => {}
+        }
+      }
+
+      asts.insert(current.path, ast.clone());
+    }
+
+    let mut overrides = HashMap::new();
+
+    let justfile = Analyzer::analyze(
+      &asts,
+      config,
+      None,
+      &[],
+      &loaded,
+      None,
+      &mut overrides,
+      &paths,
+      false,
+      root,
+    )?;
+
+    Ok(Compilation {
+      asts,
+      justfile,
+      overrides,
+      root: root.into(),
+    })
+  }
+
+  fn find_module_file<'src>(
+    parent: &Path,
+    module: Name<'src>,
+    path: Option<&Path>,
+  ) -> RunResult<'src, Option<PathBuf>> {
+    let mut candidates = Vec::new();
+
+    if let Some(path) = path {
+      let full = parent.join(path);
+
+      if filesystem::is_file(&full)? {
+        return Ok(Some(full));
+      }
+
+      candidates.push((path.join("mod.just"), true));
+
+      for name in search::JUSTFILE_NAMES {
+        candidates.push((path.join(name), false));
+      }
+    } else {
+      candidates.push((format!("{module}.just").into(), true));
+      candidates.push((format!("{module}/mod.just").into(), true));
+
+      for name in search::JUSTFILE_NAMES {
+        candidates.push((format!("{module}/{name}").into(), false));
+      }
+    }
+
+    let mut grouped = BTreeMap::<PathBuf, Vec<(PathBuf, bool)>>::new();
+
+    for (candidate, case_sensitive) in candidates {
+      let candidate = parent.join(candidate).lexiclean();
+      grouped
+        .entry(candidate.parent().unwrap().into())
+        .or_default()
+        .push((candidate, case_sensitive));
+    }
+
+    let mut found = Vec::new();
+
+    for (directory, candidates) in grouped {
+      let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(io_error) => {
+          if io_error.kind() == io::ErrorKind::NotFound {
+            continue;
+          }
+
+          return Err(
+            SearchError::Io {
+              io_error,
+              directory,
+            }
+            .into(),
+          );
+        }
+      };
+
+      for entry in entries {
+        let entry = entry.map_err(|io_error| SearchError::Io {
+          io_error,
+          directory: directory.clone(),
+        })?;
+
+        if let Some(name) = entry.file_name().to_str() {
+          for (candidate, case_sensitive) in &candidates {
+            let candidate_name = candidate.file_name().unwrap().to_str().unwrap();
+
+            let eq = if *case_sensitive {
+              name == candidate_name
+            } else {
+              name.eq_ignore_ascii_case(candidate_name)
+            };
+
+            if eq {
+              found.push(candidate.parent().unwrap().join(name));
+            }
+          }
+        }
+      }
+    }
+
+    if found.len() > 1 {
+      found.sort();
+      Err(Error::AmbiguousModuleFile {
+        found: found
+          .into_iter()
+          .map(|found| found.strip_prefix(parent).unwrap().into())
+          .collect(),
+        module,
+      })
+    } else {
+      Ok(found.into_iter().next())
+    }
+  }
+
+  fn expand_tilde(path: &str) -> RunResult<'static, PathBuf> {
+    Ok(if let Some(path) = path.strip_prefix("~/") {
+      dirs::home_dir()
+        .ok_or(Error::Homedir)?
+        .join(path.trim_start_matches('/'))
+    } else {
+      PathBuf::from(path)
+    })
+  }
+
+  #[cfg(test)]
+  pub(crate) fn test_compile(src: &str) -> RunResult<Justfile> {
+    let tokens = Lexer::test_lex(src)?;
+    let ast = Parser::parse_tokens(&mut Numerator::new(), &tokens)?;
+    let root = PathBuf::from("justfile");
+    let mut asts: HashMap<PathBuf, Ast> = HashMap::new();
+    asts.insert(root.clone(), ast);
+    let mut paths: HashMap<PathBuf, PathBuf> = HashMap::new();
+    paths.insert(root.clone(), root.clone());
+    Analyzer::analyze(
+      &asts,
+      &Config::new().unwrap(),
+      None,
+      &[],
+      &[],
+      None,
+      &mut HashMap::new(),
+      &paths,
+      false,
+      &root,
+    )
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use {super::*, temptree::temptree};
+
+  #[test]
+  fn recursive_includes_fail() {
+    let tmp = temptree! {
+      justfile: "import './subdir/b'\na: b",
+      subdir: {
+        b: "import '../justfile'\nb:"
+      }
+    };
+
+    let loader = Loader::new();
+
+    let justfile_a_path = tmp.path().join("justfile");
+    let loader_output =
+      Compiler::compile(&Config::new().unwrap(), &loader, &justfile_a_path).unwrap_err();
+
+    assert_matches!(loader_output, Error::CircularImport { current, import }
+      if current == tmp.path().join("subdir").join("b").lexiclean() &&
+      import == tmp.path().join("justfile").lexiclean()
+    );
+  }
+
+  #[test]
+  fn find_module_file() {
+    #[track_caller]
+    fn case(path: Option<&str>, files: &[&str], expected: Result<Option<&str>, &[&str]>) {
+      let module = Name {
+        token: Token {
+          column: 0,
+          kind: TokenKind::Identifier,
+          length: 3,
+          line: 0,
+          offset: 0,
+          path: Path::new(""),
+          src: "foo",
+        },
+      };
+
+      let tempdir = tempfile::tempdir().unwrap();
+
+      for file in files {
+        if let Some(parent) = Path::new(file).parent() {
+          fs::create_dir_all(tempdir.path().join(parent)).unwrap();
+        }
+
+        fs::write(tempdir.path().join(file), "").unwrap();
+      }
+
+      let actual = Compiler::find_module_file(tempdir.path(), module, path.map(Path::new));
+
+      match expected {
+        Err(expected) => match actual.unwrap_err() {
+          Error::AmbiguousModuleFile { found, .. } => {
+            assert_eq!(
+              found,
+              expected
+                .iter()
+                .map(|expected| expected.replace('/', std::path::MAIN_SEPARATOR_STR).into())
+                .collect::<Vec<PathBuf>>()
+            );
+          }
+          _ => panic!("unexpected error"),
+        },
+        Ok(Some(expected)) => assert_eq!(
+          actual.unwrap().unwrap(),
+          tempdir
+            .path()
+            .join(expected.replace('/', std::path::MAIN_SEPARATOR_STR))
+        ),
+        Ok(None) => assert_eq!(actual.unwrap(), None),
+      }
+    }
+
+    case(None, &["foo.just"], Ok(Some("foo.just")));
+    case(None, &["FOO.just"], Ok(None));
+    case(None, &["foo/mod.just"], Ok(Some("foo/mod.just")));
+    case(None, &["foo/MOD.just"], Ok(None));
+    case(None, &["foo/justfile"], Ok(Some("foo/justfile")));
+    case(None, &["foo/JUSTFILE"], Ok(Some("foo/JUSTFILE")));
+    case(None, &["foo/.justfile"], Ok(Some("foo/.justfile")));
+    case(None, &["foo/.JUSTFILE"], Ok(Some("foo/.JUSTFILE")));
+    case(
+      None,
+      &["foo/.justfile", "foo/justfile"],
+      Err(&["foo/.justfile", "foo/justfile"]),
+    );
+    case(None, &["foo/JUSTFILE"], Ok(Some("foo/JUSTFILE")));
+
+    case(Some("bar"), &["bar"], Ok(Some("bar")));
+    case(Some("bar"), &["bar/mod.just"], Ok(Some("bar/mod.just")));
+    case(Some("bar"), &["bar/justfile"], Ok(Some("bar/justfile")));
+    case(Some("bar"), &["bar/JUSTFILE"], Ok(Some("bar/JUSTFILE")));
+    case(Some("bar"), &["bar/.justfile"], Ok(Some("bar/.justfile")));
+    case(Some("bar"), &["bar/.JUSTFILE"], Ok(Some("bar/.JUSTFILE")));
+
+    case(
+      Some("bar"),
+      &["bar/justfile", "bar/mod.just"],
+      Err(&["bar/justfile", "bar/mod.just"]),
+    );
+  }
+}
+use super::*;
+
+#[derive(Copy, Clone)]
+pub(crate) struct ExecutionContext<'src: 'run, 'run> {
+  pub(crate) config: &'run Config,
+  pub(crate) dotenv: &'run BTreeMap<String, String>,
+  pub(crate) module: &'run Justfile<'src>,
+  pub(crate) search: &'run Search,
+}
+
+impl<'src: 'run, 'run> ExecutionContext<'src, 'run> {
+  pub(crate) fn tempdir<D>(&self, recipe: &Recipe<'src, D>) -> RunResult<'src, TempDir> {
+    let mut tempdir_builder = tempfile::Builder::new();
+
+    tempdir_builder.prefix("just-");
+
+    if let Some(tempdir) = &self.config.tempdir {
+      tempdir_builder.tempdir_in(self.search.working_directory.join(tempdir))
+    } else {
+      match &self.module.settings.tempdir {
+        Some(tempdir) => tempdir_builder.tempdir_in(self.search.working_directory.join(tempdir)),
+        None => {
+          if let Some(runtime_dir) = dirs::runtime_dir() {
+            let path = runtime_dir.join("just");
+            fs::create_dir_all(&path).map_err(|io_error| Error::RuntimeDirIo {
+              io_error,
+              path: path.clone(),
+            })?;
+            tempdir_builder.tempdir_in(path)
+          } else {
+            tempdir_builder.tempdir()
+          }
+        }
+      }
+    }
+    .map_err(|error| Error::TempdirIo {
+      recipe: recipe.name(),
+      io_error: error,
+    })
+  }
+
+  pub(crate) fn working_directory(&self) -> PathBuf {
+    let base = if self.module.is_submodule() {
+      &self.module.working_directory
+    } else {
+      &self.search.working_directory
+    };
+
+    if let Some(setting) = &self.module.settings.working_directory {
+      base.join(setting)
+    } else {
+      base.into()
+    }
+  }
+}
+use super::*;
+
+pub(crate) struct Loader {
+  paths: Arena<PathBuf>,
+  srcs: Arena<String>,
+}
+
+impl Loader {
+  pub(crate) fn new() -> Self {
+    Self {
+      srcs: Arena::new(),
+      paths: Arena::new(),
+    }
+  }
+
+  pub(crate) fn load<'src>(
+    &'src self,
+    config: &Config,
+    root: &Path,
+    path: &Path,
+  ) -> RunResult<'src, (&'src Path, &'src str)> {
+    Config::warn_non_unicode_path(config.color, "justfile", path);
+
+    let src = fs::read_to_string(path).map_err(|io_error| Error::Load {
+      path: path.into(),
+      io_error,
+    })?;
+
+    let relative = path.strip_prefix(root.parent().unwrap()).unwrap_or(path);
+
+    Ok((self.paths.alloc(relative.into()), self.srcs.alloc(src)))
+  }
+}
+use super::*;
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FunctionDefinition<'src> {
+  pub(crate) body: Expression<'src>,
+  pub(crate) name: Name<'src>,
+  pub(crate) parameters: Vec<(Name<'src>, Number)>,
+}
+
+impl<'src> Keyed<'src> for FunctionDefinition<'src> {
+  fn key(&self) -> &'src str {
+    self.name.lexeme()
+  }
+}
+use super::*;
+
+/// The top-level type produced by the parser. Not all successful parses result
+/// in valid justfiles, so additional consistency checks and name resolution
+/// are performed by the `Analyzer`, which produces a `Justfile` from an `Ast`.
+#[derive(Debug, Clone)]
+pub(crate) struct Ast<'src> {
+  pub(crate) items: Vec<Item<'src>>,
+  pub(crate) module_path: Modulepath,
+  pub(crate) unstable_features: BTreeSet<UnstableFeature>,
+  pub(crate) warnings: Vec<Warning>,
+  pub(crate) working_directory: PathBuf,
+}
+
+impl ColorDisplay for Ast<'_> {
+  fn fmt(&self, f: &mut Formatter, color: Color) -> fmt::Result {
+    let mut newlines = 0;
+    for (i, item) in self.items.iter().enumerate() {
+      if matches!(item, Item::Newline) {
+        newlines += 1;
+        continue;
+      }
+
+      match newlines {
+        0 => {}
+        1 => writeln!(f)?,
+        _ => {
+          writeln!(f)?;
+          writeln!(f)?;
+        }
+      }
+      newlines = 0;
+
+      if let Some(i) = i.checked_sub(1) {
+        if let Some(last) = self.items.get(i) {
+          if !matches!(last, Item::Newline) {
+            write!(f, " ")?;
+          }
+        }
+      }
+
+      write!(f, "{}", item.color_display(color))?;
+    }
+
+    writeln!(f)?;
+
+    Ok(())
+  }
+}
+use {super::*, TokenKind::*};
+
+/// Just language parser
+///
+/// The parser is a (hopefully) straightforward recursive descent parser.
+///
+/// It uses a few tokens of lookahead to disambiguate different constructs.
+///
+/// The `expect_*` and `presume_*` methods are similar in that they assert the
+/// type of unparsed tokens and consume them. However, upon encountering an
+/// unexpected token, the `expect_*` methods return an unexpected token error,
+/// whereas the `presume_*` tokens return an internal error.
+///
+/// The `presume_*` methods are used when the token stream has been inspected in
+/// some other way, and thus encountering an unexpected token is a bug in Just,
+/// and not a syntax error.
+///
+/// All methods starting with `parse_*` parse and return a language construct.
+///
+/// The parser tracks an expected set of tokens as it parses. This set contains
+/// all tokens which would have been accepted at the current point in the
+/// parse. Whenever the parser tests for a token that would be accepted, but
+/// does not find it, it adds that token to the set. When the parser accepts a
+/// token, the set is cleared. If the parser finds a token which is unexpected,
+/// the elements of the set are printed in the resultant error message.
+pub(crate) struct Parser<'run, 'src> {
+  expected_tokens: BTreeSet<TokenKind>,
+  file_depth: u32,
+  import_offsets: Vec<usize>,
+  items: Vec<Item<'src>>,
+  module_namepath: Option<&'run Namepath<'src>>,
+  next_token: usize,
+  numerator: &'run mut Numerator,
+  recursion_depth: usize,
+  tokens: &'run [Token<'src>],
+  unstable_features: BTreeSet<UnstableFeature>,
+  working_directory: &'run Path,
+}
+
+impl<'run, 'src> Parser<'run, 'src> {
+  /// Parse `tokens` into an `Ast`
+  pub(crate) fn parse(
+    file_depth: u32,
+    import_offsets: &[usize],
+    module_namepath: Option<&'run Namepath<'src>>,
+    numerator: &'run mut Numerator,
+    tokens: &'run [Token<'src>],
+    working_directory: &'run Path,
+  ) -> CompileResult<'src, Ast<'src>> {
+    Self {
+      expected_tokens: BTreeSet::new(),
+      file_depth,
+      import_offsets: import_offsets.to_vec(),
+      items: Vec::new(),
+      module_namepath,
+      next_token: 0,
+      numerator,
+      recursion_depth: 0,
+      tokens,
+      unstable_features: BTreeSet::new(),
+      working_directory,
+    }
+    .parse_ast()
+  }
+
+  pub(crate) fn parse_source(
+    numerator: &mut Numerator,
+    path: &'src Path,
+    source: &Source<'src>,
+    src: &'src str,
+  ) -> CompileResult<'src, Ast<'src>> {
+    let tokens = Lexer::lex(path, src)?;
+
+    Parser::parse(
+      source.file_depth,
+      &source.import_offsets,
+      source.namepath.as_ref(),
+      numerator,
+      &tokens,
+      &source.working_directory,
+    )
+  }
+
+  #[cfg(test)]
+  pub(crate) fn parse_tokens(
+    numerator: &'run mut Numerator,
+    tokens: &'run [Token<'src>],
+  ) -> CompileResult<'src, Ast<'src>> {
+    Self::parse(0, &[], None, numerator, tokens, "".as_ref())
+  }
+
+  fn error(&self, kind: CompileErrorKind<'src>) -> CompileResult<'src, CompileError<'src>> {
+    Ok(self.next()?.error(kind))
+  }
+
+  /// Construct an unexpected token error with the token returned by
+  /// `Parser::next`
+  fn unexpected_token(&self) -> CompileResult<'src, CompileError<'src>> {
+    self.error(CompileErrorKind::UnexpectedToken {
+      expected: self
+        .expected_tokens
+        .iter()
+        .copied()
+        .filter(|kind| *kind != ByteOrderMark)
+        .collect::<Vec<TokenKind>>(),
+      found: self.next()?.kind,
+    })
+  }
+
+  fn internal_error(&self, message: impl Into<String>) -> CompileResult<'src, CompileError<'src>> {
+    self.error(CompileErrorKind::Internal {
+      message: message.into(),
+    })
+  }
+
+  /// An iterator over the remaining significant tokens
+  fn rest(&self) -> impl Iterator<Item = Token<'src>> + 'run {
+    self.tokens[self.next_token..]
+      .iter()
+      .copied()
+      .filter(|token| token.kind != Whitespace)
+  }
+
+  /// The next significant token
+  fn next(&self) -> CompileResult<'src, Token<'src>> {
+    if let Some(token) = self.rest().next() {
+      Ok(token)
+    } else {
+      Err(self.internal_error("`Parser::next()` called after end of token stream")?)
+    }
+  }
+
+  /// Check if the next significant token is of kind `kind`
+  fn next_is(&mut self, kind: TokenKind) -> bool {
+    self.next_are(&[kind])
+  }
+
+  /// Check if the next significant tokens are of kinds `kinds`
+  ///
+  /// The first token in `kinds` will be added to the expected token set.
+  fn next_are(&mut self, kinds: &[TokenKind]) -> bool {
+    if let Some(&kind) = kinds.first() {
+      self.expected_tokens.insert(kind);
+    }
+
+    let mut rest = self.rest();
+    for kind in kinds {
+      match rest.next() {
+        Some(token) => {
+          if token.kind != *kind {
+            return false;
+          }
+        }
+        None => return false,
+      }
+    }
+    true
+  }
+
+  /// Check if the next significant tokens are of kinds `kinds`, followed by a
+  /// comment, end-of-file, or end-of-line.
+  ///
+  /// The first token in `kinds` will be added to the expected token set.
+  fn line_is(&mut self, kinds: &[TokenKind]) -> bool {
+    if let Some(&kind) = kinds.first() {
+      self.expected_tokens.insert(kind);
+    }
+
+    let mut rest = self.rest();
+    for kind in kinds {
+      match rest.next() {
+        Some(token) => {
+          if token.kind != *kind {
+            return false;
+          }
+        }
+        None => return false,
+      }
+    }
+
+    if let Some(token) = rest.next() {
+      if matches!(token.kind, Comment | Eof | Eol) {
+        return true;
+      }
+    }
+
+    false
+  }
+
+  /// Advance past one significant token, clearing the expected token set.
+  fn advance(&mut self) -> CompileResult<'src, Token<'src>> {
+    self.expected_tokens.clear();
+
+    for skipped in &self.tokens[self.next_token..] {
+      self.next_token += 1;
+
+      if skipped.kind != Whitespace {
+        return Ok(*skipped);
+      }
+    }
+
+    Err(self.internal_error("`Parser::advance()` advanced past end of token stream")?)
+  }
+
+  /// Return next token if it is of kind `expected`, otherwise, return an
+  /// unexpected token error
+  fn expect(&mut self, expected: TokenKind) -> CompileResult<'src, Token<'src>> {
+    if let Some(token) = self.accept(expected)? {
+      Ok(token)
+    } else {
+      Err(self.unexpected_token()?)
+    }
+  }
+
+  /// Return the next token if it is any of kinds in `expected`, otherwise,
+  /// return an unexpected token error
+  fn expect_any(&mut self, expected: &[TokenKind]) -> CompileResult<'src, Token<'src>> {
+    for &kind in expected {
+      if let Some(token) = self.accept(kind)? {
+        return Ok(token);
+      }
+    }
+
+    Err(self.unexpected_token()?)
+  }
+
+  /// Return an unexpected token error if the next token is not an EOL
+  fn expect_eol(&mut self) -> CompileResult<'src> {
+    self.accept(Comment)?;
+
+    if self.next_is(Eof) {
+      return Ok(());
+    }
+
+    self.expect(Eol).map(|_| ())
+  }
+
+  fn expect_keyword(&mut self, expected: Keyword) -> CompileResult<'src> {
+    let found = self.advance()?;
+
+    if found.kind == Identifier && expected == found.lexeme() {
+      Ok(())
+    } else {
+      Err(found.error(CompileErrorKind::ExpectedKeyword {
+        expected: vec![expected],
+        found,
+      }))
+    }
+  }
+
+  /// Return an internal error if the next token is not of kind `Identifier`
+  /// with lexeme `lexeme`.
+  fn presume_keyword(&mut self, keyword: Keyword) -> CompileResult<'src> {
+    let next = self.advance()?;
+
+    if next.kind != Identifier {
+      Err(self.internal_error(format!(
+        "Presumed next token would have kind {Identifier}, but found {}",
+        next.kind
+      ))?)
+    } else if keyword == next.lexeme() {
+      Ok(())
+    } else {
+      Err(self.internal_error(format!(
+        "Presumed next token would have lexeme \"{keyword}\", but found \"{}\"",
+        next.lexeme(),
+      ))?)
+    }
+  }
+
+  /// Return an internal error if the next token is not of kind `kind`.
+  fn presume(&mut self, kind: TokenKind) -> CompileResult<'src, Token<'src>> {
+    let next = self.advance()?;
+
+    if next.kind == kind {
+      Ok(next)
+    } else {
+      Err(self.internal_error(format!(
+        "Presumed next token would have kind {kind:?}, but found {:?}",
+        next.kind

@@ -1,5 +1,10 @@
 # Sol 6.1 evaluation of rust-qc v1.0.0
 
+The separate [revised ordinary QA comparison](review-v2/README.md) is graded:
+51 valid reports from 52 planned attempts, no policy blocks, and no reliable
+known-bug recall advantage. It uses a narrower task and eligible key set. The
+sections below preserve the original broader condition and coding results.
+
 All **24 writing/changing submissions passed their frozen hidden checks**. Quality
 was close to the 12-point ceiling in both arms: the mean case difference was
 **−0.0417 points with the skill**, with zero within-arm replicate variation and

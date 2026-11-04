@@ -1,0 +1,875 @@
+    assert_eq!(pair.client_conn_mut(client_ch).bytes_in_flight(), 0);
+    assert_eq!(pair.server_conn_mut(server_ch).bytes_in_flight(), 0);
+    assert!(pair.client_conn_mut(client_ch).using_ecn());
+    assert!(pair.server_conn_mut(server_ch).using_ecn());
+}
+
+#[test]
+fn zero_rtt_happypath() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server.handle_incoming = Box::new(validate_incoming);
+    let config = client_config();
+
+    // Establish normal connection
+    let client_ch = pair.begin_connect(config.clone());
+    pair.drive();
+    pair.server.assert_accept();
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(0), [][..].into());
+    pair.drive();
+
+    pair.client.addr = SocketAddr::new(
+        Ipv6Addr::LOCALHOST.into(),
+        CLIENT_PORTS.lock().unwrap().next().unwrap(),
+    );
+    info!("resuming session");
+    let client_ch = pair.begin_connect(config);
+    assert!(pair.client_conn_mut(client_ch).has_0rtt());
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    const MSG: &[u8] = b"Hello, 0-RTT!";
+    pair.client_send(client_ch, s).write(MSG).unwrap();
+    pair.drive();
+
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::Connected)
+    );
+
+    assert!(pair.client_conn_mut(client_ch).accepted_0rtt());
+    let server_ch = pair.server.assert_accept();
+
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    // We don't currently preserve stream event order wrt. connection events
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Connected)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Stream(StreamEvent::Opened { dir: Dir::Uni }))
+    );
+
+    let mut recv = pair.server_recv(server_ch, s);
+    let mut chunks = recv.read(false).unwrap();
+    assert_matches!(
+        chunks.next(usize::MAX),
+        Ok(Some(chunk)) if chunk.offset == 0 && chunk.bytes == MSG
+    );
+    let _ = chunks.finalize();
+    assert_eq!(pair.client_conn_mut(client_ch).stats().path.lost_packets, 0);
+}
+
+#[test]
+fn zero_rtt_rejection() {
+    let _guard = subscribe();
+    let server_config = ServerConfig::with_crypto(Arc::new(server_crypto_with_alpn(vec![
+        "foo".into(),
+        "bar".into(),
+    ])));
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    let mut client_crypto = Arc::new(client_crypto_with_alpn(vec!["foo".into()]));
+    let client_config = ClientConfig::new(client_crypto.clone());
+
+    // Establish normal connection
+    let client_ch = pair.begin_connect(client_config);
+    pair.drive();
+    let server_ch = pair.server.assert_accept();
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Connected)
+    );
+    assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(0), [][..].into());
+    pair.drive();
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::ConnectionLost { .. })
+    );
+    assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
+    pair.client.connections.clear();
+    pair.server.connections.clear();
+
+    // We want to have a TLS client config with the existing session cache (so resumption could
+    // happen), but with different ALPN protocols (so that the server must reject it). Reuse
+    // the existing `ClientConfig` and change the ALPN protocols to make that happen.
+    let this = Arc::get_mut(&mut client_crypto).expect("QuicClientConfig is shared");
+    let inner = Arc::get_mut(&mut this.inner).expect("QuicClientConfig.inner is shared");
+    inner.alpn_protocols = vec!["bar".into()];
+
+    // Changing protocols invalidates 0-RTT
+    let client_config = ClientConfig::new(client_crypto);
+    info!("resuming session");
+    let client_ch = pair.begin_connect(client_config);
+    assert!(pair.client_conn_mut(client_ch).has_0rtt());
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    const MSG: &[u8] = b"Hello, 0-RTT!";
+    pair.client_send(client_ch, s).write(MSG).unwrap();
+    pair.drive();
+    assert!(!pair.client_conn_mut(client_ch).accepted_0rtt());
+    let server_ch = pair.server.assert_accept();
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Connected)
+    );
+    assert_matches!(pair.server_conn_mut(server_ch).poll(), None);
+    let s2 = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    assert_eq!(s, s2);
+
+    let mut recv = pair.server_recv(server_ch, s2);
+    let mut chunks = recv.read(false).unwrap();
+    assert_eq!(chunks.next(usize::MAX), Err(ReadError::Blocked));
+    let _ = chunks.finalize();
+    assert_eq!(pair.client_conn_mut(client_ch).stats().path.lost_packets, 0);
+}
+
+fn test_zero_rtt_incoming_limit<F: FnOnce(&mut ServerConfig)>(configure_server: F) {
+    // caller sets the server limit to 4000 bytes
+    // the client writes 8000 bytes
+    const CLIENT_WRITES: usize = 8000;
+    // this gets split across 8 packets
+    // the first packet is stored in the Incoming
+    // the next three are incoming-buffered, bringing the incoming buffer size to 3600 bytes
+    // the last four are dropped due to the buffering limit and must be retransmitted
+    const EXPECTED_DROPPED: u64 = 4;
+
+    let _guard = subscribe();
+    let mut server_config = server_config();
+    configure_server(&mut server_config);
+    let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
+    let config = client_config();
+
+    // Establish normal connection
+    let client_ch = pair.begin_connect(config.clone());
+    pair.drive();
+    pair.server.assert_accept();
+    pair.client
+        .connections
+        .get_mut(&client_ch)
+        .unwrap()
+        .close(pair.time, VarInt(0), [][..].into());
+    pair.drive();
+
+    pair.client.addr = SocketAddr::new(
+        Ipv6Addr::LOCALHOST.into(),
+        CLIENT_PORTS.lock().unwrap().next().unwrap(),
+    );
+    info!("resuming session");
+    pair.server.handle_incoming = Box::new(|_| IncomingConnectionBehavior::Wait);
+    let client_ch = pair.begin_connect(config);
+    assert!(pair.client_conn_mut(client_ch).has_0rtt());
+    let s = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    pair.client_send(client_ch, s)
+        .write(&vec![0; CLIENT_WRITES])
+        .unwrap();
+    pair.drive();
+    let incoming = pair.server.waiting_incoming.pop().unwrap();
+    assert!(pair.server.waiting_incoming.is_empty());
+    let _ = pair.server.try_accept(incoming, pair.time);
+    pair.drive();
+
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    assert_matches!(
+        pair.client_conn_mut(client_ch).poll(),
+        Some(Event::Connected)
+    );
+
+    assert!(pair.client_conn_mut(client_ch).accepted_0rtt());
+    let server_ch = pair.server.assert_accept();
+
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::HandshakeDataReady)
+    );
+    // We don't currently preserve stream event order wrt. connection events
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Connected)
+    );
+    assert_matches!(
+        pair.server_conn_mut(server_ch).poll(),
+        Some(Event::Stream(StreamEvent::Opened { dir: Dir::Uni }))
+    );
+
+    let mut recv = pair.server_recv(server_ch, s);
+    let mut chunks = recv.read(false).unwrap();
+    let mut offset = 0;
+    loop {
+        match chunks.next(usize::MAX) {
+            Ok(Some(chunk)) => {
+                assert_eq!(chunk.offset as usize, offset);
+                offset += chunk.bytes.len();
+            }
+            Err(ReadError::Blocked) => break,
+            Ok(None) => panic!("unexpected stream end"),
+            Err(e) => panic!("{}", e),
+        }
+    }
+    assert_eq!(offset, CLIENT_WRITES);
+    let _ = chunks.finalize();
+    assert_eq!(
+        pair.client_conn_mut(client_ch).stats().path.lost_packets,
+        EXPECTED_DROPPED
+    );
+}
+
+#[test]
+fn zero_rtt_incoming_buffer_size() {
+    test_zero_rtt_incoming_limit(|config| {
+        config.incoming_buffer_size(4000);
+    });
+}
+            Header::Long {
+                ty: LongType::Handshake,
+                src_cid: rem_cid,
+                ..
+            } => {
+                if rem_cid != self.rem_handshake_cid {
+                    debug!(
+                        "discarding packet with mismatched remote CID: {} != {}",
+                        self.rem_handshake_cid, rem_cid
+                    );
+                    return Ok(());
+                }
+                self.on_path_validated();
+
+                self.process_early_payload(now, packet)?;
+                if self.state.is_closed() {
+                    return Ok(());
+                }
+
+                if self.crypto.is_handshaking() {
+                    trace!("handshake ongoing");
+                    return Ok(());
+                }
+
+                if self.side.is_client() {
+                    // Client-only because server params were set from the client's Initial
+                    let params =
+                        self.crypto
+                            .transport_parameters()?
+                            .ok_or_else(|| TransportError {
+                                code: TransportErrorCode::crypto(0x6d),
+                                frame: None,
+                                reason: "transport parameters missing".into(),
+                            })?;
+
+                    if self.has_0rtt() {
+                        if !self.crypto.early_data_accepted().unwrap() {
+                            debug_assert!(self.side.is_client());
+                            debug!("0-RTT rejected");
+                            self.accepted_0rtt = false;
+                            self.streams.zero_rtt_rejected();
+
+                            // Discard already-queued frames
+                            self.spaces[SpaceId::Data].pending = Retransmits::default();
+
+                            // Discard 0-RTT packets
+                            let sent_packets =
+                                mem::take(&mut self.spaces[SpaceId::Data].sent_packets);
+                            for packet in sent_packets.into_values() {
+                                self.remove_in_flight(&packet);
+                            }
+                        } else {
+                            self.accepted_0rtt = true;
+                            params.validate_resumption_from(&self.peer_params)?;
+                        }
+                    }
+                    if let Some(token) = params.stateless_reset_token {
+                        self.endpoint_events
+                            .push_back(EndpointEventInner::ResetToken(self.path.remote, token));
+                    }
+                    self.handle_peer_params(params)?;
+                    self.issue_first_cids(now);
+                } else {
+                    // Server-only
+                    self.spaces[SpaceId::Data].pending.handshake_done = true;
+                    self.discard_space(now, SpaceId::Handshake);
+                }
+
+                self.events.push_back(Event::Connected);
+                self.state = State::Established;
+                trace!("established");
+                Ok(())
+            }
+            Header::Initial(InitialHeader {
+                src_cid: rem_cid, ..
+            }) => {
+                if !state.rem_cid_set {
+                    trace!("switching remote CID to {}", rem_cid);
+                    let mut state = state.clone();
+                    self.rem_cids.update_initial_cid(rem_cid);
+                    self.rem_handshake_cid = rem_cid;
+                    self.orig_rem_cid = rem_cid;
+                    state.rem_cid_set = true;
+                    self.state = State::Handshake(state);
+                } else if rem_cid != self.rem_handshake_cid {
+                    debug!(
+                        "discarding packet with mismatched remote CID: {} != {}",
+                        self.rem_handshake_cid, rem_cid
+                    );
+                    return Ok(());
+                }
+            prev_packet = Some(packet);
+        }
+
+        // OnPacketsLost
+        if let Some(largest_lost) = lost_packets.last().cloned() {
+            let old_bytes_in_flight = self.path.in_flight.bytes;
+            let largest_lost_sent = self.spaces[pn_space].sent_packets[&largest_lost].time_sent;
+            self.stats.path.lost_packets += lost_packets.len() as u64;
+            self.stats.path.lost_bytes += size_of_lost_packets;
+            trace!(
+                "packets lost: {:?}, bytes lost: {}",
+                lost_packets, size_of_lost_packets
+            );
+
+            for &packet in &lost_packets {
+                let info = self.spaces[pn_space].take(packet).unwrap(); // safe: lost_packets is populated just above
+                self.config.qlog_sink.emit_packet_lost(
+                    packet,
+                    &info,
+                    lost_send_time,
+                    pn_space,
+                    now,
+                    self.orig_rem_cid,
+                );
+                self.remove_in_flight(&info);
+                for frame in info.stream_frames {
+                    self.streams.retransmit(frame);
+                }
+                self.spaces[pn_space].pending |= info.retransmits;
+                self.path.mtud.on_non_probe_lost(packet, info.size);
+            }
+
+            if self.path.mtud.black_hole_detected(now) {
+                self.stats.path.black_holes_detected += 1;
+                self.path
+                    .congestion
+                    .on_mtu_update(self.path.mtud.current_mtu());
+                if let Some(max_datagram_size) = self.datagrams().max_size() {
+                    self.datagrams.drop_oversized(max_datagram_size);
+                }
+            }
+
+            // Don't apply congestion penalty for lost ack-only packets
+            let lost_ack_eliciting = old_bytes_in_flight != self.path.in_flight.bytes;
+
+            if lost_ack_eliciting {
+                self.stats.path.congestion_events += 1;
+                self.path.congestion.on_congestion_event(
+                    now,
+                    largest_lost_sent,
+                    in_persistent_congestion,
+    pub fn rtt(&self) -> Duration {
+        self.path.rtt.get()
+    }
+
+    /// Current state of this connection's congestion controller, for debugging purposes
+    pub fn congestion_state(&self) -> &dyn Controller {
+        self.path.congestion.as_ref()
+    }
+
+    /// Resets path-specific settings.
+    ///
+    /// This will force-reset several subsystems related to a specific network path.
+    /// Currently this is the congestion controller, round-trip estimator, and the MTU
+    /// discovery.
+    ///
+    /// This is useful when it is known the underlying network path has changed and the old
+    /// state of these subsystems is no longer valid or optimal. In this case it might be
+    /// faster or reduce loss to settle on optimal values by restarting from the initial
+    /// configuration in the [`TransportConfig`].
+    pub fn path_changed(&mut self, now: Instant) {
+        self.path.reset(now, &self.config);
+    }
+
+    /// Modify the number of remotely initiated streams that may be concurrently open
+    ///
+    /// No streams may be opened by the peer unless fewer than `count` are already open. Large
+    /// `count`s increase both minimum and worst-case memory consumption.
+    pub fn set_max_concurrent_streams(&mut self, dir: Dir, count: VarInt) {
+        self.streams.set_max_concurrent(dir, count);
+        // If the limit was reduced, then a flow control update previously deemed insignificant may
+        // now be significant.
+        let pending = &mut self.spaces[SpaceId::Data].pending;
+        self.streams.queue_max_stream_id(pending);
+    }
+
+    /// Current number of remotely initiated streams that may be concurrently open
+    ///
+    /// If the target for this limit is reduced using [`set_max_concurrent_streams`](Self::set_max_concurrent_streams),
+    /// it will not change immediately, even if fewer streams are open. Instead, it will
+    /// decrement by one for each time a remotely initiated stream of matching directionality is closed.
+    pub fn max_concurrent_streams(&self, dir: Dir) -> u64 {
+        self.streams.max_concurrent(dir)
+    }
+
+    /// See [`TransportConfig::send_window()`]
+    pub fn set_send_window(&mut self, send_window: u64) {
+        self.streams.set_send_window(send_window);
+    }
+
+    /// See [`TransportConfig::receive_window()`]
+    pub fn set_receive_window(&mut self, receive_window: VarInt) {
+        if self.streams.set_receive_window(receive_window) {
+            self.spaces[SpaceId::Data].pending.max_data = true;
+        }
+    }
+
+    fn on_ack_received(
+        &mut self,
+        now: Instant,
+        space: SpaceId,
+        ack: frame::Ack,
+    ) -> Result<(), TransportError> {
+        if ack.largest >= self.spaces[space].next_packet_number {
+            return Err(TransportError::PROTOCOL_VIOLATION("unsent packet acked"));
+        }
+        let new_largest = {
+            let space = &mut self.spaces[space];
+            if space
+                .largest_acked_packet
+use std::any::Any;
+use std::sync::Arc;
+
+use super::{BASE_DATAGRAM_SIZE, Controller, ControllerFactory};
+use crate::Instant;
+use crate::connection::RttEstimator;
+
+/// A simple, standard congestion controller
+#[derive(Debug, Clone)]
+pub struct NewReno {
+    config: Arc<NewRenoConfig>,
+    current_mtu: u64,
+    /// Maximum number of bytes in flight that may be sent.
+    window: u64,
+    /// Slow start threshold in bytes. When the congestion window is below ssthresh, the mode is
+    /// slow start and the window grows by the number of bytes acknowledged.
+    ssthresh: u64,
+    /// The time when QUIC first detects a loss, causing it to enter recovery. When a packet sent
+    /// after this time is acknowledged, QUIC exits recovery.
+    recovery_start_time: Instant,
+    /// Bytes which had been acked by the peer since leaving slow start
+    bytes_acked: u64,
+}
+
+impl NewReno {
+    /// Construct a state using the given `config` and current time `now`
+    pub fn new(config: Arc<NewRenoConfig>, now: Instant, current_mtu: u16) -> Self {
+        Self {
+            window: config.initial_window,
+            ssthresh: u64::MAX,
+            recovery_start_time: now,
+            current_mtu: current_mtu as u64,
+            config,
+            bytes_acked: 0,
+        }
+    }
+
+    fn minimum_window(&self) -> u64 {
+        2 * self.current_mtu
+    }
+}
+
+impl Controller for NewReno {
+    fn on_ack(
+        &mut self,
+        _now: Instant,
+        sent: Instant,
+        bytes: u64,
+        app_limited: bool,
+        _rtt: &RttEstimator,
+    ) {
+        if app_limited || sent <= self.recovery_start_time {
+            return;
+        }
+
+        if self.window < self.ssthresh {
+            // Slow start
+            self.window += bytes;
+
+            if self.window >= self.ssthresh {
+                // Exiting slow start
+                // Initialize `bytes_acked` for congestion avoidance. The idea
+                // here is that any bytes over `sshthresh` will already be counted
+                // towards the congestion avoidance phase - independent of when
+                // how close to `sshthresh` the `window` was when switching states,
+                // and independent of datagram sizes.
+                self.bytes_acked = self.window - self.ssthresh;
+            }
+        } else {
+            // Congestion avoidance
+            // This implementation uses the method which does not require
+            // floating point math, which also increases the window by 1 datagram
+            // for every round trip.
+            // This mechanism is called Appropriate Byte Counting in
+            // https://tools.ietf.org/html/rfc3465
+            self.bytes_acked += bytes;
+
+            if self.bytes_acked >= self.window {
+                self.bytes_acked -= self.window;
+                self.window += self.current_mtu;
+            }
+        }
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        is_persistent_congestion: bool,
+        _lost_bytes: u64,
+    ) {
+        if sent <= self.recovery_start_time {
+            return;
+        }
+
+        self.recovery_start_time = now;
+        self.window = (self.window as f32 * self.config.loss_reduction_factor) as u64;
+        self.window = self.window.max(self.minimum_window());
+        self.ssthresh = self.window;
+
+        if is_persistent_congestion {
+            self.window = self.minimum_window();
+        }
+    }
+
+    fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.current_mtu = new_mtu as u64;
+        self.window = self.window.max(self.minimum_window());
+    }
+
+    fn window(&self) -> u64 {
+        self.window
+    }
+
+    fn metrics(&self) -> super::ControllerMetrics {
+        super::ControllerMetrics {
+            congestion_window: self.window(),
+            ssthresh: Some(self.ssthresh),
+            pacing_rate: None,
+        }
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.config.initial_window
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+/// Configuration for the `NewReno` congestion controller
+#[derive(Debug, Clone)]
+pub struct NewRenoConfig {
+    initial_window: u64,
+    loss_reduction_factor: f32,
+}
+
+impl NewRenoConfig {
+    /// Default limit on the amount of outstanding data in bytes.
+    ///
+    /// Recommended value: `min(10 * max_datagram_size, max(2 * max_datagram_size, 14720))`
+    pub fn initial_window(&mut self, value: u64) -> &mut Self {
+        self.initial_window = value;
+        self
+    }
+
+    /// Reduction in congestion window when a new loss event is detected.
+    pub fn loss_reduction_factor(&mut self, value: f32) -> &mut Self {
+        self.loss_reduction_factor = value;
+        self
+    }
+}
+
+impl Default for NewRenoConfig {
+    fn default() -> Self {
+        Self {
+            initial_window: 14720.clamp(2 * BASE_DATAGRAM_SIZE, 10 * BASE_DATAGRAM_SIZE),
+            loss_reduction_factor: 0.5,
+        }
+    }
+}
+
+impl ControllerFactory for NewRenoConfig {
+    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        Box::new(NewReno::new(self, now, current_mtu))
+    }
+}
+//! Storing tokens sent from servers in NEW_TOKEN frames and using them in subsequent connections
+
+use std::{
+    collections::{HashMap, VecDeque, hash_map},
+    sync::{Arc, Mutex},
+};
+
+use bytes::Bytes;
+use lru_slab::LruSlab;
+use tracing::trace;
+
+use crate::token::TokenStore;
+
+/// `TokenStore` implementation that stores up to `N` tokens per server name for up to a
+/// limited number of server names, in-memory
+#[derive(Debug)]
+pub struct TokenMemoryCache(Mutex<State>);
+
+impl TokenMemoryCache {
+    /// Construct empty
+    pub fn new(max_server_names: u32, max_tokens_per_server: usize) -> Self {
+        Self(Mutex::new(State::new(
+            max_server_names,
+            max_tokens_per_server,
+        )))
+    }
+}
+
+impl TokenStore for TokenMemoryCache {
+    fn insert(&self, server_name: &str, token: Bytes) {
+        trace!(%server_name, "storing token");
+        self.0.lock().unwrap().store(server_name, token)
+    }
+
+    fn take(&self, server_name: &str) -> Option<Bytes> {
+        let token = self.0.lock().unwrap().take(server_name);
+        trace!(%server_name, found=%token.is_some(), "taking token");
+        token
+    }
+}
+
+/// Defaults to a maximum of 256 servers and 2 tokens per server
+impl Default for TokenMemoryCache {
+    fn default() -> Self {
+        Self::new(256, 2)
+    }
+}
+
+/// Lockable inner state of `TokenMemoryCache`
+#[derive(Debug)]
+struct State {
+    max_server_names: u32,
+    max_tokens_per_server: usize,
+    // map from server name to index in lru
+    lookup: HashMap<Arc<str>, u32>,
+    lru: LruSlab<CacheEntry>,
+}
+
+impl State {
+    fn new(max_server_names: u32, max_tokens_per_server: usize) -> Self {
+        Self {
+            max_server_names,
+            max_tokens_per_server,
+            lookup: HashMap::new(),
+            lru: LruSlab::default(),
+        }
+    }
+
+    fn store(&mut self, server_name: &str, token: Bytes) {
+        if self.max_server_names == 0 {
+            // the rest of this method assumes that we can always insert a new entry so long as
+            // we're willing to evict a pre-existing entry. thus, an entry limit of 0 is an edge
+            // case we must short-circuit on now.
+            return;
+        }
+        if self.max_tokens_per_server == 0 {
+            // similarly to above, the rest of this method assumes that we can always push a new
+            // token to a queue so long as we're willing to evict a pre-existing token, so we
+            // short-circuit on the edge case of a token limit of 0.
+            return;
+        }
+
+        let server_name = Arc::<str>::from(server_name);
+        match self.lookup.entry(server_name.clone()) {
+            hash_map::Entry::Occupied(hmap_entry) => {
+                // key already exists, push the new token to its token queue
+                let tokens = &mut self.lru.get_mut(*hmap_entry.get()).tokens;
+                if tokens.len() >= self.max_tokens_per_server {
+                    debug_assert!(tokens.len() == self.max_tokens_per_server);
+                    tokens.pop_front().unwrap();
+                }
+                tokens.push_back(token);
+            }
+            hash_map::Entry::Vacant(hmap_entry) => {
+                // key does not yet exist, create a new one, evicting the oldest if necessary
+                let removed_key = if self.lru.len() >= self.max_server_names {
+                    // unwrap safety: max_server_names is > 0, so there's at least one entry, so
+                    //                lru() is some
+                    Some(self.lru.remove(self.lru.lru().unwrap()).server_name)
+                } else {
+                    None
+                };
+
+                hmap_entry.insert(self.lru.insert(CacheEntry::new(server_name, token)));
+
+                // for borrowing reasons, we must defer removing the evicted hmap entry to here
+                if let Some(removed_slot) = removed_key {
+                    let removed = self.lookup.remove(&removed_slot);
+                    debug_assert!(removed.is_some());
+                }
+            }
+        };
+    }
+
+    fn take(&mut self, server_name: &str) -> Option<Bytes> {
+        let slab_key = *self.lookup.get(server_name)?;
+
+        // pop from entry's token queue
+        let entry = self.lru.get_mut(slab_key);
+        // unwrap safety: we never leave tokens empty
+        let token = entry.tokens.pop_front().unwrap();
+
+        if entry.tokens.is_empty() {
+            // token stack emptied, remove entry
+            self.lru.remove(slab_key);
+            self.lookup.remove(server_name);
+        }
+
+        Some(token)
+    }
+}
+
+/// Cache entry within `TokenMemoryCache`'s LRU slab
+#[derive(Debug)]
+struct CacheEntry {
+    server_name: Arc<str>,
+    // invariant: tokens is never empty
+    tokens: VecDeque<Bytes>,
+}
+
+impl CacheEntry {
+    /// Construct with a single token
+    fn new(server_name: Arc<str>, token: Bytes) -> Self {
+        let mut tokens = VecDeque::new();
+        tokens.push_back(token);
+        Self {
+            server_name,
+            tokens,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use super::*;
+    use rand::prelude::*;
+    use rand_pcg::Pcg32;
+
+    fn new_rng() -> impl Rng {
+        Pcg32::from_seed(0xdeadbeefdeadbeefdeadbeefdeadbeefu128.to_le_bytes())
+    }
+
+    #[test]
+    fn cache_test() {
+        let mut rng = new_rng();
+        const N: usize = 2;
+
+        for _ in 0..10 {
+            let mut cache_1: Vec<(u32, VecDeque<Bytes>)> = Vec::new(); // keep it sorted oldest to newest
+            let cache_2 = TokenMemoryCache::new(20, 2);
+
+            for i in 0..200 {
+                let server_name = rng.random::<u32>() % 10;
+                if rng.random_bool(0.666) {
+                    // store
+                    let token = Bytes::from(vec![i]);
+                    println!("STORE {server_name} {token:?}");
+                    if let Some((j, _)) = cache_1
+                        .iter()
+                        .enumerate()
+                        .find(|&(_, &(server_name_2, _))| server_name_2 == server_name)
+                    {
+                        let (_, mut queue) = cache_1.remove(j);
+                        queue.push_back(token.clone());
+                        if queue.len() > N {
+                            queue.pop_front();
+                        }
+                        cache_1.push((server_name, queue));
+                    } else {
+                        let mut queue = VecDeque::new();
+                        queue.push_back(token.clone());
+                        cache_1.push((server_name, queue));
+                        if cache_1.len() > 20 {
+                            cache_1.remove(0);
+                        }
+                    }
+                    cache_2.insert(&server_name.to_string(), token);
+                } else {
+                    // take
+                    println!("TAKE {server_name}");
+                    let expecting = cache_1
+                        .iter()
+                        .enumerate()
+                        .find(|&(_, &(server_name_2, _))| server_name_2 == server_name)
+                        .map(|(j, _)| j)
+                        .map(|j| {
+                            let (_, mut queue) = cache_1.remove(j);
+                            let token = queue.pop_front().unwrap();
+                            if !queue.is_empty() {
+                                cache_1.push((server_name, queue));
+                            }
+                            token
+                        });
+                    println!("EXPECTING {expecting:?}");
+                    assert_eq!(cache_2.take(&server_name.to_string()), expecting);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_max_server_names() {
+        // test that this edge case doesn't panic
+        let cache = TokenMemoryCache::new(0, 2);
+        for i in 0..10 {
+            cache.insert(&i.to_string(), Bytes::from(vec![i]));
+            for j in 0..10 {
+                assert!(cache.take(&j.to_string()).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn zero_queue_length() {
+        // test that this edge case doesn't panic
+        let cache = TokenMemoryCache::new(256, 0);
+        for i in 0..10 {
+            cache.insert(&i.to_string(), Bytes::from(vec![i]));
+            for j in 0..10 {
+                assert!(cache.take(&j.to_string()).is_none());
+            }
+        }
+    }
+}

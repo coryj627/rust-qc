@@ -1,0 +1,789 @@
+    }
+
+    fn add_lookup_byte(lookup: &mut [u8; 16], byte: u8) {
+        lookup[(byte & 0x0f) as usize] |= 1 << (byte >> 4);
+    }
+
+    /// Computes a bit mask for the given byteslice starting from the given index,
+    /// where the 16 least significant bits indicate (by value of 1) whether or not
+    /// there is a special character at that byte position. The least significant bit
+    /// corresponds to `bytes[ix]` and the most significant bit corresponds to
+    /// `bytes[ix + 15]`.
+    /// It is only safe to call this function when `bytes.len() >= ix + VECTOR_SIZE`.
+    #[target_feature(enable = "ssse3")]
+    #[inline]
+    unsafe fn compute_mask(lut: &[u8; 16], bytes: &[u8], ix: usize) -> i32 {
+        debug_assert!(bytes.len() >= ix + VECTOR_SIZE);
+
+        let bitmap = _mm_loadu_si128(lut.as_ptr() as *const __m128i);
+        // Small lookup table to compute single bit bitshifts
+        // for 16 bytes at once.
+        let bitmask_lookup =
+            _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, -128, -1, -1, -1, -1, -1, -1, -1, -1);
+
+        // Load input from memory.
+        let raw_ptr = bytes.as_ptr().add(ix) as *const __m128i;
+        let input = _mm_loadu_si128(raw_ptr);
+        // Compute the bitmap using the bottom nibble as an index
+        // into the lookup table. Note that non-ascii bytes will have
+        // their most significant bit set and will map to lookup[0].
+        let bitset = _mm_shuffle_epi8(bitmap, input);
+        // Compute the high nibbles of the input using a 16-bit rightshift of four
+        // and a mask to prevent most-significant bit issues.
+        let higher_nibbles = _mm_and_si128(_mm_srli_epi16(input, 4), _mm_set1_epi8(0x0f));
+        // Create a bitmask for the bitmap by perform a left shift of the value
+        // of the higher nibble. Bytes with their most significant set are mapped
+        // to -1 (all ones).
+        let bitmask = _mm_shuffle_epi8(bitmask_lookup, higher_nibbles);
+        // Test the bit of the bitmap by AND'ing the bitmap and the mask together.
+        let tmp = _mm_and_si128(bitset, bitmask);
+        // Check whether the result was not null. NEQ is not a SIMD intrinsic,
+        // but comparing to the bitmask is logically equivalent. This also prevents us
+        // from matching any non-ASCII bytes since none of the bitmaps were all ones
+        // (-1).
+        let result = _mm_cmpeq_epi8(tmp, bitmask);
+
+        // Return the resulting bitmask.
+        _mm_movemask_epi8(result)
+    }
+
+    /// Calls callback on byte indices and their value.
+    /// Breaks when callback returns LoopInstruction::BreakAtWith(ix, val). And skips the
+    /// number of bytes in callback return value otherwise.
+    /// Returns the final index and a possible break value.
+    pub(super) fn iterate_special_bytes<F, T>(
+        lut: &LookupTable,
+        bytes: &[u8],
+        ix: usize,
+        callback: F,
+    ) -> (usize, Option<T>)
+    where
+        F: FnMut(usize, u8) -> LoopInstruction<Option<T>>,
+    {
+        if is_x86_feature_detected!("ssse3") && bytes.len() >= VECTOR_SIZE {
+            unsafe { simd_iterate_special_bytes(&lut.simd, bytes, ix, callback) }
+        } else {
+            super::scalar_iterate_special_bytes(&lut.scalar, bytes, ix, callback)
+        }
+    }
+
+    /// Calls the callback function for every 1 in the given bitmask with
+    /// the index `offset + ix`, where `ix` is the position of the 1 in the mask.
+    /// Returns `Ok(ix)` to continue from index `ix`, `Err((end_ix, opt_val)` to break with
+    /// final index `end_ix` and optional value `opt_val`.
+    unsafe fn process_mask<F, T>(
+        mut mask: i32,
+        bytes: &[u8],
+        mut offset: usize,
+        callback: &mut F,
+    ) -> Result<usize, (usize, Option<T>)>
+    where
+        F: FnMut(usize, u8) -> LoopInstruction<Option<T>>,
+    {
+        while mask != 0 {
+            let mask_ix = mask.trailing_zeros() as usize;
+            offset += mask_ix;
+            match callback(offset, *bytes.get_unchecked(offset)) {
+                LoopInstruction::ContinueAndSkip(skip) => {
+                    offset += skip + 1;
+                    let shift = skip + 1 + mask_ix;
+                    if shift >= 32 {
+                        break;
+                    }
+                    mask >>= shift;
+                }
+                LoopInstruction::BreakAtWith(ix, val) => return Err((ix, val)),
+            }
+        }
+        Ok(offset)
+    }
+
+    #[target_feature(enable = "ssse3")]
+    /// Important: only call this function when `bytes.len() >= 16`. Doing
+    /// so otherwise may exhibit undefined behaviour.
+    unsafe fn simd_iterate_special_bytes<F, T>(
+        lut: &[u8; 16],
+        bytes: &[u8],
+        mut ix: usize,
+        mut callback: F,
+    ) -> (usize, Option<T>)
+    where
+        F: FnMut(usize, u8) -> LoopInstruction<Option<T>>,
+    {
+        debug_assert!(bytes.len() >= VECTOR_SIZE);
+        let upperbound = bytes.len() - VECTOR_SIZE;
+
+        while ix < upperbound {
+            let mask = compute_mask(lut, bytes, ix);
+            let block_start = ix;
+            ix = match process_mask(mask, bytes, ix, &mut callback) {
+                Ok(ix) => std::cmp::max(ix, VECTOR_SIZE + block_start),
+                Err((end_ix, val)) => return (end_ix, val),
+            };
+        }
+
+        if bytes.len() > ix {
+            // shift off the bytes at start we have already scanned
+            let mask = compute_mask(lut, bytes, upperbound) >> ix - upperbound;
+            if let Err((end_ix, val)) = process_mask(mask, bytes, ix, &mut callback) {
+                return (end_ix, val);
+            }
+        }
+
+        (bytes.len(), None)
+    }
+
+    #[cfg(test)]
+    mod simd_test {
+        use super::super::create_lut;
+        use super::{iterate_special_bytes, LoopInstruction};
+        use crate::Options;
+
+        fn check_expected_indices(bytes: &[u8], expected: &[usize], skip: usize) {
+            let mut opts = Options::empty();
+            opts.insert(Options::ENABLE_MATH);
+            opts.insert(Options::ENABLE_TABLES);
+            opts.insert(Options::ENABLE_FOOTNOTES);
+            opts.insert(Options::ENABLE_STRIKETHROUGH);
+            opts.insert(Options::ENABLE_SUPERSCRIPT);
+            opts.insert(Options::ENABLE_TASKLISTS);
+
+            let lut = create_lut(&opts);
+            let mut indices = vec![];
+
+            iterate_special_bytes::<_, i32>(&lut, bytes, 0, |ix, _byte_ty| {
+                indices.push(ix);
+                LoopInstruction::ContinueAndSkip(skip)
+            });
+
+            assert_eq!(&indices[..], expected);
+        }
+
+        #[test]
+        fn simple_no_match() {
+            check_expected_indices("abcdef0123456789".as_bytes(), &[], 0);
+        }
+
+        #[test]
+        fn simple_match() {
+            check_expected_indices("*bcd&f0123456789".as_bytes(), &[0, 4], 0);
+        }
+
+        #[test]
+        fn single_open_fish() {
+            check_expected_indices("<".as_bytes(), &[0], 0);
+        }
+
+        #[test]
+        fn long_match() {
+            check_expected_indices("0123456789abcde~*bcd&f0".as_bytes(), &[15, 16, 20], 0);
+        }
+
+        #[test]
+        fn border_skip() {
+            check_expected_indices("0123456789abcde~~~~d&f0".as_bytes(), &[15, 20], 3);
+        }
+
+        #[test]
+        fn exhaustive_search() {
+            let chars = [
+                b'\n', b'\r', b'*', b'_', b'~', b'^', b'|', b'&', b'\\', b'[', b']', b'<', b'!',
+                b'`', b'$', b'{', b'}',
+            ];
+
+            for &c in &chars {
+                for i in 0u8..=255 {
+                    if !chars.contains(&i) {
+                        // full match
+                        let mut buf = [i; 18];
+                        buf[3] = c;
+                        buf[6] = c;
+
+                        check_expected_indices(&buf[..], &[3, 6], 0);
+                    }
+                }
+            }
+        }
+    }
+}
+struct LookupTable {
+    simd: [u8; 16],
+    scalar: [bool; 256],
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "simd")))]
+type LookupTable = [bool; 256];
+
+/// This function walks the byte slices from the given index and
+/// calls the callback function on all bytes (and their indices) that are in the following set:
+/// `` ` ``, `\`, `&`, `*`, `_`, `~`, `!`, `<`, `[`, `]`, `|`, `\r`, `\n`
+/// It is guaranteed not call the callback on other bytes.
+/// Whenever `callback(ix, byte)` returns a `ContinueAndSkip(n)` value, the callback
+/// will not be called with an index that is less than `ix + n + 1`.
+/// When the callback returns a `BreakAtWith(end_ix, opt+val)`, no more callbacks will be
+/// called and the function returns immediately with the return value `(end_ix, opt_val)`.
+/// If `BreakAtWith(..)` is never returned, this function will return the first
+/// index that is outside the byteslice bound and a `None` value.
+fn iterate_special_bytes<F, T>(
+    lut: &LookupTable,
+    bytes: &[u8],
+    ix: usize,
+    callback: F,
+) -> (usize, Option<T>)
+where
+    F: FnMut(usize, u8) -> LoopInstruction<Option<T>>,
+{
+    #[cfg(all(target_arch = "x86_64", feature = "simd"))]
+    {
+        simd::iterate_special_bytes(lut, bytes, ix, callback)
+    }
+    #[cfg(not(all(target_arch = "x86_64", feature = "simd")))]
+    {
+        scalar_iterate_special_bytes(lut, bytes, ix, callback)
+    }
+}
+
+fn scalar_iterate_special_bytes<F, T>(
+    lut: &[bool; 256],
+    bytes: &[u8],
+    mut ix: usize,
+    mut callback: F,
+) -> (usize, Option<T>)
+where
+    F: FnMut(usize, u8) -> LoopInstruction<Option<T>>,
+{
+    while ix < bytes.len() {
+        let b = bytes[ix];
+        if lut[b as usize] {
+            match callback(ix, b) {
+                LoopInstruction::ContinueAndSkip(skip) => {
+                    ix += skip;
+                }
+                LoopInstruction::BreakAtWith(ix, val) => {
+                    return (ix, val);
+                }
+            }
+        }
+        ix += 1;
+    }
+
+    (ix, None)
+}
+
+/// Split the usual heading content range and the content inside the trailing attribute block.
+///
+/// Returns `(leading_content_len, Option<trailing_attr_block_range>)`.
+///
+/// Note that `trailing_attr_block_range` will be empty range when the block
+/// is `{}`, since the range is content inside the wrapping `{` and `}`.
+///
+/// The closing `}` of an attribute block can have trailing whitespaces.
+/// They are automatically trimmed when the attribute block is being searched.
+///
+/// However, this method does not trim the trailing whitespaces of heading content.
+/// It is callers' responsibility to trim them if necessary.
+fn extract_attribute_block_content_from_header_text(
+    heading: &[u8],
+) -> (usize, Option<Range<usize>>) {
+    let heading_len = heading.len();
+    let mut ix = heading_len;
+use pulldown_cmark::{Options, Parser};
+
+fn parse(md: &str) {
+    let parser = Parser::new(md);
+
+    for _ in parser {}
+}
+
+fn parse_all_options(md: &str) {
+    let parser = Parser::new_ext(md, Options::all());
+
+    for _ in parser {}
+}
+
+#[test]
+fn test_lists_inside_code_spans() {
+    parse(
+        r"- `
+x
+**
+  *
+  `",
+    );
+}
+
+#[test]
+fn test_fuzzer_input_1() {
+    parse(">\n >>><N\n");
+}
+
+#[test]
+fn test_fuzzer_input_2() {
+    parse(" \u{b}\\\r- ");
+}
+
+#[test]
+fn test_fuzzer_input_3() {
+    parse_all_options("\n # #\r\u{1c} ");
+}
+
+#[test]
+fn test_fuzzer_input_4() {
+    parse_all_options("\u{0}{\tϐ}\n-");
+}
+
+#[test]
+fn test_fuzzer_input_5() {
+    parse_all_options(" \u{c}{}\n-\n");
+}
+
+#[test]
+fn test_fuzzer_input_6() {
+    parse("*\t[][\n\t<p]>\n\t[]");
+}
+
+#[test]
+fn test_fuzzer_input_7() {
+    parse_all_options("[][{]}\n-");
+}
+
+#[test]
+fn test_fuzzer_input_8() {
+    parse_all_options("a\n \u{c}{}\n-");
+}
+
+#[test]
+fn test_fuzzer_input_9() {
+    parse_all_options("a\n \u{c}{}\\\n-");
+}
+
+#[test]
+fn test_fuzzer_input_10() {
+    parse_all_options("[[    \t\n   \u{c}\u{c}\u{c}\u{c}\u{c}    {}\n-\r\u{e}\u{0}\u{0}{# }\n\u{b}\u{b}\u{b}\u{b}\u{b}\u{b}\u{b}\u{b}\u{b}\u{b}\u{0}\u{0}");
+}
+
+#[test]
+fn test_fuzzer_input_11() {
+    parse_all_options(
+        "[[\u{c}\u{c}   \t\n   \u{c}\u{c}\u{c}\u{c}\u{c}\u{c}\u{c}\u{c}\u{c}       {}\n-\r\u{e}",
+    );
+}
+
+#[test]
+fn test_fuzzer_input_12() {
+    parse_all_options("\u{c}-\n\u{c}\n-");
+}
+
+#[test]
+fn test_fuzzer_input_13() {
+    // Does not fail with Options::all():
+    Parser::new_ext(
+        ".\r> ^](\r\u{c}\r\0\0\r.\r[^\0\0\\\0\0\0^^^^^]",
+        Options::ENABLE_FOOTNOTES,
+    );
+}
+
+#[test]
+fn test_wrong_code_block() {
+    parse(
+        r##"```
+ * ```
+ "##,
+    );
+}
+
+#[test]
+fn test_unterminated_link() {
+    parse("[](\\");
+}
+
+#[test]
+fn test_unterminated_autolink() {
+    parse("<a");
+}
+
+#[test]
+fn test_infinite_loop() {
+    parse("[<!W\n\\\n");
+}
+
+#[test]
+fn test_html_tag() {
+    parse("<script\u{feff}");
+}
+
+// all of test_bad_slice_* were found in https://github.com/raphlinus/pulldown-cmark/issues/521
+#[test]
+fn test_bad_slice_a() {
+    parse("><a\n");
+}
+
+#[test]
+fn test_bad_slice_b() {
+    parse("><a a\n");
+}
+
+#[test]
+fn test_bad_slice_unicode() {
+    parse("><a a=\n毿>")
+}
+
+#[test]
+fn test_simd_wrapping_shr_issue_651() {
+    parse("`````````````````````````````````x`");
+}
+
+
+Here, though, `[foo][bar]` is parsed as a reference, since
+`[bar]` is defined:
+
+```````````````````````````````` example
+[foo][bar][baz]
+
+[baz]: /url1
+[bar]: /url2
+.
+<p><a href="/url2">foo</a><a href="/url1">baz</a></p>
+````````````````````````````````
+
+
+Here `[foo]` is not parsed as a shortcut reference, because it
+is followed by a link label (even though `[bar]` is not defined):
+
+```````````````````````````````` example
+[foo][bar][baz]
+
+[baz]: /url1
+[foo]: /url2
+.
+<p>[foo]<a href="/url1">bar</a></p>
+````````````````````````````````
+
+
+
+## Images
+
+Syntax for images is like the syntax for links, with one
+difference. Instead of [link text], we have an
+[image description](@).  The rules for this are the
+same as for [link text], except that (a) an
+image description starts with `![` rather than `[`, and
+(b) an image description may contain links.
+An image description has inline elements
+as its contents.  When an image is rendered to HTML,
+this is standardly used as the image's `alt` attribute.
+
+```````````````````````````````` example
+![foo](/url "title")
+.
+<p><img src="/url" alt="foo" title="title" /></p>
+````````````````````````````````
+
+
+```````````````````````````````` example
+![foo *bar*]
+
+[foo *bar*]: train.jpg "train & tracks"
+.
+<p><img src="train.jpg" alt="foo bar" title="train &amp; tracks" /></p>
+````````````````````````````````
+
+
+```````````````````````````````` example
+![foo ![bar](/url)](/url2)
+.
+<p><img src="/url2" alt="foo bar" /></p>
+````````````````````````````````
+
+
+```````````````````````````````` example
+![foo [bar](/url)](/url2)
+.
+<p><img src="/url2" alt="foo bar" /></p>
+````````````````````````````````
+
+
+Though this spec is concerned with parsing, not rendering, it is
+recommended that in rendering to HTML, only the plain string content
+of the [image description] be used.  Note that in
+the above example, the alt attribute's value is `foo bar`, not `foo
+[bar](/url)` or `foo <a href="/url">bar</a>`.  Only the plain string
+content is rendered, without formatting.
+
+```````````````````````````````` example
+![foo *bar*][]
+
+[foo *bar*]: train.jpg "train & tracks"
+.
+<p><img src="train.jpg" alt="foo bar" title="train &amp; tracks" /></p>
+````````````````````````````````
+
+
+```````````````````````````````` example
+![foo *bar*][foobar]
+
+[FOOBAR]: train.jpg "train & tracks"
+.
+<p><img src="train.jpg" alt="foo bar" title="train &amp; tracks" /></p>
+````````````````````````````````
+
+
+use pulldown_cmark::{html, CowStr, Event, LinkType, Options, Parser, Tag};
+use regex::RegexBuilder;
+use std::io::Write;
+
+/// This example demonstrates how to normalize the href of a wikilink. The
+/// details of this implementation can be tweaked for different use cases.
+fn main() {
+    let markdown_input: &str = r#"
+Example provided by [[https://example.org/]].
+Some people might prefer the wikilink syntax for autolinks.
+
+Wanna go for a [[Wiki Walk]]?"#;
+
+    let parser = Parser::new_ext(markdown_input, Options::ENABLE_WIKILINKS).map(|event| {
+        if let Event::Start(Tag::Link {
+            link_type: LinkType::WikiLink { has_pothole },
+            dest_url,
+            title,
+            id,
+        }) = event
+        {
+            let new_link = normalize_wikilink(dest_url);
+            Event::Start(Tag::Link {
+                link_type: LinkType::WikiLink { has_pothole },
+                dest_url: new_link,
+                title,
+                id,
+            })
+        } else {
+            event
+        }
+    });
+
+    // Write to anything implementing the `Write` trait. This could also be a file
+    // or network socket.
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle.write_all(b"\nHTML output:\n").unwrap();
+    html::write_html_io(&mut handle, parser).unwrap();
+}
+
+/// Performs wikilink normalization.
+fn normalize_wikilink(link: CowStr) -> CowStr {
+    // your wiki is stored at "/wiki"
+    let prefix: &str = "/wiki";
+    if link.is_empty() {
+        return link;
+    }
+
+    // check if the link is absolute, if it is, return as is
+    // according to RFC 3986; https://www.rfc-editor.org/rfc/rfc3986
+    let is_absolute = RegexBuilder::new("^(?:[a-z][a-z0-9+\\-.]*:)?//")
+        .case_insensitive(true)
+        .build()
+        .expect("valid regex");
+
+    if is_absolute.is_match(&link) {
+        return link;
+    }
+
+    let mut result = String::with_capacity(link.len() + 2);
+    let mut i = 0;
+    let mut mark = 0;
+    let mut in_whitespace = false;
+
+    result.push_str(prefix);
+
+    if !link.starts_with('/') {
+        result.push('/');
+    }
+
+    while i < link.len() {
+        if !in_whitespace && link.as_bytes()[i].is_ascii_whitespace() {
+            in_whitespace = true;
+            result.push_str(&link[mark..i]);
+        } else if in_whitespace && !link.as_bytes()[i].is_ascii_whitespace() {
+            result.push('_');
+            mark = i;
+            in_whitespace = false;
+        }
+
+        i += 1;
+    }
+
+    if !in_whitespace {
+        result.push_str(&link[mark..]);
+    }
+    if !result.ends_with('/') {
+        result.push('/');
+    }
+    result.into()
+}
+use std::collections::HashMap;
+use std::fmt::Write as _;
+use std::io::Write as _;
+
+use pulldown_cmark::{html, CowStr, Event, Options, Parser, Tag, TagEnd};
+
+/// This example shows how to do footnotes as bottom-notes, in the style of GitHub.
+fn main() {
+    let markdown_input: &str = "This is an [^a] footnote [^a].\n\n[^a]: footnote contents";
+    println!("Parsing the following markdown string:\n{}", markdown_input);
+
+    // To generate this style, you have to collect the footnotes at the end, while parsing.
+    // You also need to count usages.
+    let mut footnotes = Vec::new();
+    let mut in_footnote = Vec::new();
+    let mut footnote_numbers = HashMap::new();
+    // ENABLE_FOOTNOTES is used in this example, but ENABLE_OLD_FOOTNOTES would work, too.
+    let parser = Parser::new_ext(markdown_input, Options::ENABLE_FOOTNOTES)
+        .filter_map(|event| {
+            match event {
+                Event::Start(Tag::FootnoteDefinition(_)) => {
+                    in_footnote.push(vec![event]);
+                    None
+                }
+                Event::End(TagEnd::FootnoteDefinition) => {
+                    let mut f = in_footnote.pop().unwrap();
+                    f.push(event);
+                    footnotes.push(f);
+                    None
+                }
+                Event::FootnoteReference(name) => {
+                    let n = footnote_numbers.len() + 1;
+                    let (n, nr) = footnote_numbers.entry(name.clone()).or_insert((n, 0usize));
+                    *nr += 1;
+                    let html = Event::Html(format!(r##"<sup class="footnote-reference" id="fr-{name}-{nr}"><a href="#fn-{name}">[{n}]</a></sup>"##).into());
+                    if in_footnote.is_empty() {
+                        Some(html)
+                    } else {
+                        in_footnote.last_mut().unwrap().push(html);
+                        None
+                    }
+                }
+                _ if !in_footnote.is_empty() => {
+                    in_footnote.last_mut().unwrap().push(event);
+                    None
+                }
+                _ => Some(event),
+            }
+        });
+
+    // Write to anything implementing the `Write` trait. This could also be a file
+    // or network socket.
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle.write_all(b"\nHTML output:\n").unwrap();
+    html::write_html_io(&mut handle, parser).unwrap();
+
+    // To make the footnotes look right, we need to sort them by their appearance order, not by
+    // the in-tree order of their actual definitions. Unused items are omitted entirely.
+    //
+    // For example, this code:
+    //
+    //     test [^1] [^2]
+    //     [^2]: second used, first defined
+    //     [^1]: test
+    //
+    // Gets rendered like *this* if you copy it into a GitHub comment box:
+    //
+    //     <p>test <sup>[1]</sup> <sup>[2]</sup></p>
+    //     <hr>
+    //     <ol>
+    //     <li>test ↩</li>
+    //     <li>second used, first defined ↩</li>
+    //     </ol>
+    if !footnotes.is_empty() {
+        footnotes.retain(|f| match f.first() {
+            Some(Event::Start(Tag::FootnoteDefinition(name))) => {
+                footnote_numbers.get(name).unwrap_or(&(0, 0)).1 != 0
+            }
+            _ => false,
+        });
+        footnotes.sort_by_cached_key(|f| match f.first() {
+            Some(Event::Start(Tag::FootnoteDefinition(name))) => {
+                footnote_numbers.get(name).unwrap_or(&(0, 0)).0
+            }
+            _ => unreachable!(),
+        });
+        handle
+            .write_all(b"<hr><ol class=\"footnotes-list\">\n")
+            .unwrap();
+        html::write_html_io(
+            &mut handle,
+            footnotes.into_iter().flat_map(|fl| {
+                // To write backrefs, the name needs kept until the end of the footnote definition.
+                let mut name = CowStr::from("");
+                // Backrefs are included in the final paragraph of the footnote, if it's normal text.
+                // For example, this DOM can be produced:
+                //
+                // Markdown:
+                //
+                //     five [^feet].
+                //
+                //     [^feet]:
+                //         A foot is defined, in this case, as 0.3048 m.
+                //
+                //         Historically, the foot has not been defined this way, corresponding to many
+                //         subtly different units depending on the location.
+                //
+                // HTML:
+                //
+                //     <p>five <sup class="footnote-reference" id="fr-feet-1"><a href="#fn-feet">[1]</a></sup>.</p>
+                //
+                //     <ol class="footnotes-list">
+                //     <li id="fn-feet">
+                //     <p>A foot is defined, in this case, as 0.3048 m.</p>
+                //     <p>Historically, the foot has not been defined this way, corresponding to many
+                //     subtly different units depending on the location. <a href="#fr-feet-1">↩</a></p>
+                //     </li>
+                //     </ol>
+                //
+                // This is mostly a visual hack, so that footnotes use less vertical space.
+                //
+                // If there is no final paragraph, such as a tabular, list, or image footnote, it gets
+                // pushed after the last tag instead.
+                let mut has_written_backrefs = false;
+                let fl_len = fl.len();
+                let footnote_numbers = &footnote_numbers;
+                fl.into_iter().enumerate().map(move |(i, f)| match f {
+                    Event::Start(Tag::FootnoteDefinition(current_name)) => {
+                        name = current_name;
+                        has_written_backrefs = false;
+                        Event::Html(format!(r##"<li id="fn-{name}">"##).into())
+                    }
+                    Event::End(TagEnd::FootnoteDefinition) | Event::End(TagEnd::Paragraph)
+                        if !has_written_backrefs && i >= fl_len - 2 =>
+                    {
+                        let usage_count = footnote_numbers.get(&name).unwrap().1;
+                        let mut end = String::with_capacity(
+                            name.len() + (r##" <a href="#fr--1">↩</a></li>"##.len() * usage_count),
+                        );
+                        for usage in 1..=usage_count {
+                            if usage == 1 {
+                                write!(&mut end, r##" <a href="#fr-{name}-{usage}">↩</a>"##)
+                                    .unwrap();
+                            } else {
+                                write!(&mut end, r##" <a href="#fr-{name}-{usage}">↩{usage}</a>"##)
+                                    .unwrap();
+                            }
+                        }
+                        has_written_backrefs = true;
+                        if f == Event::End(TagEnd::FootnoteDefinition) {
+                            end.push_str("</li>\n");
+                        } else {
+                            end.push_str("</p>\n");
+                        }
+                        Event::Html(end.into())
+                    }
+                    Event::End(TagEnd::FootnoteDefinition) => Event::Html("</li>\n".into()),
+                    Event::FootnoteReference(_) => unreachable!("converted to HTML earlier"),
+                    f => f,
+                })
+            }),
+        )
+        .unwrap();
+        handle.write_all(b"</ol>\n").unwrap();
+    }
+}

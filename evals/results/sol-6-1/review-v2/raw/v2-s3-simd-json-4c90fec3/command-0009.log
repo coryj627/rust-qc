@@ -1,0 +1,1511 @@
+/// A dom object that references the raw input data to avoid allocations
+/// it trades having lifetimes for a gain in performance.
+///
+/// Access via array indexes is possible:
+/// ```rust
+/// use simd_json::{BorrowedValue, json};
+/// use simd_json::prelude::*;
+/// let mut a = json!([1, 2, 3]);
+/// assert_eq!(a[1], 2);
+/// a[1] = 42.into();
+/// assert_eq!(a[1], 42);
+/// ```
+///
+/// Access via object keys is possible as well:
+/// ```rust
+/// use simd_json::{BorrowedValue, json};
+/// use simd_json::prelude::*;
+/// let mut a = json!({"key": "not the value"});
+/// assert_eq!(a["key"], "not the value");
+/// a["key"] = "value".into();
+/// assert_eq!(a["key"], "value");
+/// ```
+mod cmp;
+mod from;
+mod serialize;
+
+use super::ObjectHasher;
+use crate::{Buffers, prelude::*};
+use crate::{Deserializer, Node, Result};
+use crate::{cow::Cow, safer_unchecked::GetSaferUnchecked as _};
+use halfbrown::HashMap;
+use std::fmt;
+use std::ops::{Index, IndexMut};
+
+/// Representation of a JSON object
+pub type Object<'value> = HashMap<Cow<'value, str>, Value<'value>, ObjectHasher>;
+/// Representation of a JSON array
+pub type Array<'value> = Vec<Value<'value>>;
+
+/// Parses a slice of bytes into a Value dom.
+///
+/// This function will rewrite the slice to de-escape strings.
+/// As we reference parts of the input slice the resulting dom
+/// has the same lifetime as the slice it was created from.
+///
+/// # Errors
+///
+/// Will return `Err` if `s` is invalid JSON.
+pub fn to_value(s: &mut [u8]) -> Result<Value<'_>> {
+    match Deserializer::from_slice(s) {
+        Ok(de) => Ok(BorrowDeserializer::from_deserializer(de).parse()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Parses a slice of bytes into a Value dom.
+///
+/// This function will rewrite the slice to de-escape strings.
+/// As we reference parts of the input slice the resulting dom
+/// has the same lifetime as the slice it was created from.
+///
+/// Passes in reusable buffers to reduce allocations.
+///
+///  # Errors
+///
+/// Will return `Err` if `s` is invalid JSON.
+pub fn to_value_with_buffers<'value>(
+    s: &'value mut [u8],
+    buffers: &mut Buffers,
+) -> Result<Value<'value>> {
+    match Deserializer::from_slice_with_buffers(s, buffers) {
+        Ok(de) => Ok(BorrowDeserializer::from_deserializer(de).parse()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Borrowed JSON-DOM Value, consider using the `ValueTrait`
+/// to access its content
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "ordered-float", derive(Eq))]
+pub enum Value<'value> {
+    /// Static values
+    Static(StaticNode),
+    /// string type
+    String(Cow<'value, str>),
+    /// array type
+    Array(Box<Vec<Value<'value>>>),
+    /// object type
+    Object(Box<Object<'value>>),
+}
+
+impl<'value> Value<'value> {
+    fn as_static(&self) -> Option<StaticNode> {
+        match self {
+            Self::Static(s) => Some(*s),
+            _ => None,
+        }
+    }
+
+    /// Enforces static lifetime on a borrowed value, this will
+    /// force all strings to become owned COW's, the same applies for
+    /// Object keys.
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[must_use]
+    pub fn into_static(self) -> Value<'static> {
+        match self {
+            // Ensure strings are static by turing the cow into a 'static
+            // This cow has static lifetime as it's owned, this information however is lost
+            // by the borrow checker so we need to transmute it to static.
+            // This invariant is guaranteed by the implementation of the cow, cloning an owned
+            // value will produce a owned value again see:
+            // https://docs.rs/beef/0.4.4/src/beef/generic.rs.html#379-391
+            Self::String(s) => unsafe {
+                std::mem::transmute::<Value<'value>, Value<'static>>(Self::String(Cow::from(
+                    s.into_owned(),
+                )))
+            },
+            // For an array we turn every value into a static
+            Self::Array(arr) => arr.into_iter().map(Value::into_static).collect(),
+            // For an object, we turn all keys into owned Cows and all values into 'static Values
+            Self::Object(obj) => obj
+                .into_iter()
+                .map(|(k, v)| (Cow::from(k.into_owned()), v.into_static()))
+                .collect(),
+
+            // Static nodes are always static
+            Value::Static(s) => Value::Static(s),
+        }
+    }
+
+    /// Clones the current value and enforces a static lifetime, it works the same
+    /// as `into_static` but includes cloning logic
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[must_use]
+    pub fn clone_static(&self) -> Value<'static> {
+        match self {
+            // Ensure strings are static by turing the cow into a 'static
+            // This cow has static lifetime as it's owned, this information however is lost
+            // by the borrow checker so we need to transmute it to static.
+            // This invariant is guaranteed by the implementation of the cow, cloning an owned
+            // value will produce a owned value again see:
+            // https://docs.rs/beef/0.4.4/src/beef/generic.rs.html#379-391
+            Self::String(s) => unsafe {
+                std::mem::transmute::<Value<'value>, Value<'static>>(Self::String(Cow::from(
+                    s.to_string(),
+                )))
+            },
+            // For an array we turn every value into a static
+            Self::Array(arr) => arr.iter().cloned().map(Value::into_static).collect(),
+            // For an object, we turn all keys into owned Cows and all values into 'static Values
+            Self::Object(obj) => obj
+                .iter()
+                .map(|(k, v)| (Cow::from(k.to_string()), v.clone_static()))
+                .collect(),
+
+            // Static nodes are always static
+            Value::Static(s) => Value::Static(*s),
+        }
+    }
+}
+
+impl<'value> ValueBuilder<'value> for Value<'value> {
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn null() -> Self {
+        Self::Static(StaticNode::Null)
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn array_with_capacity(capacity: usize) -> Self {
+        Self::Array(Box::new(Vec::with_capacity(capacity)))
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn object_with_capacity(capacity: usize) -> Self {
+        Self::Object(Box::new(Object::with_capacity_and_hasher(
+            capacity,
+            ObjectHasher::default(),
+        )))
+    }
+}
+
+impl<'value> ValueAsMutArray for Value<'value> {
+    type Array = Array<'value>;
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_array_mut(&mut self) -> Option<&mut Vec<Value<'value>>> {
+        match self {
+            Self::Array(a) => Some(a),
+            _ => None,
+        }
+    }
+}
+impl<'value> ValueAsMutObject for Value<'value> {
+    type Object = Object<'value>;
+    /// Get mutable access to a map.
+    ///
+    /// ```rust
+    /// use simd_json::*;
+    /// use value_trait::prelude::*;
+    ///
+    /// let mut object: BorrowedValue = json!({
+    ///   "answer": 23,
+    ///   "key": 7
+    /// }).into();
+    /// assert_eq!(object["answer"], 23);
+    ///
+    /// if let Some(inner) = object.as_object_mut() {
+    ///   inner.insert("value".into(), BorrowedValue::from(json!({"nested": 42})));
+    /// }
+    /// assert_eq!(object["value"], json!({"nested": 42}));
+    ///
+    /// ```
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_object_mut(&mut self) -> Option<&mut Object<'value>> {
+        match self {
+            Self::Object(m) => Some(m),
+            _ => None,
+        }
+    }
+}
+
+impl TypedValue for Value<'_> {
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn value_type(&self) -> ValueType {
+        match self {
+            Self::Static(s) => s.value_type(),
+            Self::String(_) => ValueType::String,
+            Self::Array(_) => ValueType::Array,
+            Self::Object(_) => ValueType::Object,
+        }
+    }
+}
+impl ValueAsScalar for Value<'_> {
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_null(&self) -> Option<()> {
+        self.as_static()?.as_null()
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_bool(&self) -> Option<bool> {
+        self.as_static()?.as_bool()
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_i64(&self) -> Option<i64> {
+        self.as_static()?.as_i64()
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_i128(&self) -> Option<i128> {
+        self.as_static()?.as_i128()
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_u64(&self) -> Option<u64> {
+        self.as_static()?.as_u64()
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_u128(&self) -> Option<u128> {
+        self.as_static()?.as_u128()
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_f64(&self) -> Option<f64> {
+        self.as_static()?.as_f64()
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn cast_f64(&self) -> Option<f64> {
+        self.as_static()?.cast_f64()
+    }
+
+/// A lifetime less DOM implementation. It uses strings to make te
+/// structure fully owned, avoiding lifetimes at the cost of performance.
+/// Access via array indexes is possible:
+/// ```rust
+/// use simd_json::{OwnedValue, json};
+/// use simd_json::prelude::*;
+/// let mut a = json!([1, 2, 3]);
+/// assert_eq!(a[1], 2);
+/// a[1] = 42.into();
+/// assert_eq!(a[1], 42);
+/// ```
+///
+/// Access via object keys is possible as well:
+/// ```rust
+/// use simd_json::{OwnedValue, json};
+/// use simd_json::prelude::*;
+/// let mut a = json!({"key": "not the value"});
+/// assert_eq!(a["key"], "not the value");
+/// a["key"] = "value".into();
+/// assert_eq!(a["key"], "value");
+/// ```
+mod cmp;
+mod from;
+mod serialize;
+
+use super::ObjectHasher;
+use crate::{Buffers, prelude::*};
+use crate::{Deserializer, Node, Result};
+use halfbrown::HashMap;
+use std::fmt;
+use std::ops::{Index, IndexMut};
+
+/// Representation of a JSON object
+pub type Object = HashMap<String, Value, ObjectHasher>;
+
+/// Parses a slice of bytes into a Value dom.
+///
+/// This function will rewrite the slice to de-escape strings.
+/// We do not keep any references to the raw data but re-allocate
+/// owned memory wherever required thus returning a value without
+/// a lifetime.
+///
+/// # Errors
+///
+/// Will return `Err` if `s` is invalid JSON.
+pub fn to_value(s: &mut [u8]) -> Result<Value> {
+    match Deserializer::from_slice(s) {
+        Ok(de) => Ok(OwnedDeserializer::from_deserializer(de).parse()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Parses a slice of bytes into a Value dom.
+///
+/// This function will rewrite the slice to de-escape strings.
+/// We do not keep any references to the raw data but re-allocate
+/// owned memory wherever required thus returning a value without
+/// a lifetime.
+///
+/// Passes in reusable buffers to reduce allocations.
+///
+/// # Errors
+///
+/// Will return `Err` if `s` is invalid JSON.
+pub fn to_value_with_buffers(s: &mut [u8], buffers: &mut Buffers) -> Result<Value> {
+    match Deserializer::from_slice_with_buffers(s, buffers) {
+        Ok(de) => Ok(OwnedDeserializer::from_deserializer(de).parse()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Owned JSON-DOM Value, consider using the `ValueTrait`
+/// to access it's content.
+/// This is slower then the `BorrowedValue` as a tradeoff
+/// for getting rid of lifetimes.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "ordered-float", derive(Eq))]
+pub enum Value {
+    /// Static values
+    Static(StaticNode),
+    /// string type
+    String(String),
+    /// array type
+    Array(Box<Vec<Value>>),
+    /// object type
+    Object(Box<Object>),
+}
+
+impl Value {
+    fn as_static(&self) -> Option<StaticNode> {
+        match self {
+            Value::Static(s) => Some(*s),
+            _ => None,
+        }
+    }
+}
+
+impl ValueBuilder<'_> for Value {
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn null() -> Self {
+        Self::Static(StaticNode::Null)
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn array_with_capacity(capacity: usize) -> Self {
+        Self::Array(Box::new(Vec::with_capacity(capacity)))
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn object_with_capacity(capacity: usize) -> Self {
+        Self::Object(Box::new(Object::with_capacity_and_hasher(
+            capacity,
+            ObjectHasher::default(),
+        )))
+    }
+}
+
+impl ValueAsMutArray for Value {
+    type Array = Vec<Self>;
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_array_mut(&mut self) -> Option<&mut Vec<Self>> {
+        match self {
+            Self::Array(a) => Some(a),
+            _ => None,
+        }
+    }
+}
+impl ValueAsMutObject for Value {
+    type Object = Object;
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_object_mut(&mut self) -> Option<&mut Object> {
+        match self {
+            Self::Object(m) => Some(m),
+            _ => None,
+        }
+    }
+}
+
+impl TypedValue for Value {
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn value_type(&self) -> ValueType {
+        match self {
+            Self::Static(s) => s.value_type(),
+            Self::String(_) => ValueType::String,
+            Self::Array(_) => ValueType::Array,
+            Self::Object(_) => ValueType::Object,
+        }
+    }
+}
+impl ValueAsScalar for Value {
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_null(&self) -> Option<()> {
+        self.as_static()?.as_null()
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_bool(&self) -> Option<bool> {
+        self.as_static()?.as_bool()
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_i64(&self) -> Option<i64> {
+        self.as_static()?.as_i64()
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_i128(&self) -> Option<i128> {
+        self.as_static()?.as_i128()
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_u64(&self) -> Option<u64> {
+        self.as_static()?.as_u64()
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_u128(&self) -> Option<u128> {
+        self.as_static()?.as_u128()
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_f64(&self) -> Option<f64> {
+        self.as_static()?.as_f64()
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn cast_f64(&self) -> Option<f64> {
+        self.as_static()?.cast_f64()
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+}
+impl ValueAsArray for Value {
+    type Array = Vec<Self>;
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_array(&self) -> Option<&Vec<Self>> {
+        match self {
+            Self::Array(a) => Some(a),
+            _ => None,
+        }
+    }
+}
+impl ValueAsObject for Value {
+    type Object = Object;
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn as_object(&self) -> Option<&Object> {
+// This is mostly taken from json-rust's codegen
+// as it seems to perform well and it makes snense to see
+// if we can adopt the approach
+//
+// https://github.com/maciejhirsz/json-rust/blob/master/src/codegen.rs
+
+use super::{Object, Value};
+use crate::prelude::*;
+use std::io;
+use std::io::Write;
+use value_trait::generator::{
+    DumpGenerator, PrettyGenerator, PrettyWriterGenerator, WriterGenerator,
+};
+
+//use util::print_dec;
+
+impl Writable for Value<'_> {
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn encode(&self) -> String {
+        let mut g = DumpGenerator::new();
+        let _r = g.write_json(self);
+        g.consume()
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn encode_pp(&self) -> String {
+        let mut g = PrettyGenerator::new(2);
+        let _r = g.write_json(self);
+        g.consume()
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn write<'writer, W>(&self, w: &mut W) -> io::Result<()>
+    where
+        W: 'writer + Write,
+    {
+        let mut g = WriterGenerator::new(w);
+        g.write_json(self)
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn write_pp<'writer, W>(&self, w: &mut W) -> io::Result<()>
+    where
+        W: 'writer + Write,
+    {
+        let mut g = PrettyWriterGenerator::new(w, 2);
+        g.write_json(self)
+    }
+}
+
+trait Generator: BaseGenerator {
+    type T: Write;
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn write_object(&mut self, object: &Object) -> io::Result<()> {
+        if object.is_empty() {
+            self.write(b"{}")
+        } else {
+            let mut iter = object.iter();
+            stry!(self.write(b"{"));
+
+            // We know this exists since it's not empty
+            let Some((key, value)) = iter.next() else {
+                // We check against size
+                unreachable!("object is not empty but has no next");
+            };
+            self.indent();
+            stry!(self.new_line());
+            stry!(self.write_simple_string(key));
+            stry!(self.write_min(b": ", b':'));
+            stry!(self.write_json(value));
+
+            for (key, value) in iter {
+                stry!(self.write(b","));
+                stry!(self.new_line());
+                stry!(self.write_simple_string(key));
+                stry!(self.write_min(b": ", b':'));
+                stry!(self.write_json(value));
+            }
+            self.dedent();
+            stry!(self.new_line());
+            self.write(b"}")
+        }
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn write_json(&mut self, json: &Value) -> io::Result<()> {
+        match *json {
+            Value::Static(StaticNode::Null) => self.write(b"null"),
+            Value::Static(StaticNode::I64(number)) => self.write_int(number),
+            #[cfg(feature = "128bit")]
+            Value::Static(StaticNode::I128(number)) => self.write_int(number),
+            Value::Static(StaticNode::U64(number)) => self.write_int(number),
+            #[cfg(feature = "128bit")]
+            Value::Static(StaticNode::U128(number)) => self.write_int(number),
+            #[allow(clippy::useless_conversion)] // .into() required by ordered-float
+            Value::Static(StaticNode::F64(number)) => self.write_float(number.into()),
+            Value::Static(StaticNode::Bool(true)) => self.write(b"true"),
+            Value::Static(StaticNode::Bool(false)) => self.write(b"false"),
+            Value::String(ref string) => self.write_string(string),
+            Value::Array(ref array) => {
+                if array.is_empty() {
+                    self.write(b"[]")
+                } else {
+                    let mut iter = <[Value]>::iter(array);
+                    // We know we have one item
+
+                    let Some(item) = iter.next() else {
+                        // We check against size
+                        unreachable!("array is not empty but has no next");
+                    };
+                    stry!(self.write(b"["));
+                    self.indent();
+
+                    stry!(self.new_line());
+                    stry!(self.write_json(item));
+
+                    for item in iter {
+                        stry!(self.write(b","));
+                        stry!(self.new_line());
+                        stry!(self.write_json(item));
+                    }
+                    self.dedent();
+                    stry!(self.new_line());
+                    self.write(b"]")
+                }
+            }
+            Value::Object(ref object) => self.write_object(object),
+        }
+    }
+}
+
+trait FastGenerator: BaseGenerator {
+    type T: Write;
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn write_object(&mut self, object: &Object) -> io::Result<()> {
+        if object.is_empty() {
+            self.write(b"{}")
+        } else {
+            let mut iter = object.iter();
+            stry!(self.write(b"{\""));
+
+            // We know this exists since it's not empty
+            let Some((key, value)) = iter.next() else {
+                // We check against size
+                unreachable!("object is not empty but has no next");
+            };
+            stry!(self.write_simple_str_content(key));
+            stry!(self.write(b"\":"));
+            stry!(self.write_json(value));
+
+            for (key, value) in iter {
+                stry!(self.write(b",\""));
+                stry!(self.write_simple_str_content(key));
+                stry!(self.write(b"\":"));
+                stry!(self.write_json(value));
+            }
+            self.write(b"}")
+        }
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn write_json(&mut self, json: &Value) -> io::Result<()> {
+        match *json {
+            Value::Static(StaticNode::Null) => self.write(b"null"),
+            Value::Static(StaticNode::I64(number)) => self.write_int(number),
+            #[cfg(feature = "128bit")]
+            Value::Static(StaticNode::I128(number)) => self.write_int(number),
+            Value::Static(StaticNode::U64(number)) => self.write_int(number),
+            #[cfg(feature = "128bit")]
+            Value::Static(StaticNode::U128(number)) => self.write_int(number),
+            #[allow(clippy::useless_conversion)] // .into() required by ordered-float
+            Value::Static(StaticNode::F64(number)) => self.write_float(number.into()),
+            Value::Static(StaticNode::Bool(true)) => self.write(b"true"),
+            Value::Static(StaticNode::Bool(false)) => self.write(b"false"),
+            Value::String(ref string) => self.write_string(string),
+            Value::Array(ref array) => {
+                if array.is_empty() {
+                    self.write(b"[]")
+                } else {
+                    let mut iter = <[Value]>::iter(array);
+                    // We know we have one item
+                    let Some(item) = iter.next() else {
+                        // We check against size
+                        unreachable!("array is not empty but has no next");
+                    };
+
+                    stry!(self.write(b"["));
+                    stry!(self.write_json(item));
+
+                    for item in iter {
+                        stry!(self.write(b","));
+                        stry!(self.write_json(item));
+                    }
+                    self.write(b"]")
+                }
+            }
+            Value::Object(ref object) => self.write_object(object),
+        }
+    }
+}
+
+impl FastGenerator for DumpGenerator {
+    type T = Vec<u8>;
+}
+
+impl Generator for PrettyGenerator {
+    type T = Vec<u8>;
+}
+
+impl<W> FastGenerator for WriterGenerator<'_, W>
+where
+    W: Write,
+{
+    type T = W;
+}
+
+impl<W> Generator for PrettyWriterGenerator<'_, W>
+where
+    W: Write,
+{
+    type T = W;
+}
+
+#[cfg(test)]
+mod test {
+    use super::Value;
+    use crate::prelude::*;
+
+    #[test]
+    fn null() {
+        assert_eq!(Value::Static(StaticNode::Null).encode(), "null");
+    }
+    #[test]
+    fn bool_true() {
+        assert_eq!(Value::Static(StaticNode::Bool(true)).encode(), "true");
+    }
+    #[test]
+    fn bool_false() {
+        assert_eq!(Value::Static(StaticNode::Bool(false)).encode(), "false");
+    }
+
+    #[test]
+    fn obj() {
+        let mut o = Value::object();
+        o.insert("k", ()).expect("insert");
+        assert_eq!(o.encode(), r#"{"k":null}"#);
+    }
+
+mod pp;
+use crate::{Error, ErrorType};
+pub use pp::*;
+use serde_ext::ser;
+use std::io::Write;
+use std::str;
+use value_trait::generator::BaseGenerator;
+
+macro_rules! iomap {
+    ($e:expr_2021) => {
+        ($e).map_err(|err| Error::generic(ErrorType::Io(err)))
+    };
+}
+
+/// Write a value to a vector
+/// # Errors
+/// when the data can not be written
+#[cfg_attr(not(feature = "no-inline"), inline)]
+pub fn to_vec<T>(to: &T) -> crate::Result<Vec<u8>>
+where
+    T: ser::Serialize + ?Sized,
+{
+    let v = Vec::with_capacity(512);
+    let mut s = Serializer(v);
+    to.serialize(&mut s).map(|()| s.0)
+}
+
+/// Write a value to a string
+///
+/// # Errors
+/// when the data can not be written
+#[cfg_attr(not(feature = "no-inline"), inline)]
+pub fn to_string<T>(to: &T) -> crate::Result<String>
+where
+    T: ser::Serialize + ?Sized,
+{
+    to_vec(to).map(|v| unsafe { String::from_utf8_unchecked(v) })
+}
+
+/// Write a value to a string
+/// # Errors
+/// when the data can not be written
+#[cfg_attr(not(feature = "no-inline"), inline)]
+pub fn to_writer<T, W>(writer: W, to: &T) -> crate::Result<()>
+where
+    T: ser::Serialize + ?Sized,
+    W: Write,
+{
+    let mut s = Serializer(writer);
+    to.serialize(&mut s)
+}
+struct Serializer<W: Write>(W);
+
+impl<W> BaseGenerator for Serializer<W>
+where
+    W: Write,
+{
+    type T = W;
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn get_writer(&mut self) -> &mut Self::T {
+        &mut self.0
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn write_min(&mut self, _slice: &[u8], min: u8) -> std::io::Result<()> {
+        self.0.write_all(&[min])
+    }
+}
+struct SerializeSeq<'serializer, W: Write + 'serializer> {
+    s: &'serializer mut Serializer<W>,
+    first: bool,
+}
+impl<W> ser::SerializeSeq for SerializeSeq<'_, W>
+where
+    W: Write,
+{
+    type Ok = ();
+    type Error = Error;
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_element<T>(&mut self, value: &T) -> Result<(), Self::Error>
+    where
+        T: ?Sized + serde_ext::Serialize,
+    {
+        let SerializeSeq {
+            ref mut s,
+            ref mut first,
+            ..
+        } = *self;
+        if *first {
+            *first = false;
+            value.serialize(&mut **s)
+        } else {
+            iomap!(s.write(b",")).and_then(|()| value.serialize(&mut **s))
+        }
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        if self.first {
+            Ok(())
+        } else {
+            iomap!(self.s.write(b"]"))
+        }
+    }
+}
+
+impl<W> ser::SerializeTuple for SerializeSeq<'_, W>
+where
+    W: Write,
+{
+    type Ok = ();
+    type Error = Error;
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_element<T>(&mut self, value: &T) -> Result<(), Self::Error>
+    where
+        T: ?Sized + serde_ext::Serialize,
+    {
+        let SerializeSeq {
+            ref mut s,
+            ref mut first,
+        } = *self;
+        if *first {
+            *first = false;
+            value.serialize(&mut **s)
+        } else {
+            iomap!(s.write(b",")).and_then(|()| value.serialize(&mut **s))
+        }
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        if self.first {
+            Ok(())
+        } else {
+            iomap!(self.s.write(b"]"))
+        }
+    }
+}
+
+impl<W> ser::SerializeTupleStruct for SerializeSeq<'_, W>
+where
+    W: Write,
+{
+    type Ok = ();
+    type Error = Error;
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_field<T>(&mut self, value: &T) -> Result<(), Self::Error>
+    where
+        T: ?Sized + serde_ext::Serialize,
+    {
+        let SerializeSeq {
+            ref mut s,
+            ref mut first,
+        } = *self;
+        if *first {
+            *first = false;
+            value.serialize(&mut **s)
+        } else {
+            iomap!(s.write(b",")).and_then(|()| value.serialize(&mut **s))
+        }
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        if self.first {
+            Ok(())
+        } else {
+            iomap!(self.s.write(b"]"))
+        }
+    }
+}
+
+impl<W> ser::SerializeTupleVariant for SerializeSeq<'_, W>
+where
+    W: Write,
+{
+    type Ok = ();
+    type Error = Error;
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_field<T>(&mut self, value: &T) -> Result<(), Self::Error>
+    where
+        T: ?Sized + serde_ext::Serialize,
+    {
+        let SerializeSeq {
+            ref mut s,
+            ref mut first,
+        } = *self;
+        if *first {
+            *first = false;
+            value.serialize(&mut **s)
+        } else {
+            iomap!(s.write(b",")).and_then(|()| value.serialize(&mut **s))
+        }
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        if self.first {
+            iomap!(self.s.write(b"}"))
+        } else {
+            iomap!(self.s.write(b"]}"))
+        }
+    }
+}
+
+struct SerializeMap<'serializer, W: Write + 'serializer> {
+    s: &'serializer mut Serializer<W>,
+    first: bool,
+    wrote_closing: bool,
+}
+
+impl<W> ser::SerializeMap for SerializeMap<'_, W>
+where
+    W: Write,
+{
+    type Ok = ();
+    type Error = Error;
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_key<T>(&mut self, key: &T) -> Result<(), Self::Error>
+    where
+        T: ?Sized + serde_ext::Serialize,
+    {
+        let SerializeMap {
+            ref mut s,
+            ref mut first,
+            ..
+        } = *self;
+
+        if *first {
+            *first = false;
+            key.serialize(MapKeySerializer { s: &mut **s })
+                .and_then(|()| iomap!(s.write(b":")))
+        } else {
+            iomap!(s.write(b","))
+                .and_then(|()| key.serialize(MapKeySerializer { s: &mut **s }))
+                .and_then(|()| iomap!(s.write(b":")))
+        }
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn serialize_value<T>(&mut self, value: &T) -> Result<(), Self::Error>
+    where
+        T: ?Sized + serde_ext::Serialize,
+    {
+        let SerializeMap { ref mut s, .. } = *self;
+        value.serialize(&mut **s)
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn end(self) -> Result<Self::Ok, Self::Error> {
+        if self.wrote_closing {
+            Ok(())
+        } else {
+            iomap!(self.s.write(b"}"))
+        }
+    }
+}
+
+/// Deserializer struct to deserialize a JSON
+#[derive(Debug)]
+pub struct Deserializer<'de> {
+    // Note: we use the 2nd part as both index and length since only one is ever
+    // used (array / object use len) everything else uses idx
+    pub(crate) tape: Vec<Node<'de>>,
+    idx: usize,
+}
+
+// architecture dependant parse_str
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SillyWrapper<'de> {
+    input: *mut u8,
+    _marker: std::marker::PhantomData<&'de ()>,
+}
+
+impl From<*mut u8> for SillyWrapper<'_> {
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    fn from(input: *mut u8) -> Self {
+        Self {
+            input,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "runtime-detection",
+    any(target_arch = "x86_64", target_arch = "x86"),
+))] // The runtime detection code is inspired from simdutf8's implementation
+type FnRaw = *mut ();
+#[cfg(all(
+    feature = "runtime-detection",
+    any(target_arch = "x86_64", target_arch = "x86"),
+))]
+type ParseStrFn = for<'invoke, 'de> unsafe fn(
+    SillyWrapper<'de>,
+    &'invoke [u8],
+    &'invoke mut [u8],
+    usize,
+) -> std::result::Result<&'de str, error::Error>;
+#[cfg(all(
+    feature = "runtime-detection",
+    any(target_arch = "x86_64", target_arch = "x86"),
+))]
+type FindStructuralBitsFn = unsafe fn(
+    input: &[u8],
+    structural_indexes: &mut Vec<u32>,
+) -> std::result::Result<(), ErrorType>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Supported implementations
+pub enum Implementation {
+    /// Rust native implementation
+    Native,
+    /// Rust native implementation with using [`std::simd`]
+    StdSimd,
+    /// SSE4.2 implementation
+    SSE42,
+    /// AVX2 implementation
+    AVX2,
+    /// ARM NEON implementation
+    NEON,
+    /// WEBASM SIMD128 implementation
+    SIMD128,
+}
+
+impl std::fmt::Display for Implementation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Implementation::Native => write!(f, "Rust Native"),
+            Implementation::StdSimd => write!(f, "std::simd"),
+            Implementation::SSE42 => write!(f, "SSE42"),
+            Implementation::AVX2 => write!(f, "AVX2"),
+            Implementation::NEON => write!(f, "NEON"),
+            Implementation::SIMD128 => write!(f, "SIMD128"),
+        }
+    }
+}
+
+impl Deserializer<'_> {
+    /// returns the algorithm / architecture used by the deserializer
+    #[cfg(all(
+        feature = "runtime-detection",
+        any(target_arch = "x86_64", target_arch = "x86"),
+    ))]
+    #[must_use]
+    pub fn algorithm() -> Implementation {
+        if std::is_x86_feature_detected!("avx2") {
+            Implementation::AVX2
+        } else if std::is_x86_feature_detected!("sse4.2") {
+            Implementation::SSE42
+        } else {
+            #[cfg(feature = "portable")]
+            let r = Implementation::StdSimd;
+            #[cfg(not(feature = "portable"))]
+            let r = Implementation::Native;
+            r
+        }
+    }
+    #[cfg(not(any(
+        all(
+            feature = "runtime-detection",
+            any(target_arch = "x86_64", target_arch = "x86")
+        ),
+        feature = "portable",
+        target_feature = "avx2",
+        target_feature = "sse4.2",
+        target_feature = "simd128",
+        target_arch = "aarch64",
+    )))]
+    /// returns the algorithm / architecture used by the deserializer
+    #[must_use]
+    pub fn algorithm() -> Implementation {
+        Implementation::Native
+    }
+    #[cfg(all(feature = "portable", not(feature = "runtime-detection")))]
+    /// returns the algorithm / architecture used by the deserializer
+    #[must_use]
+    pub fn algorithm() -> Implementation {
+        Implementation::StdSimd
+    }
+
+    #[cfg(all(
+        target_feature = "avx2",
+        not(feature = "portable"),
+        not(feature = "runtime-detection"),
+    ))]
+    /// returns the algorithm / architecture used by the deserializer
+    #[must_use]
+    pub fn algorithm() -> Implementation {
+        Implementation::AVX2
+    }
+
+    #[cfg(all(
+        target_feature = "sse4.2",
+        not(target_feature = "avx2"),
+        not(feature = "runtime-detection"),
+        not(feature = "portable"),
+    ))]
+    /// returns the algorithm / architecture used by the deserializer
+    #[must_use]
+    pub fn algorithm() -> Implementation {
+        Implementation::SSE42
+    }
+
+    #[cfg(all(target_arch = "aarch64", not(feature = "portable")))]
+    /// returns the algorithm / architecture used by the deserializer
+    #[must_use]
+    pub fn algorithm() -> Implementation {
+        Implementation::NEON
+    }
+
+    #[cfg(all(target_feature = "simd128", not(feature = "portable")))]
+    /// returns the algorithm / architecture used by the deserializer
+    #[must_use]
+    pub fn algorithm() -> Implementation {
+        Implementation::SIMD128
+    }
+}
+
+impl<'de> Deserializer<'de> {
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[cfg(all(
+        feature = "runtime-detection",
+        any(target_arch = "x86_64", target_arch = "x86"),
+    ))]
+    pub(crate) unsafe fn parse_str_<'invoke>(
+        input: *mut u8,
+        data: &'invoke [u8],
+        buffer: &'invoke mut [u8],
+        idx: usize,
+    ) -> Result<&'de str>
+    where
+        'de: 'invoke,
+    {
+        unsafe {
+            use std::sync::atomic::{AtomicPtr, Ordering};
+
+            static FN: AtomicPtr<()> = AtomicPtr::new(get_fastest as FnRaw);
+
+            #[cfg_attr(not(feature = "no-inline"), inline)]
+            fn get_fastest_available_implementation() -> ParseStrFn {
+                if std::is_x86_feature_detected!("avx2") {
+                    impls::avx2::parse_str
+                } else if std::is_x86_feature_detected!("sse4.2") {
+                    impls::sse42::parse_str
+                } else {
+                    #[cfg(feature = "portable")]
+                    let r = impls::portable::parse_str;
+                    #[cfg(not(feature = "portable"))]
+                    let r = impls::native::parse_str;
+                    r
+                }
+            }
+
+            #[cfg_attr(not(feature = "no-inline"), inline)]
+            unsafe fn get_fastest<'invoke, 'de>(
+                input: SillyWrapper<'de>,
+                data: &'invoke [u8],
+                buffer: &'invoke mut [u8],
+                idx: usize,
+            ) -> core::result::Result<&'de str, error::Error>
+            where
+                'de: 'invoke,
+            {
+                unsafe {
+                    let fun = get_fastest_available_implementation();
+                    FN.store(fun as FnRaw, Ordering::Relaxed);
+                    (fun)(input, data, buffer, idx)
+                }
+            }
+
+            let input: SillyWrapper<'de> = SillyWrapper::from(input);
+            let fun = FN.load(Ordering::Relaxed);
+            mem::transmute::<FnRaw, ParseStrFn>(fun)(input, data, buffer, idx)
+        }
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[cfg(not(any(
+        all(
+            feature = "runtime-detection",
+            any(target_arch = "x86_64", target_arch = "x86")
+        ),
+        feature = "portable",
+        target_feature = "avx2",
+        target_feature = "sse4.2",
+        target_feature = "simd128",
+        target_arch = "aarch64",
+    )))]
+    pub(crate) unsafe fn parse_str_<'invoke>(
+        input: *mut u8,
+        data: &'invoke [u8],
+        buffer: &'invoke mut [u8],
+        idx: usize,
+    ) -> Result<&'de str>
+    where
+        'de: 'invoke,
+    {
+        let input: SillyWrapper<'de> = SillyWrapper::from(input);
+        unsafe { impls::native::parse_str(input, data, buffer, idx) }
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[cfg(all(feature = "portable", not(feature = "runtime-detection")))]
+    pub(crate) unsafe fn parse_str_<'invoke>(
+        input: *mut u8,
+        data: &'invoke [u8],
+        buffer: &'invoke mut [u8],
+        idx: usize,
+    ) -> Result<&'de str>
+    where
+        'de: 'invoke,
+    {
+        let input: SillyWrapper<'de> = SillyWrapper::from(input);
+        impls::portable::parse_str(input, data, buffer, idx)
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[cfg(all(
+        target_feature = "avx2",
+        not(feature = "portable"),
+        not(feature = "runtime-detection"),
+    ))]
+    pub(crate) unsafe fn parse_str_<'invoke>(
+        input: *mut u8,
+        data: &'invoke [u8],
+        buffer: &'invoke mut [u8],
+        idx: usize,
+    ) -> Result<&'de str> {
+        let input: SillyWrapper<'de> = SillyWrapper::from(input);
+        unsafe { impls::avx2::parse_str(input, data, buffer, idx) }
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[cfg(all(
+        target_feature = "sse4.2",
+        not(target_feature = "avx2"),
+        not(feature = "runtime-detection"),
+        not(feature = "portable"),
+    ))]
+    pub(crate) unsafe fn parse_str_<'invoke>(
+        input: *mut u8,
+        data: &'invoke [u8],
+        buffer: &'invoke mut [u8],
+        idx: usize,
+    ) -> Result<&'de str> {
+        let input: SillyWrapper<'de> = SillyWrapper::from(input);
+        unsafe { impls::sse42::parse_str(input, data, buffer, idx) }
+    }
+
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[cfg(all(target_arch = "aarch64", not(feature = "portable")))]
+    pub(crate) unsafe fn parse_str_<'invoke>(
+        input: *mut u8,
+        data: &'invoke [u8],
+        buffer: &'invoke mut [u8],
+        idx: usize,
+    ) -> Result<&'de str> {
+        let input: SillyWrapper = SillyWrapper::from(input);
+        impls::neon::parse_str(input, data, buffer, idx)
+    }
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[cfg(all(target_feature = "simd128", not(feature = "portable")))]
+    pub(crate) unsafe fn parse_str_<'invoke>(
+        input: *mut u8,
+        data: &'invoke [u8],
+        buffer: &'invoke mut [u8],
+        idx: usize,
+    ) -> Result<&'de str> {
+        let input: SillyWrapper<'de> = SillyWrapper::from(input);
+        impls::simd128::parse_str(input, data, buffer, idx)
+    }
+}
+
+/// architecture dependant `find_structural_bits`
+impl Deserializer<'_> {
+    #[cfg_attr(not(feature = "no-inline"), inline)]
+    #[cfg(all(
+        feature = "runtime-detection",
+        any(target_arch = "x86_64", target_arch = "x86"),
+    ))]
+    pub(crate) unsafe fn find_structural_bits(
+        input: &[u8],
+        structural_indexes: &mut Vec<u32>,
+    ) -> std::result::Result<(), ErrorType> {
+        unsafe {
+            use std::sync::atomic::{AtomicPtr, Ordering};
+
+            static FN: AtomicPtr<()> = AtomicPtr::new(get_fastest as FnRaw);
+
+            #[cfg_attr(not(feature = "no-inline"), inline)]
+            fn get_fastest_available_implementation() -> FindStructuralBitsFn {
+                if std::is_x86_feature_detected!("avx2") {
+                    Deserializer::_find_structural_bits::<impls::avx2::SimdInput>
+                } else if std::is_x86_feature_detected!("sse4.2") {
+                    Deserializer::_find_structural_bits::<impls::sse42::SimdInput>
+                } else {
+                    #[cfg(feature = "portable")]
+                    let r = Deserializer::_find_structural_bits::<impls::portable::SimdInput>;
+                    #[cfg(not(feature = "portable"))]
+                    let r = Deserializer::_find_structural_bits::<impls::native::SimdInput>;
+                    r
+                }
+            }
+
+            #[cfg_attr(not(feature = "no-inline"), inline)]
+            unsafe fn get_fastest(
+                input: &[u8],
+                structural_indexes: &mut Vec<u32>,
+
+== format
+
+== clippy
+   Compiling libc v0.2.175
+   Compiling proc-macro2 v1.0.101
+   Compiling unicode-ident v1.0.18
+    Checking cfg-if v1.0.3
+   Compiling getrandom v0.3.3
+   Compiling autocfg v1.5.0
+   Compiling serde v1.0.219
+   Compiling num-traits v0.2.19
+   Compiling crossbeam-utils v0.8.21
+   Compiling quote v1.0.40
+   Compiling zerocopy v0.8.26
+   Compiling shlex v1.3.0
+   Compiling syn v2.0.106
+   Compiling find-msvc-tools v0.1.0
+   Compiling cc v1.2.35
+   Compiling syn v1.0.109
+    Checking itoa v1.0.15
+    Checking ryu v1.0.20
+    Checking once_cell v1.21.3
+   Compiling serde_json v1.0.143
+   Compiling rustix v1.0.8
+   Compiling jemalloc-sys v0.5.4+5.3.0-patched
+    Checking crossbeam-epoch v0.9.18
+    Checking rand_core v0.9.3
+    Checking linux-raw-sys v0.9.4
+   Compiling rayon-core v1.13.0
+    Checking foldhash v0.1.5
+    Checking equivalent v1.0.2
+    Checking regex-syntax v0.8.6
+    Checking memchr v2.7.5
+   Compiling version_check v0.9.5
+   Compiling serde_derive v1.0.219
+    Checking bitflags v2.9.4
+    Checking allocator-api2 v0.2.21
+    Checking either v1.15.0
+    Checking hashbrown v0.15.5
+   Compiling ahash v0.8.12
+    Checking crossbeam-deque v0.8.6
+    Checking half v2.6.0
+    Checking clap_lex v0.7.5
+    Checking plotters-backend v0.3.7
+    Checking ciborium-io v0.2.2
+    Checking fastrand v2.3.0
+    Checking arrayvec v0.7.6
+    Checking anstyle v1.0.11
+    Checking clap_builder v4.5.47
+    Checking tempfile v3.21.0
+    Checking ciborium-ll v0.2.2
+    Checking plotters-svg v0.3.7
+    Checking regex-automata v0.4.10
+   Compiling alloc_counter_macro v0.0.2
+    Checking halfbrown v0.3.0
+    Checking itertools v0.13.0
+    Checking ppv-lite86 v0.2.21
+    Checking float-cmp v0.10.0
+    Checking ordered-float v5.0.0
+    Checking wait-timeout v0.2.1
+    Checking pin-utils v0.1.0
+    Checking unicode-width v0.2.1
+    Checking same-file v1.0.6
+    Checking bit-vec v0.8.0
+    Checking quick-error v1.2.3
+    Checking fnv v1.0.7
+    Checking cast v0.3.0
+    Checking bit-set v0.8.0
+    Checking rusty-fork v0.3.0
+    Checking getopts v0.2.24
+    Checking walkdir v2.5.0
+    Checking value-trait v0.11.0
+    Checking alloc_counter v0.0.4
+    Checking rand_chacha v0.9.0
+    Checking tinytemplate v1.2.1
+    Checking criterion-plot v0.6.0
+    Checking regex v1.11.2
+    Checking ciborium v0.2.2
+    Checking rayon v1.11.0
+    Checking plotters v0.3.7
+    Checking clap v4.5.47
+    Checking rand_xorshift v0.4.0
+    Checking rand v0.9.2
+    Checking num_cpus v1.17.0
+    Checking lazy_static v1.5.0
+    Checking unarray v0.1.4
+    Checking oorandom v11.1.5
+    Checking anes v0.1.6
+    Checking beef v0.5.2
+    Checking simdutf8 v0.1.5
+    Checking colored v3.0.0
+    Checking proptest v1.7.0
+    Checking core_affinity v0.8.3
+    Checking criterion v0.7.0
+    Checking jemallocator v0.5.4
+    Checking simd-json v0.16.0 (/work/crate)
+error: cannot find macro `static_cast_i128` in this scope
+    --> src/numberparse/approx.rs:339:30
+     |
+ 339 |             let i = unsafe { static_cast_i128!(i.wrapping_neg()) };
+     |                              ^^^^^^^^^^^^^^^^
+     |
+    ::: src/macros.rs:1224:1
+     |
+1224 | macro_rules! static_cast_i32 {
+     | ---------------------------- similarly named macro `static_cast_i32` defined here
+     |
+help: a macro with a similar name exists
+     |
+ 339 -             let i = unsafe { static_cast_i128!(i.wrapping_neg()) };
+ 339 +             let i = unsafe { static_cast_i32!(i.wrapping_neg()) };
+     |
+
+error[E0554]: `#![feature]` may not be used on the stable release channel
+ --> src/lib.rs:2:32
+  |
+2 | #![cfg_attr(feature = "hints", feature(core_intrinsics))]
+  |                                ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: the feature `core_intrinsics` is internal to the compiler or standard library
+ --> src/lib.rs:2:40
+  |
+2 | #![cfg_attr(feature = "hints", feature(core_intrinsics))]
+  |                                        ^^^^^^^^^^^^^^^
+  |
+  = note: using it is strongly discouraged
+note: the lint level is defined here
+ --> src/lib.rs:1:9
+  |
+1 | #![deny(warnings)]
+  |         ^^^^^^^^
+  = note: `#[deny(internal_features)]` implied by `#[deny(warnings)]`
+
+error: unused imports: `static_cast_i64` and `unlikely`
+ --> src/numberparse/approx.rs:7:21
+  |
+7 | use crate::macros::{static_cast_i64, unlikely};
+  |                     ^^^^^^^^^^^^^^^  ^^^^^^^^
+  |
+  = note: `#[deny(unused_imports)]` implied by `#[deny(warnings)]`
+
+error: unused import: `macros::static_cast_u64`
+  --> src/lib.rs:47:5
+   |
+47 | use macros::static_cast_u64;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: unused import: `crate::macros::unlikely`
+ --> src/stage2.rs:3:5
+  |
+3 | use crate::macros::unlikely;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `#[ignore]` without reason
+   --> src/tests/serde.rs:589:1
+    |
+589 | #[ignore]
+    | ^^^^^^^^^
+    |
+    = help: add a reason with `= ".."`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#ignore_without_reason
+note: the lint level is defined here
+   --> src/lib.rs:9:5
+    |
+  9 |     clippy::pedantic,
+    |     ^^^^^^^^^^^^^^^^
+    = note: `#[deny(clippy::ignore_without_reason)]` implied by `#[deny(clippy::pedantic)]`
+
+error: `#[ignore]` without reason
+   --> src/tests.rs:169:1
+    |
+169 | #[ignore]
+    | ^^^^^^^^^
+    |
+    = help: add a reason with `= ".."`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.99.0/index.html#ignore_without_reason
+
+For more information about this error, try `rustc --explain E0554`.
+error: could not compile `simd-json` (lib) due to 6 previous errors

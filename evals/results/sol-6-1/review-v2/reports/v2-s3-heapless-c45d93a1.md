@@ -1,0 +1,73 @@
+Found **14 issues**. The requested existing suite passes, but added regression tests expose the problems below. All reported observations were reproduced locally; explanations of their causes come from source inspection.
+
+1. **SPSC `peek()` lacks synchronization with the producer** — [src/spsc.rs:273](/work/crate/src/spsc.rs:273).  
+   Cross-thread consumers should observe published, initialized elements. `peek()` checks availability using relaxed loads, then returns an element reference without acquiring the producer’s release store. The ordinary two-thread `spsc_consumer_peek_cross_thread` test passes natively, but Miri reports a data race between enqueueing and peeking. This affects the queue’s documented use across execution contexts.
+
+2. **`Deque::make_contiguous()` leaves an invalid back index when full** — [src/deque.rs:489](/work/crate/src/deque.rs:489).  
+   Compaction should preserve subsequent queue behavior. One branch stores `back = len`, which equals capacity for a full deque instead of wrapping to zero. The regression fills a capacity-four deque, rotates it, compacts `[3,4,5,6]`, then removes all four items. Expected: empty, length zero. Observed: nonempty, length four. Callers cannot reliably drain or reuse the deque afterward.
+
+3. **Popping a modified sorted-list entry removes it twice** — [src/sorted_linked_list.rs:713](/work/crate/src/sorted_linked_list.rs:713).  
+   `FindMutView::pop()` should remove and return the selected element once. It leaves `maybe_changed` set, so its destructor calls `pop_internal()` again and reinserts a value. Starting with `[3,2,1]`, changing `2` to `20`, then calling `pop()` returns `20` but leaves `[20,3]`, rather than `[3,1]`. The regression demonstrates both a resurrected value and a lost element.
+
+4. **`IndexMap::truncate()` makes retained keys unreachable** — [src/index_map.rs:1274](/work/crate/src/index_map.rs:1274).  
+   Truncation should preserve lookup of the retained prefix. Clearing index slots without repairing probe chains introduces holes before retained entries. With `FnvIndexMap<u8,u8,4>`, inserting keys `[0,1,4]` and truncating to two leaves key `1` visible during iteration, but `get(&1)` returns `None`. Both default-FNV and controlled-hasher regressions fail.
+
+5. **Collecting into `LinearMap` preserves duplicate keys** — [src/linear_map.rs:534](/work/crate/src/linear_map.rs:534).  
+   Collection should maintain the dictionary’s unique-key behavior established by `insert()`. Instead, it extends the backing vector directly. Collecting `[(1,10),(1,20)]` produces length two and lookup value `10`, rather than one updated entry. With capacity one, the same input panics despite containing only one distinct key. Both cases were executed.
+
+6. **The `bytes` adapter panics on exact-capacity writes** — [src/bytes.rs:19](/work/crate/src/bytes.rs:19).  
+   `BufMut` should accept writes up to `remaining_mut()`. The `>=` check rejects advancing exactly to capacity. Calling safe `put_slice(b"abcd")` on `Vec<u8,4>` panics with “Advance out of range.” Existing adapter tests cover advancing one byte and exceeding capacity, but miss this ordinary boundary.
+
+7. **Owning `IndexMap` iteration reverses its established iteration order** — [src/index_map.rs:1455](/work/crate/src/index_map.rs:1455).  
+   As an API consistency expectation, consuming this insertion-ordered map should agree with its documented borrowed iterators. `IntoIter::next()` instead pops from the backing vector’s end. The executed comparison observes `[(3,30),(2,20),(1,10)]` from owning iteration versus insertion order from `iter()`. Switching loop ownership therefore reverses processing order; collecting into another ordered map also reverses it.
+
+8. **`CString::from_bytes_with_nul()` accepts missing terminators** — [src/c_string.rs:83](/work/crate/src/c_string.rs:83).  
+   Its documentation explicitly requires an error when input lacks a trailing nul. The implementation delegates to the permissive append method, which supplies the terminator. Separate regressions show that both `b"abc"` and empty input succeed. Callers using this constructor for validation receive success for documented-invalid input.
+
+9. **The owning `Vec` iterator repeats destruction after a destructor panics** — [src/vec/mod.rs:1527](/work/crate/src/vec/mod.rs:1527).  
+   Elements should be destroyed at most once during cleanup. The iterator clears its backing vector’s length only after dropping remaining elements. If that operation unwinds, field cleanup drops the vector again, including previously consumed elements. An executed counter-based test observes destruction counts `[2,2,2]` instead of `[1,1,1]`.
+
+10. **`Deque::clear()` and `HistoryBuf::clear()` retain dropped contents during unwinding** — [src/deque.rs:237](/work/crate/src/deque.rs:237), [src/history_buf.rs:318](/work/crate/src/history_buf.rs:318).  
+    Both clear their bookkeeping after running destructors. If one destructor panics and the caller catches it, later dropping the container destroys the same elements again. Separate ordinary counter-based regressions observe `[2,2,2]` destruction counts for both containers. Resource-owning elements consequently receive repeated cleanup.
+
+11. **A panicking `IndexMap::retain()` predicate leaves stale indices** — [src/index_map.rs:307](/work/crate/src/index_map.rs:307).  
+    After unwinding, retained elements should remain accessible through a consistent map. The backing vector repairs its contents during unwinding, but rebuilding the map’s indices is skipped. Removing key `0`, then panicking on key `1`, leaves iteration showing keys `[1,2]`; subsequent `get(&1)` panics at the index bounds assertion. The regression reproduces this secondary failure after catching the predicate panic.
+
+12. **Capacity erasure removes `Vec`’s Serde support** — [src/ser.rs:52](/work/crate/src/ser.rs:52).  
+    `VecView` is documented as the capacity-erased vector interface, but the serialization implementation imposes an implicit `Sized` storage bound. A compile harness accepts `&Vec<u8,4>` through `T: Serialize + ?Sized`, then rejects `v.as_view()` with E0277. This prevents serialization through ordinary APIs accepting vector views; the implementation needs to accommodate unsized storage.
+
+13. **The docs.rs configuration fails on the installed nightly** — [src/lib.rs:133](/work/crate/src/lib.rs:133).  
+    Building with `--cfg docsrs` should generate documentation. On `nightly-2026-10-01`, rustdoc fails with E0557 because `doc_auto_cfg` was removed and merged into `doc_cfg`. This is a pre-existing toolchain compatibility failure. The reproduction used the host target; the configured i686 documentation target was unavailable.
+
+14. **Strict Clippy fails on Rust 1.99.1** — [src/index_map.rs:178](/work/crate/src/index_map.rs:178), [src/string/mod.rs:353](/work/crate/src/string/mod.rs:353).  
+    The repository’s warnings-as-errors lint policy does not pass with the supplied toolchain. Default-feature Clippy rejects `question_mark` and `ref_as_ptr`; the requested combined features add diagnostics in deserialization, MPMC and pool code. These are pre-existing lint failures, not runtime defects.
+
+Checks ran on **aarch64 Linux, Rust 1.99.1**, with `RUSTUP_AUTO_INSTALL=0` and `CARGO_NET_OFFLINE=true`. Below, `$F` abbreviates the exact requested feature list:
+
+```sh
+F=alloc,defmt,mpmc_large,portable-atomic-critical-section,serde,ufmt,bytes
+```
+
+| Command from `/work/crate` | Outcome |
+|---|---|
+| `cargo test --locked --features="$F"` | Passed: 220 unit, 9 integration, 184 documentation tests |
+| `cargo test --locked --no-default-features` | Passed: 186 unit, 9 integration, 177 documentation tests |
+| `MIRIFLAGS=-Zmiri-ignore-leaks cargo +nightly-2026-10-01 miri test --locked --features="$F"` | Passed: 218 unit, 6 integration, 184 documentation tests; 5 ignored; integer-to-pointer warning |
+| `cargo check --locked --no-default-features --features "$feature"` | Passed separately for alloc, bytes, defmt, mpmc_large, portable-atomic, portable-atomic-critical-section, serde and ufmt |
+| `RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --features="$F"` | Passed |
+| `RUSTDOCFLAGS='-D warnings --cfg docsrs' cargo +nightly-2026-10-01 doc --locked --no-deps --features="$F"` | Failed: E0557, removed feature |
+| `cargo clippy --locked --all-targets -- -D warnings` | Failed |
+| `cargo clippy --locked --all-targets --features="$F" -- -D warnings` | Failed |
+| `cargo fmt --all -- --check` | Passed; unstable documentation-code formatting option ignored |
+| `cargo +nightly-2026-10-01 fmt --all -- --check` | Blocked: nightly rustfmt is not installed |
+
+Added files are confined to `/work/tmp/review`: [regressions](/work/tmp/review/tests/review_regressions.rs), [unwind tests](/work/tmp/review/tests/review_unwind.rs), [model comparisons](/work/tmp/review/tests/review_models.rs), and the [Serde compile harness](/work/tmp/review/examples/review_vecview_serde.rs). Original source, manifest and lockfile remain unchanged.
+
+Commands executed from that scratch copy:
+
+- `cargo test --locked --features="$F" --test review_regressions --test review_unwind --test review_models --no-fail-fast`: **14 failed tests, 6 passed**. Four model comparisons passed; failing assertions establish the findings above.
+- `cargo +nightly-2026-10-01 miri test --locked --test review_regressions spsc_consumer_peek_cross_thread -- --nocapture`: failed with the reported data race.
+- `cargo check --locked --features serde --example review_vecview_serde`: failed with E0277.
+- From its `cfail` directory, `cargo run --offline`: blocked because `trybuild` is not prefetched.
+
+**Finding count: 14.** Coverage excludes release-mode checks, sanitizer instrumentation and unavailable cross-target configurations. Miri’s baseline run disabled leak checking and honored existing ignored tests. No dedicated security assessment was performed. Last clock reading: **685.5 / 2700 active seconds — 11.4214 minutes**.

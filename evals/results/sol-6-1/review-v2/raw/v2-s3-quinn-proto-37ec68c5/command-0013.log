@@ -1,0 +1,704 @@
+            rs.record_sent_max_stream_data(max);
+
+            trace!(stream = %id, max = max, "MAX_STREAM_DATA");
+            buf.write(frame::FrameType::MAX_STREAM_DATA);
+            buf.write(id);
+            buf.write_var(max);
+            stats.max_stream_data += 1;
+        }
+
+        // MAX_STREAMS
+        for dir in Dir::iter() {
+            if !pending.max_stream_id[dir as usize] || buf.len() + 9 >= max_size {
+                continue;
+            }
+
+            pending.max_stream_id[dir as usize] = false;
+            retransmits.get_or_create().max_stream_id[dir as usize] = true;
+            self.sent_max_remote[dir as usize] = self.max_remote[dir as usize];
+            trace!(
+                value = self.max_remote[dir as usize],
+                "MAX_STREAMS ({:?})", dir
+            );
+            buf.write(match dir {
+                Dir::Uni => frame::FrameType::MAX_STREAMS_UNI,
+                Dir::Bi => frame::FrameType::MAX_STREAMS_BIDI,
+            });
+            buf.write_var(self.max_remote[dir as usize]);
+            match dir {
+                Dir::Uni => stats.max_streams_uni += 1,
+                Dir::Bi => stats.max_streams_bidi += 1,
+            }
+        }
+    }
+
+    pub(crate) fn write_stream_frames(
+        &mut self,
+        buf: &mut Vec<u8>,
+        max_buf_size: usize,
+        fair: bool,
+    ) -> StreamMetaVec {
+        let mut stream_frames = StreamMetaVec::new();
+        while buf.len() + frame::Stream::SIZE_BOUND < max_buf_size {
+            if max_buf_size
+                .checked_sub(buf.len() + frame::Stream::SIZE_BOUND)
+                .is_none()
+            {
+                break;
+            }
+
+            // Pop the stream of the highest priority that currently has pending data
+            // If the stream still has some pending data left after writing, it will be reinserted, otherwise not
+            let Some(stream) = self.pending.pop() else {
+                break;
+            };
+
+            let id = stream.id;
+
+            let stream = match self.send.get_mut(&id).and_then(|s| s.as_mut()) {
+                Some(s) => s,
+                // Stream was reset with pending data and the reset was acknowledged
+                None => continue,
+            };
+
+            // Reset streams aren't removed from the pending list and still exist while the peer
+            // hasn't acknowledged the reset, but should not generate STREAM frames, so we need to
+            // check for them explicitly.
+            if stream.is_reset() {
+                continue;
+            }
+
+            // Now that we know the `StreamId`, we can better account for how many bytes
+            // are required to encode it.
+            let max_buf_size = max_buf_size - buf.len() - 1 - VarInt::size(id.into());
+            let (offsets, encode_length) = stream.pending.poll_transmit(max_buf_size);
+            let fin = offsets.end == stream.pending.offset()
+                && matches!(stream.state, SendState::DataSent { .. });
+            if fin {
+                stream.fin_pending = false;
+            }
+
+            if stream.is_pending() {
+                // If the stream still has pending data, reinsert it, possibly with an updated priority value
+                // Fairness with other streams is achieved by implementing round-robin scheduling,
+                // so that the other streams will have a chance to write data
+                // before we touch this stream again.
+                if fair {
+                    self.pending.push_pending(id, stream.priority);
+                } else {
+                    self.pending.reinsert_pending(id, stream.priority);
+                }
+            }
+
+            let meta = frame::StreamMeta { id, offsets, fin };
+            trace!(id = %meta.id, off = meta.offsets.start, len = meta.offsets.end - meta.offsets.start, fin = meta.fin, "STREAM");
+            meta.encode(encode_length, buf);
+
+            // The range might not be retrievable in a single `get` if it is
+            // stored in noncontiguous fashion. Therefore this loop iterates
+            // until the range is fully copied into the frame.
+            let mut offsets = meta.offsets.clone();
+            while offsets.start != offsets.end {
+                let data = stream.pending.get(offsets.clone());
+                offsets.start += data.len() as u64;
+                buf.put_slice(data);
+            }
+            stream_frames.push(meta);
+        }
+
+        stream_frames
+    }
+
+    /// Notify the application that new streams were opened or a stream became readable.
+    fn on_stream_frame(&mut self, notify_readable: bool, stream: StreamId) {
+        if stream.initiator() == self.side {
+            // Notifying about the opening of locally-initiated streams would be redundant.
+            if notify_readable {
+                self.events.push_back(StreamEvent::Readable { id: stream });
+            }
+            return;
+        }
+        let next = &mut self.next_remote[stream.dir() as usize];
+        if stream.index() >= *next {
+            *next = stream.index() + 1;
+            self.opened[stream.dir() as usize] = true;
+        } else if notify_readable {
+            self.events.push_back(StreamEvent::Readable { id: stream });
+        }
+    }
+
+    pub(crate) fn received_ack_of(&mut self, frame: frame::StreamMeta) {
+        let mut entry = match self.send.entry(frame.id) {
+            hash_map::Entry::Vacant(_) => return,
+            hash_map::Entry::Occupied(e) => e,
+        };
+
+        let stream = match entry.get_mut().as_mut() {
+            Some(s) => s,
+            None => {
+                // Because we only call this after sending data on this stream,
+                // this closure should be unreachable. If we did somehow screw that up,
+                // then we might hit an underflow below with unpredictable effects down
+                // the line. Best to short-circuit.
+                return;
+            }
+        };
+
+        if stream.is_reset() {
+            // We account for outstanding data on reset streams at time of reset
+            return;
+        }
+        let id = frame.id;
+        self.unacked_data -= frame.offsets.end - frame.offsets.start;
+        if !stream.ack(frame) {
+            // The stream is unfinished or may still need retransmits
+            return;
+        }
+
+        entry.remove_entry();
+        self.stream_freed(id, StreamHalf::Send);
+        self.events.push_back(StreamEvent::Finished { id });
+    }
+
+    pub(crate) fn retransmit(&mut self, frame: frame::StreamMeta) {
+        let stream = match self.send.get_mut(&frame.id).and_then(|s| s.as_mut()) {
+            // Loss of data on a closed stream is a noop
+            None => return,
+            Some(x) => x,
+        };
+        if !stream.is_pending() {
+            self.pending.push_pending(frame.id, stream.priority);
+        }
+        stream.fin_pending |= frame.fin;
+        stream.pending.retransmit(frame.offsets);
+    }
+
+    pub(crate) fn retransmit_all_for_0rtt(&mut self) {
+        for dir in Dir::iter() {
+            for index in 0..self.next[dir as usize] {
+                let id = StreamId::new(Side::Client, dir, index);
+                let stream = match self.send.get_mut(&id).and_then(|s| s.as_mut()) {
+                    Some(stream) => stream,
+                    None => continue,
+                };
+                if stream.pending.is_fully_acked() && !stream.fin_pending {
+                    // Stream data can't be acked in 0-RTT, so we must not have sent anything on
+                    // this stream
+                    continue;
+                }
+                if !stream.is_pending() {
+                    self.pending.push_pending(id, stream.priority);
+                }
+                stream.pending.retransmit_all_for_0rtt();
+            }
+        }
+    }
+
+    pub(crate) fn received_max_streams(
+        &mut self,
+        dir: Dir,
+        count: u64,
+    ) -> Result<(), TransportError> {
+        if count > MAX_STREAM_COUNT {
+            return Err(TransportError::FRAME_ENCODING_ERROR(
+                "unrepresentable stream limit",
+            ));
+        }
+
+        let current = &mut self.max[dir as usize];
+        if count > *current {
+            *current = count;
+            self.events.push_back(StreamEvent::Available { dir });
+        }
+
+        Ok(())
+    }
+
+    /// Handle increase to connection-level flow control limit
+    pub(crate) fn received_max_data(&mut self, n: VarInt) {
+        self.max_data = self.max_data.max(n.into());
+    }
+
+    pub(crate) fn received_max_stream_data(
+        &mut self,
+        id: StreamId,
+        offset: u64,
+    ) -> Result<(), TransportError> {
+        if id.initiator() != self.side && id.dir() == Dir::Uni {
+            debug!("got MAX_STREAM_DATA on recv-only {}", id);
+            return Err(TransportError::STREAM_STATE_ERROR(
+                "MAX_STREAM_DATA on recv-only stream",
+            ));
+        }
+
+        let write_limit = self.write_limit();
+        let max_send_data = self.max_send_data(id);
+        if let Some(ss) = self
+            .send
+            .get_mut(&id)
+            .map(get_or_insert_send(max_send_data))
+        {
+            if ss.increase_max_data(offset) {
+                if write_limit > 0 {
+                    self.events.push_back(StreamEvent::Writable { id });
+                } else if !ss.connection_blocked {
+                    // The stream is still blocked on the connection flow control
+                    // window. In order to get unblocked when the window relaxes
+                    // it needs to be in the connection blocked list.
+                    ss.connection_blocked = true;
+                    self.connection_blocked.push(id);
+                }
+            }
+        } else if id.initiator() == self.side && self.is_local_unopened(id) {
+            debug!("got MAX_STREAM_DATA on unopened {}", id);
+            return Err(TransportError::STREAM_STATE_ERROR(
+                "MAX_STREAM_DATA on unopened stream",
+            ));
+        }
+
+        self.on_stream_frame(false, id);
+        Ok(())
+    }
+
+    /// Returns the maximum amount of data this is allowed to be written on the connection
+    pub(crate) fn write_limit(&self) -> u64 {
+        (self.max_data - self.data_sent)
+            // `send_window` can be set after construction to something *less* than `unacked_data`
+            .min(self.send_window.saturating_sub(self.unacked_data))
+    }
+
+    /// Yield stream events
+    pub(crate) fn poll(&mut self) -> Option<StreamEvent> {
+        if let Some(dir) = Dir::iter().find(|&i| mem::replace(&mut self.opened[i as usize], false))
+        {
+            return Some(StreamEvent::Opened { dir });
+        }
+
+        if self.write_limit() > 0 {
+            while let Some(id) = self.connection_blocked.pop() {
+                let stream = match self.send.get_mut(&id).and_then(|s| s.as_mut()) {
+                    None => continue,
+                    Some(s) => s,
+                };
+
+                debug_assert!(stream.connection_blocked);
+                stream.connection_blocked = false;
+
+                // If it's no longer sensible to write to a stream (even to detect an error) then don't
+                // report it.
+                if stream.is_writable() && stream.max_data > stream.offset() {
+                    return Some(StreamEvent::Writable { id });
+                }
+            }
+        }
+
+        self.events.pop_front()
+    }
+
+    /// Queues MAX_STREAM_ID frames in `pending` if needed
+    ///
+    /// Returns whether any frames were queued.
+    pub(crate) fn queue_max_stream_id(&mut self, pending: &mut Retransmits) -> bool {
+        let mut queued = false;
+        for dir in Dir::iter() {
+            let diff = self.max_remote[dir as usize] - self.sent_max_remote[dir as usize];
+            // To reduce traffic, only announce updates if at least 1/8 of the flow control window
+            // has been consumed.
+            if diff > self.max_concurrent_remote_count[dir as usize] / 8 {
+                pending.max_stream_id[dir as usize] = true;
+                queued = true;
+            }
+        }
+        queued
+    }
+
+    /// Check for errors entailed by the peer's use of `id` as a send stream
+    fn validate_receive_id(&mut self, id: StreamId) -> Result<(), TransportError> {
+        if self.side == id.initiator() {
+            match id.dir() {
+                Dir::Uni => {
+                    return Err(TransportError::STREAM_STATE_ERROR(
+                        "illegal operation on send-only stream",
+                    ));
+                }
+                Dir::Bi if id.index() >= self.next[Dir::Bi as usize] => {
+                    return Err(TransportError::STREAM_STATE_ERROR(
+                        "operation on unopened stream",
+                    ));
+                }
+                Dir::Bi => {}
+            };
+        } else {
+            let limit = self.max_remote[id.dir() as usize];
+            if id.index() >= limit {
+                return Err(TransportError::STREAM_LIMIT_ERROR(""));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a locally initiated stream has never been open
+    pub(crate) fn is_local_unopened(&self, id: StreamId) -> bool {
+use std::{
+    fmt,
+    net::{SocketAddrV4, SocketAddrV6},
+    num::TryFromIntError,
+    sync::Arc,
+};
+
+#[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
+use rustls::client::WebPkiServerVerifier;
+#[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use thiserror::Error;
+
+#[cfg(feature = "bloom")]
+use crate::BloomTokenLog;
+#[cfg(not(feature = "bloom"))]
+use crate::NoneTokenLog;
+#[cfg(any(feature = "rustls-aws-lc-rs", feature = "rustls-ring"))]
+use crate::crypto::rustls::{QuicServerConfig, configured_provider};
+use crate::{
+    DEFAULT_SUPPORTED_VERSIONS, Duration, MAX_CID_SIZE, RandomConnectionIdGenerator, SystemTime,
+    TokenLog, TokenMemoryCache, TokenStore, VarInt, VarIntBoundsExceeded,
+    cid_generator::{ConnectionIdGenerator, HashedConnectionIdGenerator},
+    crypto::{self, HandshakeTokenKey, HmacKey},
+    shared::ConnectionId,
+};
+
+mod transport;
+#[cfg(feature = "qlog")]
+pub use transport::QlogConfig;
+pub use transport::{AckFrequencyConfig, IdleTimeout, MtuDiscoveryConfig, TransportConfig};
+
+/// Global configuration for the endpoint, affecting all connections
+///
+/// Default values should be suitable for most internet applications.
+#[derive(Clone)]
+pub struct EndpointConfig {
+    pub(crate) reset_key: Arc<dyn HmacKey>,
+    pub(crate) max_udp_payload_size: VarInt,
+    /// CID generator factory
+    ///
+    /// Create a cid generator for local cid in Endpoint struct
+    pub(crate) connection_id_generator_factory:
+        Arc<dyn Fn() -> Box<dyn ConnectionIdGenerator> + Send + Sync>,
+    pub(crate) supported_versions: Vec<u32>,
+    pub(crate) grease_quic_bit: bool,
+    /// Minimum interval between outgoing stateless reset packets
+    pub(crate) min_reset_interval: Duration,
+    /// Optional seed to be used internally for random number generation
+    pub(crate) rng_seed: Option<[u8; 32]>,
+}
+
+impl EndpointConfig {
+    /// Create a default config with a particular `reset_key`
+    pub fn new(reset_key: Arc<dyn HmacKey>) -> Self {
+        let cid_factory =
+            || -> Box<dyn ConnectionIdGenerator> { Box::<HashedConnectionIdGenerator>::default() };
+        Self {
+            reset_key,
+            max_udp_payload_size: (1500u32 - 28).into(), // Ethernet MTU minus IP + UDP headers
+            connection_id_generator_factory: Arc::new(cid_factory),
+            supported_versions: DEFAULT_SUPPORTED_VERSIONS.to_vec(),
+            grease_quic_bit: true,
+            min_reset_interval: Duration::from_millis(20),
+            rng_seed: None,
+        }
+    }
+
+    /// Supply a custom connection ID generator factory
+    ///
+    /// Called once by each `Endpoint` constructed from this configuration to obtain the CID
+    /// generator which will be used to generate the CIDs used for incoming packets on all
+    /// connections involving that  `Endpoint`. A custom CID generator allows applications to embed
+    /// information in local connection IDs, e.g. to support stateless packet-level load balancers.
+    ///
+    /// Defaults to [`HashedConnectionIdGenerator`].
+    pub fn cid_generator<F: Fn() -> Box<dyn ConnectionIdGenerator> + Send + Sync + 'static>(
+        &mut self,
+        factory: F,
+    ) -> &mut Self {
+        self.connection_id_generator_factory = Arc::new(factory);
+        self
+    }
+
+    /// Private key used to send authenticated connection resets to peers who were
+    /// communicating with a previous instance of this endpoint.
+    pub fn reset_key(&mut self, key: Arc<dyn HmacKey>) -> &mut Self {
+        self.reset_key = key;
+        self
+    }
+
+    /// Maximum UDP payload size accepted from peers (excluding UDP and IP overhead).
+    ///
+    /// Must be greater or equal than 1200.
+    ///
+    /// Defaults to 1472, which is the largest UDP payload that can be transmitted in the typical
+    /// 1500 byte Ethernet MTU. Deployments on links with larger MTUs (e.g. loopback or Ethernet
+    /// with jumbo frames) can raise this to improve performance at the cost of a linear increase in
+    /// datagram receive buffer size.
+    pub fn max_udp_payload_size(&mut self, value: u16) -> Result<&mut Self, ConfigError> {
+        if !(1200..=65_527).contains(&value) {
+            return Err(ConfigError::OutOfBounds);
+        }
+
+        self.max_udp_payload_size = value.into();
+        Ok(self)
+    }
+
+    /// Get the current value of [`max_udp_payload_size`](Self::max_udp_payload_size)
+    //
+    // While most parameters don't need to be readable, this must be exposed to allow higher-level
+    // layers, e.g. the `quinn` crate, to determine how large a receive buffer to allocate to
+    // support an externally-defined `EndpointConfig`.
+    //
+    // While `get_` accessors are typically unidiomatic in Rust, we favor concision for setters,
+    // which will be used far more heavily.
+    pub fn get_max_udp_payload_size(&self) -> u64 {
+        self.max_udp_payload_size.into()
+    }
+
+    /// Override supported QUIC versions
+    pub fn supported_versions(&mut self, supported_versions: Vec<u32>) -> &mut Self {
+        self.supported_versions = supported_versions;
+        self
+    }
+
+    /// Whether to accept QUIC packets containing any value for the fixed bit
+    ///
+    /// Enabled by default. Helps protect against protocol ossification and makes traffic less
+    /// identifiable to observers. Disable if helping observers identify this traffic as QUIC is
+    /// desired.
+    pub fn grease_quic_bit(&mut self, value: bool) -> &mut Self {
+        self.grease_quic_bit = value;
+        self
+    }
+
+    /// Minimum interval between outgoing stateless reset packets
+    ///
+    /// Defaults to 20ms. Limits the impact of attacks which flood an endpoint with garbage packets,
+    /// e.g. [ISAKMP/IKE amplification]. Larger values provide a stronger defense, but may delay
+    /// detection of some error conditions by clients. Using a [`ConnectionIdGenerator`] with a low
+    /// rate of false positives in [`validate`](ConnectionIdGenerator::validate) reduces the risk
+    /// incurred by a small minimum reset interval.
+    ///
+    /// [ISAKMP/IKE
+    /// amplification]: https://bughunters.google.com/blog/5960150648750080/preventing-cross-service-udp-loops-in-quic#isakmp-ike-amplification-vs-quic
+    pub fn min_reset_interval(&mut self, value: Duration) -> &mut Self {
+        self.min_reset_interval = value;
+        self
+    }
+
+    /// Optional seed to be used internally for random number generation
+    ///
+    /// By default, quinn will initialize an endpoint's rng using a platform entropy source.
+    /// However, you can seed the rng yourself through this method (e.g. if you need to run quinn
+    /// deterministically or if you are using quinn in an environment that doesn't have a source of
+    /// entropy available).
+    pub fn rng_seed(&mut self, seed: Option<[u8; 32]>) -> &mut Self {
+        self.rng_seed = seed;
+        self
+    }
+}
+
+impl fmt::Debug for EndpointConfig {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("EndpointConfig")
+            // reset_key not debug
+            .field("max_udp_payload_size", &self.max_udp_payload_size)
+            // cid_generator_factory not debug
+            .field("supported_versions", &self.supported_versions)
+            .field("grease_quic_bit", &self.grease_quic_bit)
+            .field("rng_seed", &self.rng_seed)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(any(feature = "aws-lc-rs", feature = "ring"))]
+impl Default for EndpointConfig {
+    fn default() -> Self {
+        #[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
+        use aws_lc_rs::hmac;
+        use rand::RngCore;
+        #[cfg(feature = "ring")]
+        use ring::hmac;
+
+        let mut reset_key = [0; 64];
+        rand::rng().fill_bytes(&mut reset_key);
+
+        Self::new(Arc::new(hmac::Key::new(hmac::HMAC_SHA256, &reset_key)))
+    }
+}
+
+/// Parameters governing incoming connections
+///
+/// Default values should be suitable for most internet applications.
+#[derive(Clone)]
+pub struct ServerConfig {
+    /// Transport configuration to use for incoming connections
+    pub transport: Arc<TransportConfig>,
+
+    /// TLS configuration used for incoming connections
+    ///
+    /// Must be set to use TLS 1.3 only.
+    pub crypto: Arc<dyn crypto::ServerConfig>,
+
+    /// Configuration for sending and handling validation tokens
+    pub validation_token: ValidationTokenConfig,
+
+    /// Used to generate one-time AEAD keys to protect handshake tokens
+    pub(crate) token_key: Arc<dyn HandshakeTokenKey>,
+
+    /// Duration after a retry token was issued for which it's considered valid
+    pub(crate) retry_token_lifetime: Duration,
+
+    /// Whether to allow clients to migrate to new addresses
+    ///
+    /// Improves behavior for clients that move between different internet connections or suffer NAT
+    /// rebinding. Enabled by default.
+    pub(crate) migration: bool,
+
+    pub(crate) preferred_address_v4: Option<SocketAddrV4>,
+    pub(crate) preferred_address_v6: Option<SocketAddrV6>,
+
+    pub(crate) max_incoming: usize,
+    pub(crate) incoming_buffer_size: u64,
+    pub(crate) incoming_buffer_size_total: u64,
+
+    pub(crate) time_source: Arc<dyn TimeSource>,
+}
+
+impl ServerConfig {
+    /// Create a default config with a particular handshake token key
+    pub fn new(
+        crypto: Arc<dyn crypto::ServerConfig>,
+        token_key: Arc<dyn HandshakeTokenKey>,
+    ) -> Self {
+        Self {
+            transport: Arc::new(TransportConfig::default()),
+            crypto,
+
+            token_key,
+            retry_token_lifetime: Duration::from_secs(15),
+
+            migration: true,
+
+            validation_token: ValidationTokenConfig::default(),
+
+            preferred_address_v4: None,
+            preferred_address_v6: None,
+
+            max_incoming: 1 << 16,
+            incoming_buffer_size: 10 << 20,
+            incoming_buffer_size_total: 100 << 20,
+
+            time_source: Arc::new(StdSystemTime),
+        }
+    }
+
+    /// Set a custom [`TransportConfig`]
+    pub fn transport_config(&mut self, transport: Arc<TransportConfig>) -> &mut Self {
+98:/// expects timeouts through various methods. A number of simple getter methods are exposed
+270:            expected_token: Bytes::new(),
+378:    pub fn poll_timeout(&mut self) -> Option<Instant> {
+388:    pub fn poll(&mut self) -> Option<Event> {
+406:    pub fn poll_endpoint_events(&mut self) -> Option<EndpointEvent> {
+412:    pub fn streams(&mut self) -> Streams<'_> {
+421:    pub fn recv_stream(&mut self, id: StreamId) -> RecvStream<'_> {
+422:        assert!(id.dir() == Dir::Bi || id.initiator() != self.side.side());
+432:    pub fn send_stream(&mut self, id: StreamId) -> SendStream<'_> {
+433:        assert!(id.dir() == Dir::Bi || id.initiator() == self.side.side());
+452:    pub fn poll_transmit(
+458:        assert!(max_datagrams != 0);
+565:                self.zero_rtt_crypto.as_ref().expect(
+603:                    debug_assert!(untracked_bytes <= segment_size as u64);
+679:                        // sending large enough volumes of data for GSO to be useful, we expect
+710:                        // unexpectedly.
+745:            debug_assert!(buf_capacity - buf.len() >= MIN_PACKET_SPACE);
+763:            debug_assert!(
+804:                debug_assert!(
+852:                    // `unwrap` guaranteed to succeed because `builder_storage` was populated just
+854:                    let mut builder = builder_storage.take().unwrap();
+889:            debug_assert!(
+1021:            .expect("previous path challenge pending without token");
+1092:    pub fn handle_event(&mut self, event: ConnectionEvent) {
+1168:    pub fn handle_timeout(&mut self, now: Instant) {
+1244:    pub fn close(&mut self, now: Instant, error_code: VarInt, reason: Bytes) {
+1262:    pub fn datagrams(&mut self) -> Datagrams<'_> {
+1267:    pub fn stats(&self) -> ConnectionStats {
+1279:    pub fn ping(&mut self) {
+1286:    pub fn force_key_update(&mut self) {
+1303:    pub fn initiate_key_update(&mut self) {
+1308:    pub fn crypto_session(&self) -> &dyn crypto::Session {
+1316:    pub fn is_handshaking(&self) -> bool {
+1327:    pub fn is_closed(&self) -> bool {
+1335:    pub fn is_drained(&self) -> bool {
+1342:    pub fn accepted_0rtt(&self) -> bool {
+1347:    pub fn has_0rtt(&self) -> bool {
+1352:    pub fn has_pending_retransmits(&self) -> bool {
+1357:    pub fn side(&self) -> Side {
+1362:    pub fn remote_address(&self) -> SocketAddr {
+1375:    pub fn local_ip(&self) -> Option<IpAddr> {
+1380:    pub fn rtt(&self) -> Duration {
+1385:    pub fn congestion_state(&self) -> &dyn Controller {
+1399:    pub fn path_changed(&mut self, now: Instant) {
+1407:    pub fn set_max_concurrent_streams(&mut self, dir: Dir, count: VarInt) {
+1420:    pub fn max_concurrent_streams(&self, dir: Dir) -> u64 {
+1425:    pub fn set_send_window(&mut self, send_window: u64) {
+1430:    pub fn set_receive_window(&mut self, receive_window: VarInt) {
+1619:                .expect("no previous keys")
+1622:                .expect("update not acknowledged yet")
+1652:            // A PTO when we're not expecting any ACKs must be due to handshake anti-amplification
+1655:                debug_assert!(!self.peer_completed_address_validation());
+1674:        let lost_send_time = now.checked_sub(loss_delay).unwrap();
+1675:        let largest_acked_packet = self.spaces[pn_space].largest_acked_packet.unwrap();
+1750:                let info = self.spaces[pn_space].take(packet).unwrap(); // safe: lost_packets is populated just above
+1793:            let info = self.spaces[SpaceId::Data].take(packet).unwrap(); // safe: lost_mtu_probe is omitted from lost_packets, and therefore must not have been removed yet
+1811:            debug_assert!(!self.peer_completed_address_validation());
+1999:        debug_assert!(self.side.is_server());
+2005:                state.expected_token = packet.header.token.clone();
+2043:                        .expect("crypto layer didn't supply transport parameters with ticket");
+2075:        let expected = if !self.state.is_handshake() {
+2081:            // flight, but we expect Handshake CRYPTO until the handshake is complete.
+2086:        // complete. Therefore, we will never see CRYPTO data from a later-than-expected space.
+2087:        debug_assert!(space <= expected, "received out-of-order CRYPTO data");
+2090:        if space < expected && end > self.spaces[space].crypto_stream.bytes_read() {
+2092:                "received new {:?} CRYPTO data when expecting {:?}",
+2093:                space, expected
+2096:                "new data at unexpected encryption level",
+2160:        debug_assert!(
+2170:                    .expect("handshake should be complete"),
+2175:        debug_assert!(space as usize > self.highest_space as usize);
+2184:        debug_assert!(space_id != SpaceId::Data);
+2268:            debug!("discarding packet with unexpected remote during handshake");
+2296:                    .unwrap()
+2324:                            if self.side.is_server() && token != &hs.expected_token {
+2411:                    SpaceId::Data => self.process_payload(now, remote, number.unwrap(), packet)?,
+2414:                        trace!("discarding unexpected pre-handshake packet");
+2475:                let client_hello = state.client_hello.take().unwrap();
+2514:                    expected_token: Bytes::new(),
+2556:                        if !self.crypto.early_data_accepted().unwrap() {
+2557:                            debug_assert!(self.side.is_client());
+2637:                self.process_payload(now, remote, number.unwrap(), packet)?;
+3036:                panic!("packets from unknown remote should be dropped by clients");
+3038:            debug_assert!(
+3062:                    .unwrap_or(u16::MAX);
+3093:    pub fn local_address_changed(&mut self) {
+3194:            // Safe to unwrap because this is always provided when ACK frequency is enabled
+3195:            let config = self.config.ack_frequency_config.as_ref().unwrap();
+3209:                request_max_ack_delay: max_ack_delay.as_micros().try_into().unwrap_or(VarInt::MAX),
+3355:                panic!("NEW_TOKEN frames should not be enqueued by clients");
+3413:        debug_assert!(!space.pending_acks.ranges().is_empty());
+3416:        debug_assert!(space.crypto.is_some(), "tried to send ACK in 0-RTT");
+3480:            }).expect("preferred address CID is the first received, and hence is guaranteed to be legal");
+3485:            u16::try_from(self.peer_params.max_udp_payload_size.into_inner()).unwrap_or(u16::MAX),
+3532:            .expect("only called for `Data` packets");
+3541:                .unwrap() // safe because update_keys() can only be triggered by short packets
+3543:            mem::replace(self.next_crypto.as_mut().unwrap(), new),
+3579:            panic!("Packets should never be coalesced in tests");
+3710:    pub fn current_mtu(&self) -> u16 {
+3717:    /// frames. Changes if the length of the remote connection ID changes, which is expected to be
+3724:                self.spaces[SpaceId::Data].largest_acked_packet.unwrap_or(0),
+3812:                token: token_store.take(&server_name).unwrap_or_default(),
+3969:        pub(super) expected_token: Bytes,

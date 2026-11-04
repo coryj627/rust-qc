@@ -1,0 +1,323 @@
+    ///         std::io::copy(&mut file, &mut std::io::stdout())?;
+    ///     }
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    #[derive(Clone, Debug)]
+    pub struct ZipArchive<R> {
+        pub(super) reader: R,
+        pub(super) shared: Arc<Shared>,
+    }
+}
+
+#[cfg(feature = "aes-crypto")]
+use crate::aes::PWD_VERIFY_LENGTH;
+use crate::extra_fields::UnicodeExtraField;
+use crate::result::ZipError::InvalidPassword;
+use crate::spec::is_dir;
+use crate::types::ffi::{S_IFLNK, S_IFREG};
+use crate::unstable::{path_to_string, LittleEndianReadExt};
+pub use zip_archive::ZipArchive;
+
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum CryptoReader<'a, R: Read> {
+    Plaintext(io::Take<&'a mut R>),
+    ZipCrypto(ZipCryptoReaderValid<io::Take<&'a mut R>>),
+    #[cfg(feature = "aes-crypto")]
+    Aes {
+        reader: AesReaderValid<io::Take<&'a mut R>>,
+        vendor_version: AesVendorVersion,
+    },
+}
+
+impl<R: Read> Read for CryptoReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            CryptoReader::Plaintext(r) => r.read(buf),
+            CryptoReader::ZipCrypto(r) => r.read(buf),
+            #[cfg(feature = "aes-crypto")]
+            CryptoReader::Aes { reader: r, .. } => r.read(buf),
+        }
+    }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        match self {
+            CryptoReader::Plaintext(r) => r.read_to_end(buf),
+            CryptoReader::ZipCrypto(r) => r.read_to_end(buf),
+            #[cfg(feature = "aes-crypto")]
+            CryptoReader::Aes { reader: r, .. } => r.read_to_end(buf),
+        }
+    }
+
+    fn read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
+        match self {
+            CryptoReader::Plaintext(r) => r.read_to_string(buf),
+            CryptoReader::ZipCrypto(r) => r.read_to_string(buf),
+            #[cfg(feature = "aes-crypto")]
+            CryptoReader::Aes { reader: r, .. } => r.read_to_string(buf),
+        }
+    }
+}
+
+impl<'a, R: Read> CryptoReader<'a, R> {
+    /// Consumes this decoder, returning the underlying reader.
+    pub fn into_inner(self) -> io::Take<&'a mut R> {
+        match self {
+            CryptoReader::Plaintext(r) => r,
+            CryptoReader::ZipCrypto(r) => r.into_inner(),
+            #[cfg(feature = "aes-crypto")]
+            CryptoReader::Aes { reader: r, .. } => r.into_inner(),
+        }
+    }
+
+    /// Returns `true` if the data is encrypted using AE2.
+    pub const fn is_ae2_encrypted(&self) -> bool {
+        #[cfg(feature = "aes-crypto")]
+        return matches!(
+            self,
+            CryptoReader::Aes {
+                vendor_version: AesVendorVersion::Ae2,
+                ..
+            }
+        );
+        #[cfg(not(feature = "aes-crypto"))]
+        false
+    }
+}
+
+#[cold]
+fn invalid_state<T>() -> io::Result<T> {
+    Err(io::Error::other("ZipFileReader was in an invalid state"))
+}
+
+pub(crate) enum ZipFileReader<'a, R: Read> {
+    NoReader,
+    Raw(io::Take<&'a mut R>),
+    Compressed(Box<Crc32Reader<Decompressor<io::BufReader<CryptoReader<'a, R>>>>>),
+}
+
+impl<R: Read> Read for ZipFileReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            ZipFileReader::NoReader => invalid_state(),
+            ZipFileReader::Raw(r) => r.read(buf),
+            ZipFileReader::Compressed(r) => r.read(buf),
+        }
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        match self {
+            ZipFileReader::NoReader => invalid_state(),
+            ZipFileReader::Raw(r) => r.read_exact(buf),
+            ZipFileReader::Compressed(r) => r.read_exact(buf),
+        }
+    }
+
+    fn read_to_end(&mut self, buf: &mut Vec<u8>) -> io::Result<usize> {
+        match self {
+            ZipFileReader::NoReader => invalid_state(),
+            ZipFileReader::Raw(r) => r.read_to_end(buf),
+            ZipFileReader::Compressed(r) => r.read_to_end(buf),
+        }
+    }
+
+    fn read_to_string(&mut self, buf: &mut String) -> io::Result<usize> {
+        match self {
+            ZipFileReader::NoReader => invalid_state(),
+            ZipFileReader::Raw(r) => r.read_to_string(buf),
+            ZipFileReader::Compressed(r) => r.read_to_string(buf),
+        }
+    }
+}
+
+impl<'a, R: Read> ZipFileReader<'a, R> {
+    fn into_inner(self) -> io::Result<io::Take<&'a mut R>> {
+        match self {
+            ZipFileReader::NoReader => invalid_state(),
+            ZipFileReader::Raw(r) => Ok(r),
+            ZipFileReader::Compressed(r) => {
+                Ok(r.into_inner().into_inner()?.into_inner().into_inner())
+            }
+        }
+    }
+}
+
+/// A struct for reading a zip file
+    crc32: u32,
+    reader: CryptoReader<R>,
+    flags: u16,
+) -> ZipResult<ZipFileReader<R>> {
+    let ae2_encrypted = reader.is_ae2_encrypted();
+
+    Ok(ZipFileReader::Compressed(Box::new(Crc32Reader::new(
+        Decompressor::new(
+            io::BufReader::new(reader),
+            compression_method,
+            uncompressed_size,
+            flags,
+        )?,
+        crc32,
+        ae2_encrypted,
+    ))))
+}
+
+pub(crate) fn make_symlink<T>(
+    outpath: &Path,
+    target: &[u8],
+    #[allow(unused)] existing_files: &IndexMap<Box<str>, T>,
+) -> ZipResult<()> {
+    let Ok(target_str) = std::str::from_utf8(target) else {
+        return Err(invalid!("Invalid UTF-8 as symlink target"));
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::fs::File;
+        let output = File::create(outpath);
+        output?.write_all(target)?;
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(Path::new(&target_str), outpath)?;
+    }
+    #[cfg(windows)]
+    {
+        let target = Path::new(OsStr::new(&target_str));
+        let target_is_dir_from_archive =
+            existing_files.contains_key(target_str) && is_dir(target_str);
+        let target_is_dir = if target_is_dir_from_archive {
+            true
+        } else if let Ok(meta) = std::fs::metadata(target) {
+            meta.is_dir()
+        } else {
+            false
+        };
+        if target_is_dir {
+            std::os::windows::fs::symlink_dir(target, outpath)?;
+        } else {
+            std::os::windows::fs::symlink_file(target, outpath)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) struct CentralDirectoryInfo {
+    pub(crate) archive_offset: u64,
+    pub(crate) directory_start: u64,
+    pub(crate) number_of_files: usize,
+    pub(crate) disk_number: u32,
+    pub(crate) disk_with_central_directory: u32,
+}
+
+impl<'a> TryFrom<&'a CentralDirectoryEndInfo> for CentralDirectoryInfo {
+    type Error = ZipError;
+
+    fn try_from(value: &'a CentralDirectoryEndInfo) -> Result<Self, Self::Error> {
+        let (relative_cd_offset, number_of_files, disk_number, disk_with_central_directory) =
+            match &value.eocd64 {
+                Some(DataAndPosition { data: eocd64, .. }) => {
+                    if eocd64.number_of_files_on_this_disk > eocd64.number_of_files {
+                        return Err(invalid!("ZIP64 footer indicates more files on this disk than in the whole archive"));
+                    }
+                    (
+                        eocd64.central_directory_offset,
+                        eocd64.number_of_files as usize,
+                        eocd64.disk_number,
+                        eocd64.disk_with_central_directory,
+                    )
+                }
+                _ => (
+                    value.eocd.data.central_directory_offset as u64,
+                    value.eocd.data.number_of_files_on_this_disk as usize,
+                    value.eocd.data.disk_number as u32,
+                    value.eocd.data.disk_with_central_directory as u32,
+                ),
+            };
+
+        let directory_start = relative_cd_offset
+            .checked_add(value.archive_offset)
+            .ok_or(invalid!("Invalid central directory size or offset"))?;
+
+        Ok(Self {
+            archive_offset: value.archive_offset,
+            directory_start,
+            number_of_files,
+            disk_number,
+            disk_with_central_directory,
+        })
+    }
+}
+
+impl<R> ZipArchive<R> {
+    pub(crate) fn from_finalized_writer(
+        files: IndexMap<Box<str>, ZipFileData>,
+        comment: Box<[u8]>,
+        zip64_comment: Option<Box<[u8]>>,
+        reader: R,
+        central_start: u64,
+    ) -> ZipResult<Self> {
+        let initial_offset = match files.first() {
+            Some((_, file)) => file.header_start,
+            None => central_start,
+        };
+        let shared = Arc::new(Shared {
+            files,
+            offset: initial_offset,
+            dir_start: central_start,
+            config: Config {
+                archive_offset: ArchiveOffset::Known(initial_offset),
+            },
+            comment,
+            zip64_comment,
+        });
+        Ok(Self { reader, shared })
+    }
+
+    /// Total size of the files in the archive, if it can be known. Doesn't include directories or
+    /// metadata.
+    pub fn decompressed_size(&self) -> Option<u128> {
+        let mut total = 0u128;
+        for file in self.shared.files.values() {
+    pub fn add_symlink_from_path<P: AsRef<Path>, T: AsRef<Path>, E: FileOptionExtension>(
+        &mut self,
+        path: P,
+        target: T,
+        options: FileOptions<E>,
+    ) -> ZipResult<()> {
+        self.add_symlink(path_to_string(path), path_to_string(target), options)
+    }
+
+    fn finalize(&mut self) -> ZipResult<u64> {
+        self.finish_file()?;
+
+        let mut central_start = self.write_central_and_footer()?;
+        let writer = self.inner.get_plain();
+        let footer_end = writer.stream_position()?;
+        let archive_end = writer.seek(SeekFrom::End(0))?;
+        if footer_end < archive_end {
+            // Data from an aborted file is past the end of the footer.
+
+            // Overwrite the magic so the footer is no longer valid.
+            writer.seek(SeekFrom::Start(central_start))?;
+            writer.write_u32_le(0)?;
+            writer.seek(SeekFrom::Start(
+                footer_end - size_of::<Zip32CDEBlock>() as u64 - self.comment.len() as u64,
+            ))?;
+            writer.write_u32_le(0)?;
+
+            // Rewrite the footer at the actual end.
+            let central_and_footer_size = footer_end - central_start;
+            writer.seek(SeekFrom::End(-(central_and_footer_size as i64)))?;
+            central_start = self.write_central_and_footer()?;
+            debug_assert!(self.inner.get_plain().stream_position()? == archive_end);
+        }
+
+        Ok(central_start)
+    }
+
+    fn write_central_and_footer(&mut self) -> Result<u64, ZipError> {
+        let writer = self.inner.get_plain();
+
+        let mut version_needed = MIN_VERSION as u16;
