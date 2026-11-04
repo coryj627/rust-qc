@@ -54,3 +54,41 @@ Both transcript checks found nothing in either pilot run. check_runs.py counted 
     python3 -I check_runs.py r3f1b1f=... rae3760=...
     python3 -I host_builds.py r3f1b1f=... rae3760=...
     python3 -I pilot_checks.py <results>/stage1
+
+# Commands run in Stage 2
+
+## Reproducers
+
+Reproducer projects live under `/srv/rqc/repro/projects/<project>`, with their own copy of `sb`.
+
+    python3 -I run_repros.py setup <clone> moka
+    python3 -I run_repros.py run <clone> moka <results>/stage2/reproducers.tsv <results>/stage2/logs
+    python3 -I run_repros.py clean <clone> moka
+    run_all_repros.sh <clone> <results> h2 quinn-proto just heapless git2 mlua zip pulldown-cmark simd-json
+
+The five `blocked` rows were classified by reading each failing log and script; the reasons are in each row's note.
+
+## Key rules
+
+    python3 -I prep_keyrules.py <clone> git2 h2 heapless just mlua moka pulldown-cmark quinn-proto simd-json zip
+    python3 -I launch.py kr-git2 kr-h2 kr-heapless kr-just kr-mlua kr-moka kr-pulldown-cmark kr-quinn-proto kr-simd-json kr-zip --root /srv/rqc/keyrules --read-only
+    # answers parsed from each stream's result, from the first '{' to the last '}', into private rules.json
+    python3 -I add_key_rules.py <clone> <results>/stage2 <rules.json>
+
+## Controls
+
+    python3 -I prep_workspaces.py keyed <clone> h2 quinn-proto just heapless git2 mlua zip pulldown-cmark moka simd-json
+    python3 -I prep_controls.py <clone> h2 quinn-proto just heapless
+    python3 -I launch.py c-heapless c-h2 c-just c-quinn-proto          # order drawn at random
+    python3 -I prep_controls.py <clone> git2 mlua zip pulldown-cmark moka simd-json
+    python3 -I launch.py c-git2 c-zip c-mlua                            # order drawn at random
+    python3 -I launch.py c-moka c-pulldown-cmark c-simd-json            # order drawn at random
+    python3 -I collect_controls.py <results>/stage2 <project>...
+
+## Transcript checks
+
+Output in `stage2/transcript-checks.txt`.
+
+    python3 -I check_runs.py --root /srv/rqc/keyrules kr-<project>=<stream> ...
+    python3 -I check_runs.py c-<project>=<stream> ...
+    python3 -I host_builds.py c-<project>=<stream> ...
