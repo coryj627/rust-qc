@@ -7,6 +7,7 @@ Each version lists what changed in the rules and scripts. A rule change names th
 ### Rule changes
 
 - Audit reports now keep QA hygiene and its counts in a separate section from defects. Skill runs reported far more items that are not defects on both models tested: 111 against 12 on Opus 5.5, and 86 against 28 hygiene items on Sol 6.1. This changes how results are presented, not what an audit checks. It has not been tested, and nothing here is expected to find more bugs.
+- Create and modify summaries now list the verification commands that ran, as plain `cargo` commands, with the outcome of each. In the Sol 6.1 coding runs, both skill runs on the DECOM fix gave test counts without commands, and graders deducted 0.25 of 12 points from each. The evidence is small and the change has not been tested.
 
 ### Fixed
 
