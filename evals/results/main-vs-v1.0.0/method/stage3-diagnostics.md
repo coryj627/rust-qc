@@ -36,3 +36,11 @@ Four new moka audits ran for the v1.0.0 arm with the earlier rounds' exact brief
 One agent graded the four redacted reports with the earlier rounds' grader brief, as in the regrading test. It found 0 of 20; the earlier rounds found 17 of 20. The audits used 4 to 10 clock minutes, wrote 509 to 1,136 words and cost 4.38 to 6.02 USD each, 20.58 USD in all, plus 0.12 USD for grading.
 
 So the Report wording does not explain the drop. What remains is how agents are started (`claude -p` here, subagents of an interactive session before) and the effort level, which no event confirms.
+
+## Subagent test
+
+Two moka audits for the v1.0.0 arm ran as subagents of an interactive Claude Code session, as the earlier rounds ran them: `claude-opus-5-5` at high effort, the earlier rounds' brief (with the x86_64 line), the same workspaces, template and sandbox. They used 12 and 14 clock minutes, 90 and 137 tool calls, and about 287,000 and 309,000 tokens. Neither read outside its workspace, used the network or built on the host, though both ran ordinary host commands such as `mkdir`, `cp` and `awk`, which a subagent is not prevented from running.
+
+One agent graded both redacted reports with the earlier rounds' grader brief: 0 of 10. Both reports found the same bugs that are not in the key as this round's `claude -p` audits did, for example `invalidate_entries_if` skipping one entry per batch and `remove` returning expired values.
+
+So neither the Report wording nor the way agents are started explains the drop. Every setup tried here stops at 4 to 33 clock minutes and finds few or none of moka's key bugs, where the earlier rounds' runs used 15 to 36 minutes and found 17 of 20.
